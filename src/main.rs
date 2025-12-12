@@ -1,15 +1,14 @@
 mod protos;
 mod vision;
-mod ui;
-mod field;
+#[path = "GUI/mod.rs"]
+mod gui;
 
 use tokio::sync::mpsc;
 use vision::Vision;
-use ui::ConfigUpdate;
+use gui::ConfigUpdate;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Create channels
     let (vision_tx, mut vision_rx) = mpsc::channel(100); 
     let (status_tx, status_rx) = mpsc::channel(100);
@@ -18,58 +17,71 @@ async fn main() {
     let vision_ip = "224.5.23.2".to_string();
     let vision_port = 10020;
     
-    let ui_ip = vision_ip.clone();
-    let ui_port = vision_port;
+    let gui_ip = vision_ip.clone();
+    let gui_port = vision_port;
+    let gui_config_tx = config_tx.clone();
 
-    // Spawn a task to handle configuration updates and restart vision
-    tokio::spawn(async move {
-        let mut current_ip = vision_ip;
-        let mut current_port = vision_port;
-        
-        loop {
-            let mut vision_system = Vision::new(current_ip.clone(), current_port);
-            let vision_tx_clone = vision_tx.clone();
-            let status_tx_clone = status_tx.clone();
-            
-            // Spawn vision task
-            let mut vision_handle = tokio::spawn(async move {
-                let _ = vision_system.run(vision_tx_clone, status_tx_clone).await;
-            });
+    // Spawn a background thread to run the vision system
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Spawn a task to handle configuration updates and restart vision
+            tokio::spawn(async move {
+                let mut current_ip = vision_ip;
+                let mut current_port = vision_port;
+                
+                loop {
+                    let mut vision_system = Vision::new(current_ip.clone(), current_port);
+                    let vision_tx_clone = vision_tx.clone();
+                    let status_tx_clone = status_tx.clone();
+                    
+                    // Spawn vision task
+                    let mut vision_handle = tokio::spawn(async move {
+                        let _ = vision_system.run(vision_tx_clone, status_tx_clone).await;
+                    });
 
-            // Wait for config update or vision task to complete
-            tokio::select! {
-                Some(config) = config_rx.recv() => {
-                    // Update configuration
-                    match config {
-                        ConfigUpdate::ChangeIpPort(new_ip, new_port) => {
-                            current_ip = new_ip;
-                            current_port = new_port;
+                    // Wait for config update or vision task to complete
+                    tokio::select! {
+                        Some(config) = config_rx.recv() => {
+                            // Update configuration
+                            match config {
+                                ConfigUpdate::ChangeIpPort(new_ip, new_port) => {
+                                    current_ip = new_ip;
+                                    current_port = new_port;
+                                }
+                            }
+                            // Abort and loop will restart with new config
+                        }
+                        _result = &mut vision_handle => {
+                            // Vision task completed unexpectedly
+                            // Add a small delay before restarting to prevent tight loop
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
-                    // Abort and loop will restart with new config
+                    
+                    // If we're here from config update, abort the vision task
+                    if !vision_handle.is_finished() {
+                        vision_handle.abort();
+                    }
                 }
-                result = &mut vision_handle => {
-                    // Vision task completed unexpectedly
-                    // Add a small delay before restarting to prevent tight loop
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            // Spawn a background task to consume vision events
+            tokio::spawn(async move {
+                while let Some(_event) = vision_rx.recv().await {
+                    // Process vision events if needed
+                    // For now, we just consume them
                 }
+            });
+
+            // Keep the runtime alive
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            
-            // If we're here from config update, abort the vision task
-            if !vision_handle.is_finished() {
-                vision_handle.abort();
-            }
-        }
+        });
     });
 
-    // Spawn a background task to consume vision events
-    tokio::spawn(async move {
-        while let Some(_event) = vision_rx.recv().await {
-            // Process vision events if needed
-            // For now, we just consume them
-        }
-    });
-
-    // Run UI (blocks until user quits)
-    let _ = ui::run_ui(status_rx, config_tx, ui_ip, ui_port).await;
+    // Run GUI (blocks until window is closed)
+    // The GUI will consume status_rx directly through its subscription
+    let _ = gui::run_gui(gui_ip, gui_port, gui_config_tx, status_rx);
 }

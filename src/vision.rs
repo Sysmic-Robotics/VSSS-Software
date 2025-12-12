@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::protos::ssl_vision_wrapper::SSL_WrapperPacket; 
 use crate::protos::ssl_vision_detection::{SSL_DetectionBall, SSL_DetectionRobot};
 use protobuf::Message;
-use crate::ui::StatusUpdate;
+use crate::gui::StatusUpdate;
 
 // --- Data Structures ---
 

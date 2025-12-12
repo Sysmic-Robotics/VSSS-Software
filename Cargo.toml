@@ -7,8 +7,7 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 protobuf = "3.2" # Matches C++ ParseFromArray style
 glam = "0.24"    # Standard Rust crate for vector math (replaces QVector2D)
-ratatui = "0.29"
-crossterm = "0.28"
+iced = { version = "0.13", features = ["canvas", "tokio"] }
 
 [build-dependencies]
 protobuf-codegen = "3" # Tool to generate Rust code from .proto files
