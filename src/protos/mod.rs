@@ -1,0 +1,28 @@
+// @generated
+
+pub mod grSim_Commands;
+pub mod grSim_Packet;
+pub mod grSim_Replacement;
+pub mod grSim_Robotstatus;
+pub mod ssl_gc_api;
+pub mod ssl_gc_change;
+pub mod ssl_gc_common;
+pub mod ssl_gc_engine;
+pub mod ssl_gc_engine_config;
+pub mod ssl_gc_game_event;
+pub mod ssl_gc_geometry;
+pub mod ssl_gc_rcon;
+pub mod ssl_gc_rcon_autoref;
+pub mod ssl_gc_rcon_remotecontrol;
+pub mod ssl_gc_rcon_team;
+pub mod ssl_gc_referee_message;
+pub mod ssl_gc_state;
+pub mod ssl_simulation_config;
+pub mod ssl_simulation_control;
+pub mod ssl_simulation_error;
+pub mod ssl_simulation_robot_control;
+pub mod ssl_simulation_robot_feedback;
+pub mod ssl_simulation_synchronous;
+pub mod ssl_vision_detection;
+pub mod ssl_vision_geometry;
+pub mod ssl_vision_wrapper;
