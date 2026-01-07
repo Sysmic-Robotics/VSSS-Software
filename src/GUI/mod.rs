@@ -45,6 +45,7 @@ pub enum StatusUpdate {
 
 #[derive(Debug, Clone)]
 pub struct Robot {
+    #[allow(dead_code)] // ID may be used for labeling robots in the future
     pub id: u32,
     pub team: u32,
     pub position: Vec2,
@@ -267,7 +268,7 @@ impl VisionGui {
         Theme::Dark
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         // Tab buttons
         let vision_button = button(
             text("Vision")

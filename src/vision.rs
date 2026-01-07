@@ -14,12 +14,14 @@ use crate::gui::StatusUpdate;
 // --- Data Structures ---
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // These fields will be used when implementing tracking/control logic
 pub struct BallData {
     pub position: Vec2,
     pub velocity: Vec2,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // These fields will be used when implementing tracking/control logic
 pub struct RobotData {
     pub id: u32,
     pub team: u32,
@@ -30,6 +32,7 @@ pub struct RobotData {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // These events will be consumed by control modules
 pub enum VisionEvent {
     Ball(BallData),
     Robot(RobotData),
@@ -59,6 +62,7 @@ pub struct Vision {
     tracker: Tracker,
     last_error_print: Instant,
     error_count: u64,
+    debug_print_count: u64,
 }
 
 impl Vision {
@@ -69,6 +73,7 @@ impl Vision {
             tracker: Tracker::new(),
             last_error_print: Instant::now() - Duration::from_secs(10),
             error_count: 0,
+            debug_print_count: 0,
         }
     }
 
@@ -138,22 +143,33 @@ impl Vision {
 
     // Helper for Balls
     async fn process_ball(&mut self, sender: &mpsc::Sender<VisionEvent>, status_tx: &mpsc::Sender<StatusUpdate>, ball: &SSL_DetectionBall, dt: f32) -> Result<(), Box<dyn Error>> {
-        // Access protobuf fields directly (e.g. ball.x())
-        // Note: rust-protobuf 3.x often uses Option<f32> for optional fields, 
-        // but simple fields might be direct. Check generated code if .x() or .x is needed.
+        // SSL Vision coordinates are in millimeters
         let raw_x = ball.x(); 
         let raw_y = ball.y(); 
         
-        let x = raw_x / 1000.0;
-        let y = raw_y / 1000.0;
+        // Debug: Print first few ball positions to verify coordinates
+        if self.debug_print_count < 5 {
+            eprintln!("Ball: raw_x={} mm, raw_y={} mm, converted: x={} m, y={} m", 
+                     raw_x, raw_y, raw_x / 1000.0, raw_y / 1000.0);
+            self.debug_print_count += 1;
+        }
+        
+        // Convert to meters for internal processing (tracker works in meters)
+        let x_m = raw_x / 1000.0;
+        let y_m = raw_y / 1000.0;
 
-        let (xf, yf, _thetaf, vx, vy, _omega) = self.tracker.track(-1, -1, x, y, 0.0, dt);
+        let (xf_m, yf_m, _thetaf, vx, vy, _omega) = self.tracker.track(-1, -1, x_m, y_m, 0.0, dt);
 
-        // Send position to UI
-        let _ = status_tx.send(StatusUpdate::BallPosition(Vec2::new(xf, yf))).await;
+        // Convert back to millimeters for display (field.rs expects millimeters)
+        let xf_mm = xf_m * 1000.0;
+        let yf_mm = yf_m * 1000.0;
 
+        // Send position to UI (in millimeters)
+        let _ = status_tx.send(StatusUpdate::BallPosition(Vec2::new(xf_mm, yf_mm))).await;
+
+        // VisionEvent uses meters for internal processing
         let event = VisionEvent::Ball(BallData {
-            position: Vec2::new(xf, yf),
+            position: Vec2::new(xf_m, yf_m),
             velocity: Vec2::new(vx, vy),
         });
 
@@ -169,24 +185,52 @@ impl Vision {
                            robot: &SSL_DetectionRobot, 
                            team: i32, dt: f32) -> Result<(), Box<dyn Error>> 
     {
-        let id = robot.robot_id(); // In newer protobufs, might be robot_id() or just robot_id
+        // Check if required fields are present
+        if !robot.has_x() || !robot.has_y() {
+            // Skip robots without valid coordinates
+            return Ok(());
+        }
+
+        let id = robot.robot_id();
+        // SSL Vision coordinates are in millimeters, with origin at center of field
         let raw_x = robot.x();
         let raw_y = robot.y();
         let raw_theta = robot.orientation();
 
-        let x = raw_x / 1000.0;
-        let y = raw_y / 1000.0;
+        // Debug: Print first few robot positions to verify coordinates
+        // Print all robots initially to debug the issue
+        if self.debug_print_count < 30 {
+            eprintln!("Robot id={} (team {}): raw_x={} mm, raw_y={} mm, theta={} rad, has_x={}, has_y={}, has_id={}", 
+                     id, team, raw_x, raw_y, raw_theta, robot.has_x(), robot.has_y(), robot.has_robot_id());
+            self.debug_print_count += 1;
+        }
+
+        // Skip robots with zero coordinates (likely invalid data)
+        // But allow robots at the center if they're actually there
+        // The issue might be that all robots are being reported at (0,0)
+        if raw_x == 0.0 && raw_y == 0.0 && self.debug_print_count < 5 {
+            eprintln!("WARNING: Robot {} (team {}) has zero coordinates - this might indicate missing data", id, team);
+        }
+
+        // Convert to meters for internal processing (tracker works in meters)
+        let x_m = raw_x / 1000.0;
+        let y_m = raw_y / 1000.0;
         let theta = raw_theta;
 
-        let (xf, yf, thetaf, vx, vy, omega) = self.tracker.track(team, id as i32, x, y, theta, dt);
+        let (xf_m, yf_m, thetaf, vx, vy, omega) = self.tracker.track(team, id as i32, x_m, y_m, theta, dt);
 
-        // Send position to UI
-        let _ = status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf, yf), thetaf)).await;
+        // Convert back to millimeters for display (field.rs expects millimeters)
+        let xf_mm = xf_m * 1000.0;
+        let yf_mm = yf_m * 1000.0;
 
+        // Send position to UI (in millimeters, with origin at center)
+        let _ = status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf)).await;
+
+        // VisionEvent uses meters for internal processing
         let event = VisionEvent::Robot(RobotData {
             id: id,
             team: team as u32,
-            position: Vec2::new(xf, yf),
+            position: Vec2::new(xf_m, yf_m),
             orientation: thetaf,
             velocity: Vec2::new(vx, vy),
             angular_velocity: omega,

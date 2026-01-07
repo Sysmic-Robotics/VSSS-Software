@@ -68,7 +68,8 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     center.x + ball.position.x * scale,
                     center.y - ball.position.y * scale,
                 );
-                let ball_circle = Path::circle(ball_pos, 150.0 * scale);
+                // Ball radius is smaller than robots (robots are 90.0 * scale)
+                let ball_circle = Path::circle(ball_pos, 50.0 * scale);
                 frame.fill(&ball_circle, Color::from_rgb(1.0, 0.0, 0.0));
             }
 
