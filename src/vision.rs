@@ -51,7 +51,6 @@ pub struct Vision {
     tracker_enabled: Arc<AtomicBool>, // Flag compartido para habilitar/deshabilitar el tracker
     last_error_print: Instant,
     error_count: u64,
-    debug_print_count: u64,
 }
 
 impl Vision {
@@ -63,7 +62,6 @@ impl Vision {
             tracker_enabled,
             last_error_print: Instant::now() - Duration::from_secs(10),
             error_count: 0,
-            debug_print_count: 0,
         }
     }
 
@@ -119,10 +117,9 @@ impl Vision {
                         }
                     }
                 },
-                Err(e) => {
+                Err(_e) => {
                     self.error_count += 1;
                     if self.last_error_print.elapsed() >= Duration::from_secs(2) {
-                        eprintln!("Failed to parse packet: {} ({} errors in last 2s)", e, self.error_count);
                         self.last_error_print = Instant::now();
                         self.error_count = 0;
                     }
@@ -136,13 +133,6 @@ impl Vision {
         // SSL Vision coordinates are in millimeters
         let raw_x = ball.x(); 
         let raw_y = ball.y(); 
-        
-        // Debug: Print first few ball positions to verify coordinates
-        if self.debug_print_count < 5 {
-            eprintln!("Ball: raw_x={} mm, raw_y={} mm, converted: x={} m, y={} m", 
-                     raw_x, raw_y, raw_x / 1000.0, raw_y / 1000.0);
-            self.debug_print_count += 1;
-        }
         
         // Convert to meters for internal processing (tracker works in meters)
         let x_m = raw_x as f64 / 1000.0;
@@ -194,21 +184,6 @@ impl Vision {
         let raw_x = robot.x();
         let raw_y = robot.y();
         let raw_theta = robot.orientation();
-
-        // Debug: Print first few robot positions to verify coordinates
-        // Print all robots initially to debug the issue
-        if self.debug_print_count < 30 {
-            eprintln!("Robot id={} (team {}): raw_x={} mm, raw_y={} mm, theta={} rad, has_x={}, has_y={}, has_id={}", 
-                     id, team, raw_x, raw_y, raw_theta, robot.has_x(), robot.has_y(), robot.has_robot_id());
-            self.debug_print_count += 1;
-        }
-
-        // Skip robots with zero coordinates (likely invalid data)
-        // But allow robots at the center if they're actually there
-        // The issue might be that all robots are being reported at (0,0)
-        if raw_x == 0.0 && raw_y == 0.0 && self.debug_print_count < 5 {
-            eprintln!("WARNING: Robot {} (team {}) has zero coordinates - this might indicate missing data", id, team);
-        }
 
         // Convert to meters for internal processing (tracker works in meters)
         let x_m = raw_x as f64 / 1000.0;

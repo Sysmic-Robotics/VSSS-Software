@@ -1,1 +1,5 @@
 /target
+
+# Archivos markdown de documentación/guías (no subir al repositorio)
+*.md
+!README.md

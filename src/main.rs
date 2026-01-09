@@ -2,15 +2,17 @@ mod protos;
 mod vision;
 mod tracker;
 mod world;
+mod motion;
+mod radio;
 #[path = "GUI/mod.rs"]
 mod gui;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock as TokioRwLock};
 use vision::{Vision, VisionEvent};
 use gui::ConfigUpdate;
-use world::World;
+use world::{World, RobotState};
 use std::time::Duration;
-use std::sync::{Arc, RwLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 fn main() {
     // Create channels
@@ -26,7 +28,8 @@ fn main() {
     let gui_config_tx = config_tx.clone();
 
     // Create World instance (11 robots per team for SSL)
-    let world = Arc::new(RwLock::new(World::new(11, 11)));
+    // Usar TokioRwLock para acceso async-friendly
+    let world = Arc::new(TokioRwLock::new(World::new(11, 11)));
     let world_clone = world.clone();
     
     // Create shared flag for tracker state
@@ -91,7 +94,7 @@ fn main() {
             let world_for_vision = world_clone.clone();
             tokio::spawn(async move {
                 while let Some(event) = vision_rx.recv().await {
-                    let mut world = world_for_vision.write().unwrap();
+                    let mut world = world_for_vision.write().await;
                     
                     match event {
                         VisionEvent::Robot(robot_data) => {
@@ -117,8 +120,66 @@ fn main() {
                 let mut interval = tokio::time::interval(Duration::from_millis(100));
                 loop {
                     interval.tick().await;
-                    let mut world = world_for_update.write().unwrap();
+                    let mut world = world_for_update.write().await;
                     world.update();
+                }
+            });
+
+            // Initialize Motion and Radio systems
+            let motion = motion::Motion::new();
+            let radio = match radio::Radio::new(false, "127.0.0.1", 20011).await {
+                Ok(r) => Arc::new(TokioMutex::new(r)),
+                Err(_e) => {
+                    // Skip motion/radio integration if radio creation fails
+                    // Keep the runtime alive
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            };
+            
+            // Spawn a task to periodically compute motion commands and send them
+            // Note: This uses blocking reads from RwLock. For better async performance,
+            // consider migrating World to use tokio::sync::RwLock in the future.
+            let world_for_motion = world_clone.clone();
+            let radio_for_motion = radio.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
+                loop {
+                    interval.tick().await;
+                    
+                    // Read world state (async read)
+                    let (ball_pos, robots_data): (glam::Vec2, Vec<RobotState>) = {
+                        let world = world_for_motion.read().await;
+                        let ball_pos = world.get_ball_state().position;
+                        let robots_data: Vec<_> = world.get_blue_team_active()
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        (ball_pos, robots_data)
+                    };
+                    
+                    if robots_data.is_empty() {
+                        continue;
+                    }
+                    
+                    let mut radio_guard = radio_for_motion.lock().await;
+                    
+                    let mut commands_added = 0;
+                    for robot_state in robots_data {
+                        if robot_state.active {
+                            let motion_cmd = {
+                                let world = world_for_motion.read().await;
+                                motion.move_to(&robot_state, ball_pos, &world)
+                            };
+                            radio_guard.add_motion_command(motion_cmd);
+                            commands_added += 1;
+                        }
+                    }
+                    
+                    if commands_added > 0 {
+                        let _ = radio_guard.send_commands().await;
+                    }
                 }
             });
 
