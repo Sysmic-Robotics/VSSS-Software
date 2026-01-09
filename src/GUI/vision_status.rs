@@ -149,6 +149,7 @@ pub fn view<'a>(
     last_robot_count: usize,
     packet_history: &'a VecDeque<(f64, u64)>,
     chart_cache: &'a Cache,
+    tracker_enabled: bool,
 ) -> Element<'a, Message> {
     let status_color = if connected {
         Color::from_rgb(0.0, 0.8, 0.0)
@@ -208,6 +209,28 @@ pub fn view<'a>(
                 text(format!("Robots: {}", last_robot_count)).font(font::Font::MONOSPACE).size(12),
             ]
             .spacing(10),
+            row![
+                text("Filtro Kalman: ").font(font::Font::MONOSPACE).size(12),
+                button(text(if tracker_enabled { "Desactivar" } else { "Activar" })
+                    .font(font::Font::MONOSPACE)
+                    .size(12))
+                    .on_press(Message::ToggleTracker(!tracker_enabled))
+                    .padding([3, 10]),
+                text(if tracker_enabled { "Habilitado" } else { "Deshabilitado" })
+                    .font(font::Font::MONOSPACE)
+                    .size(12)
+                    .style(move |_theme: &Theme| {
+                        text::Style {
+                            color: Some(if tracker_enabled {
+                                Color::from_rgb(0.0, 0.8, 0.0)
+                            } else {
+                                Color::from_rgb(0.8, 0.0, 0.0)
+                            }),
+                        }
+                    }),
+            ]
+            .spacing(5)
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(8)
         .padding(12)

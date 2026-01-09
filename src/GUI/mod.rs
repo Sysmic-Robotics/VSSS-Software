@@ -29,6 +29,7 @@ pub enum Message {
     ChangeIp(String),
     ChangePort(String),
     Connect,
+    ToggleTracker(bool), // Nuevo mensaje para toggle del tracker
     Tick,
     TabSelected(TabView),
 }
@@ -76,11 +77,13 @@ pub struct VisionGui {
     start_time: Instant,
     last_second: u64,
     current_second_count: u64,
+    tracker_enabled: bool, // Estado del filtro Kalman
 }
 
 #[derive(Debug, Clone)]
 pub enum ConfigUpdate {
     ChangeIpPort(String, u16),
+    ToggleTracker(bool), // true = habilitado, false = deshabilitado
 }
 
 impl VisionGui {
@@ -110,6 +113,7 @@ impl VisionGui {
                 start_time: Instant::now(),
                 last_second: 0,
                 current_second_count: 0,
+                tracker_enabled: true, // Habilitado por defecto
             },
             Task::none(),
         )
@@ -231,6 +235,13 @@ impl VisionGui {
             Message::TabSelected(tab) => {
                 self.active_tab = tab;
             }
+            Message::ToggleTracker(enabled) => {
+                self.tracker_enabled = enabled;
+                // Enviar comando al módulo Vision
+                if let Some(tx) = &self.config_tx {
+                    let _ = tx.try_send(ConfigUpdate::ToggleTracker(enabled));
+                }
+            }
         }
         Task::none()
     }
@@ -311,6 +322,7 @@ impl VisionGui {
                     self.last_robot_count,
                     &self.packet_history,
                     &self.chart_cache,
+                    self.tracker_enabled,
                 )
             }
             TabView::Robots => {

@@ -2,6 +2,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::error::Error;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use glam::Vec2;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use crate::protos::ssl_vision_wrapper::SSL_WrapperPacket;
 use crate::protos::ssl_vision_detection::{SSL_DetectionBall, SSL_DetectionRobot};
 use protobuf::Message;
 use crate::gui::StatusUpdate;
+use crate::tracker::Tracker;
 
 // --- Data Structures ---
 
@@ -38,21 +40,7 @@ pub enum VisionEvent {
     Robot(RobotData),
 }
 
-// Placeholder tracker - no actual tracking logic
-struct Tracker;
-
-impl Tracker {
-    fn new() -> Self {
-        Self
-    }
-
-    // Placeholder: just returns the input values with zero velocities
-    fn track(&mut self, _team: i32, _id: i32, x: f32, y: f32, theta: f32, _dt: f32) -> (f32, f32, f32, f32, f32, f32) {
-        // Returns: (x, y, theta, vx, vy, omega)
-        // TODO: Implement actual tracking logic here
-        (x, y, theta, 0.0, 0.0, 0.0)
-    }
-}
+// Tracker is now imported from crate::tracker module
 
 // --- The Vision Module ---
 
@@ -60,17 +48,19 @@ pub struct Vision {
     multicast_ip: String,
     port: u16,
     tracker: Tracker,
+    tracker_enabled: Arc<AtomicBool>, // Flag compartido para habilitar/deshabilitar el tracker
     last_error_print: Instant,
     error_count: u64,
     debug_print_count: u64,
 }
 
 impl Vision {
-    pub fn new(ip: String, port: u16) -> Self {
+    pub fn new(ip: String, port: u16, tracker_enabled: Arc<AtomicBool>) -> Self {
         Self {
             multicast_ip: ip,
             port,
             tracker: Tracker::new(),
+            tracker_enabled,
             last_error_print: Instant::now() - Duration::from_secs(10),
             error_count: 0,
             debug_print_count: 0,
@@ -155,22 +145,30 @@ impl Vision {
         }
         
         // Convert to meters for internal processing (tracker works in meters)
-        let x_m = raw_x / 1000.0;
-        let y_m = raw_y / 1000.0;
+        let x_m = raw_x as f64 / 1000.0;
+        let y_m = raw_y as f64 / 1000.0;
+        let dt_f64 = dt as f64;
 
-        let (xf_m, yf_m, _thetaf, vx, vy, _omega) = self.tracker.track(-1, -1, x_m, y_m, 0.0, dt);
+        // Usar tracker solo si está habilitado
+        let (xf_m, yf_m, vx, vy) = if self.tracker_enabled.load(Ordering::Relaxed) {
+            let (xf, yf, _thetaf, vx, vy, _omega) = self.tracker.track(-1, -1, x_m, y_m, 0.0, dt_f64);
+            (xf, yf, vx, vy)
+        } else {
+            // Sin filtro: usar posiciones medidas directamente, velocidades en cero
+            (x_m, y_m, 0.0, 0.0)
+        };
 
         // Convert back to millimeters for display (field.rs expects millimeters)
-        let xf_mm = xf_m * 1000.0;
-        let yf_mm = yf_m * 1000.0;
+        let xf_mm = (xf_m * 1000.0) as f32;
+        let yf_mm = (yf_m * 1000.0) as f32;
 
         // Send position to UI (in millimeters)
         let _ = status_tx.send(StatusUpdate::BallPosition(Vec2::new(xf_mm, yf_mm))).await;
 
         // VisionEvent uses meters for internal processing
         let event = VisionEvent::Ball(BallData {
-            position: Vec2::new(xf_m, yf_m),
-            velocity: Vec2::new(vx, vy),
+            position: Vec2::new(xf_m as f32, yf_m as f32),
+            velocity: Vec2::new(vx as f32, vy as f32),
         });
 
         if let Err(_) = sender.send(event).await {
@@ -213,27 +211,34 @@ impl Vision {
         }
 
         // Convert to meters for internal processing (tracker works in meters)
-        let x_m = raw_x / 1000.0;
-        let y_m = raw_y / 1000.0;
-        let theta = raw_theta;
+        let x_m = raw_x as f64 / 1000.0;
+        let y_m = raw_y as f64 / 1000.0;
+        let theta = raw_theta as f64;
+        let dt_f64 = dt as f64;
 
-        let (xf_m, yf_m, thetaf, vx, vy, omega) = self.tracker.track(team, id as i32, x_m, y_m, theta, dt);
+        // Usar tracker solo si está habilitado
+        let (xf_m, yf_m, thetaf, vx, vy, omega) = if self.tracker_enabled.load(Ordering::Relaxed) {
+            self.tracker.track(team, id as i32, x_m, y_m, theta, dt_f64)
+        } else {
+            // Sin filtro: usar posiciones medidas directamente, velocidades en cero
+            (x_m, y_m, theta, 0.0, 0.0, 0.0)
+        };
 
         // Convert back to millimeters for display (field.rs expects millimeters)
-        let xf_mm = xf_m * 1000.0;
-        let yf_mm = yf_m * 1000.0;
+        let xf_mm = (xf_m * 1000.0) as f32;
+        let yf_mm = (yf_m * 1000.0) as f32;
 
         // Send position to UI (in millimeters, with origin at center)
-        let _ = status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf)).await;
+        let _ = status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32)).await;
 
         // VisionEvent uses meters for internal processing
         let event = VisionEvent::Robot(RobotData {
             id: id,
             team: team as u32,
-            position: Vec2::new(xf_m, yf_m),
-            orientation: thetaf,
-            velocity: Vec2::new(vx, vy),
-            angular_velocity: omega,
+            position: Vec2::new(xf_m as f32, yf_m as f32),
+            orientation: thetaf as f32,
+            velocity: Vec2::new(vx as f32, vy as f32),
+            angular_velocity: omega as f32,
         });
 
         sender.send(event).await?;
