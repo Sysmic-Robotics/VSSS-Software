@@ -20,8 +20,9 @@ fn main() {
     let (status_tx, status_rx) = mpsc::channel(100);
     let (config_tx, mut config_rx) = mpsc::channel(10);
 
-    let vision_ip = "224.5.23.2".to_string();
-    let vision_port = 10020;
+    // Configuración para FIRASim (según configuración del simulador)
+    let vision_ip = "224.0.0.1".to_string();  // FIRASim usa 224.0.0.1 para visión multicast
+    let vision_port = 10002;                  // FIRASim usa puerto 10002 para visión
     
     let gui_ip = vision_ip.clone();
     let gui_port = vision_port;
@@ -46,46 +47,80 @@ fn main() {
                 let mut current_port = vision_port;
                 let tracker_enabled = tracker_enabled_clone;
                 
+                let mut vision_handle: Option<tokio::task::JoinHandle<()>> = None;
+                
                 loop {
-                    let mut vision_system = Vision::new(current_ip.clone(), current_port, tracker_enabled.clone());
-                    let vision_tx_clone = vision_tx.clone();
-                    let status_tx_clone = status_tx.clone();
-                    
-                    // Spawn vision task
-                    let mut vision_handle = tokio::spawn(async move {
-                        let _ = vision_system.run(vision_tx_clone, status_tx_clone).await;
-                    });
+                    // Solo crear un nuevo sistema de visión si no existe uno corriendo
+                    if vision_handle.is_none() || vision_handle.as_ref().unwrap().is_finished() {
+                        eprintln!("[Main] Iniciando sistema de visión en {}:{}", current_ip, current_port);
+                        let mut vision_system = Vision::new(current_ip.clone(), current_port, tracker_enabled.clone());
+                        let vision_tx_clone = vision_tx.clone();
+                        let status_tx_clone = status_tx.clone();
+                        
+                        // Spawn vision task
+                        vision_handle = Some(tokio::spawn(async move {
+                            match vision_system.run(vision_tx_clone, status_tx_clone).await {
+                                Ok(_) => {
+                                    eprintln!("[Main] Sistema de visión terminó normalmente");
+                                }
+                                Err(e) => {
+                                    eprintln!("[Main] Error en sistema de visión: {}", e);
+                                }
+                            }
+                        }));
+                    }
 
                     // Wait for config update or vision task to complete
-                    tokio::select! {
-                        Some(config) = config_rx.recv() => {
-                            // Update configuration
+                    if let Some(ref mut handle) = vision_handle {
+                        // Guardar el estado antes del select para evitar problemas de borrow
+                        let handle_finished = handle.is_finished();
+                        
+                        tokio::select! {
+                            Some(config) = config_rx.recv() => {
+                                // Update configuration
+                                match config {
+                                    ConfigUpdate::ChangeIpPort(new_ip, new_port) => {
+                                        eprintln!("[Main] Cambiando configuración a {}:{}", new_ip, new_port);
+                                        current_ip = new_ip;
+                                        current_port = new_port;
+                                        // Abort and loop will restart with new config
+                                        // Usar vision_handle directamente después del select
+                                        if let Some(ref mut h) = vision_handle {
+                                            if !h.is_finished() {
+                                                h.abort();
+                                            }
+                                        }
+                                        vision_handle = None; // Forzar recreación en la siguiente iteración
+                                    }
+                                    ConfigUpdate::ToggleTracker(enabled) => {
+                                        tracker_enabled.store(enabled, Ordering::Relaxed);
+                                        eprintln!("[Main] Tracker {}", if enabled { "habilitado" } else { "deshabilitado" });
+                                        // No reiniciar el task, el flag se lee en tiempo real
+                                    }
+                                }
+                            }
+                            _ = handle => {
+                                // Vision task completed unexpectedly
+                                eprintln!("[Main] Sistema de visión terminó inesperadamente, reiniciando en 1 segundo...");
+                                vision_handle = None;
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    } else {
+                        // Si no hay handle, solo esperar por cambios de configuración
+                        if let Some(config) = config_rx.recv().await {
                             match config {
                                 ConfigUpdate::ChangeIpPort(new_ip, new_port) => {
+                                    eprintln!("[Main] Cambiando configuración a {}:{}", new_ip, new_port);
                                     current_ip = new_ip;
                                     current_port = new_port;
-                                    // Abort and loop will restart with new config
-                                    if !vision_handle.is_finished() {
-                                        vision_handle.abort();
-                                    }
                                 }
                                 ConfigUpdate::ToggleTracker(enabled) => {
                                     tracker_enabled.store(enabled, Ordering::Relaxed);
-                                    // No reiniciar el task, el flag se lee en tiempo real
-                                    continue; // Continuar el loop sin reiniciar vision
+                                    eprintln!("[Main] Tracker {}", if enabled { "habilitado" } else { "deshabilitado" });
                                 }
                             }
                         }
-                        _result = &mut vision_handle => {
-                            // Vision task completed unexpectedly
-                            // Add a small delay before restarting to prevent tight loop
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                    
-                    // If we're here from config update, abort the vision task
-                    if !vision_handle.is_finished() {
-                        vision_handle.abort();
                     }
                 }
             });
@@ -126,10 +161,15 @@ fn main() {
             });
 
             // Initialize Motion and Radio systems
+            // FIRASim escucha comandos en puerto 20011 (según configuración del simulador)
             let motion = motion::Motion::new();
-            let radio = match radio::Radio::new(false, "127.0.0.1", 20011).await {
-                Ok(r) => Arc::new(TokioMutex::new(r)),
-                Err(_e) => {
+            let radio = match radio::Radio::new(false, radio::SimulatorType::FIRASim, "127.0.0.1", 20011).await {
+                Ok(r) => {
+                    eprintln!("[Main] Radio inicializado exitosamente para FIRASim en 127.0.0.1:20011");
+                    Arc::new(TokioMutex::new(r))
+                },
+                Err(e) => {
+                    eprintln!("[Main] Error inicializando radio: {}", e);
                     // Skip motion/radio integration if radio creation fails
                     // Keep the runtime alive
                     loop {
@@ -137,6 +177,54 @@ fn main() {
                     }
                 }
             };
+            
+            // Tarea de prueba: enviar comandos periódicos a un robot para verificar comunicación
+            let radio_test = radio.clone();
+            tokio::spawn(async move {
+                eprintln!("[Main] ========================================");
+                eprintln!("[Main] Iniciando tarea de prueba de comandos...");
+                eprintln!("[Main] Enviando comandos al robot azul ID 0 cada segundo");
+                eprintln!("[Main] Verifica en FIRASim si el robot azul ID 0 se mueve");
+                eprintln!("[Main] ========================================");
+                let mut counter = 0u64;
+                let mut interval = tokio::time::interval(Duration::from_millis(100)); // 10 Hz
+                
+                loop {
+                    interval.tick().await;
+                    counter += 1;
+                    
+                        // Cada segundo, enviar comandos de prueba a todos los robots azules (IDs 0-3)
+                        if counter % 10 == 0 {
+                            let mut radio_guard = radio_test.lock().await;
+                            
+                            // Crear comandos para todos los robots habilitados (0-3)
+                            use motion::MotionCommand;
+                            for robot_id in 0..4 {
+                                let test_cmd = MotionCommand {
+                                    id: robot_id,
+                                    team: 0, // Azul
+                                    vx: 0.5, // Velocidad más alta para ser más visible (m/s)
+                                    vy: 0.0,
+                                    omega: 0.0,
+                                    orientation: 0.0,
+                                };
+                                
+                                radio_guard.add_motion_command(test_cmd);
+                            }
+                            
+                            match radio_guard.send_commands().await {
+                                Ok(_) => {
+                                    if counter % 10 == 0 { // Log cada segundo
+                                        eprintln!("[Main] ✓ Comandos enviados: robots azules IDs 0-3, vx=0.5 m/s (contador: {})", counter);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[Main] ✗ Error enviando comandos de prueba: {}", e);
+                                }
+                            }
+                        }
+                }
+            });
             
             // Spawn a task to periodically compute motion commands and send them
             // Note: This uses blocking reads from RwLock. For better async performance,
