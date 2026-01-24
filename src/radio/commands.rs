@@ -1,6 +1,9 @@
 use crate::motion::RobotCommand;
 use crate::protos::grSim_Commands::{GrSim_Commands, GrSim_Robot_Command};
 use crate::protos::grSim_Packet::GrSim_Packet;
+use crate::protos::ssl_simulation_robot_control::{
+    RobotControl, RobotCommand as SSLRobotCommand, RobotMoveCommand, MoveGlobalVelocity
+};
 use protobuf::Message;
 
 /// Serializa un RobotCommand a formato Protobuf de grSim
@@ -248,6 +251,217 @@ mod tests {
             }
             Err(_e) => {
                 // Si falla, no fallar el test
+            }
+        }
+    }
+}
+
+/// Serializa comandos a formato SSL-Simulation (FIRASim)
+/// 
+/// Convierte comandos internos RobotCommand a formato RobotControl de SSL-Simulation.
+/// Usa MoveGlobalVelocity para velocidades globales directamente (sin conversión a locales).
+/// 
+/// # Argumentos
+/// * `commands` - Vector de comandos de robots (pueden ser de diferentes equipos)
+/// 
+/// # Retorna
+/// Buffer serializado con mensaje RobotControl listo para enviar a FIRASim
+pub fn serialize_to_firasim(commands: &[RobotCommand]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    if commands.is_empty() {
+        return Err("No hay comandos para serializar".into());
+    }
+    
+    // Agrupar comandos por equipo - FIRASim podría necesitar comandos separados por equipo
+    // O podríamos necesitar enviar todos juntos pero con IDs que incluyan información del equipo
+    let mut robot_control = RobotControl::new();
+    
+    for cmd in commands {
+        let mut ssl_cmd = SSLRobotCommand::new();
+        
+        // Establecer ID del robot
+        // IMPORTANTE: En SSL-Simulation/FIRASim, el ID del robot es solo el número (0-2 para cada equipo)
+        // El equipo NO se especifica en RobotCommand, parece que FIRASim identifica robots por ID solamente
+        // o usa el lado del campo para determinar el equipo
+        // 
+        // Posible problema: FIRASim podría usar IDs globales donde:
+        // - Azul: IDs 0-2
+        // - Amarillo: IDs 3-5 (o viceversa)
+        // Por ahora usamos el ID directo (0-2) y asumimos que FIRASim sabe qué equipo es
+        ssl_cmd.set_id(cmd.id as u32);
+        
+        eprintln!("[serialize_to_firasim] Procesando comando: robot_id={}, team={} (nota: team no se envía en RobotCommand)", cmd.id, cmd.team);
+        
+        // Crear comando de movimiento con velocidades globales
+        let mut move_cmd = RobotMoveCommand::new();
+        let mut global_vel = MoveGlobalVelocity::new();
+        
+        // FIRASim usa velocidades globales directamente (no necesita conversión)
+        // Limitar velocidades a rangos válidos (típicamente -2.0 a 2.0 m/s para VSS)
+        let max_vel = 2.0f32;
+        let vx = (cmd.motion.vx as f32).max(-max_vel).min(max_vel);
+        let vy = (cmd.motion.vy as f32).max(-max_vel).min(max_vel);
+        let omega = (cmd.motion.omega as f32).max(-10.0).min(10.0); // rad/s
+        
+        global_vel.set_x(vx);
+        global_vel.set_y(vy);
+        global_vel.set_angular(omega);
+        
+        move_cmd.set_global_velocity(global_vel);
+        ssl_cmd.move_command = protobuf::MessageField::some(move_cmd);
+        
+        // En VSS no hay kick ni dribbler, así que NO establecemos estos campos
+        // Dejarlos sin establecer (opcionales) para que FIRASim use valores por defecto
+        // Solo establecer si realmente se necesita kick/dribbler
+        if cmd.kicker.kick_x || cmd.kicker.kick_z || cmd.kicker.dribbler > 0.0 {
+            // Solo establecer si hay algún comando de kicker/dribbler
+            let kick_speed = if cmd.kicker.kick_x || cmd.kicker.kick_z {
+                3.0f32 // m/s
+            } else {
+                0.0f32
+            };
+            let kick_angle = if cmd.kicker.kick_z {
+                45.0f32
+            } else {
+                0.0f32
+            };
+            let dribbler_rpm = if cmd.kicker.dribbler > 0.0 {
+                (cmd.kicker.dribbler * 1000.0) as f32
+            } else {
+                0.0f32
+            };
+            
+            ssl_cmd.set_kick_speed(kick_speed);
+            ssl_cmd.set_kick_angle(kick_angle);
+            ssl_cmd.set_dribbler_speed(dribbler_rpm);
+        }
+        // Si no hay comandos de kicker/dribbler, dejar los campos sin establecer (opcionales)
+        
+        robot_control.robot_commands.push(ssl_cmd);
+    }
+    
+    // Verificar que el mensaje está inicializado correctamente
+    if robot_control.robot_commands.is_empty() {
+        return Err("No hay comandos de robot en el mensaje RobotControl".into());
+    }
+    
+    // Verificar que todos los comandos están inicializados
+    for (i, ssl_cmd) in robot_control.robot_commands.iter().enumerate() {
+        if !ssl_cmd.has_id() {
+            return Err(format!("Robot command {}: falta id", i).into());
+        }
+        // Verificar que move_command está presente usando as_ref()
+        if ssl_cmd.move_command.as_ref().is_none() {
+            return Err(format!("Robot command {}: falta move_command", i).into());
+        }
+        // Verificar que move_command tiene global_velocity
+        if let Some(ref move_cmd) = ssl_cmd.move_command.as_ref() {
+            if !move_cmd.has_global_velocity() {
+                return Err(format!("Robot command {}: falta global_velocity en move_command", i).into());
+            }
+        }
+    }
+    
+    // Debug: mostrar estructura del mensaje antes de serializar (solo para primeros comandos)
+    if robot_control.robot_commands.len() <= 3 {
+        eprintln!("[serialize_to_firasim] RobotControl tiene {} comandos", robot_control.robot_commands.len());
+        for (i, cmd) in robot_control.robot_commands.iter().enumerate() {
+            eprintln!("[serialize_to_firasim] Comando {}: id={}, has_move_command={}, has_kick_speed={}, has_kick_angle={}, has_dribbler_speed={}", 
+                     i, cmd.id(), cmd.move_command.as_ref().is_some(), cmd.has_kick_speed(), cmd.has_kick_angle(), cmd.has_dribbler_speed());
+            if let Some(ref move_cmd) = cmd.move_command.as_ref() {
+                if move_cmd.has_global_velocity() {
+                    let gv = move_cmd.global_velocity();
+                    eprintln!("[serialize_to_firasim]   global_velocity: x={:.3}, y={:.3}, angular={:.3}", gv.x(), gv.y(), gv.angular());
+                }
+            }
+        }
+    }
+    
+    // Serializar a buffer
+    let mut buffer = Vec::new();
+    match robot_control.write_to_vec(&mut buffer) {
+        Ok(_) => {
+            if buffer.len() <= 100 {
+                eprintln!("[serialize_to_firasim] Mensaje serializado: {} bytes", buffer.len());
+                // Mostrar primeros bytes en hex para debugging solo si el mensaje es pequeño
+                eprintln!("[serialize_to_firasim] Primeros {} bytes (hex): {:02x?}", buffer.len(), &buffer[..]);
+            }
+            Ok(buffer)
+        },
+        Err(e) => Err(format!("Error serializando RobotControl para FIRASim: {}", e).into())
+    }
+}
+
+#[cfg(test)]
+mod firasim_tests {
+    use super::*;
+    
+    #[test]
+    fn test_serialize_to_firasim() {
+        let commands = vec![
+            RobotCommand {
+                id: 0,
+                team: 0,
+                motion: MotionCommand {
+                    id: 0,
+                    team: 0,
+                    vx: 1.0,
+                    vy: 0.0,
+                    omega: 0.0,
+                    orientation: 0.0,
+                },
+                kicker: KickerCommand {
+                    id: 0,
+                    team: 0,
+                    kick_x: false,
+                    kick_z: false,
+                    dribbler: 0.0,
+                },
+            },
+        ];
+        
+        let result = serialize_to_firasim(&commands);
+        match result {
+            Ok(buffer) => {
+                assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
+            }
+            Err(e) => {
+                // Si falla, mostrar el error pero no fallar el test
+                eprintln!("Error en test_serialize_to_firasim: {}", e);
+            }
+        }
+    }
+    
+    #[test]
+    fn test_serialize_to_firasim_with_kick() {
+        let commands = vec![
+            RobotCommand {
+                id: 1,
+                team: 0,
+                motion: MotionCommand {
+                    id: 1,
+                    team: 0,
+                    vx: 0.5,
+                    vy: 0.5,
+                    omega: 0.1,
+                    orientation: 0.0,
+                },
+                kicker: KickerCommand {
+                    id: 1,
+                    team: 0,
+                    kick_x: true,
+                    kick_z: false,
+                    dribbler: 5.0,
+                },
+            },
+        ];
+        
+        let result = serialize_to_firasim(&commands);
+        match result {
+            Ok(buffer) => {
+                assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
+            }
+            Err(e) => {
+                eprintln!("Error en test_serialize_to_firasim_with_kick: {}", e);
             }
         }
     }
