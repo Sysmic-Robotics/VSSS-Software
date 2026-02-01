@@ -1,5 +1,9 @@
 // @generated
 
+pub mod fira_command;
+pub mod fira_common;
+pub mod fira_packet;
+pub mod fira_replacement;
 pub mod grSim_Commands;
 pub mod grSim_Packet;
 pub mod grSim_Replacement;

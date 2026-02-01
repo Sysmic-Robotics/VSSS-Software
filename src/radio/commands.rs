@@ -4,6 +4,8 @@ use crate::protos::grSim_Packet::GrSim_Packet;
 use crate::protos::ssl_simulation_robot_control::{
     RobotControl, RobotCommand as SSLRobotCommand, RobotMoveCommand, MoveGlobalVelocity
 };
+use crate::protos::fira_command::{Command as FiraCommand, Commands as FiraCommands};
+use crate::protos::fira_packet::Packet as FiraPacket;
 use protobuf::Message;
 
 /// Serializa un RobotCommand a formato Protobuf de grSim
@@ -389,6 +391,48 @@ pub fn serialize_to_firasim(commands: &[RobotCommand]) -> Result<Vec<u8>, Box<dy
         },
         Err(e) => Err(format!("Error serializando RobotControl para FIRASim: {}", e).into())
     }
+}
+
+/// Serializa comandos al protocolo FIRA (VSSS/FIRASim) para el puerto 20011.
+/// Convierte velocidades globales (vx, vy, omega) a wheel_left/wheel_right usando la orientación del robot.
+/// FIRASim (VSS) espera este formato, no SSL-Simulation.
+pub fn serialize_to_fira_actuator(commands: &[RobotCommand]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    if commands.is_empty() {
+        return Err("No hay comandos para serializar (FIRA)".into());
+    }
+
+    let mut fira_commands = FiraCommands::new();
+    for cmd in commands {
+        let theta = cmd.motion.orientation;
+        let vx = cmd.motion.vx;
+        let vy = cmd.motion.vy;
+        let omega = cmd.motion.omega;
+
+        // Velocidad hacia adelante en el marco del robot (eje X = frente)
+        let v_forward = vx * theta.cos() + vy * theta.sin();
+        // Differential drive: wheel_left = v_forward - k*omega, wheel_right = v_forward + k*omega
+        // k ~ (wheel_base/2) / wheel_radius para rad/s; FIRASim suele esperar valores en [-2, 2] tipo m/s
+        let k_omega = 0.05;
+        let mut wheel_left = v_forward - k_omega * omega;
+        let mut wheel_right = v_forward + k_omega * omega;
+        let max_wheel = 2.0_f64;
+        wheel_left = wheel_left.clamp(-max_wheel, max_wheel);
+        wheel_right = wheel_right.clamp(-max_wheel, max_wheel);
+
+        let mut fira_cmd = FiraCommand::new();
+        fira_cmd.id = cmd.id as u32;
+        fira_cmd.yellowteam = cmd.team == 1;
+        fira_cmd.wheel_left = wheel_left;
+        fira_cmd.wheel_right = wheel_right;
+        fira_commands.robot_commands.push(fira_cmd);
+    }
+
+    let mut packet = FiraPacket::new();
+    packet.cmd = protobuf::MessageField::some(fira_commands);
+
+    let mut buffer = Vec::new();
+    packet.write_to_vec(&mut buffer)?;
+    Ok(buffer)
 }
 
 #[cfg(test)]

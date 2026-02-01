@@ -7,7 +7,10 @@ use glam::Vec2;
 use std::time::{Duration, Instant};
 
 // Import the generated Protobuf structs
-use crate::protos::ssl_vision_wrapper::SSL_WrapperPacket; 
+// FIRA/VSSS protocol (FIRASim): Environment with Frame (ball, robots) — VSSSLeague/FIRAClient, VSSSProto
+use crate::protos::fira_packet::Environment as FiraEnvironment;
+use crate::protos::fira_common::{Ball as FiraBall, Robot as FiraRobot};
+use crate::protos::ssl_vision_wrapper::SSL_WrapperPacket;
 use crate::protos::ssl_vision_detection::{SSL_DetectionBall, SSL_DetectionRobot};
 use protobuf::Message;
 use crate::gui::StatusUpdate;
@@ -168,134 +171,222 @@ impl Vision {
         eprintln!("[Vision] 6. Verifica que el simulador está corriendo (no pausado)");
         eprintln!("[Vision] ========================================");
 
-        let mut buf = [0u8; 65536]; // Buffer más grande para paquetes grandes
+        let mut buf = [0u8; 65536];
         let mut packet_count = 0u64;
         let mut last_packet_time = Instant::now();
         let mut last_status_print = Instant::now();
-        let mut last_debug_print = Instant::now();
+        let mut detection_count = 0u64;
+        let mut geometry_only_count = 0u64;
 
         eprintln!("[Vision] === INICIANDO RECEPCIÓN DE PAQUETES ===");
-        eprintln!("[Vision] Socket binded en: 0.0.0.0:{}", self.port);
         eprintln!("[Vision] Esperando paquetes multicast de {}:{}", self.multicast_ip, self.port);
-        eprintln!("[Vision] Tamaño de buffer: {} bytes", buf.len());
 
         loop {
-            // Agregar timeout para mostrar mensajes periódicos si no hay datos
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, addr)) => {
                             packet_count += 1;
                             last_packet_time = Instant::now();
-                            
-                            if packet_count == 1 {
-                                eprintln!("[Vision] ========================================");
-                                eprintln!("[Vision] ¡PRIMER PAQUETE RECIBIDO!");
-                                eprintln!("[Vision] De: {}", addr);
-                                eprintln!("[Vision] Tamaño: {} bytes", len);
-                                eprintln!("[Vision] Primeros 32 bytes (hex): {:02x?}", &buf[..len.min(32)]);
-                                eprintln!("[Vision] ========================================");
-                            } else if packet_count % 60 == 0 {
-                                eprintln!("[Vision] Recibidos {} paquetes (último de {}, {} bytes)", packet_count, addr, len);
-                            }
-                            
-                            // Debug cada 10 paquetes para los primeros 50
-                            if packet_count <= 50 && packet_count % 10 == 0 {
-                                eprintln!("[Vision] Debug: Paquete #{} de {}, {} bytes", packet_count, addr, len);
-                            }
-                            
                             let data = &buf[..len];
 
-                            // Send packet received status
+                            // Log primer paquete y cada 120 paquetes
+                            if packet_count == 1 {
+                                eprintln!("[Vision] ✓ PRIMER PAQUETE de {} ({} bytes)", addr, len);
+                                eprintln!("[Vision] Hex: {:02x?}", &data[..len.min(48)]);
+                            }
+
                             let _ = status_tx.send(StatusUpdate::PacketReceived).await;
 
-                            // --- REAL PROTOBUF PARSING ---
-                            
-                            // 1. Parse the packet
-                            match SSL_WrapperPacket::parse_from_bytes(data) {
-                                Ok(wrapper_packet) => {
-                                    // 2. Check if it has detection data
-                                    if let Some(detection) = wrapper_packet.detection.as_ref() {
-                                        let dt = 0.016; // Fixed timestep
+                            // FIRASim/VSSS envía protocolo FIRA: fira_message.sim_to_ref.Environment
+                            // (VSSSLeague/FIRAClient, VSSSProto). Probar primero ese formato.
+                            let mut handled = false;
+                            if let Ok(env) = FiraEnvironment::parse_from_bytes(data) {
+                                if let Some(frame) = env.frame.as_ref() {
+                                    detection_count += 1;
+                                    let robot_count = frame.robots_yellow.len() + frame.robots_blue.len();
+                                    let ball_count = if frame.ball.is_some() { 1 } else { 0 };
 
-                                        // Send detection counts
-                                        let _ = status_tx.send(StatusUpdate::BallDetected(detection.balls.len())).await;
-                                        let _ = status_tx.send(StatusUpdate::RobotsDetected(
-                                            detection.robots_yellow.len() + detection.robots_blue.len()
-                                        )).await;
+                                    if detection_count <= 5 || detection_count % 60 == 0 {
+                                        eprintln!("[Vision] ✓ DETECTION (FIRA) #{}: {} robots, {} balls",
+                                                 detection_count, robot_count, ball_count);
+                                    }
 
-                                        // 3. Process Balls
-                                        for ball in detection.balls.iter() {
-                                            self.process_ball(&sender, &status_tx, ball, dt).await?;
-                                        }
+                                    let _ = status_tx.send(StatusUpdate::BallDetected(ball_count)).await;
+                                    let _ = status_tx.send(StatusUpdate::RobotsDetected(robot_count)).await;
 
-                                        // 4. Process Yellow Robots (Team 1)
-                                        for robot in detection.robots_yellow.iter() {
-                                            self.process_robot(&sender, &status_tx, robot, 1, dt).await?;
-                                        }
+                                    let dt = 0.016f32;
+                                    if let Some(ball) = frame.ball.as_ref() {
+                                        let _ = self.process_ball_fira(&sender, &status_tx, ball, dt).await;
+                                    }
+                                    for robot in frame.robots_yellow.iter() {
+                                        let _ = self.process_robot_fira(&sender, &status_tx, robot, 1, dt).await;
+                                    }
+                                    for robot in frame.robots_blue.iter() {
+                                        let _ = self.process_robot_fira(&sender, &status_tx, robot, 0, dt).await;
+                                    }
+                                    handled = true;
+                                }
+                            }
 
-                                        // 5. Process Blue Robots (Team 0)
-                                        for robot in detection.robots_blue.iter() {
-                                            self.process_robot(&sender, &status_tx, robot, 0, dt).await?;
-                                        }
-                                    } else {
-                                        if packet_count <= 5 {
-                                            eprintln!("[Vision] Paquete recibido pero sin datos de detección");
+                            // Fallback: SSL Vision (grSim u otros)
+                            if !handled {
+                                match SSL_WrapperPacket::parse_from_bytes(data) {
+                                    Ok(packet) => {
+                                        if let Some(detection) = packet.detection.as_ref() {
+                                            detection_count += 1;
+                                            let robot_count = detection.robots_yellow.len() + detection.robots_blue.len();
+                                            let ball_count = detection.balls.len();
+
+                                            if detection_count <= 5 || detection_count % 60 == 0 {
+                                                eprintln!("[Vision] ✓ DETECTION (SSL) #{}: {} robots, {} balls",
+                                                         detection_count, robot_count, ball_count);
+                                            }
+
+                                            let _ = status_tx.send(StatusUpdate::BallDetected(ball_count)).await;
+                                            let _ = status_tx.send(StatusUpdate::RobotsDetected(robot_count)).await;
+
+                                            let dt = 0.016f32;
+                                            for ball in detection.balls.iter() {
+                                                let _ = self.process_ball(&sender, &status_tx, ball, dt).await;
+                                            }
+                                            for robot in detection.robots_yellow.iter() {
+                                                let _ = self.process_robot(&sender, &status_tx, robot, 1, dt).await;
+                                            }
+                                            for robot in detection.robots_blue.iter() {
+                                                let _ = self.process_robot(&sender, &status_tx, robot, 0, dt).await;
+                                            }
+                                        } else {
+                                            geometry_only_count += 1;
                                         }
                                     }
-                                },
-                                Err(e) => {
-                                    self.error_count += 1;
-                                    if self.last_error_print.elapsed() >= Duration::from_secs(2) {
-                                        eprintln!("[Vision] Error parseando protobuf ({} errores acumulados): {}", self.error_count, e);
-                                        if packet_count == 0 {
-                                            eprintln!("[Vision] ¿Está FIRASim enviando datos en {}:{}?", self.multicast_ip, self.port);
-                                        }
-                                        self.last_error_print = Instant::now();
-                                        self.error_count = 0;
+                                    Err(_) => {
+                                        geometry_only_count += 1;
                                     }
                                 }
                             }
+                            
+                            // Log estadísticas cada 5 segundos
+                            if packet_count % 300 == 0 {
+                                eprintln!("[Vision] Stats: {} packets ({} detection, {} geometry-only)", 
+                                         packet_count, detection_count, geometry_only_count);
+                            }
                         },
                         Err(e) => {
-                            eprintln!("[Vision] Error recibiendo datos UDP: {}", e);
+                            eprintln!("[Vision] Error UDP: {}", e);
                             return Err(e.into());
                         }
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    // Timeout: mostrar estado cada 5 segundos si no hay datos
                     if packet_count == 0 {
                         if last_status_print.elapsed() >= Duration::from_secs(5) {
-                            eprintln!("[Vision] ========================================");
-                            eprintln!("[Vision] ESPERANDO PAQUETES... (ninguno recibido aún)");
-                            eprintln!("[Vision] Tiempo transcurrido: {}s", last_status_print.elapsed().as_secs());
-                            eprintln!("[Vision] ========================================");
-                            eprintln!("[Vision] Verifica:");
-                            eprintln!("  1. FIRASim está corriendo y muestra 'Vision server connected on: 10002'");
-                            eprintln!("  2. FIRASim config: Vision multicast address = {}, port = {}", self.multicast_ip, self.port);
-                            eprintln!("  3. El firewall de Windows no está bloqueando el puerto {}", self.port);
-                            eprintln!("  4. La red permite tráfico multicast");
-                            eprintln!("  5. Prueba ejecutar como administrador si persiste el problema");
-                            eprintln!("[Vision] ========================================");
+                            eprintln!("[Vision] ⚠ Sin paquetes. Verifica FIRASim está enviando a {}:{}", 
+                                     self.multicast_ip, self.port);
                             last_status_print = Instant::now();
                         }
                     } else if last_packet_time.elapsed() > Duration::from_secs(5) {
-                        eprintln!("[Vision] ⚠ No se han recibido paquetes en los últimos 5 segundos (último: hace {}s)", 
-                                 last_packet_time.elapsed().as_secs());
-                    }
-                    
-                    // Debug adicional cada 15 segundos
-                    if last_debug_print.elapsed() >= Duration::from_secs(15) {
-                        eprintln!("[Vision] [DEBUG] Socket activo, esperando datos... Paquetes recibidos hasta ahora: {}", packet_count);
-                        last_debug_print = Instant::now();
+                        eprintln!("[Vision] ⚠ Sin paquetes en 5s (total: {}, detection: {})", 
+                                 packet_count, detection_count);
                     }
                 }
             }
         }
     }
+    
+    /// Intenta extraer SSL_DetectionFrame manualmente de un paquete que falló el parsing normal
+    fn try_extract_detection(&self, data: &[u8]) -> Option<crate::protos::ssl_vision_detection::SSL_DetectionFrame> {
+        use protobuf::CodedInputStream;
+        use crate::protos::ssl_vision_detection::SSL_DetectionFrame;
+        
+        let mut input = CodedInputStream::from_bytes(data);
+        
+        while let Ok(Some(tag)) = input.read_raw_tag_or_eof() {
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+            
+            if wire_type == 2 { // Length-delimited
+                if let Ok(len) = input.read_raw_varint32() {
+                    if let Ok(bytes) = input.read_raw_bytes(len) {
+                        // Tag 10 = field 1 (detection)
+                        if tag == 10 || field_num == 1 {
+                            if let Ok(detection) = SSL_DetectionFrame::parse_from_bytes(&bytes) {
+                                return Some(detection);
+                            }
+                        }
+                    }
+                }
+            } else if wire_type == 0 {
+                let _ = input.read_raw_varint64(); // Skip varint
+            } else if wire_type == 1 {
+                let _ = input.read_fixed64(); // Skip fixed64
+            } else if wire_type == 5 {
+                let _ = input.read_fixed32(); // Skip fixed32
+            }
+        }
+        None
+    }
 
-    // Helper for Balls
+    /// Procesa pelota del protocolo FIRA (coordenadas ya en metros).
+    async fn process_ball_fira(&mut self, sender: &mpsc::Sender<VisionEvent>, status_tx: &mpsc::Sender<StatusUpdate>, ball: &FiraBall, dt: f32) -> Result<(), Box<dyn Error>> {
+        let x_m = ball.x;
+        let y_m = ball.y;
+        let dt_f64 = dt as f64;
+
+        let (xf_m, yf_m, vx, vy) = if self.tracker_enabled.load(Ordering::Relaxed) {
+            let (xf, yf, _thetaf, vx, vy, _omega) = self.tracker.track(-1, -1, x_m, y_m, 0.0, dt_f64);
+            (xf, yf, vx, vy)
+        } else {
+            (x_m, y_m, 0.0, 0.0)
+        };
+
+        let xf_mm = (xf_m * 1000.0) as f32;
+        let yf_mm = (yf_m * 1000.0) as f32;
+
+        let _ = status_tx.send(StatusUpdate::BallPosition(Vec2::new(xf_mm, yf_mm))).await;
+
+        let event = VisionEvent::Ball(BallData {
+            position: Vec2::new(xf_m as f32, yf_m as f32),
+            velocity: Vec2::new(vx as f32, vy as f32),
+        });
+        if sender.send(event).await.is_err() {
+            return Err("Channel closed".into());
+        }
+        Ok(())
+    }
+
+    /// Procesa robot del protocolo FIRA (coordenadas ya en metros).
+    async fn process_robot_fira(&mut self, sender: &mpsc::Sender<VisionEvent>, status_tx: &mpsc::Sender<StatusUpdate>, robot: &FiraRobot, team: i32, dt: f32) -> Result<(), Box<dyn Error>> {
+        let id = robot.robot_id;
+        let x_m = robot.x;
+        let y_m = robot.y;
+        let theta = robot.orientation;
+        let dt_f64 = dt as f64;
+
+        let (xf_m, yf_m, thetaf, vx, vy, omega) = if self.tracker_enabled.load(Ordering::Relaxed) {
+            self.tracker.track(team, id as i32, x_m, y_m, theta, dt_f64)
+        } else {
+            (x_m, y_m, theta, 0.0, 0.0, 0.0)
+        };
+
+        let xf_mm = (xf_m * 1000.0) as f32;
+        let yf_mm = (yf_m * 1000.0) as f32;
+
+        let _ = status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32)).await;
+
+        let event = VisionEvent::Robot(RobotData {
+            id,
+            team: team as u32,
+            position: Vec2::new(xf_m as f32, yf_m as f32),
+            orientation: thetaf as f32,
+            velocity: Vec2::new(vx as f32, vy as f32),
+            angular_velocity: omega as f32,
+        });
+        sender.send(event).await?;
+        Ok(())
+    }
+
+    // Helper for Balls (SSL Vision, coordenadas en mm)
     async fn process_ball(&mut self, sender: &mpsc::Sender<VisionEvent>, status_tx: &mpsc::Sender<StatusUpdate>, ball: &SSL_DetectionBall, dt: f32) -> Result<(), Box<dyn Error>> {
         // SSL Vision coordinates are in millimeters
         let raw_x = ball.x(); 
@@ -371,7 +462,18 @@ impl Vision {
         let yf_mm = (yf_m * 1000.0) as f32;
 
         // Send position to UI (in millimeters, with origin at center)
-        let _ = status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32)).await;
+        match status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32)).await {
+            Ok(_) => {
+                // Log ocasional para debugging (solo primeros robots)
+                if id < 3 && team == 0 {
+                    eprintln!("[Vision] ✓ Enviada posición robot azul ID={} a GUI: pos=({:.1}, {:.1}) mm, orientación={:.2} rad", 
+                             id, xf_mm, yf_mm, thetaf);
+                }
+            }
+            Err(e) => {
+                eprintln!("[Vision] ✗ Error enviando posición de robot ID={} a GUI: {}", id, e);
+            }
+        }
 
         // VisionEvent uses meters for internal processing
         let event = VisionEvent::Robot(RobotData {

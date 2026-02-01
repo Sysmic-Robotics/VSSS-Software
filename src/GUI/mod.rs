@@ -168,6 +168,8 @@ impl VisionGui {
                         self.last_robot_count = count;
                     }
                     StatusUpdate::RobotPosition(id, team, position, orientation) => {
+                        eprintln!("[GUI] Recibida posición de robot: ID={}, team={}, pos=({:.2}, {:.2}) mm, orientación={:.2} rad", 
+                                 id, team, position.x, position.y, orientation);
                         self.robots.insert(
                             (team, id),
                             Robot {
@@ -178,6 +180,7 @@ impl VisionGui {
                             },
                         );
                         self.field_cache.clear();
+                        eprintln!("[GUI] Total robots en mapa: {}", self.robots.len());
                     }
                     StatusUpdate::BallPosition(position) => {
                         self.ball = Some(Ball { position });
