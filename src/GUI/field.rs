@@ -5,14 +5,20 @@ use std::collections::HashMap;
 
 use super::{Ball, Message, Robot};
 
-const FIELD_LENGTH: f32 = 9000.0; // mm
-const FIELD_WIDTH: f32 = 6000.0;  // mm
-const FIELD_MARGIN: f32 = 300.0;  // mm - espacio verde fuera de los límites
-const PENALTY_WIDTH: f32 = 2000.0; // mm - ancho del área de penalty
-const PENALTY_DEPTH: f32 = 1000.0; // mm - profundidad del área de penalty
-const GOAL_WIDTH: f32 = 1000.0;   // mm - ancho del arco
-const GOAL_DEPTH: f32 = 180.0;    // mm - profundidad del arco
-const CENTER_CIRCLE_RADIUS: f32 = 500.0; // mm
+// Dimensiones del campo VSS (Very Small Size League) — alineadas con FIRASim
+const FIELD_LENGTH: f32 = 1500.0; // mm - Campo VSS 1.5m x 1.3m
+const FIELD_WIDTH: f32 = 1300.0;  // mm
+const FIELD_MARGIN: f32 = 100.0;  // mm - espacio verde fuera de los límites
+// Zona de arquero (goalkeeper area): rectángulo delante del arco, como en FIRASim
+const GOALKEEPER_AREA_WIDTH: f32 = 400.0;  // mm - mismo ancho que el arco
+const GOALKEEPER_AREA_DEPTH: f32 = 130.0;  // mm - profundidad típica VSS/FIRASim
+const GOAL_WIDTH: f32 = 400.0;   // mm - ancho del arco
+const GOAL_DEPTH: f32 = 50.0;    // mm - profundidad del arco
+const CENTER_CIRCLE_RADIUS: f32 = 200.0;   // mm
+// Tamaños visuales proporcionales a FIRASim (robots ~75mm diámetro, pelota ~43mm)
+const ROBOT_RADIUS_MM: f32 = 38.0;   // mm - radio para dibujo (~76mm diámetro)
+const BALL_RADIUS_MM: f32 = 22.0;   // mm - radio para dibujo (~44mm diámetro)
+const ORIENTATION_LINE_MM: f32 = 55.0; // mm - longitud de la línea de orientación
 
 pub struct FieldCanvas<'a> {
     pub robots: &'a HashMap<(u32, u32), Robot>,
@@ -81,30 +87,30 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                 Stroke::default().with_width(2.0).with_color(Color::WHITE),
             );
 
-            // Draw penalty areas (left and right)
-            // Left penalty area (negative X side)
-            let left_penalty_rect = Path::rectangle(
+            // Zonas de arquero (goalkeeper areas) — rectángulos delante de cada arco, estilo FIRASim
+            // Izquierda (lado X negativo)
+            let left_goalkeeper_rect = Path::rectangle(
                 Point::new(
                     center.x - FIELD_LENGTH * scale / 2.0,
-                    center.y - PENALTY_WIDTH * scale / 2.0,
+                    center.y - GOALKEEPER_AREA_WIDTH * scale / 2.0,
                 ),
-                Size::new(PENALTY_DEPTH * scale, PENALTY_WIDTH * scale),
+                Size::new(GOALKEEPER_AREA_DEPTH * scale, GOALKEEPER_AREA_WIDTH * scale),
             );
             frame.stroke(
-                &left_penalty_rect,
+                &left_goalkeeper_rect,
                 Stroke::default().with_width(2.0).with_color(Color::WHITE),
             );
 
-            // Right penalty area (positive X side)
-            let right_penalty_rect = Path::rectangle(
+            // Derecha (lado X positivo)
+            let right_goalkeeper_rect = Path::rectangle(
                 Point::new(
-                    center.x + FIELD_LENGTH * scale / 2.0 - PENALTY_DEPTH * scale,
-                    center.y - PENALTY_WIDTH * scale / 2.0,
+                    center.x + FIELD_LENGTH * scale / 2.0 - GOALKEEPER_AREA_DEPTH * scale,
+                    center.y - GOALKEEPER_AREA_WIDTH * scale / 2.0,
                 ),
-                Size::new(PENALTY_DEPTH * scale, PENALTY_WIDTH * scale),
+                Size::new(GOALKEEPER_AREA_DEPTH * scale, GOALKEEPER_AREA_WIDTH * scale),
             );
             frame.stroke(
-                &right_penalty_rect,
+                &right_goalkeeper_rect,
                 Stroke::default().with_width(2.0).with_color(Color::WHITE),
             );
 
@@ -167,18 +173,17 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                 Stroke::default().with_width(2.0).with_color(Color::WHITE),
             );
 
-            // Draw ball
+            // Draw ball (proporción real ~43mm diámetro)
             if let Some(ball) = self.ball {
                 let ball_pos = Point::new(
                     center.x + ball.position.x * scale,
                     center.y - ball.position.y * scale,
                 );
-                // Ball radius is smaller than robots (robots are 90.0 * scale)
-                let ball_circle = Path::circle(ball_pos, 50.0 * scale);
+                let ball_circle = Path::circle(ball_pos, BALL_RADIUS_MM * scale);
                 frame.fill(&ball_circle, Color::from_rgb(1.0, 0.0, 0.0));
             }
 
-            // Draw robots
+            // Draw robots (proporción real ~75mm diámetro, como en FIRASim)
             for robot in self.robots.values() {
                 let color = if robot.team == 0 {
                     Color::from_rgb(0.0, 0.0, 1.0)
@@ -191,17 +196,16 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     center.y - robot.position.y * scale,
                 );
 
-                // Draw robot circle
-                let robot_circle = Path::circle(robot_pos, 90.0 * scale);
+                let robot_circle = Path::circle(robot_pos, ROBOT_RADIUS_MM * scale);
                 frame.fill(&robot_circle, color);
                 frame.stroke(
                     &robot_circle,
                     Stroke::default().with_width(1.0).with_color(Color::BLACK),
                 );
 
-                // Draw orientation indicator
-                let dx = robot.orientation.cos() * 120.0 * scale;
-                let dy = -robot.orientation.sin() * 120.0 * scale;
+                // Línea de orientación (proporcionada al tamaño del robot)
+                let dx = robot.orientation.cos() * ORIENTATION_LINE_MM * scale;
+                let dy = -robot.orientation.sin() * ORIENTATION_LINE_MM * scale;
                 let orientation_line = Path::line(
                     robot_pos,
                     Point::new(robot_pos.x + dx, robot_pos.y + dy),

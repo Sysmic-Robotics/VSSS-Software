@@ -102,14 +102,35 @@ impl Radio {
         entry.kicker = cmd;
     }
     
+    /// Crea robots en FIRASim antes de enviar comandos
+    /// 
+    /// # Argumentos
+    /// * `robot_ids` - Vector de tuplas (id, team) donde team=0 es azul, team=1 es amarillo
+    pub async fn create_robots(&self, robot_ids: &[(u32, u32)]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self.simulator_type {
+            SimulatorType::FIRASim => {
+                if let Some(ref client) = self.firasim_client {
+                    client.create_robots(robot_ids).await
+                } else {
+                    Err("FIRASim client no está inicializado".into())
+                }
+            }
+            SimulatorType::GrSim => {
+                // grSim no necesita crear robots explícitamente
+                eprintln!("[Radio] GrSim no requiere creación explícita de robots");
+                Ok(())
+            }
+        }
+    }
+    
     /// Envía todos los comandos acumulados
     /// 
     /// Para grSim: agrupa comandos por equipo (requiere un mensaje por equipo)
     /// Para FIRASim: envía todos los comandos en un solo mensaje RobotControl
-    pub async fn send_commands(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn send_commands(&mut self) -> Result<Option<crate::protos::ssl_simulation_synchronous::SimulationSyncResponse>, Box<dyn std::error::Error + Send + Sync>> {
         if self.command_map.is_empty() {
             eprintln!("[Radio] send_commands() llamado pero command_map está vacío");
-            return Ok(());
+            return Ok(None);
         }
         
         eprintln!("[Radio] Enviando {} comandos (simulator_type: {:?})", self.command_map.len(), self.simulator_type);
@@ -139,17 +160,26 @@ impl Radio {
                 } else {
                     eprintln!("[Radio] ✗ GrSim client no está inicializado");
                 }
+                self.command_map.clear();
+                return Ok(None);
             }
             SimulatorType::FIRASim => {
                 // FIRASim acepta todos los comandos en un solo mensaje
+                // Intentar modo síncrono para obtener detección y mantener GUI actualizada
                 let all_commands: Vec<RobotCommand> = self.command_map.values().cloned().collect();
                 
-                eprintln!("[Radio] Preparando {} comandos para FIRASim", all_commands.len());
-                
                 if let Some(ref client) = self.firasim_client {
-                    match client.send_commands(&all_commands).await {
-                        Ok(_) => {
-                            eprintln!("[Radio] ✓ Comandos enviados exitosamente a FIRASim");
+                    match client.send_commands_sync(&all_commands).await {
+                        Ok(Some(response)) => {
+                            eprintln!("[Radio] ✓ Comandos enviados y respuesta recibida de FIRASim");
+                            if !response.detection.is_empty() {
+                                eprintln!("[Radio] ✓✓✓ Respuesta contiene {} frames de detección!", response.detection.len());
+                            }
+                            self.command_map.clear();
+                            return Ok(Some(response));
+                        }
+                        Ok(None) => {
+                            eprintln!("[Radio] ✓ Comandos enviados a FIRASim (sin respuesta de detección)");
                         }
                         Err(e) => {
                             eprintln!("[Radio] ✗ Error enviando comandos a FIRASim: {}", e);
@@ -164,7 +194,7 @@ impl Radio {
         }
         
         self.command_map.clear();
-        Ok(())
+        Ok(None)
     }
 }
 
