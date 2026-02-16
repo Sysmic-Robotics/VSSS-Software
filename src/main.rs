@@ -10,9 +10,26 @@ mod gui;
 use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock as TokioRwLock};
 use vision::{Vision, VisionEvent, BallData, RobotData};
 use gui::ConfigUpdate;
-use world::{World, RobotState};
-use std::time::Duration;
+use world::World;
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+// ====== Instrumentación temporal de movimiento (fácil de borrar) ======
+const DEBUG_MOTION_LINE_STEP_TARGET: bool = false;
+const DEBUG_MOTION_LINE_STEP_X: f32 = 0.20;
+const DEBUG_MOTION_LINE_STEP_Y: f32 = -0.10;
+const DEBUG_MOTION_ROTATE_IN_PLACE: bool = false;
+const DEBUG_MOTION_ROTATE_OMEGA: f64 = 4.8;
+const DEBUG_MOTION_CHASE_FACE_KP: f64 = 4.0;
+const DEBUG_MOTION_CHASE_FACE_KI: f64 = 0.0;
+const DEBUG_MOTION_CHASE_FACE_KD: f64 = 0.15;
+const DEBUG_MOTION_LOG_POSITION_ERROR: bool = true;
+const DEBUG_MOTION_LOG_CMD_VS_REAL: bool = true;
+const DEBUG_MOTION_TRACK_LATENCY: bool = true;
+const DEBUG_MOTION_TRACK_COUNTS: bool = true;
+const DEBUG_MOTION_LOG_KPI: bool = true;
+// ======================================================================
 
 fn main() {
     // Create channels
@@ -32,6 +49,10 @@ fn main() {
     // Usar TokioRwLock para acceso async-friendly
     let world = Arc::new(TokioRwLock::new(World::new(3, 3)));
     let world_clone = world.clone();
+    let command_timestamps: Arc<TokioMutex<HashMap<(i32, i32), Instant>>> =
+        Arc::new(TokioMutex::new(HashMap::new()));
+    let commands_sent_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let updates_received_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     
     // Create shared flag for tracker state
     let tracker_enabled = Arc::new(AtomicBool::new(true)); // Habilitado por defecto
@@ -133,6 +154,8 @@ fn main() {
 
             // Spawn a background task to consume vision events and update World
             let world_for_vision = world_clone.clone();
+            let command_timestamps_for_vision = command_timestamps.clone();
+            let updates_received_for_vision = updates_received_counter.clone();
             tokio::spawn(async move {
                 while let Some(event) = vision_rx.recv().await {
                     let mut world = world_for_vision.write().await;
@@ -147,6 +170,22 @@ fn main() {
                                 robot_data.velocity,
                                 robot_data.angular_velocity as f64,
                             );
+                            if DEBUG_MOTION_TRACK_LATENCY {
+                                let key = (robot_data.team as i32, robot_data.id as i32);
+                                let mut map = command_timestamps_for_vision.lock().await;
+                                if let Some(sent_at) = map.remove(&key) {
+                                    let latency_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                                    if latency_ms > 1.0 {
+                                        eprintln!(
+                                            "[MotionDebug] latencia cmd->vision robot={} team={} {:.2} ms",
+                                            robot_data.id, robot_data.team, latency_ms
+                                        );
+                                    }
+                                }
+                            }
+                            if DEBUG_MOTION_TRACK_COUNTS {
+                                updates_received_for_vision.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                         VisionEvent::Ball(ball_data) => {
                             world.update_ball(ball_data.position, ball_data.velocity);
@@ -173,7 +212,8 @@ fn main() {
             let motion = motion::Motion::new();
             let radio = match radio::Radio::new(false, radio::SimulatorType::FIRASim, "127.0.0.1", 20011).await {
                 Ok(r) => {
-                    eprintln!("[Main] Radio inicializado exitosamente para FIRASim en 127.0.0.1:20011");
+                    eprintln!("[Main] Radio inicializado para FIRASim en 127.0.0.1:20011");
+                    eprintln!("[Main] Asegúrate de que FIRASim esté en ejecución y escuchando en el puerto 20011 (actuador) para que los robots se muevan.");
                     Arc::new(TokioMutex::new(r))
                 },
                 Err(e) => {
@@ -208,126 +248,218 @@ fn main() {
                 }
             }
             
-            // Tarea de prueba: enviar comandos periódicos a un robot para verificar comunicación
-            let radio_test = radio.clone();
-            let status_tx_for_test = status_tx.clone();
-            let vision_tx_for_test = vision_tx.clone();
-            tokio::spawn(async move {
-                eprintln!("[Main] ========================================");
-                eprintln!("[Main] Iniciando tarea de prueba de comandos...");
-                eprintln!("[Main] Enviando comandos a robots azules IDs 0-2 cada segundo");
-                eprintln!("[Main] Verifica en FIRASim si los robots azules se mueven");
-                eprintln!("[Main] ========================================");
-                let mut counter = 0u64;
-                let mut interval = tokio::time::interval(Duration::from_millis(100)); // 10 Hz
-                
-                loop {
-                    interval.tick().await;
-                    counter += 1;
-                    
-                        // Enviar comandos de movimiento circular para hacer los robots visibles
-                        // Esto ayuda a detectar si FIRASim está procesando comandos
+            // ========== PRUEBA TEMPORAL: Robot 0 persigue la pelota ==========
+            // Poner a `true` para que solo el robot 0 (azul) persiga la pelota con move_direct.
+            // Poner a `false` para tarea de prueba circular (robots 0-2) o comportamiento normal.
+            const ENABLE_ROBOT_0_CHASE_BALL_TEST: bool = true;
+            // =================================================================
+
+            // Tarea de prueba solo cuando NO está activo el modo "robot 0 persigue pelota"
+            if !ENABLE_ROBOT_0_CHASE_BALL_TEST {
+                let radio_test = radio.clone();
+                tokio::spawn(async move {
+                    eprintln!("[Main] Tarea de prueba de comandos activa (robots 0-2, movimiento circular)");
+                    let mut counter = 0u64;
+                    let mut interval = tokio::time::interval(Duration::from_millis(100));
+                    loop {
+                        interval.tick().await;
+                        counter += 1;
                         if counter % 10 == 0 {
                             let mut radio_guard = radio_test.lock().await;
-                            
-                            // Crear comandos para todos los robots habilitados (0-2 para VSS)
-                            // Usar movimiento circular para que sea más obvio
                             use motion::MotionCommand;
-                            let t = (counter as f32 * 0.1) * std::f32::consts::PI / 2.0; // Varía cada segundo
-                            
+                            let t = (counter as f32 * 0.1) * std::f32::consts::PI / 2.0;
                             for robot_id in 0..3 {
-                                // Cada robot se mueve en un patrón diferente
                                 let (vx, vy, omega) = match robot_id {
-                                    0 => (t.cos() * 0.3, t.sin() * 0.3, 0.0),  // Círculo
-                                    1 => (0.3, 0.0, 0.5),                        // Línea recta + rotación
-                                    2 => (0.0, 0.3, -0.5),                       // Movimiento lateral + rotación
+                                    0 => (t.cos() * 0.3, t.sin() * 0.3, 0.0),
+                                    1 => (0.3, 0.0, 0.5),
+                                    2 => (0.0, 0.3, -0.5),
                                     _ => (0.0, 0.0, 0.0),
                                 };
-                                
-                                let test_cmd = MotionCommand {
+                                radio_guard.add_motion_command(MotionCommand {
                                     id: robot_id,
-                                    team: 0, // Azul
+                                    team: 0,
                                     vx: vx as f64,
                                     vy: vy as f64,
                                     omega,
                                     orientation: 0.0,
-                                };
-                                
-                                radio_guard.add_motion_command(test_cmd);
+                                });
                             }
-                            
-                            match radio_guard.send_commands().await {
-                                Ok(_) => {
-                                    if counter % 60 == 0 { // Log cada 6 segundos
-                                        eprintln!("[Main] ✓ Comandos enviados: robots azules IDs 0-2 con movimientos variados (contador: {})", counter);
-                                        eprintln!("[Main] ℹ Verifica en FIRASim que los robots se están moviendo");
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[Main] ✗ Error enviando comandos de prueba: {}", e);
-                                }
-                            }
+                            let _ = radio_guard.send_commands().await;
                         }
-                }
-            });
-            
-            // ========== PRUEBA TEMPORAL: Robot 0 persigue la pelota ==========
-            // Poner a `true` para que solo el robot 0 (azul) persiga la pelota con move_direct.
-            // Poner a `false` (o eliminar este bloque) para volver al comportamiento normal
-            // (todos los robots azules van hacia la pelota con path planner).
-            const ENABLE_ROBOT_0_CHASE_BALL_TEST: bool = true;
-            // =================================================================
+                    }
+                });
+            }
 
             // Spawn a task to periodically compute motion commands and send them
             let world_for_motion = world_clone.clone();
             let radio_for_motion = radio.clone();
-            let status_tx_for_motion = status_tx.clone();
-            let vision_tx_for_motion = vision_tx.clone();
+            let command_timestamps_for_motion = command_timestamps.clone();
+            let commands_sent_for_motion = commands_sent_counter.clone();
+            let updates_received_for_motion = updates_received_counter.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
+                static LAST_COUNT_LOG_SEC: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                static LAST_KPI_LOG_SEC: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
                 loop {
                     interval.tick().await;
 
-                    let (ball_pos, robots_data): (glam::Vec2, Vec<RobotState>) = {
+                    let (tick_target, robot_snapshot, computed_commands): (
+                        glam::Vec2,
+                        HashMap<i32, (glam::Vec2, glam::Vec2)>,
+                        Vec<motion::MotionCommand>,
+                    ) = {
                         let world = world_for_motion.read().await;
-                        let ball_pos = world.get_ball_state().position;
+                        let ball_pos = if DEBUG_MOTION_LINE_STEP_TARGET {
+                            glam::Vec2::new(DEBUG_MOTION_LINE_STEP_X, DEBUG_MOTION_LINE_STEP_Y)
+                        } else {
+                            world.get_ball_state().position
+                        };
                         let robots_data: Vec<_> = world.get_blue_team_active()
                             .into_iter()
                             .cloned()
                             .collect();
-                        (ball_pos, robots_data)
+                        let robot_snapshot = robots_data
+                            .iter()
+                            .map(|robot| (robot.id, (robot.position, robot.velocity)))
+                            .collect::<HashMap<_, _>>();
+
+                        if robots_data.is_empty() {
+                            (ball_pos, robot_snapshot, Vec::new())
+                        } else if DEBUG_MOTION_ROTATE_IN_PLACE {
+                            if let Some(robot_0) = robots_data.iter().find(|r| r.id == 0) {
+                                (
+                                    ball_pos,
+                                    robot_snapshot,
+                                    vec![motion::MotionCommand {
+                                        id: robot_0.id,
+                                        team: robot_0.team,
+                                        vx: 0.0,
+                                        vy: 0.0,
+                                        omega: DEBUG_MOTION_ROTATE_OMEGA,
+                                        orientation: robot_0.orientation,
+                                    }],
+                                )
+                            } else {
+                                (ball_pos, robot_snapshot, Vec::new())
+                            }
+                        } else if ENABLE_ROBOT_0_CHASE_BALL_TEST {
+                            // --- Modo prueba: solo robot 0 (azul) persigue la pelota ---
+                            if let Some(robot_0) = robots_data.iter().find(|r| r.id == 0) {
+                                let mut cmd = motion.move_direct(robot_0, ball_pos);
+                                let to_target = ball_pos - robot_0.position;
+                                let distance = to_target.length();
+                                if distance.is_finite() && distance > 1e-4 {
+                                    let target_angle = to_target.y.atan2(to_target.x) as f64;
+                                    let heading_error = motion::Motion::normalize_angle(
+                                        target_angle - robot_0.orientation
+                                    );
+                                    let face_cmd = motion.face_to_angle(
+                                        robot_0,
+                                        target_angle,
+                                        DEBUG_MOTION_CHASE_FACE_KP,
+                                        DEBUG_MOTION_CHASE_FACE_KI,
+                                        DEBUG_MOTION_CHASE_FACE_KD,
+                                    );
+
+                                    // Para drive diferencial: priorizar orientación cuando error angular es alto.
+                                    let max_error = std::f64::consts::FRAC_PI_2;
+                                    let alignment = ((max_error - heading_error.abs()) / max_error)
+                                        .clamp(0.0, 1.0);
+                                    cmd.vx *= alignment;
+                                    cmd.vy *= alignment;
+                                    cmd.omega = face_cmd.omega;
+                                }
+                                (ball_pos, robot_snapshot, vec![cmd])
+                            } else {
+                                (ball_pos, robot_snapshot, Vec::new())
+                            }
+                        } else {
+                            // --- Comportamiento normal: todos los robots azules van a la pelota ---
+                            let commands = robots_data
+                                .iter()
+                                .filter(|robot_state| robot_state.active)
+                                .map(|robot_state| motion.move_to(robot_state, ball_pos, &world))
+                                .collect();
+                            (ball_pos, robot_snapshot, commands)
+                        }
                     };
 
-                    if robots_data.is_empty() {
+                    if computed_commands.is_empty() {
                         continue;
                     }
-
-                    let mut radio_guard = radio_for_motion.lock().await;
-                    let mut commands_added = 0u32;
-
-                    if ENABLE_ROBOT_0_CHASE_BALL_TEST {
-                        // --- Modo prueba: solo robot 0 (azul) persigue la pelota ---
-                        if let Some(robot_0) = robots_data.iter().find(|r| r.id == 0) {
-                            let motion_cmd = motion.move_direct(robot_0, ball_pos);
-                            radio_guard.add_motion_command(motion_cmd);
-                            commands_added += 1;
+                    let computed_count = computed_commands.len() as u64;
+                    if DEBUG_MOTION_LOG_KPI {
+                        let now_sec = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let prev_sec = LAST_KPI_LOG_SEC.swap(now_sec, Ordering::Relaxed);
+                        if prev_sec != now_sec {
+                            let kpi = motion::summarize_commands(&computed_commands);
+                            eprintln!(
+                                "[MotionDebug] KPI mean_speed={:.3} peak_speed={:.3} mean_abs_omega={:.3}",
+                                kpi.mean_speed,
+                                kpi.peak_speed,
+                                kpi.mean_abs_omega
+                            );
                         }
-                    } else {
-                        // --- Comportamiento normal: todos los robots azules van a la pelota ---
-                        for robot_state in robots_data {
-                            if robot_state.active {
-                                let motion_cmd = {
-                                    let world = world_for_motion.read().await;
-                                    motion.move_to(&robot_state, ball_pos, &world)
-                                };
-                                radio_guard.add_motion_command(motion_cmd);
-                                commands_added += 1;
+                    }
+
+                    if DEBUG_MOTION_LOG_POSITION_ERROR || DEBUG_MOTION_LOG_CMD_VS_REAL {
+                        for cmd in &computed_commands {
+                            if let Some((pos, vel)) = robot_snapshot.get(&cmd.id) {
+                                let pos_error = (tick_target - *pos).length();
+                                if DEBUG_MOTION_LOG_POSITION_ERROR {
+                                    eprintln!(
+                                        "[MotionDebug] robot={} err={:.3}m target=({:.2},{:.2}) pos=({:.2},{:.2})",
+                                        cmd.id, pos_error, tick_target.x, tick_target.y, pos.x, pos.y
+                                    );
+                                }
+                                if DEBUG_MOTION_LOG_CMD_VS_REAL {
+                                    let cmd_speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
+                                    let real_speed = vel.length() as f64;
+                                    eprintln!(
+                                        "[MotionDebug] robot={} cmd_speed={:.3} real_speed={:.3} omega={:.3}",
+                                        cmd.id, cmd_speed, real_speed, cmd.omega
+                                    );
+                                }
                             }
                         }
                     }
 
-                    if commands_added > 0 {
-                        let _ = radio_guard.send_commands().await;
+                    let sent_at = Instant::now();
+                    if DEBUG_MOTION_TRACK_LATENCY {
+                        let mut map = command_timestamps_for_motion.lock().await;
+                        for motion_cmd in &computed_commands {
+                            map.insert((motion_cmd.team, motion_cmd.id), sent_at);
+                        }
+                    }
+                    let mut radio_guard = radio_for_motion.lock().await;
+                    for motion_cmd in computed_commands {
+                        radio_guard.add_motion_command(motion_cmd);
+                    }
+
+                    if let Err(err) = radio_guard.send_commands().await {
+                        eprintln!("[Main] Error enviando comandos de movimiento: {}", err);
+                    } else if DEBUG_MOTION_TRACK_COUNTS {
+                        commands_sent_for_motion.fetch_add(computed_count, Ordering::Relaxed);
+                        let now_sec = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let prev_sec = LAST_COUNT_LOG_SEC.swap(now_sec, Ordering::Relaxed);
+                        if prev_sec != now_sec {
+                            let sent = commands_sent_for_motion.load(Ordering::Relaxed);
+                            let recv = updates_received_for_motion.load(Ordering::Relaxed);
+                            eprintln!(
+                                "[MotionDebug] contador sent_ticks={} recv_updates={} ratio={:.2}",
+                                sent,
+                                recv,
+                                if sent > 0 { recv as f64 / sent as f64 } else { 0.0 }
+                            );
+                        }
                     }
                 }
             });

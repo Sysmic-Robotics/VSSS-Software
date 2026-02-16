@@ -164,22 +164,14 @@ impl Radio {
                 return Ok(None);
             }
             SimulatorType::FIRASim => {
-                // FIRASim acepta todos los comandos en un solo mensaje
-                // Intentar modo síncrono para obtener detección y mantener GUI actualizada
+                // FIRASim puerto 20011: solo paquete FIRA (Packet con cmd.robot_commands), no SSL-Simulation
                 let all_commands: Vec<RobotCommand> = self.command_map.values().cloned().collect();
                 
                 if let Some(ref client) = self.firasim_client {
-                    match client.send_commands_sync(&all_commands).await {
-                        Ok(Some(response)) => {
-                            eprintln!("[Radio] ✓ Comandos enviados y respuesta recibida de FIRASim");
-                            if !response.detection.is_empty() {
-                                eprintln!("[Radio] ✓✓✓ Respuesta contiene {} frames de detección!", response.detection.len());
-                            }
+                    match client.send_commands(&all_commands).await {
+                        Ok(()) => {
                             self.command_map.clear();
-                            return Ok(Some(response));
-                        }
-                        Ok(None) => {
-                            eprintln!("[Radio] ✓ Comandos enviados a FIRASim (sin respuesta de detección)");
+                            return Ok(None);
                         }
                         Err(e) => {
                             eprintln!("[Radio] ✗ Error enviando comandos a FIRASim: {}", e);
@@ -213,6 +205,7 @@ mod tests {
             vx: 1.0,
             vy: 0.0,
             omega: 0.0,
+            orientation: 0.0,
         };
         
         radio.add_motion_command(motion_cmd);
