@@ -7,6 +7,14 @@ use crate::protos::ssl_simulation_robot_control::{
 use crate::protos::fira_command::{Command as FiraCommand, Commands as FiraCommands};
 use crate::protos::fira_packet::Packet as FiraPacket;
 use protobuf::Message;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn sanitize_and_clamp(value: f64, min: f64, max: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    value.clamp(min, max)
+}
 
 /// Serializa un RobotCommand a formato Protobuf de grSim
 pub fn serialize_robot_command(cmd: &RobotCommand) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
@@ -210,16 +218,9 @@ mod tests {
             },
         };
         
-        let result = serialize_robot_command(&cmd);
-        match result {
-            Ok(buffer) => {
-                // Verificar que el buffer no está vacío
-                assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
-            }
-            Err(_e) => {
-                // Si falla, no fallar el test
-            }
-        }
+        let buffer = serialize_robot_command(&cmd)
+            .expect("serialización de un comando grSim debe ser exitosa");
+        assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
     }
     
     #[test]
@@ -246,15 +247,9 @@ mod tests {
             },
         ];
         
-        let result = serialize_commands(&commands);
-        match result {
-            Ok(buffer) => {
-                assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
-            }
-            Err(_e) => {
-                // Si falla, no fallar el test
-            }
-        }
+        let buffer = serialize_commands(&commands)
+            .expect("serialización de comandos grSim debe ser exitosa");
+        assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
     }
 }
 
@@ -299,10 +294,9 @@ pub fn serialize_to_firasim(commands: &[RobotCommand]) -> Result<Vec<u8>, Box<dy
         
         // FIRASim usa velocidades globales directamente (no necesita conversión)
         // Limitar velocidades a rangos válidos (típicamente -2.0 a 2.0 m/s para VSS)
-        let max_vel = 2.0f32;
-        let vx = (cmd.motion.vx as f32).max(-max_vel).min(max_vel);
-        let vy = (cmd.motion.vy as f32).max(-max_vel).min(max_vel);
-        let omega = (cmd.motion.omega as f32).max(-10.0).min(10.0); // rad/s
+        let vx = sanitize_and_clamp(cmd.motion.vx, -MOTION_VEL_MAX, MOTION_VEL_MAX) as f32;
+        let vy = sanitize_and_clamp(cmd.motion.vy, -MOTION_VEL_MAX, MOTION_VEL_MAX) as f32;
+        let omega = sanitize_and_clamp(cmd.motion.omega, -MOTION_OMEGA_MAX, MOTION_OMEGA_MAX) as f32; // rad/s
         
         global_vel.set_x(vx);
         global_vel.set_y(vy);
@@ -393,31 +387,69 @@ pub fn serialize_to_firasim(commands: &[RobotCommand]) -> Result<Vec<u8>, Box<dy
     }
 }
 
+/// Constantes del robot VSS para conversión v,omega → wheel_left/wheel_right (rad/s).
+/// Ver RESPUESTAS_PUERTO_20011.md: L = separación entre ruedas, r = radio de rueda.
+const WHEEL_BASE_L: f64 = 0.05;   // m, típico VSS ~0.05–0.06
+const WHEEL_RADIUS_R: f64 = 0.02; // m, depende del modelo en FIRASim
+/// Límite típico útil en FIRASim: ±20 a ±40 rad/s.
+const WHEEL_RAD_S_MAX: f64 = 20.0;
+/// Límites de entrada esperados para comandos cinemáticos.
+const MOTION_VEL_MAX: f64 = 2.0;   // m/s
+const MOTION_OMEGA_MAX: f64 = 10.0; // rad/s
+
 /// Serializa comandos al protocolo FIRA (VSSS/FIRASim) para el puerto 20011.
-/// Convierte velocidades globales (vx, vy, omega) a wheel_left/wheel_right usando la orientación del robot.
-/// FIRASim (VSS) espera este formato, no SSL-Simulation.
+/// Convierte velocidades globales (vx, vy, omega) a wheel_left/wheel_right en rad/s.
+/// Fórmula diferencial: omega_left = v/r - omega*L/(2*r), omega_right = v/r + omega*L/(2*r).
 pub fn serialize_to_fira_actuator(commands: &[RobotCommand]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     if commands.is_empty() {
         return Err("No hay comandos para serializar (FIRA)".into());
     }
 
+    static CLIPPED_WHEEL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static NON_FINITE_INPUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
     let mut fira_commands = FiraCommands::new();
     for cmd in commands {
-        let theta = cmd.motion.orientation;
-        let vx = cmd.motion.vx;
-        let vy = cmd.motion.vy;
-        let omega = cmd.motion.omega;
+        let raw_theta = cmd.motion.orientation;
+        let raw_vx = cmd.motion.vx;
+        let raw_vy = cmd.motion.vy;
+        let raw_omega = cmd.motion.omega;
 
-        // Velocidad hacia adelante en el marco del robot (eje X = frente)
-        let v_forward = vx * theta.cos() + vy * theta.sin();
-        // Differential drive: wheel_left = v_forward - k*omega, wheel_right = v_forward + k*omega
-        // k ~ (wheel_base/2) / wheel_radius para rad/s; FIRASim suele esperar valores en [-2, 2] tipo m/s
-        let k_omega = 0.05;
-        let mut wheel_left = v_forward - k_omega * omega;
-        let mut wheel_right = v_forward + k_omega * omega;
-        let max_wheel = 2.0_f64;
-        wheel_left = wheel_left.clamp(-max_wheel, max_wheel);
-        wheel_right = wheel_right.clamp(-max_wheel, max_wheel);
+        if !raw_theta.is_finite() || !raw_vx.is_finite() || !raw_vy.is_finite() || !raw_omega.is_finite() {
+            let n = NON_FINITE_INPUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 5 || n % 120 == 0 {
+                eprintln!(
+                    "[serialize_to_fira_actuator] entrada no finita (#{}) robot={} theta={} vx={} vy={} omega={}",
+                    n, cmd.id, raw_theta, raw_vx, raw_vy, raw_omega
+                );
+            }
+        }
+
+        let theta = if raw_theta.is_finite() { raw_theta } else { 0.0 };
+        let vx = sanitize_and_clamp(raw_vx, -MOTION_VEL_MAX, MOTION_VEL_MAX);
+        let vy = sanitize_and_clamp(raw_vy, -MOTION_VEL_MAX, MOTION_VEL_MAX);
+        let omega = sanitize_and_clamp(raw_omega, -MOTION_OMEGA_MAX, MOTION_OMEGA_MAX);
+
+        // v = velocidad lineal en la dirección del robot (m/s)
+        let v = vx * theta.cos() + vy * theta.sin();
+        // omega_left/right en rad/s (drive diferencial: L = wheel base, r = wheel radius)
+        let inv_r = 1.0 / WHEEL_RADIUS_R;
+        let half_l_over_r = WHEEL_BASE_L / (2.0 * WHEEL_RADIUS_R);
+        let mut wheel_left = v * inv_r - omega * half_l_over_r;
+        let mut wheel_right = v * inv_r + omega * half_l_over_r;
+        let unclamped_left = wheel_left;
+        let unclamped_right = wheel_right;
+        wheel_left = wheel_left.clamp(-WHEEL_RAD_S_MAX, WHEEL_RAD_S_MAX);
+        wheel_right = wheel_right.clamp(-WHEEL_RAD_S_MAX, WHEEL_RAD_S_MAX);
+        if (unclamped_left - wheel_left).abs() > f64::EPSILON || (unclamped_right - wheel_right).abs() > f64::EPSILON {
+            let n = CLIPPED_WHEEL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 5 || n % 120 == 0 {
+                eprintln!(
+                    "[serialize_to_fira_actuator] saturación ruedas (#{}) robot={} left={:.3}->{:.3} right={:.3}->{:.3}",
+                    n, cmd.id, unclamped_left, wheel_left, unclamped_right, wheel_right
+                );
+            }
+        }
 
         let mut fira_cmd = FiraCommand::new();
         fira_cmd.id = cmd.id as u32;
@@ -463,16 +495,9 @@ mod firasim_tests {
             },
         ];
         
-        let result = serialize_to_firasim(&commands);
-        match result {
-            Ok(buffer) => {
-                assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
-            }
-            Err(e) => {
-                // Si falla, mostrar el error pero no fallar el test
-                eprintln!("Error en test_serialize_to_firasim: {}", e);
-            }
-        }
+        let buffer = serialize_to_firasim(&commands)
+            .expect("serialización FIRASim debe ser exitosa");
+        assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
     }
     
     #[test]
@@ -499,14 +524,8 @@ mod firasim_tests {
             },
         ];
         
-        let result = serialize_to_firasim(&commands);
-        match result {
-            Ok(buffer) => {
-                assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
-            }
-            Err(e) => {
-                eprintln!("Error en test_serialize_to_firasim_with_kick: {}", e);
-            }
-        }
+        let buffer = serialize_to_firasim(&commands)
+            .expect("serialización FIRASim con kick debe ser exitosa");
+        assert!(!buffer.is_empty(), "Buffer serializado no debe estar vacío");
     }
 }

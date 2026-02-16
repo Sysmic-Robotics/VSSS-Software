@@ -25,8 +25,9 @@ impl FIRASimClient {
     pub async fn new(address: &str, port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         let addr: SocketAddr = format!("{}:{}", address, port).parse()?;
-        
-        // SimulatorCommand generalmente usa el mismo puerto que RobotControl
+        // No usar connect(): con UDP conectado, si FIRASim no escucha en el puerto,
+        // el kernel devuelve "Connection refused" en envíos. Con send_to() los
+        // datagramas se envían sin ese error y FIRASim los recibe cuando está activo.
         let control_addr: SocketAddr = format!("{}:{}", address, port).parse()?;
         
         Ok(Self {
@@ -264,7 +265,6 @@ impl FIRASimClient {
 
         match self.socket.send_to(&buffer, &self.address).await {
             Ok(_) => {
-                // Log reducido: solo primeros 3 comandos y cada 60 paquetes
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static PACKET_COUNT: AtomicU64 = AtomicU64::new(0);
                 let n = PACKET_COUNT.fetch_add(1, Ordering::Relaxed) + 1;

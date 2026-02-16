@@ -39,6 +39,13 @@ impl PIDController {
         
         p_term + i_term + d_term
     }
+
+    /// Actualiza las ganancias sin reiniciar el estado interno del PID.
+    pub fn set_gains(&mut self, kp: f64, ki: f64, kd: f64) {
+        self.kp = kp;
+        self.ki = ki;
+        self.kd = kd;
+    }
     
     /// Resetea el acumulador integral
     pub fn reset_integral(&mut self) {
