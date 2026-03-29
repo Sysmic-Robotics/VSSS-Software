@@ -470,6 +470,7 @@ pub fn serialize_to_fira_actuator(commands: &[RobotCommand]) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod firasim_tests {
     use super::*;
+    use crate::motion::{MotionCommand, KickerCommand};
     
     #[test]
     fn test_serialize_to_firasim() {
