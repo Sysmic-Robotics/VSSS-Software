@@ -27,9 +27,9 @@ pub struct FastPathPlanner {
 }
 
 const SEGMENT_SAMPLES: i32 = 200;
-const SUBGOAL_ATTEMPTS: i32 = 14;
-const SUBGOAL_STEP_BASE: f32 = 0.11;
-const SUBGOAL_STEP_GROWTH: f32 = 0.04;
+const SUBGOAL_ATTEMPTS: i32 = 18;
+const SUBGOAL_STEP_BASE: f32 = 0.06;  // was 0.11 — más pequeño para espacios apretados VSS
+const SUBGOAL_STEP_GROWTH: f32 = 0.02; // was 0.04 — crecimiento gradual más fino
 
 impl FastPathPlanner {
     /// Crea un nuevo FastPathPlanner con la profundidad máxima especificada
@@ -41,7 +41,8 @@ impl FastPathPlanner {
     /// Verifica si una trayectoria colisiona (200 puntos de verificación)
     /// EXACTO al código C++ línea 18-25
     fn trajectory_collides(&self, traj: &Trajectory, env: &Environment) -> bool {
-        for i in 0..SEGMENT_SAMPLES {
+        // Empieza en i=1 para no verificar el punto de inicio (el robot ya está ahí).
+        for i in 1..SEGMENT_SAMPLES {
             let t = i as f32 / SEGMENT_SAMPLES as f32;
             let point = traj.start + t * (traj.goal - traj.start);
             if env.collides(point) {
@@ -53,7 +54,8 @@ impl FastPathPlanner {
 
     /// Retorna el primer punto de colisión sobre el segmento, si existe.
     fn first_collision_point(&self, traj: &Trajectory, env: &Environment) -> Option<Vec2> {
-        for i in 0..SEGMENT_SAMPLES {
+        // Empieza en i=1 para no reportar el punto de inicio como colisión.
+        for i in 1..SEGMENT_SAMPLES {
             let t = i as f32 / SEGMENT_SAMPLES as f32;
             let point = traj.start + t * (traj.goal - traj.start);
             if env.collides(point) {
@@ -212,7 +214,9 @@ impl FastPathPlanner {
     pub fn get_path(&self, from: Vec2, to: Vec2, env: &Environment) -> Vec<Vec2> {
         let raw_path = self.create_path(from, to, env);
         if raw_path.is_empty() {
-            return vec![from, to]; // Fallback si la ruta es inválida
+            // Planner falló: devolver solo [from] para que move_to active recuperación.
+            // NO devolver [from, to] — enviaría al robot directo a través del obstáculo.
+            return vec![from];
         }
         
         let mut points = Vec::new();

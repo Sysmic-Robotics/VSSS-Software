@@ -34,7 +34,7 @@ impl Motion {
     /// Crea un nuevo sistema de movimiento
     pub fn new() -> Self {
         Self {
-            path_planner: FastPathPlanner::new(5), // max_depth = 5
+            path_planner: FastPathPlanner::new(7), // max_depth = 7: más recursión para espacios apretados
             pid_x_by_robot: Mutex::new(HashMap::new()),
             pid_y_by_robot: Mutex::new(HashMap::new()),
             pid_theta_by_robot: Mutex::new(HashMap::new()),
@@ -81,11 +81,11 @@ impl Motion {
                 };
             }
             let direction = diff / distance;
-            // Perfil de frenado proporcional igual que move_direct(): ágil lejos, suave al llegar.
-            let dist_to_next = distance; // distancia al próximo waypoint
+            // Frenar basado en distancia al OBJETIVO FINAL, no al waypoint intermedio.
+            // Si se usara dist_to_next, el robot frenaría en cada waypoint (max ~0.4 m/s).
+            // Con dist_to_goal, mantiene velocidad máxima hasta los últimos 50cm del goal.
             let dist_to_goal = (target - robot_state.position).length();
-            let brake_ref = dist_to_next.min(dist_to_goal);
-            let normalized = (brake_ref / BRAKE_DISTANCE).clamp(0.0, 1.0);
+            let normalized = (dist_to_goal / BRAKE_DISTANCE).clamp(0.0, 1.0);
             let speed = (MIN_LINEAR_SPEED as f32)
                 + normalized * ((MAX_LINEAR_SPEED - MIN_LINEAR_SPEED) as f32);
 
@@ -98,13 +98,15 @@ impl Motion {
                 orientation: robot_state.orientation,
             }
         } else {
-            // Ya está en el objetivo o path inválido
+            // path.len() <= 1: planner no pudo rodear los obstáculos.
+            // Recuperación: retroceder opuesto al target + rotar para buscar nueva ruta.
+            let to_target = (target - robot_state.position).normalize_or_zero();
             MotionCommand {
                 id: robot_state.id,
                 team: robot_state.team,
-                vx: 0.0,
-                vy: 0.0,
-                omega: 0.0,
+                vx: -(to_target.x as f64) * MIN_LINEAR_SPEED,
+                vy: -(to_target.y as f64) * MIN_LINEAR_SPEED,
+                omega: MAX_ANGULAR_SPEED * 0.4,
                 orientation: robot_state.orientation,
             }
         }
@@ -315,6 +317,63 @@ mod tests {
 
         // Con componente integral no nula, el segundo tick debe acumular al menos el mismo esfuerzo.
         assert!(cmd_2.vx >= cmd_1.vx);
+    }
+
+    /// Verifica que move_to mantiene velocidad máxima con waypoints intermedios (fix braking).
+    /// Antes del fix: max speed ≈ 0.4 m/s porque brake_ref = dist_to_next (corto).
+    /// Después del fix: speed = f(dist_to_goal) → llega más rápido.
+    #[test]
+    fn test_move_to_speed_with_obstacle_detour() {
+        let motion = Motion::new();
+        // Poner un robot obstáculo que fuerza un desvío
+        let mut world = World::new(3, 3);
+        world.update_robot(1, 0, Vec2::new(0.20, 0.0), 0.0, Vec2::ZERO, 0.0);
+        world.update_ball(Vec2::new(0.0, 0.5), Vec2::ZERO); // pelota fuera del camino
+
+        let mut robot = RobotState::new(0, 0);
+        robot.position = Vec2::new(-0.40, 0.0);
+
+        let target = Vec2::new(0.40, 0.0); // obstáculo en el medio → path con waypoint
+
+        let cmd = motion.move_to(&robot, target, &world);
+        let speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
+
+        // Con dist_to_goal ≈ 0.80m >> BRAKE_DISTANCE=0.50m → speed debe ser MAX_LINEAR_SPEED
+        assert!(
+            speed > 1.0,
+            "velocidad {:.3} m/s demasiado baja — el braking fix no funciona",
+            speed
+        );
+    }
+
+    /// Verifica que move_to activa recuperación (no v=0) cuando el planner no puede rodar.
+    #[test]
+    fn test_move_to_stuck_recovery() {
+        let motion = Motion::new();
+        // Crear una "pared" de robots que bloqueen el camino directo Y las rutas alternativas
+        let mut world = World::new(3, 3);
+        // Cluster de robots tapando todos los ángulos posibles de salida
+        for i in 0..3 {
+            let angle = (i as f32) * std::f32::consts::PI * 2.0 / 3.0;
+            world.update_robot(
+                i + 1, 0,
+                Vec2::new(0.05 * angle.cos(), 0.05 * angle.sin()),
+                0.0, Vec2::ZERO, 0.0,
+            );
+        }
+        world.update_ball(Vec2::new(0.0, -0.5), Vec2::ZERO);
+
+        let mut robot = RobotState::new(0, 0);
+        robot.position = Vec2::new(0.0, 0.0);
+        let target = Vec2::new(0.5, 0.0);
+
+        let cmd = motion.move_to(&robot, target, &world);
+        // Si está atascado, debe devolver un comando de recuperación (no todo ceros)
+        let total = cmd.vx.abs() + cmd.vy.abs() + cmd.omega.abs();
+        assert!(
+            total > 0.0,
+            "move_to devolvió v=0 cuando atascado — la recuperación no funciona"
+        );
     }
 
     /// Simulación headless completa: approach + pivote + empuje de pelota.
