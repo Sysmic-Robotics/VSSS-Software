@@ -26,6 +26,11 @@ pub struct FastPathPlanner {
     max_depth: i32,
 }
 
+const SEGMENT_SAMPLES: i32 = 200;
+const SUBGOAL_ATTEMPTS: i32 = 14;
+const SUBGOAL_STEP_BASE: f32 = 0.11;
+const SUBGOAL_STEP_GROWTH: f32 = 0.04;
+
 impl FastPathPlanner {
     /// Crea un nuevo FastPathPlanner con la profundidad máxima especificada
     /// EXACTO al código C++ línea 16
@@ -36,14 +41,26 @@ impl FastPathPlanner {
     /// Verifica si una trayectoria colisiona (200 puntos de verificación)
     /// EXACTO al código C++ línea 18-25
     fn trajectory_collides(&self, traj: &Trajectory, env: &Environment) -> bool {
-        for i in 0..200 {
-            let t = i as f32 / 200.0;
+        for i in 0..SEGMENT_SAMPLES {
+            let t = i as f32 / SEGMENT_SAMPLES as f32;
             let point = traj.start + t * (traj.goal - traj.start);
             if env.collides(point) {
                 return true;
             }
         }
         false
+    }
+
+    /// Retorna el primer punto de colisión sobre el segmento, si existe.
+    fn first_collision_point(&self, traj: &Trajectory, env: &Environment) -> Option<Vec2> {
+        for i in 0..SEGMENT_SAMPLES {
+            let t = i as f32 / SEGMENT_SAMPLES as f32;
+            let point = traj.start + t * (traj.goal - traj.start);
+            if env.collides(point) {
+                return Some(point);
+            }
+        }
+        None
     }
     
     /// Busca un sub-objetivo rotando el vector dirección
@@ -52,25 +69,39 @@ impl FastPathPlanner {
         &self,
         traj: &Trajectory,
         env: &Environment,
-        robot_diameter: f32,
+        clearance: f32,
         direction: i32,
     ) -> Vec2 {
-        let obs_point = traj.goal;
-        let mut dir_vec = (obs_point - traj.start).normalize();
-        
-        for _i in 0..10 {
-            let offset = Vec2::new(-dir_vec.y, dir_vec.x) * (direction as f32 * robot_diameter);
-            let subgoal = obs_point + offset;
-            
-            if !env.collides(subgoal) &&
-               subgoal.x >= -4.5 && subgoal.x <= 4.5 &&
-               subgoal.y >= -3.0 && subgoal.y <= 3.0 {
+        let obs_point = match self.first_collision_point(traj, env) {
+            Some(p) => p,
+            None => return Vec2::new(f32::NAN, f32::NAN),
+        };
+
+        let segment = traj.goal - traj.start;
+        if segment.length_squared() <= f32::EPSILON {
+            return Vec2::new(f32::NAN, f32::NAN);
+        }
+
+        let mut dir_vec = segment.normalize();
+        for i in 0..SUBGOAL_ATTEMPTS {
+            let lateral = Vec2::new(-dir_vec.y, dir_vec.x) * direction as f32;
+            let radial = clearance + i as f32 * SUBGOAL_STEP_GROWTH;
+            let subgoal = obs_point + lateral * radial;
+
+            // El subgoal debe ser transitable y además sus dos tramos no deben colisionar.
+            let seg_a = self.make_segment(traj.start, subgoal);
+            let seg_b = self.make_segment(subgoal, traj.goal);
+            if !env.collides(subgoal)
+                && !self.trajectory_collides(&seg_a, env)
+                && !self.trajectory_collides(&seg_b, env)
+            {
                 return subgoal;
             }
-            
+
+            // Explora nuevas orientaciones de escape alrededor de la normal.
             dir_vec = rotate_vector(dir_vec, PI / 4.0);
         }
-        
+
         // Retornar NaN si no se encuentra sub-objetivo
         // EXACTO línea 42
         Vec2::new(f32::NAN, f32::NAN)
@@ -88,13 +119,19 @@ impl FastPathPlanner {
         let mut result_a = Vec::new();
         let mut result_b = Vec::new();
         let mut stack = vec![(Trajectory { start, goal }, 0)];
+        let mut failed_a = false;
         
         // Path A (right-hand rule) - EXACTO línea 53-64
         while let Some((traj, depth)) = stack.pop() {
-            if self.trajectory_collides(&traj, env) && depth < self.max_depth {
-                let sub = self.search_subgoal(&traj, env, 0.36, 1);
+            if self.trajectory_collides(&traj, env) {
+                if depth >= self.max_depth {
+                    failed_a = true;
+                    break;
+                }
+                let sub = self.search_subgoal(&traj, env, SUBGOAL_STEP_BASE, 1);
                 if sub.x.is_nan() {
-                    return Vec::new();
+                    failed_a = true;
+                    break;
                 }
                 stack.push((Trajectory { start: sub, goal: traj.goal }, depth + 1));
                 stack.push((Trajectory { start: traj.start, goal: sub }, depth + 1));
@@ -105,11 +142,17 @@ impl FastPathPlanner {
         
         // Path B (left-hand rule) - EXACTO línea 66-79
         stack = vec![(Trajectory { start, goal }, 0)];
+        let mut failed_b = false;
         while let Some((traj, depth)) = stack.pop() {
-            if self.trajectory_collides(&traj, env) && depth < self.max_depth {
-                let sub = self.search_subgoal(&traj, env, 0.36, -1);
+            if self.trajectory_collides(&traj, env) {
+                if depth >= self.max_depth {
+                    failed_b = true;
+                    break;
+                }
+                let sub = self.search_subgoal(&traj, env, SUBGOAL_STEP_BASE, -1);
                 if sub.x.is_nan() {
-                    return Vec::new();
+                    failed_b = true;
+                    break;
                 }
                 stack.push((Trajectory { start: sub, goal: traj.goal }, depth + 1));
                 stack.push((Trajectory { start: traj.start, goal: sub }, depth + 1));
@@ -117,9 +160,18 @@ impl FastPathPlanner {
                 result_b.push(traj);
             }
         }
+        if failed_a {
+            result_a.clear();
+        }
+        if failed_b {
+            result_b.clear();
+        }
         
         // Retornar el path más corto - EXACTO línea 81
-        if result_a.len() <= result_b.len() && !result_a.is_empty() {
+        if result_a.is_empty() && result_b.is_empty() {
+            return Vec::new();
+        }
+        if !result_a.is_empty() && (result_b.is_empty() || result_a.len() <= result_b.len()) {
             result_a
         } else {
             result_b

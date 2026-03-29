@@ -1,10 +1,11 @@
 /// Controlador PID para control de movimiento
 pub struct PIDController {
-    kp: f64,          // Ganancia proporcional
-    ki: f64,          // Ganancia integral
-    kd: f64,          // Ganancia derivativa
-    integral: f64,    // Acumulador integral
-    last_error: f64,  // Error anterior (para derivativa)
+    kp: f64,             // Ganancia proporcional
+    ki: f64,             // Ganancia integral
+    kd: f64,             // Ganancia derivativa
+    integral: f64,       // Acumulador integral
+    last_error: f64,     // Error anterior (para derivativa)
+    integral_limit: f64, // Anti-windup: límite del acumulador integral
 }
 
 impl PIDController {
@@ -16,16 +17,23 @@ impl PIDController {
             kd,
             integral: 0.0,
             last_error: 0.0,
+            integral_limit: 5.0,
         }
     }
-    
+
+    /// Establece el límite del acumulador integral (anti-windup).
+    pub fn with_integral_limit(mut self, limit: f64) -> Self {
+        self.integral_limit = limit;
+        self
+    }
+
     /// Calcula la salida del controlador PID
     pub fn compute(&mut self, error: f64, dt: f64) -> f64 {
         // Término proporcional
         let p_term = self.kp * error;
-        
-        // Término integral
-        self.integral += error * dt;
+
+        // Término integral con anti-windup
+        self.integral = (self.integral + error * dt).clamp(-self.integral_limit, self.integral_limit);
         let i_term = self.ki * self.integral;
         
         // Término derivativo
@@ -65,18 +73,18 @@ mod tests {
     
     #[test]
     fn test_pid_controller() {
-        let mut pid = PIDController::new(1.0, 0.1, 0.01);
-        
+        // kd=0 para aislar comportamiento P+I sin spike derivativo en el primer tick
+        let mut pid = PIDController::new(1.0, 0.1, 0.0);
+
         // Test con error constante
         let output1 = pid.compute(1.0, 0.1);
         assert!(output1 > 0.0);
-        
-        // El término integral debe acumularse (output2 debería ser mayor)
+
+        // El término integral acumula: output2 debe ser mayor que output1
+        // output1 = 1.0*1.0 + 0.1*(1.0*0.1) = 1.0 + 0.01 = 1.01
+        // output2 = 1.0*1.0 + 0.1*(2.0*0.1) = 1.0 + 0.02 = 1.02
         let output2 = pid.compute(1.0, 0.1);
-        // Con ki=0.1, el término integral aumenta: output2 = output1 + 0.1*1.0*0.1 = output1 + 0.01
-        // output1 = 1.0*1.0 + 0.1*0.1 + 0.01*0 = 1.0 + 0.01 = 1.01
-        // output2 = 1.0*1.0 + 0.1*0.2 + 0.01*0 = 1.0 + 0.02 = 1.02
-        assert!(output2 > output1 - 0.001); // Permitir pequeña diferencia numérica
+        assert!(output2 > output1);
     }
     
     #[test]

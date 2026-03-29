@@ -21,14 +21,19 @@ const DEBUG_MOTION_LINE_STEP_X: f32 = 0.20;
 const DEBUG_MOTION_LINE_STEP_Y: f32 = -0.10;
 const DEBUG_MOTION_ROTATE_IN_PLACE: bool = false;
 const DEBUG_MOTION_ROTATE_OMEGA: f64 = 4.8;
-const DEBUG_MOTION_CHASE_FACE_KP: f64 = 4.0;
+const DEBUG_MOTION_CHASE_FACE_KP: f64 = 1.8;
 const DEBUG_MOTION_CHASE_FACE_KI: f64 = 0.0;
-const DEBUG_MOTION_CHASE_FACE_KD: f64 = 0.15;
-const DEBUG_MOTION_LOG_POSITION_ERROR: bool = true;
-const DEBUG_MOTION_LOG_CMD_VS_REAL: bool = true;
-const DEBUG_MOTION_TRACK_LATENCY: bool = true;
-const DEBUG_MOTION_TRACK_COUNTS: bool = true;
-const DEBUG_MOTION_LOG_KPI: bool = true;
+const DEBUG_MOTION_CHASE_FACE_KD: f64 = 0.05;
+const DEBUG_MOTION_CAPTURE_GOAL_X: f32 = 0.75;
+const DEBUG_MOTION_CAPTURE_GOAL_Y: f32 = 0.0;
+const DEBUG_MOTION_CAPTURE_STAGING_OFFSET_M: f32 = 0.16;
+const DEBUG_MOTION_CAPTURE_STAGING_TOL_M: f32 = 0.08;
+const DEBUG_MOTION_CAPTURE_HEADING_TOL_RAD: f64 = 0.28;
+const DEBUG_MOTION_LOG_POSITION_ERROR: bool = false;
+const DEBUG_MOTION_LOG_CMD_VS_REAL: bool = false;
+const DEBUG_MOTION_TRACK_LATENCY: bool = false;
+const DEBUG_MOTION_TRACK_COUNTS: bool = true;  // un log/seg, útil para verificar que se envían comandos
+const DEBUG_MOTION_LOG_KPI: bool = true;        // un log/seg, útil para tuning de velocidad
 // ======================================================================
 
 fn main() {
@@ -247,6 +252,24 @@ fn main() {
                     }
                 }
             }
+
+            // Limpieza inicial: neutraliza cualquier comando previo latente en FIRASim.
+            {
+                let mut radio_guard = radio.lock().await;
+                for robot_id in 0..3 {
+                    radio_guard.add_motion_command(motion::MotionCommand {
+                        id: robot_id,
+                        team: 0,
+                        vx: 0.0,
+                        vy: 0.0,
+                        omega: 0.0,
+                        orientation: 0.0,
+                    });
+                }
+                if let Err(err) = radio_guard.send_commands().await {
+                    eprintln!("[Main] Error enviando comandos neutros iniciales: {}", err);
+                }
+            }
             
             // ========== PRUEBA TEMPORAL: Robot 0 persigue la pelota ==========
             // Poner a `true` para que solo el robot 0 (azul) persiga la pelota con move_direct.
@@ -302,6 +325,8 @@ fn main() {
                     std::sync::atomic::AtomicU64::new(0);
                 static LAST_KPI_LOG_SEC: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
+                // Histéresis de fase: evita oscilar entre APPROACH y CAPTURA en el borde del umbral.
+                let mut in_captura = false;
                 loop {
                     interval.tick().await;
 
@@ -347,32 +372,58 @@ fn main() {
                         } else if ENABLE_ROBOT_0_CHASE_BALL_TEST {
                             // --- Modo prueba: solo robot 0 (azul) persigue la pelota ---
                             if let Some(robot_0) = robots_data.iter().find(|r| r.id == 0) {
-                                let mut cmd = motion.move_direct(robot_0, ball_pos);
-                                let to_target = ball_pos - robot_0.position;
-                                let distance = to_target.length();
-                                if distance.is_finite() && distance > 1e-4 {
-                                    let target_angle = to_target.y.atan2(to_target.x) as f64;
-                                    let heading_error = motion::Motion::normalize_angle(
-                                        target_angle - robot_0.orientation
-                                    );
-                                    let face_cmd = motion.face_to_angle(
-                                        robot_0,
-                                        target_angle,
+                                let goal_pos = glam::Vec2::new(
+                                    DEBUG_MOTION_CAPTURE_GOAL_X,
+                                    DEBUG_MOTION_CAPTURE_GOAL_Y
+                                );
+                                let ball_to_goal = (goal_pos - ball_pos).normalize_or_zero();
+                                let staging_point = ball_pos - (ball_to_goal * DEBUG_MOTION_CAPTURE_STAGING_OFFSET_M);
+                                let to_goal = goal_pos - robot_0.position;
+
+                                let dist_staging   = (staging_point - robot_0.position).length();
+                                let dot_robot_ball = (robot_0.position - ball_pos).dot(goal_pos - ball_pos);
+                                let behind_ball    = dot_robot_ball < 0.02;
+                                let in_front_of_ball = dot_robot_ball > 0.05;
+                                let heading_goal   = to_goal.y.atan2(to_goal.x) as f64;
+
+                                // Histéresis: entrar cuando detrás + cerca de staging.
+                                // Salir SOLO cuando claramente por delante de la pelota (5cm).
+                                // No salir por dist_staging: el robot debe empujar libremente.
+                                if behind_ball && dist_staging <= DEBUG_MOTION_CAPTURE_STAGING_TOL_M {
+                                    in_captura = true;
+                                } else if in_front_of_ball {
+                                    in_captura = false;
+                                }
+
+                                // Approach: move_to con path planning (pelota es obstáculo → rodea).
+                                // Captura: move_direct con target 12cm PASADO la pelota hacia el goal.
+                                // Apuntar más allá evita que move_direct se detenga antes de empujar.
+                                let push_target = ball_pos + ball_to_goal * 0.12;
+                                let mut cmd = if in_captura {
+                                    motion.move_direct(robot_0, push_target)
+                                } else {
+                                    motion.move_to(robot_0, staging_point, &world)
+                                };
+
+                                // Approach: mirar hacia staging_point (heading alineado con movimiento).
+                                // Captura: mirar hacia la pelota — staging está sobre la línea
+                                // ball-goal, entonces face_to(ball) ≈ face_to_angle(goal) desde
+                                // staging, y además sigue al ball cuando se mueve (pivote real).
+                                let face_cmd = if in_captura {
+                                    motion.face_to(robot_0, ball_pos,
                                         DEBUG_MOTION_CHASE_FACE_KP,
                                         DEBUG_MOTION_CHASE_FACE_KI,
-                                        DEBUG_MOTION_CHASE_FACE_KD,
-                                    );
-
-                                    // Para drive diferencial: priorizar orientación cuando error angular es alto.
-                                    let max_error = std::f64::consts::FRAC_PI_2;
-                                    let alignment = ((max_error - heading_error.abs()) / max_error)
-                                        .clamp(0.0, 1.0);
-                                    cmd.vx *= alignment;
-                                    cmd.vy *= alignment;
-                                    cmd.omega = face_cmd.omega;
-                                }
+                                        DEBUG_MOTION_CHASE_FACE_KD)
+                                } else {
+                                    motion.face_to(robot_0, staging_point,
+                                        DEBUG_MOTION_CHASE_FACE_KP,
+                                        DEBUG_MOTION_CHASE_FACE_KI,
+                                        DEBUG_MOTION_CHASE_FACE_KD)
+                                };
+                                cmd.omega = face_cmd.omega;
                                 (ball_pos, robot_snapshot, vec![cmd])
                             } else {
+                                in_captura = false;
                                 (ball_pos, robot_snapshot, Vec::new())
                             }
                         } else {
