@@ -4,6 +4,9 @@ mod tracker;
 mod world;
 mod motion;
 mod radio;
+mod skills;
+mod tactics;
+mod plays;
 #[path = "GUI/mod.rs"]
 mod gui;
 
@@ -15,26 +18,22 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-// ====== Instrumentación temporal de movimiento (fácil de borrar) ======
+// ====== Flags de diagnóstico y constantes de campo ======
 const DEBUG_MOTION_LINE_STEP_TARGET: bool = false;
 const DEBUG_MOTION_LINE_STEP_X: f32 = 0.20;
 const DEBUG_MOTION_LINE_STEP_Y: f32 = -0.10;
 const DEBUG_MOTION_ROTATE_IN_PLACE: bool = false;
 const DEBUG_MOTION_ROTATE_OMEGA: f64 = 4.8;
-const DEBUG_MOTION_CHASE_FACE_KP: f64 = 1.8;
-const DEBUG_MOTION_CHASE_FACE_KI: f64 = 0.0;
-const DEBUG_MOTION_CHASE_FACE_KD: f64 = 0.05;
+// Goals del campo VSS/FIRA (metros). Azul ataca al lado positivo X.
 const DEBUG_MOTION_CAPTURE_GOAL_X: f32 = 0.75;
 const DEBUG_MOTION_CAPTURE_GOAL_Y: f32 = 0.0;
-const DEBUG_MOTION_CAPTURE_STAGING_OFFSET_M: f32 = 0.16;
-const DEBUG_MOTION_CAPTURE_STAGING_TOL_M: f32 = 0.08;
-const DEBUG_MOTION_CAPTURE_HEADING_TOL_RAD: f64 = 0.28;
+// Para afinar kp/ki/kd del ChaseSkill, editar los campos en skills/mod.rs: ChaseSkill::new().
 const DEBUG_MOTION_LOG_POSITION_ERROR: bool = false;
 const DEBUG_MOTION_LOG_CMD_VS_REAL: bool = false;
 const DEBUG_MOTION_TRACK_LATENCY: bool = false;
-const DEBUG_MOTION_TRACK_COUNTS: bool = true;  // un log/seg, útil para verificar que se envían comandos
-const DEBUG_MOTION_LOG_KPI: bool = true;        // un log/seg, útil para tuning de velocidad
-// ======================================================================
+const DEBUG_MOTION_TRACK_COUNTS: bool = true;
+const DEBUG_MOTION_LOG_KPI: bool = true;
+// ========================================================
 
 fn main() {
     // Create channels
@@ -271,62 +270,25 @@ fn main() {
                 }
             }
             
-            // ========== PRUEBA TEMPORAL: Robot 0 persigue la pelota ==========
-            // Poner a `true` para que solo el robot 0 (azul) persiga la pelota con move_direct.
-            // Poner a `false` para tarea de prueba circular (robots 0-2) o comportamiento normal.
-            const ENABLE_ROBOT_0_CHASE_BALL_TEST: bool = true;
-            // =================================================================
-
-            // Tarea de prueba solo cuando NO está activo el modo "robot 0 persigue pelota"
-            if !ENABLE_ROBOT_0_CHASE_BALL_TEST {
-                let radio_test = radio.clone();
-                tokio::spawn(async move {
-                    eprintln!("[Main] Tarea de prueba de comandos activa (robots 0-2, movimiento circular)");
-                    let mut counter = 0u64;
-                    let mut interval = tokio::time::interval(Duration::from_millis(100));
-                    loop {
-                        interval.tick().await;
-                        counter += 1;
-                        if counter % 10 == 0 {
-                            let mut radio_guard = radio_test.lock().await;
-                            use motion::MotionCommand;
-                            let t = (counter as f32 * 0.1) * std::f32::consts::PI / 2.0;
-                            for robot_id in 0..3 {
-                                let (vx, vy, omega) = match robot_id {
-                                    0 => (t.cos() * 0.3, t.sin() * 0.3, 0.0),
-                                    1 => (0.3, 0.0, 0.5),
-                                    2 => (0.0, 0.3, -0.5),
-                                    _ => (0.0, 0.0, 0.0),
-                                };
-                                radio_guard.add_motion_command(MotionCommand {
-                                    id: robot_id,
-                                    team: 0,
-                                    vx: vx as f64,
-                                    vy: vy as f64,
-                                    omega,
-                                    orientation: 0.0,
-                                });
-                            }
-                            let _ = radio_guard.send_commands().await;
-                        }
-                    }
-                });
-            }
-
             // Spawn a task to periodically compute motion commands and send them
             let world_for_motion = world_clone.clone();
             let radio_for_motion = radio.clone();
             let command_timestamps_for_motion = command_timestamps.clone();
             let commands_sent_for_motion = commands_sent_counter.clone();
             let updates_received_for_motion = updates_received_counter.clone();
+            // Play activo: controla los 3 robots del equipo azul.
+            // Robot 0 → atacante, Robot 1 → soporte, Robot 2 → portero.
+            let mut active_play: Box<dyn plays::Play> = Box::new(plays::StandardPlay::new(
+                glam::Vec2::new(DEBUG_MOTION_CAPTURE_GOAL_X, DEBUG_MOTION_CAPTURE_GOAL_Y),
+                glam::Vec2::new(-DEBUG_MOTION_CAPTURE_GOAL_X, DEBUG_MOTION_CAPTURE_GOAL_Y),
+            ));
+
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
                 static LAST_COUNT_LOG_SEC: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 static LAST_KPI_LOG_SEC: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
-                // Histéresis de fase: evita oscilar entre APPROACH y CAPTURA en el borde del umbral.
-                let mut in_captura = false;
                 loop {
                     interval.tick().await;
 
@@ -341,100 +303,29 @@ fn main() {
                         } else {
                             world.get_ball_state().position
                         };
-                        let robots_data: Vec<_> = world.get_blue_team_active()
-                            .into_iter()
-                            .cloned()
-                            .collect();
-                        let robot_snapshot = robots_data
+                        let robot_snapshot = world.get_blue_team_active()
                             .iter()
                             .map(|robot| (robot.id, (robot.position, robot.velocity)))
                             .collect::<HashMap<_, _>>();
 
-                        if robots_data.is_empty() {
-                            (ball_pos, robot_snapshot, Vec::new())
-                        } else if DEBUG_MOTION_ROTATE_IN_PLACE {
-                            if let Some(robot_0) = robots_data.iter().find(|r| r.id == 0) {
-                                (
-                                    ball_pos,
-                                    robot_snapshot,
-                                    vec![motion::MotionCommand {
-                                        id: robot_0.id,
-                                        team: robot_0.team,
-                                        vx: 0.0,
-                                        vy: 0.0,
-                                        omega: DEBUG_MOTION_ROTATE_OMEGA,
-                                        orientation: robot_0.orientation,
-                                    }],
-                                )
-                            } else {
-                                (ball_pos, robot_snapshot, Vec::new())
-                            }
-                        } else if ENABLE_ROBOT_0_CHASE_BALL_TEST {
-                            // --- Modo prueba: solo robot 0 (azul) persigue la pelota ---
-                            if let Some(robot_0) = robots_data.iter().find(|r| r.id == 0) {
-                                let goal_pos = glam::Vec2::new(
-                                    DEBUG_MOTION_CAPTURE_GOAL_X,
-                                    DEBUG_MOTION_CAPTURE_GOAL_Y
-                                );
-                                let ball_to_goal = (goal_pos - ball_pos).normalize_or_zero();
-                                let staging_point = ball_pos - (ball_to_goal * DEBUG_MOTION_CAPTURE_STAGING_OFFSET_M);
-                                let to_goal = goal_pos - robot_0.position;
-
-                                let dist_staging   = (staging_point - robot_0.position).length();
-                                let dot_robot_ball = (robot_0.position - ball_pos).dot(goal_pos - ball_pos);
-                                let behind_ball    = dot_robot_ball < 0.02;
-                                let in_front_of_ball = dot_robot_ball > 0.05;
-                                let heading_goal   = to_goal.y.atan2(to_goal.x) as f64;
-
-                                // Histéresis: entrar cuando detrás + cerca de staging.
-                                // Salir SOLO cuando claramente por delante de la pelota (5cm).
-                                // No salir por dist_staging: el robot debe empujar libremente.
-                                if behind_ball && dist_staging <= DEBUG_MOTION_CAPTURE_STAGING_TOL_M {
-                                    in_captura = true;
-                                } else if in_front_of_ball {
-                                    in_captura = false;
-                                }
-
-                                // Approach: move_to con path planning (pelota es obstáculo → rodea).
-                                // Captura: move_direct con target 12cm PASADO la pelota hacia el goal.
-                                // Apuntar más allá evita que move_direct se detenga antes de empujar.
-                                let push_target = ball_pos + ball_to_goal * 0.12;
-                                let mut cmd = if in_captura {
-                                    motion.move_direct(robot_0, push_target)
-                                } else {
-                                    motion.move_to(robot_0, staging_point, &world)
-                                };
-
-                                // Approach: mirar hacia staging_point (heading alineado con movimiento).
-                                // Captura: mirar hacia la pelota — staging está sobre la línea
-                                // ball-goal, entonces face_to(ball) ≈ face_to_angle(goal) desde
-                                // staging, y además sigue al ball cuando se mueve (pivote real).
-                                let face_cmd = if in_captura {
-                                    motion.face_to(robot_0, ball_pos,
-                                        DEBUG_MOTION_CHASE_FACE_KP,
-                                        DEBUG_MOTION_CHASE_FACE_KI,
-                                        DEBUG_MOTION_CHASE_FACE_KD)
-                                } else {
-                                    motion.face_to(robot_0, staging_point,
-                                        DEBUG_MOTION_CHASE_FACE_KP,
-                                        DEBUG_MOTION_CHASE_FACE_KI,
-                                        DEBUG_MOTION_CHASE_FACE_KD)
-                                };
-                                cmd.omega = face_cmd.omega;
-                                (ball_pos, robot_snapshot, vec![cmd])
-                            } else {
-                                in_captura = false;
-                                (ball_pos, robot_snapshot, Vec::new())
-                            }
-                        } else {
-                            // --- Comportamiento normal: todos los robots azules van a la pelota ---
-                            let commands = robots_data
+                        let commands = if DEBUG_MOTION_ROTATE_IN_PLACE {
+                            world.get_blue_team_active()
                                 .iter()
-                                .filter(|robot_state| robot_state.active)
-                                .map(|robot_state| motion.move_to(robot_state, ball_pos, &world))
-                                .collect();
-                            (ball_pos, robot_snapshot, commands)
-                        }
+                                .filter(|r| r.id == 0)
+                                .map(|r| motion::MotionCommand {
+                                    id: r.id,
+                                    team: r.team,
+                                    vx: 0.0,
+                                    vy: 0.0,
+                                    omega: DEBUG_MOTION_ROTATE_OMEGA,
+                                    orientation: r.orientation,
+                                })
+                                .collect()
+                        } else {
+                            active_play.tick(&world, &motion)
+                        };
+
+                        (ball_pos, robot_snapshot, commands)
                     };
 
                     if computed_commands.is_empty() {
