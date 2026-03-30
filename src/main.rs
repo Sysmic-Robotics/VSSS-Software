@@ -1,13 +1,6 @@
-mod protos;
-mod vision;
-mod tracker;
-mod world;
-mod motion;
-mod radio;
-mod skills;
-mod tactics;
-mod plays;
-mod coach;
+// Módulos del engine vienen de la lib (src/lib.rs).
+// Solo la GUI se declara aquí porque es exclusiva del binario principal.
+use rustengine::{vision, world, motion, radio, plays, coach};
 #[path = "GUI/mod.rs"]
 mod gui;
 

@@ -16,6 +16,8 @@ use std::collections::VecDeque;
 use glam::Vec2;
 
 use field::FieldCanvas;
+// StatusUpdate vive en vision.rs para que la lib no dependa de gui.
+pub use rustengine::vision::StatusUpdate;
 
 /// `true` imprime cada actualización de robot en stderr (muy ruidoso). Dejar en `false` para auditar con `[FieldAudit]` en `main`.
 const GUI_LOG_EVERY_ROBOT_UPDATE: bool = false;
@@ -35,16 +37,6 @@ pub enum Message {
     ToggleTracker(bool), // Nuevo mensaje para toggle del tracker
     Tick,
     TabSelected(TabView),
-}
-
-#[derive(Debug, Clone)]
-pub enum StatusUpdate {
-    Connected(String, u16),
-    PacketReceived,
-    BallDetected(usize),
-    RobotsDetected(usize),
-    RobotPosition(u32, u32, Vec2, f32), // id, team, position, orientation
-    BallPosition(Vec2),
 }
 
 #[derive(Debug, Clone)]

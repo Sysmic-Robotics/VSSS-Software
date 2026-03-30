@@ -91,13 +91,27 @@ impl Motion {
         // de la pelota): incluir la pelota haría que el UVF deflecte al robot lejos del staging.
         let ball_pos = env.get_ball_position();
         let target_near_ball = (target - ball_pos).length() < self.uvf.influence_radius * 1.5;
-        let obstacles: Vec<Vec2> = if target_near_ball {
+        let mut obstacles: Vec<Vec2> = if target_near_ball {
             env.get_robots().to_vec()
         } else {
             let mut obs = env.get_robots().to_vec();
             obs.push(ball_pos);
             obs
         };
+
+        // Wall avoidance: obstáculos virtuales en los límites del campo lógico.
+        // Cuando el robot se acerca a una pared, el UVF lo deflecta tangencialmente
+        // igual que con robots. Sin esto, los robots se quedan pegados a las paredes.
+        let rp = robot_state.position;
+        let wall_threshold = self.uvf.influence_radius * 1.5;
+        const WALL_X: f32 = 0.70;
+        const WALL_Y: f32 = 0.60;
+        if (WALL_X - rp.x.abs()) < wall_threshold {
+            obstacles.push(Vec2::new(rp.x.signum() * WALL_X, rp.y));
+        }
+        if (WALL_Y - rp.y.abs()) < wall_threshold {
+            obstacles.push(Vec2::new(rp.x, rp.y.signum() * WALL_Y));
+        }
 
         let theta_uvf = self.uvf.compute(robot_state.position, target, &obstacles);
 
