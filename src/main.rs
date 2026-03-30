@@ -7,6 +7,7 @@ mod radio;
 mod skills;
 mod tactics;
 mod plays;
+mod coach;
 #[path = "GUI/mod.rs"]
 mod gui;
 
@@ -16,7 +17,7 @@ use gui::ConfigUpdate;
 use world::World;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 
 // ====== Flags de diagnóstico y constantes de campo ======
 const DEBUG_MOTION_LINE_STEP_TARGET: bool = false;
@@ -27,12 +28,18 @@ const DEBUG_MOTION_ROTATE_OMEGA: f64 = 4.8;
 // Goals del campo VSS/FIRA (metros). Azul ataca al lado positivo X.
 const DEBUG_MOTION_CAPTURE_GOAL_X: f32 = 0.75;
 const DEBUG_MOTION_CAPTURE_GOAL_Y: f32 = 0.0;
+/// true  → CoachPlay(RuleBasedCoach): pipeline RL-ready, comportamiento equivalente a StandardPlay
+/// false → StandardPlay: lógica directa de tácticas, sin pasar por Coach/Observation
+const USE_COACH_PLAY: bool = false;
 // Para afinar kp/ki/kd del ChaseSkill, editar los campos en skills/mod.rs: ChaseSkill::new().
 const DEBUG_MOTION_LOG_POSITION_ERROR: bool = false;
 const DEBUG_MOTION_LOG_CMD_VS_REAL: bool = false;
 const DEBUG_MOTION_TRACK_LATENCY: bool = false;
-const DEBUG_MOTION_TRACK_COUNTS: bool = true;
-const DEBUG_MOTION_LOG_KPI: bool = true;
+const DEBUG_MOTION_TRACK_COUNTS: bool = false;
+const DEBUG_MOTION_LOG_KPI: bool = false;
+/// Una línea por segundo: balón, robots azules (posición/θ/velocidad + comando), rivales amarillos.
+/// Actívalo para auditar el campo sin mirar la GUI (logs legibles).
+const DEBUG_FIELD_AUDIT: bool = true;
 // ========================================================
 
 fn main() {
@@ -277,11 +284,18 @@ fn main() {
             let commands_sent_for_motion = commands_sent_counter.clone();
             let updates_received_for_motion = updates_received_counter.clone();
             // Play activo: controla los 3 robots del equipo azul.
-            // Robot 0 → atacante, Robot 1 → soporte, Robot 2 → portero.
-            let mut active_play: Box<dyn plays::Play> = Box::new(plays::StandardPlay::new(
-                glam::Vec2::new(DEBUG_MOTION_CAPTURE_GOAL_X, DEBUG_MOTION_CAPTURE_GOAL_Y),
-                glam::Vec2::new(-DEBUG_MOTION_CAPTURE_GOAL_X, DEBUG_MOTION_CAPTURE_GOAL_Y),
-            ));
+            // USE_COACH_PLAY=false → StandardPlay (tácticas directas, comportamiento actual)
+            // USE_COACH_PLAY=true  → CoachPlay(RuleBasedCoach) (pipeline RL-ready)
+            let attack_goal = glam::Vec2::new(DEBUG_MOTION_CAPTURE_GOAL_X, DEBUG_MOTION_CAPTURE_GOAL_Y);
+            let own_goal = glam::Vec2::new(-DEBUG_MOTION_CAPTURE_GOAL_X, DEBUG_MOTION_CAPTURE_GOAL_Y);
+            let mut active_play: Box<dyn plays::Play> = if USE_COACH_PLAY {
+                Box::new(plays::CoachPlay::new(
+                    Box::new(coach::RuleBasedCoach::new(attack_goal, own_goal)),
+                    0, // equipo azul
+                ))
+            } else {
+                Box::new(plays::StandardPlay::new(attack_goal, own_goal))
+            };
 
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(16)); // ~60 FPS
@@ -289,12 +303,14 @@ fn main() {
                     std::sync::atomic::AtomicU64::new(0);
                 static LAST_KPI_LOG_SEC: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
+                static LAST_FIELD_AUDIT_SEC: AtomicU64 = AtomicU64::new(0);
+                let mut field_audit_t0: Option<Instant> = None;
                 loop {
                     interval.tick().await;
 
                     let (tick_target, robot_snapshot, computed_commands): (
                         glam::Vec2,
-                        HashMap<i32, (glam::Vec2, glam::Vec2)>,
+                        HashMap<i32, (glam::Vec2, glam::Vec2, f64)>,
                         Vec<motion::MotionCommand>,
                     ) = {
                         let world = world_for_motion.read().await;
@@ -305,7 +321,12 @@ fn main() {
                         };
                         let robot_snapshot = world.get_blue_team_active()
                             .iter()
-                            .map(|robot| (robot.id, (robot.position, robot.velocity)))
+                            .map(|robot| {
+                                (
+                                    robot.id,
+                                    (robot.position, robot.velocity, robot.orientation),
+                                )
+                            })
                             .collect::<HashMap<_, _>>();
 
                         let commands = if DEBUG_MOTION_ROTATE_IN_PLACE {
@@ -324,6 +345,81 @@ fn main() {
                         } else {
                             active_play.tick(&world, &motion)
                         };
+
+                        if DEBUG_FIELD_AUDIT {
+                            let now_sec = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let prev_sec = LAST_FIELD_AUDIT_SEC.swap(now_sec, Ordering::Relaxed);
+                            if prev_sec != now_sec {
+                                let t0 = field_audit_t0.get_or_insert_with(Instant::now);
+                                let t_elapsed = t0.elapsed().as_secs_f64();
+                                let ball_st = world.get_ball_state();
+                                let bp = if DEBUG_MOTION_LINE_STEP_TARGET {
+                                    glam::Vec2::new(DEBUG_MOTION_LINE_STEP_X, DEBUG_MOTION_LINE_STEP_Y)
+                                } else {
+                                    ball_st.position
+                                };
+                                let bv = ball_st.velocity;
+                                let mut y_parts: Vec<String> = world
+                                    .get_yellow_team_active()
+                                    .iter()
+                                    .map(|r| {
+                                        format!(
+                                            "Y{}({:.2},{:.2})",
+                                            r.id, r.position.x, r.position.y
+                                        )
+                                    })
+                                    .collect();
+                                y_parts.sort();
+                                let yellow_s = if y_parts.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" | {}", y_parts.join(" "))
+                                };
+
+                                let mut ids: Vec<i32> = commands.iter().map(|c| c.id).collect();
+                                ids.sort_unstable();
+                                let mut blue_s = String::new();
+                                for id in ids {
+                                    if let Some(cmd) = commands.iter().find(|c| c.id == id) {
+                                        let piece = if let Some((p, v, th)) =
+                                            robot_snapshot.get(&id)
+                                        {
+                                            format!(
+                                                " B{}:pos({:.2},{:.2}) θ={:.0}° v={:.2} cmd({:.2},{:.2}) ω={:.2}",
+                                                id,
+                                                p.x,
+                                                p.y,
+                                                th.to_degrees(),
+                                                v.length(),
+                                                cmd.vx,
+                                                cmd.vy,
+                                                cmd.omega
+                                            )
+                                        } else {
+                                            format!(
+                                                " B{}:pos(?) cmd({:.2},{:.2}) ω={:.2}",
+                                                id, cmd.vx, cmd.vy, cmd.omega
+                                            )
+                                        };
+                                        blue_s.push_str(&piece);
+                                    }
+                                }
+
+                                eprintln!(
+                                    "[FieldAudit] t={:.1}s ball=({:.3},{:.3})m v_ball=({:.3},{:.3}){}{}",
+                                    t_elapsed,
+                                    bp.x,
+                                    bp.y,
+                                    bv.x,
+                                    bv.y,
+                                    blue_s,
+                                    yellow_s
+                                );
+                            }
+                        }
 
                         (ball_pos, robot_snapshot, commands)
                     };
@@ -351,7 +447,7 @@ fn main() {
 
                     if DEBUG_MOTION_LOG_POSITION_ERROR || DEBUG_MOTION_LOG_CMD_VS_REAL {
                         for cmd in &computed_commands {
-                            if let Some((pos, vel)) = robot_snapshot.get(&cmd.id) {
+                            if let Some((pos, vel, _)) = robot_snapshot.get(&cmd.id) {
                                 let pos_error = (tick_target - *pos).length();
                                 if DEBUG_MOTION_LOG_POSITION_ERROR {
                                     eprintln!(

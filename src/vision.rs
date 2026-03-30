@@ -16,6 +16,13 @@ use protobuf::Message;
 use crate::gui::StatusUpdate;
 use crate::tracker::Tracker;
 
+/// Log por cada robot azul enviado a la GUI (SSL). Desactivado por defecto; usar `[FieldAudit]` en main.
+const VISION_LOG_EVERY_BLUE_ROBOT_TO_GUI: bool = false;
+/// Log de cada N detecciones FIRA/SSL (≈1 s a ~60 Hz si N=60).
+const VISION_LOG_DETECTION_EVERY_N: u64 = 120;
+/// Log de estadísticas de paquetes cada N paquetes (~5 s a ~60 Hz si N=300).
+const VISION_LOG_PACKET_STATS_EVERY_N: u64 = 3000;
+
 // --- Data Structures ---
 
 #[derive(Debug, Clone)]
@@ -207,7 +214,7 @@ impl Vision {
                                     let robot_count = frame.robots_yellow.len() + frame.robots_blue.len();
                                     let ball_count = if frame.ball.is_some() { 1 } else { 0 };
 
-                                    if detection_count <= 5 || detection_count % 60 == 0 {
+                                    if detection_count <= 3 || detection_count % VISION_LOG_DETECTION_EVERY_N == 0 {
                                         eprintln!("[Vision] ✓ DETECTION (FIRA) #{}: {} robots, {} balls",
                                                  detection_count, robot_count, ball_count);
                                     }
@@ -238,7 +245,7 @@ impl Vision {
                                             let robot_count = detection.robots_yellow.len() + detection.robots_blue.len();
                                             let ball_count = detection.balls.len();
 
-                                            if detection_count <= 5 || detection_count % 60 == 0 {
+                                            if detection_count <= 3 || detection_count % VISION_LOG_DETECTION_EVERY_N == 0 {
                                                 eprintln!("[Vision] ✓ DETECTION (SSL) #{}: {} robots, {} balls",
                                                          detection_count, robot_count, ball_count);
                                             }
@@ -266,8 +273,7 @@ impl Vision {
                                 }
                             }
                             
-                            // Log estadísticas cada 5 segundos
-                            if packet_count % 300 == 0 {
+                            if packet_count % VISION_LOG_PACKET_STATS_EVERY_N == 0 && packet_count > 0 {
                                 eprintln!("[Vision] Stats: {} packets ({} detection, {} geometry-only)", 
                                          packet_count, detection_count, geometry_only_count);
                             }
@@ -464,8 +470,7 @@ impl Vision {
         // Send position to UI (in millimeters, with origin at center)
         match status_tx.send(StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32)).await {
             Ok(_) => {
-                // Log ocasional para debugging (solo primeros robots)
-                if id < 3 && team == 0 {
+                if VISION_LOG_EVERY_BLUE_ROBOT_TO_GUI && id < 3 && team == 0 {
                     eprintln!("[Vision] ✓ Enviada posición robot azul ID={} a GUI: pos=({:.1}, {:.1}) mm, orientación={:.2} rad", 
                              id, xf_mm, yf_mm, thetaf);
                 }

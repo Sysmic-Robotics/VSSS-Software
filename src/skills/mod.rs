@@ -58,10 +58,7 @@ impl Skill for GoToSkill {
             self.done = true;
             return Self::stop(robot);
         }
-        let mut cmd = motion.move_to(robot, self.target, world);
-        let face = motion.face_to(robot, self.target, self.kp, self.ki, self.kd);
-        cmd.omega = face.omega;
-        cmd
+        motion.move_and_face(robot, self.target, self.target, world, self.kp, self.ki, self.kd)
     }
 
     fn is_done(&self) -> bool {
@@ -129,15 +126,26 @@ impl Skill for ChaseSkill {
             self.in_captura = false;
         }
 
-        let face_target = if self.in_captura { ball_pos } else { staging_point };
-        let mut cmd = if self.in_captura {
-            motion.move_direct(robot, push_target)
+        // Pre-alineación solo muy cerca del staging: si se usa el balón demasiado pronto,
+        // UVF pide un heading y `face_to` otro → coupling≈0 y el robot solo gira.
+        let pre_align_radius = self.staging_tol * 1.5; // ~0.12 m
+        let face_target = if self.in_captura || dist_staging < pre_align_radius {
+            ball_pos
         } else {
-            motion.move_to(robot, staging_point, world)
+            staging_point
         };
-        let face = motion.face_to(robot, face_target, self.kp, self.ki, self.kd);
-        cmd.omega = face.omega;
-        cmd
+
+        if self.in_captura {
+            // En CAPTURA: move_direct ignora obstáculos (debe empujar la pelota directo).
+            // face_to(ball): mantiene heading mientras empuja y sigue a la pelota.
+            let mut cmd = motion.move_direct(robot, push_target);
+            let face = motion.face_to(robot, face_target, self.kp, self.ki, self.kd);
+            cmd.omega = face.omega;
+            cmd
+        } else {
+            // En APPROACH: UVF rodea obstáculos + coupling velocidad-steering integrado.
+            motion.move_and_face(robot, staging_point, face_target, world, self.kp, self.ki, self.kd)
+        }
     }
 
     fn is_done(&self) -> bool {
@@ -183,10 +191,7 @@ impl Skill for DefendSkill {
         let target_y = ball_pos.y.clamp(-self.goal_half_y, self.goal_half_y);
         let defend_pos = Vec2::new(self.defend_x, target_y);
 
-        let mut cmd = motion.move_to(robot, defend_pos, world);
-        let face = motion.face_to(robot, ball_pos, self.kp, self.ki, self.kd);
-        cmd.omega = face.omega;
-        cmd
+        motion.move_and_face(robot, defend_pos, ball_pos, world, self.kp, self.ki, self.kd)
     }
 
     fn is_done(&self) -> bool {

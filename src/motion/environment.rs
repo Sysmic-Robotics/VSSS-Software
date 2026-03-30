@@ -8,12 +8,14 @@ pub struct Environment {
     ball_position: Vec2,    // Posición del balón
 }
 
-// Geometría aproximada VSS (metros). Evita usar valores de SSL 9x6.
-const VSS_HALF_FIELD_X: f32 = 0.75;
-const VSS_HALF_FIELD_Y: f32 = 0.65;
-const GOAL_BOX_MIN_X: f32 = 0.60;
-const GOAL_BOX_HALF_Y: f32 = 0.22;
-const ROBOT_COLLISION_RADIUS: f32 = 0.04; // ~radio real VSS: diámetro 7.5cm → 3.75cm + margen
+// Geometría VSS (metros). Campo físico: ±0.75 × ±0.65.
+// Se usa un margen de 5cm para que el planner nunca llegue a la pared real,
+// evitando que los robots queden atascados contra los límites del campo.
+const VSS_HALF_FIELD_X: f32 = 0.70; // físico 0.75 - 0.05 margen
+const VSS_HALF_FIELD_Y: f32 = 0.60; // físico 0.65 - 0.05 margen
+// ROBOT_COLLISION_RADIUS: radio de exclusión alrededor de robots obstáculo.
+// 0.06m detecta antes de colisión física (radio real ~0.038m) dando margen para rodear.
+const ROBOT_COLLISION_RADIUS: f32 = 0.06;
 const BALL_COLLISION_RADIUS: f32 = 0.05;
 
 impl Environment {
@@ -60,14 +62,6 @@ impl Environment {
             || point.y < -VSS_HALF_FIELD_Y
             || point.y > VSS_HALF_FIELD_Y
         {
-            return true;
-        }
-        
-        // Zonas del arco (aproximadas VSS): evitar que el planner atraviese el área.
-        if point.x >= GOAL_BOX_MIN_X && point.y.abs() <= GOAL_BOX_HALF_Y {
-            return true;
-        }
-        if point.x <= -GOAL_BOX_MIN_X && point.y.abs() <= GOAL_BOX_HALF_Y {
             return true;
         }
         
@@ -123,17 +117,21 @@ mod tests {
     }
     
     #[test]
-    fn test_environment_collides_goalie_boxes() {
-        let world = World::new(11, 11);
+    fn test_environment_collides_outside_logical_field() {
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.3, 0.3), Vec2::ZERO); // pelota fuera del área de test
         let robot = RobotState::new(0, 0);
         let env = Environment::new(&world, &robot);
-        
-        // Yellow goalie box
-        assert!(env.collides(Vec2::new(4.0, 0.0)));
-        assert!(env.collides(Vec2::new(3.5, 0.0)));
-        
-        // Blue goalie box
-        assert!(env.collides(Vec2::new(-4.0, 0.0)));
-        assert!(env.collides(Vec2::new(-3.5, 0.0)));
+
+        // Fuera del campo lógico (margen 5cm: ±0.70 × ±0.60)
+        assert!(env.collides(Vec2::new(0.72, 0.0)));   // x > 0.70
+        assert!(env.collides(Vec2::new(-0.72, 0.0)));  // x < -0.70
+        assert!(env.collides(Vec2::new(0.0, 0.62)));   // y > 0.60
+        assert!(env.collides(Vec2::new(0.0, -0.62)));  // y < -0.60
+
+        // Dentro del campo (portero puede estar aquí sin bloqueo por goal box)
+        assert!(!env.collides(Vec2::new(-0.63, 0.0))); // defensa del portero
+        assert!(!env.collides(Vec2::new(0.63, 0.0)));  // cerca del arco rival
+        assert!(!env.collides(Vec2::new(0.0, 0.0)));   // centro
     }
 }
