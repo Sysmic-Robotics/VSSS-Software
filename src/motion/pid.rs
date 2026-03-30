@@ -6,6 +6,7 @@ pub struct PIDController {
     integral: f64,       // Acumulador integral
     last_error: f64,     // Error anterior (para derivativa)
     integral_limit: f64, // Anti-windup: límite del acumulador integral
+    initialized: bool,   // Evita spike derivativo en el primer tick
 }
 
 impl PIDController {
@@ -18,6 +19,7 @@ impl PIDController {
             integral: 0.0,
             last_error: 0.0,
             integral_limit: 5.0,
+            initialized: false,
         }
     }
 
@@ -36,13 +38,16 @@ impl PIDController {
         self.integral = (self.integral + error * dt).clamp(-self.integral_limit, self.integral_limit);
         let i_term = self.ki * self.integral;
         
-        // Término derivativo
-        let d_term = if dt > 0.0 {
+        // Término derivativo: se omite en el primer tick para evitar el spike
+        // derivativo causado por last_error=0 con error≠0 (kd × error/dt puede
+        // ser >>MAX_OMEGA y causa un giro brusco visible en el primer frame).
+        let d_term = if dt > 0.0 && self.initialized {
             self.kd * (error - self.last_error) / dt
         } else {
             0.0
         };
-        
+
+        self.initialized = true;
         self.last_error = error;
         
         p_term + i_term + d_term
@@ -60,10 +65,11 @@ impl PIDController {
         self.integral = 0.0;
     }
     
-    /// Resetea completamente el controlador
+    /// Resetea completamente el controlador (próximo tick no tendrá spike derivativo)
     pub fn reset(&mut self) {
         self.integral = 0.0;
         self.last_error = 0.0;
+        self.initialized = false;
     }
 }
 
