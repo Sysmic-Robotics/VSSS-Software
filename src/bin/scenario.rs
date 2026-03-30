@@ -29,9 +29,9 @@ use glam::Vec2;
 fn scenario_tick(world: &World, motion: &Motion) -> Vec<MotionCommand> {
     // ── Ejemplo 1: Robot 0 va a una posición fija ──────────────
     //go_to_point(world, motion, ROBOT_ID, Vec2::new(0.3, 0.2))
-
+    go_to_point(world, motion, ROBOT_ID, Vec2::new(0.0, 0.0))
     // ── Ejemplo 2: Robot 0 persigue la pelota ──────────────────
-    chase_ball(world, motion, ROBOT_ID)
+    //chase_ball(world, motion, ROBOT_ID)
 
     // ── Ejemplo 3: Robot 0 hace un circuito de 4 puntos ────────
     // circuit(world, motion, ROBOT_ID, &[
@@ -47,9 +47,19 @@ fn scenario_tick(world: &World, motion: &Motion) -> Vec<MotionCommand> {
 
 // ─────────────────────────────────────────────────────────────
 // Funciones de ayuda — puedes usarlas o escribir las tuyas.
+//
+// NOTA: los robots VSS son diferenciales — sin omega (rotación)
+// el robot solo puede avanzar/retroceder en la dirección que ya
+// mira. Por eso todos los helpers usan move_and_face en lugar de
+// move_to, así el robot rota Y avanza al mismo tiempo.
+// Ganancias PID de heading: kp=1.2, ki=0.0, kd=0.10
 // ─────────────────────────────────────────────────────────────
 
-/// Mueve un robot a una posición fija.
+const KP: f64 = 1.2;
+const KI: f64 = 0.0;
+const KD: f64 = 0.10;
+
+/// Mueve un robot a una posición fija mirando hacia donde va.
 fn go_to_point(world: &World, motion: &Motion, robot_id: i32, target: Vec2) -> Vec<MotionCommand> {
     let team_robots = if OWN_TEAM == 0 {
         world.get_blue_team_active()
@@ -59,7 +69,7 @@ fn go_to_point(world: &World, motion: &Motion, robot_id: i32, target: Vec2) -> V
     team_robots
         .iter()
         .filter(|r| r.id == robot_id)
-        .map(|r| motion.move_to(r, target, world))
+        .map(|r| motion.move_and_face(r, target, target, world, KP, KI, KD))
         .collect()
 }
 
@@ -73,7 +83,6 @@ fn chase_ball(world: &World, motion: &Motion, robot_id: i32) -> Vec<MotionComman
 /// Hace un circuito de puntos (pasa al siguiente al llegar).
 #[allow(dead_code)]
 fn circuit(world: &World, motion: &Motion, robot_id: i32, waypoints: &[Vec2]) -> Vec<MotionCommand> {
-    // Estado del circuito: índice actual guardado en thread_local
     use std::cell::Cell;
     thread_local! {
         static WAYPOINT_IDX: Cell<usize> = Cell::new(0);
@@ -92,11 +101,10 @@ fn circuit(world: &World, motion: &Motion, robot_id: i32, waypoints: &[Vec2]) ->
     WAYPOINT_IDX.with(|idx_cell| {
         let idx = idx_cell.get();
         let target = waypoints[idx % waypoints.len()];
-        let dist = (target - robot.position).length();
-        if dist < 0.08 {
+        if (target - robot.position).length() < 0.08 {
             idx_cell.set((idx + 1) % waypoints.len());
         }
-        vec![motion.move_to(robot, target, world)]
+        vec![motion.move_and_face(robot, target, target, world, KP, KI, KD)]
     })
 }
 
@@ -110,7 +118,7 @@ fn all_to_center(world: &World, motion: &Motion) -> Vec<MotionCommand> {
     };
     team_robots
         .iter()
-        .map(|r| motion.move_to(r, Vec2::ZERO, world))
+        .map(|r| motion.move_and_face(r, Vec2::ZERO, Vec2::ZERO, world, KP, KI, KD))
         .collect()
 }
 
