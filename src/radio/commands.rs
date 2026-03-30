@@ -391,8 +391,10 @@ pub fn serialize_to_firasim(commands: &[RobotCommand]) -> Result<Vec<u8>, Box<dy
 /// Ver RESPUESTAS_PUERTO_20011.md: L = separación entre ruedas, r = radio de rueda.
 const WHEEL_BASE_L: f64 = 0.05;   // m, típico VSS ~0.05–0.06
 const WHEEL_RADIUS_R: f64 = 0.02; // m, depende del modelo en FIRASim
-/// Límite típico útil en FIRASim: ±20 a ±40 rad/s.
-const WHEEL_RAD_S_MAX: f64 = 20.0;
+/// Calculado para no clipear a MAX_LINEAR_SPEED=1.2 m/s:
+///   wheel_needed = 1.2/0.02 + 3.0*0.05/(2*0.02) = 60 + 3.75 = 63.75 → 70 con margen.
+/// El valor anterior (20.0) limitaba la velocidad efectiva a 0.4 m/s (3× por debajo).
+const WHEEL_RAD_S_MAX: f64 = 70.0;
 /// Límites de entrada esperados para comandos cinemáticos.
 const MOTION_VEL_MAX: f64 = 2.0;   // m/s
 const MOTION_OMEGA_MAX: f64 = 10.0; // rad/s
