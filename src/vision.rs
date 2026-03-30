@@ -13,8 +13,19 @@ use crate::protos::fira_common::{Ball as FiraBall, Robot as FiraRobot};
 use crate::protos::ssl_vision_wrapper::SSL_WrapperPacket;
 use crate::protos::ssl_vision_detection::{SSL_DetectionBall, SSL_DetectionRobot};
 use protobuf::Message;
-use crate::gui::StatusUpdate;
 use crate::tracker::Tracker;
+
+/// Eventos de estado que vision envía a la GUI.
+/// Definidos aquí para que vision.rs no dependa del módulo gui.
+#[derive(Debug, Clone)]
+pub enum StatusUpdate {
+    Connected(String, u16),
+    PacketReceived,
+    BallDetected(usize),
+    RobotsDetected(usize),
+    RobotPosition(u32, u32, Vec2, f32), // id, team, position, orientation
+    BallPosition(Vec2),
+}
 
 /// Log por cada robot azul enviado a la GUI (SSL). Desactivado por defecto; usar `[FieldAudit]` en main.
 const VISION_LOG_EVERY_BLUE_ROBOT_TO_GUI: bool = false;
