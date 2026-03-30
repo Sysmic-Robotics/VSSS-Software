@@ -45,8 +45,10 @@ impl StuckDetector {
         self.last_pos = robot_pos;
 
         // Solo contar stuck cuando estamos lejos del target (no cuando llegamos y paramos)
+        // Umbral 6mm/tick ≈ 0.36 m/s a 60Hz — por encima de COUPLING_FLOOR × MIN_SPEED
+        // para evitar falsos positivos cuando el robot está girando con heading error alto.
         if dist_to_target > 0.08 {
-            if moved < 0.003 {
+            if moved < 0.006 {
                 self.stuck_ticks += 1;
             } else {
                 self.stuck_ticks = 0;
@@ -55,8 +57,8 @@ impl StuckDetector {
             self.stuck_ticks = 0;
         }
 
-        // Activar yield tras ~0.33s sin moverse
-        if self.stuck_ticks >= 20 && self.yield_ticks == 0 {
+        // Activar yield tras ~0.5s sin moverse (30 ticks × 16ms)
+        if self.stuck_ticks >= 30 && self.yield_ticks == 0 {
             // Dirección de escape: alterna según cuadrante del robot para que
             // dos robots que se bloquean frontalmente elijan lados opuestos.
             self.yield_dir = if (robot_pos.x + robot_pos.y) >= 0.0 { 1.0 } else { -1.0 };
