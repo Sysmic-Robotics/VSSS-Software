@@ -35,9 +35,10 @@ impl PIDController {
         let p_term = self.kp * error;
 
         // Término integral con anti-windup
-        self.integral = (self.integral + error * dt).clamp(-self.integral_limit, self.integral_limit);
+        self.integral =
+            (self.integral + error * dt).clamp(-self.integral_limit, self.integral_limit);
         let i_term = self.ki * self.integral;
-        
+
         // Término derivativo: se omite en el primer tick para evitar el spike
         // derivativo causado por last_error=0 con error≠0 (kd × error/dt puede
         // ser >>MAX_OMEGA y causa un giro brusco visible en el primer frame).
@@ -49,7 +50,7 @@ impl PIDController {
 
         self.initialized = true;
         self.last_error = error;
-        
+
         p_term + i_term + d_term
     }
 
@@ -59,12 +60,12 @@ impl PIDController {
         self.ki = ki;
         self.kd = kd;
     }
-    
+
     /// Resetea el acumulador integral
     pub fn reset_integral(&mut self) {
         self.integral = 0.0;
     }
-    
+
     /// Resetea completamente el controlador (próximo tick no tendrá spike derivativo)
     pub fn reset(&mut self) {
         self.integral = 0.0;
@@ -76,7 +77,7 @@ impl PIDController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_pid_controller() {
         // kd=0 para aislar comportamiento P+I sin spike derivativo en el primer tick
@@ -92,13 +93,13 @@ mod tests {
         let output2 = pid.compute(1.0, 0.1);
         assert!(output2 > output1);
     }
-    
+
     #[test]
     fn test_pid_reset() {
         let mut pid = PIDController::new(1.0, 0.1, 0.01);
         pid.compute(1.0, 0.1);
         pid.reset();
-        
+
         // Después del reset, el output debe ser igual al primero
         let output1 = pid.compute(1.0, 0.1);
         let mut pid2 = PIDController::new(1.0, 0.1, 0.01);

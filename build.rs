@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 fn main() {
     let proto_dir = "src/protos";
-    
+
     // 1. Collect all .proto files in the directory
     let proto_files: Vec<PathBuf> = fs::read_dir(proto_dir)
         .expect("Failed to read protos directory")

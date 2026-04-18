@@ -103,6 +103,14 @@ impl Vision {
         }
     }
 
+    fn send_status_best_effort(status_tx: &mpsc::Sender<StatusUpdate>, update: StatusUpdate) {
+        match status_tx.try_send(update) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
     pub async fn run(
         &mut self,
         sender: mpsc::Sender<VisionEvent>,
@@ -171,12 +179,10 @@ impl Vision {
         }
 
         // Send connection status
-        let _ = status_tx
-            .send(StatusUpdate::Connected(
-                self.multicast_ip.clone(),
-                self.port,
-            ))
-            .await;
+        Self::send_status_best_effort(
+            &status_tx,
+            StatusUpdate::Connected(self.multicast_ip.clone(), self.port),
+        );
         eprintln!("[Vision] ========================================");
         eprintln!("[Vision] ✓ Sistema de visión inicializado");
         eprintln!(
@@ -224,7 +230,7 @@ impl Vision {
                                 eprintln!("[Vision] Hex: {:02x?}", &data[..len.min(48)]);
                             }
 
-                            let _ = status_tx.send(StatusUpdate::PacketReceived).await;
+                            Self::send_status_best_effort(&status_tx, StatusUpdate::PacketReceived);
 
                             // FIRASim/VSSS envía protocolo FIRA: fira_message.sim_to_ref.Environment
                             // (VSSSLeague/FIRAClient, VSSSProto). Probar primero ese formato.
@@ -241,8 +247,8 @@ impl Vision {
                                              detection_count, robot_count, ball_count);
                                 }
 
-                                let _ = status_tx.send(StatusUpdate::BallDetected(ball_count)).await;
-                                let _ = status_tx.send(StatusUpdate::RobotsDetected(robot_count)).await;
+                                Self::send_status_best_effort(&status_tx, StatusUpdate::BallDetected(ball_count));
+                                Self::send_status_best_effort(&status_tx, StatusUpdate::RobotsDetected(robot_count));
 
                                 let dt = 0.016f32;
                                 if let Some(ball) = frame.ball.as_ref() {
@@ -271,8 +277,8 @@ impl Vision {
                                                          detection_count, robot_count, ball_count);
                                             }
 
-                                            let _ = status_tx.send(StatusUpdate::BallDetected(ball_count)).await;
-                                            let _ = status_tx.send(StatusUpdate::RobotsDetected(robot_count)).await;
+                                            Self::send_status_best_effort(&status_tx, StatusUpdate::BallDetected(ball_count));
+                                            Self::send_status_best_effort(&status_tx, StatusUpdate::RobotsDetected(robot_count));
 
                                             let dt = 0.016f32;
                                             for ball in detection.balls.iter() {
@@ -343,9 +349,10 @@ impl Vision {
         let xf_mm = (xf_m * 1000.0) as f32;
         let yf_mm = (yf_m * 1000.0) as f32;
 
-        let _ = status_tx
-            .send(StatusUpdate::BallPosition(Vec2::new(xf_mm, yf_mm)))
-            .await;
+        Self::send_status_best_effort(
+            status_tx,
+            StatusUpdate::BallPosition(Vec2::new(xf_mm, yf_mm)),
+        );
 
         let event = VisionEvent::Ball(BallData {
             position: Vec2::new(xf_m as f32, yf_m as f32),
@@ -381,14 +388,10 @@ impl Vision {
         let xf_mm = (xf_m * 1000.0) as f32;
         let yf_mm = (yf_m * 1000.0) as f32;
 
-        let _ = status_tx
-            .send(StatusUpdate::RobotPosition(
-                id,
-                team as u32,
-                Vec2::new(xf_mm, yf_mm),
-                thetaf as f32,
-            ))
-            .await;
+        Self::send_status_best_effort(
+            status_tx,
+            StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32),
+        );
 
         let event = VisionEvent::Robot(RobotData {
             id,
@@ -434,9 +437,10 @@ impl Vision {
         let yf_mm = (yf_m * 1000.0) as f32;
 
         // Send position to UI (in millimeters)
-        let _ = status_tx
-            .send(StatusUpdate::BallPosition(Vec2::new(xf_mm, yf_mm)))
-            .await;
+        Self::send_status_best_effort(
+            status_tx,
+            StatusUpdate::BallPosition(Vec2::new(xf_mm, yf_mm)),
+        );
 
         // VisionEvent uses meters for internal processing
         let event = VisionEvent::Ball(BallData {
@@ -490,29 +494,15 @@ impl Vision {
         let yf_mm = (yf_m * 1000.0) as f32;
 
         // Send position to UI (in millimeters, with origin at center)
-        match status_tx
-            .send(StatusUpdate::RobotPosition(
-                id,
-                team as u32,
-                Vec2::new(xf_mm, yf_mm),
-                thetaf as f32,
-            ))
-            .await
-        {
-            Ok(_) => {
-                if VISION_LOG_EVERY_BLUE_ROBOT_TO_GUI && id < 3 && team == 0 {
-                    eprintln!(
-                        "[Vision] ✓ Enviada posición robot azul ID={} a GUI: pos=({:.1}, {:.1}) mm, orientación={:.2} rad",
-                        id, xf_mm, yf_mm, thetaf
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "[Vision] ✗ Error enviando posición de robot ID={} a GUI: {}",
-                    id, e
-                );
-            }
+        Self::send_status_best_effort(
+            status_tx,
+            StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32),
+        );
+        if VISION_LOG_EVERY_BLUE_ROBOT_TO_GUI && id < 3 && team == 0 {
+            eprintln!(
+                "[Vision] ✓ Enviada posición robot azul ID={} a GUI: pos=({:.1}, {:.1}) mm, orientación={:.2} rad",
+                id, xf_mm, yf_mm, thetaf
+            );
         }
 
         // VisionEvent uses meters for internal processing
@@ -527,5 +517,24 @@ impl Vision {
 
         sender.send(event).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_updates_drop_when_gui_channel_is_full() {
+        let (status_tx, mut status_rx) = mpsc::channel(1);
+
+        Vision::send_status_best_effort(&status_tx, StatusUpdate::PacketReceived);
+        Vision::send_status_best_effort(&status_tx, StatusUpdate::PacketReceived);
+
+        assert!(matches!(
+            status_rx.try_recv(),
+            Ok(StatusUpdate::PacketReceived)
+        ));
+        assert!(status_rx.try_recv().is_err());
     }
 }

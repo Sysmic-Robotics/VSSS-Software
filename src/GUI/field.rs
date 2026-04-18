@@ -1,23 +1,23 @@
-use iced::widget::canvas::{self, Cache, Geometry, Path, Stroke};
 use iced::mouse;
-use iced::{Point, Rectangle, Color, Size, Theme};
+use iced::widget::canvas::{self, Cache, Geometry, Path, Stroke};
+use iced::{Color, Point, Rectangle, Size, Theme};
 use std::collections::HashMap;
 
 use super::{Ball, Message, Robot};
 
 // Dimensiones del campo VSS (Very Small Size League) — alineadas con FIRASim
 const FIELD_LENGTH: f32 = 1500.0; // mm - Campo VSS 1.5m x 1.3m
-const FIELD_WIDTH: f32 = 1300.0;  // mm
-const FIELD_MARGIN: f32 = 100.0;  // mm - espacio verde fuera de los límites
+const FIELD_WIDTH: f32 = 1300.0; // mm
+const FIELD_MARGIN: f32 = 100.0; // mm - espacio verde fuera de los límites
 // Zona de arquero (goalkeeper area): rectángulo delante del arco, como en FIRASim
-const GOALKEEPER_AREA_WIDTH: f32 = 400.0;  // mm - mismo ancho que el arco
-const GOALKEEPER_AREA_DEPTH: f32 = 130.0;  // mm - profundidad típica VSS/FIRASim
-const GOAL_WIDTH: f32 = 400.0;   // mm - ancho del arco
-const GOAL_DEPTH: f32 = 50.0;    // mm - profundidad del arco
-const CENTER_CIRCLE_RADIUS: f32 = 200.0;   // mm
+const GOALKEEPER_AREA_WIDTH: f32 = 400.0; // mm - mismo ancho que el arco
+const GOALKEEPER_AREA_DEPTH: f32 = 130.0; // mm - profundidad típica VSS/FIRASim
+const GOAL_WIDTH: f32 = 400.0; // mm - ancho del arco
+const GOAL_DEPTH: f32 = 50.0; // mm - profundidad del arco
+const CENTER_CIRCLE_RADIUS: f32 = 200.0; // mm
 // Tamaños visuales proporcionales a FIRASim (robots ~75mm diámetro, pelota ~43mm)
-const ROBOT_RADIUS_MM: f32 = 38.0;   // mm - radio para dibujo (~76mm diámetro)
-const BALL_RADIUS_MM: f32 = 22.0;   // mm - radio para dibujo (~44mm diámetro)
+const ROBOT_RADIUS_MM: f32 = 38.0; // mm - radio para dibujo (~76mm diámetro)
+const BALL_RADIUS_MM: f32 = 22.0; // mm - radio para dibujo (~44mm diámetro)
 const ORIENTATION_LINE_MM: f32 = 55.0; // mm - longitud de la línea de orientación
 
 pub struct FieldCanvas<'a> {
@@ -206,10 +206,8 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                 // Línea de orientación (proporcionada al tamaño del robot)
                 let dx = robot.orientation.cos() * ORIENTATION_LINE_MM * scale;
                 let dy = -robot.orientation.sin() * ORIENTATION_LINE_MM * scale;
-                let orientation_line = Path::line(
-                    robot_pos,
-                    Point::new(robot_pos.x + dx, robot_pos.y + dy),
-                );
+                let orientation_line =
+                    Path::line(robot_pos, Point::new(robot_pos.x + dx, robot_pos.y + dy));
                 frame.stroke(
                     &orientation_line,
                     Stroke::default().with_width(2.0).with_color(Color::BLACK),

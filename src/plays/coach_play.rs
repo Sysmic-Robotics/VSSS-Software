@@ -17,7 +17,8 @@ use crate::world::World;
 /// ```ignore
 /// CoachPlay::new(Box::new(RlCoach::load("model.onnx")), 0)
 /// ```
-/// No se requieren otros cambios en el engine.
+/// El seam sigue disponible, pero hoy requiere cablear un entry point que use
+/// `CoachPlay`; el `main` por defecto corre una base headless de skills simples.
 ///
 /// # StuckDetector
 /// Deliberadamente omitido en esta fase. El modelo RL aprenderá a evitar deadlocks
@@ -35,7 +36,7 @@ pub struct CoachPlay {
 }
 
 impl CoachPlay {
-    /// Crea un CoachPlay con ganancias PID por defecto (mismas que ChaseSkill).
+    /// Crea un CoachPlay con ganancias PID por defecto (mismas que ApproachBallBehindSkill).
     /// `own_team`: 0 = azul, 1 = amarillo.
     pub fn new(coach: Box<dyn Coach>, own_team: i32) -> Self {
         Self {

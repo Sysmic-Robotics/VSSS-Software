@@ -19,7 +19,8 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 
 ```bash
 cargo build --release   # build optimizado (necesario para tiempo real)
-cargo run --release     # correr el engine
+cargo run --release     # correr el main headless actual
+cargo run --bin scenario --release  # probar una skill manualmente en FIRASim
 cargo test              # suite de tests
 cargo clippy            # lint
 cargo fmt               # formato
@@ -34,11 +35,13 @@ FIRASim (multicast 224.0.0.1:10002)
   └─ vision.rs         parse SSL-Vision protobuf
       └─ tracker/ekf   Extended Kalman Filter por robot/balón
           └─ world/    estado compartido Arc<RwLock<World>>
-              └─ coach/    decide targets por robot (Strategy layer)
-                  └─ plays/ asigna targets a motion primitives
-                      └─ motion/   UVF + PID → MotionCommand
-                          └─ radio/    serializa protobuf → UDP 127.0.0.1:20011
-                              └─ FIRASim recibe y aplica
+              └─ skills/   primitives reactivas simples
+                  └─ motion/   UVF + PID → MotionCommand
+                      └─ radio/    serializa protobuf → UDP 127.0.0.1:20011
+                          └─ FIRASim recibe y aplica
+
+Camino alternativo / futuro:
+  world/ → coach/ → plays/ → motion/ → radio/
 ```
 
 ### Módulos principales
@@ -48,13 +51,13 @@ FIRASim (multicast 224.0.0.1:10002)
 | `vision.rs` | Receptor UDP multicast; parsea SSL-Vision protobuf; emite `VisionEvent` al resto del sistema |
 | `tracker/` | EKF por entidad (robot/balón). Estado: posición + orientación + velocidades. Activable desde GUI |
 | `world/` | Estado canónico del juego: poses de robots, posición/velocidad del balón, flags de inactividad |
-| `coach/` | Capa de estrategia: decide dónde debe ir cada robot. Actualmente reglas clásicas; diseñado para recibir un modelo RL |
-| `plays/` | Ejecuta las decisiones del Coach usando motion primitives. `CoachPlay` conecta Coach → Motion |
-| `skills/` | Acciones primitivas de un robot: `GoToSkill`, `ChaseSkill`, `DefendSkill` |
-| `tactics/` | Roles continuos: `AttackerTactic`, `SupportTactic`, `GoalkeeperTactic` (con `StuckDetector`) |
+| `coach/` | Base futura para estrategia/RL. Hoy expone observaciones y coaches, pero no es la ruta por defecto del `main` |
+| `plays/` | Orquestación de alto nivel (`StandardPlay`, `CoachPlay`). Quedó como base futura; el `main` actual no entra por aquí |
+| `skills/` | Primitives reactivas simples con trait `Skill -> MotionCommand`: `ChaseBallSkill`, `GoToSkill`, `FacePointSkill`, `HoldPositionSkill`, etc. |
+| `tactics/` | Wrappers de rol sobre skills (`AttackerTactic`, `SupportTactic`, `GoalkeeperTactic`) con `StuckDetector`; útiles como base futura |
 | `motion/` | UVF para evasión de obstáculos, PID para heading y velocidad, braking profile |
 | `radio/` | Clientes UDP para FIRASim y GrSim; serializa `RobotCommand` a protobuf |
-| `GUI/` | Interfaz Iced: campo 2D, estado de visión, config IP/puerto, toggle del tracker |
+| `GUI/` | Interfaz Iced para inspección visual. Sigue en el repo, pero el flujo actual de `main` y `scenario` es headless |
 | `protos/` | Bindings Rust generados en compilación desde `.proto` (FIRA, SSL-Vision, grSim) |
 
 ---
@@ -63,7 +66,7 @@ FIRASim (multicast 224.0.0.1:10002)
 
 ```
 src/
-├── main.rs                # Loop principal 60 Hz, spawn de tasks Tokio, config flags
+├── main.rs                # Entry point headless actual: visión + world + una skill simple + radio
 ├── vision.rs              # Recepción y parsing de visión
 ├── world/
 │   ├── mod.rs             # World struct, Arc<RwLock> state
@@ -80,10 +83,10 @@ src/
 │   └── rule_based_coach.rs # Implementación clásica del Coach (fallback y A/B testing)
 ├── plays/
 │   ├── mod.rs             # Play trait
-│   ├── standard_play.rs   # StandardPlay: tácticas directas sin pasar por Coach
-│   └── coach_play.rs      # CoachPlay: puente Coach → Motion (pipeline RL-ready)
+│   ├── standard_play.rs   # Orquestación fija de tácticas (camino alternativo, no default)
+│   └── coach_play.rs      # Puente Coach → Motion para integración futura de strategy/RL
 ├── skills/
-│   └── mod.rs             # GoToSkill, ChaseSkill, DefendSkill
+│   └── mod.rs             # trait Skill -> MotionCommand + primitives reactivas simples
 ├── tactics/
 │   └── mod.rs             # AttackerTactic, SupportTactic, GoalkeeperTactic, StuckDetector
 ├── motion/
@@ -111,10 +114,10 @@ src/
 
 | Constante | Valor | Descripción |
 |-----------|-------|-------------|
-| `USE_COACH_PLAY` | `false` | `true` activa pipeline RL-ready (`CoachPlay + RuleBasedCoach`) |
-| `DEBUG_MOTION_CAPTURE_GOAL_X` | `0.75` | X del arco rival (azul ataca hacia +X) |
-| `DEBUG_MOTION_LOG_KPI` | `true` | Imprime velocidad media por segundo |
-| `DEBUG_MOTION_TRACK_COUNTS` | `true` | Cuenta ticks de visión vs control |
+| `OWN_TEAM` | `0` | Equipo controlado por el binario principal (`0` azul, `1` amarillo) |
+| `ROBOT_ID` | `0` | Robot que controla la base mínima actual |
+
+El `main` actual es deliberadamente pequeño: usa la misma base headless que `scenario`, sin GUI ni plays.
 
 ### Parámetros de movimiento (`src/motion/mod.rs`)
 
@@ -132,14 +135,17 @@ src/
 | `influence_radius` | `0.20 m` | Radio de influencia de obstáculos |
 | `k_rep` | `1.5` | Ganancia repulsiva tangencial |
 
-### Parámetros del atacante (`src/skills/mod.rs`, `ChaseSkill::new()`)
+### Parámetros de skills de balón (`src/skills/mod.rs`)
 
-| Parámetro | Valor | Descripción |
-|-----------|-------|-------------|
-| `staging_offset` | `0.16 m` | Distancia detrás de la pelota para el staging point |
-| `staging_tol` | `0.08 m` | Tolerancia para entrar a fase CAPTURA |
-| `push_overshoot` | `0.12 m` | Distancia más allá de la pelota al empujar |
-| `kp/ki/kd` | `1.2/0.0/0.10` | Ganancias PID de heading |
+Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre todo para pruebas manuales en `scenario` y como base para una capa futura de strategy.
+
+| Parámetro | Skill | Valor | Descripción |
+|-----------|-------|-------|-------------|
+| `staging_offset` | `ApproachBallBehindSkill` | `0.16 m` | Distancia detrás de la pelota para el staging point |
+| `staging_tol` | `ApproachBallBehindSkill` | `0.08 m` | Radio desde el cual la skill deja de trasladar y prioriza orientar al robot |
+| `push_overshoot` | `PushBallSkill` | `0.12 m` | Distancia más allá de la pelota al empujar |
+| `lose_radius` | `PushBallSkill` | `0.25 m` | Si el robot pierde demasiado la pelota, la skill pasa a frenar |
+| `kp/ki/kd` | `ApproachBallBehindSkill`, `PushBallSkill`, `AlignBallToTargetSkill` | `1.2/0.0/0.10` | Ganancias PID de heading para primitives orientadas a la pelota |
 
 ---
 
@@ -168,9 +174,9 @@ impl Coach for RlCoach {
 }
 ```
 
-**2.** En `src/main.rs`, cambiar `USE_COACH_PLAY = true` y reemplazar `RuleBasedCoach::new(...)` con `RlCoach::load("model.onnx")`.
+**2.** Conectar ese coach a un entry point que instancie `CoachPlay` o a tu futuro módulo `strategy`.
 
-Eso es todo. El motion layer (UVF, PID, evasión de obstáculos) no cambia.
+Hoy `main.rs` no tiene un switch para `CoachPlay`; el seam RL sigue existiendo en `coach/` y `plays/`, pero la ruta por defecto del runtime es la base headless de skills simples.
 
 ### Contrato de la observación (`Observation::to_flat_vec()`)
 
@@ -220,14 +226,14 @@ Azul ataca hacia +X (DEBUG_MOTION_CAPTURE_GOAL_X = 0.75)
 ## Concurrencia
 
 ```
-main thread: Iced GUI
-background thread (Tokio runtime):
+Tokio runtime:
   ├─ vision_task      (event-driven) UDP multicast → World
   ├─ world_updater    (100 ms)       marca robots inactivos
-  └─ motion_loop      (16 ms, 60 Hz) Coach → Motion → Radio → FIRASim
+  └─ control_loop     (16 ms, 60 Hz) Skill → Radio → FIRASim
 ```
 
 Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales `mpsc`.
+La GUI sigue en el repo, pero no forma parte del flujo por defecto del `main`.
 
 ---
 
@@ -238,4 +244,4 @@ cargo test                                              # todos los tests
 cargo test test_robot_motion_simulation -- --nocapture  # simulación headless 8s
 ```
 
-57 tests unitarios que cubren: UVF, motion (move_to, move_and_face, move_direct), PID, Environment, Skills (GoTo, Chase, Defend), Tactics, Observation/Coach, World, Tracker.
+68 tests unitarios que cubren: UVF, motion, PID, Environment, radio, skills, tactics, observation/coach, world, tracker y vision.

@@ -47,9 +47,30 @@ mod tests {
     #[test]
     fn summarize_commands_reports_expected_values() {
         let data = vec![
-            MotionCommand { id: 0, team: 0, vx: 1.0, vy: 0.0, omega: 0.5, orientation: 0.0 },
-            MotionCommand { id: 0, team: 0, vx: 0.0, vy: 1.0, omega: -0.5, orientation: 0.0 },
-            MotionCommand { id: 0, team: 0, vx: 0.0, vy: 0.0, omega: 0.0, orientation: 0.0 },
+            MotionCommand {
+                id: 0,
+                team: 0,
+                vx: 1.0,
+                vy: 0.0,
+                omega: 0.5,
+                orientation: 0.0,
+            },
+            MotionCommand {
+                id: 0,
+                team: 0,
+                vx: 0.0,
+                vy: 1.0,
+                omega: -0.5,
+                orientation: 0.0,
+            },
+            MotionCommand {
+                id: 0,
+                team: 0,
+                vx: 0.0,
+                vy: 0.0,
+                omega: 0.0,
+                orientation: 0.0,
+            },
         ];
 
         let kpi = summarize_commands(&data);
