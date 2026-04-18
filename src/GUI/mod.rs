@@ -1,19 +1,19 @@
 mod field;
 mod vision_status;
 
-use iced::{
-    widget::{button, column, container, row, text, Canvas},
-    Element, Length, Subscription, Task, Theme,
-};
-use iced::widget::canvas::Cache;
+use glam::Vec2;
 use iced::futures::SinkExt;
 use iced::stream;
-use tokio::sync::mpsc;
+use iced::widget::canvas::Cache;
+use iced::{
+    Element, Length, Subscription, Task, Theme,
+    widget::{Canvas, button, column, container, row, text},
+};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use std::collections::VecDeque;
-use glam::Vec2;
+use tokio::sync::mpsc;
 
 use field::FieldCanvas;
 // StatusUpdate vive en vision.rs para que la lib no dependa de gui.
@@ -131,15 +131,18 @@ impl VisionGui {
                         self.packet_count += 1;
                         let elapsed = self.start_time.elapsed().as_secs_f64();
                         let current_second = elapsed.floor() as u64;
-                        
+
                         // If we've moved to a new second, record the previous second's count
                         if current_second > self.last_second {
                             if self.current_second_count > 0 {
-                                self.packet_history.push_back((self.last_second as f64, self.current_second_count));
+                                self.packet_history.push_back((
+                                    self.last_second as f64,
+                                    self.current_second_count,
+                                ));
                             }
                             self.last_second = current_second;
                             self.current_second_count = 1;
-                            
+
                             // Keep only last 60 seconds of data
                             while let Some(&(time, _)) = self.packet_history.front() {
                                 if current_second as f64 - time > 60.0 {
@@ -148,7 +151,7 @@ impl VisionGui {
                                     break;
                                 }
                             }
-                            
+
                             // Clear chart cache to trigger redraw
                             self.chart_cache.clear();
                         } else {
@@ -196,33 +199,31 @@ impl VisionGui {
                 self.vision_port = port;
             }
             Message::Connect => {
-                if let Ok(port) = self.vision_port.parse::<u16>() {
-                    if let Some(tx) = &self.config_tx {
-                        let _ = tx.try_send(ConfigUpdate::ChangeIpPort(
-                            self.vision_ip.clone(),
-                            port,
-                        ));
-                    }
+                if let Ok(port) = self.vision_port.parse::<u16>()
+                    && let Some(tx) = &self.config_tx
+                {
+                    let _ = tx.try_send(ConfigUpdate::ChangeIpPort(self.vision_ip.clone(), port));
                 }
             }
             Message::Tick => {
                 // Update chart even when no packets arrive
                 let elapsed = self.start_time.elapsed().as_secs_f64();
                 let current_second = elapsed.floor() as u64;
-                
+
                 // If we've moved to a new second, record the previous second's count
                 if current_second > self.last_second {
                     // Record the count for the previous second (could be 0)
-                    self.packet_history.push_back((self.last_second as f64, self.current_second_count));
-                    
+                    self.packet_history
+                        .push_back((self.last_second as f64, self.current_second_count));
+
                     // Fill in any missing seconds with 0 packets
                     for sec in (self.last_second + 1)..current_second {
                         self.packet_history.push_back((sec as f64, 0));
                     }
-                    
+
                     self.last_second = current_second;
                     self.current_second_count = 0;
-                    
+
                     // Keep only last 60 seconds of data
                     while let Some(&(time, _)) = self.packet_history.front() {
                         if current_second as f64 - time > 60.0 {
@@ -231,7 +232,7 @@ impl VisionGui {
                             break;
                         }
                     }
-                    
+
                     // Clear chart cache to trigger redraw
                     self.chart_cache.clear();
                 }
@@ -252,7 +253,7 @@ impl VisionGui {
 
     fn subscription(&self) -> Subscription<Message> {
         let rx = self.status_rx.clone();
-        
+
         let status_subscription = Subscription::run_with_id(
             "status_updates",
             stream::channel(100, move |mut output| async move {
@@ -260,22 +261,22 @@ impl VisionGui {
                     let mut rx_lock = rx.lock().unwrap();
                     rx_lock.take()
                 };
-                
+
                 if let Some(mut rx) = receiver {
                     while let Some(update) = rx.recv().await {
                         let _ = output.send(Message::StatusUpdate(update)).await;
                     }
                 }
-                
+
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }),
         );
-        
-        let tick_subscription = iced::time::every(std::time::Duration::from_millis(500))
-            .map(|_| Message::Tick);
-        
+
+        let tick_subscription =
+            iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::Tick);
+
         Subscription::batch([status_subscription, tick_subscription])
     }
 
@@ -285,29 +286,23 @@ impl VisionGui {
 
     fn view(&self) -> Element<'_, Message> {
         // Tab buttons
-        let vision_button = button(
-            text("Vision")
-                .size(14)
-        )
-        .padding([8, 16])
-        .style(if self.active_tab == TabView::Vision {
-            button::primary
-        } else {
-            button::secondary
-        })
-        .on_press(Message::TabSelected(TabView::Vision));
+        let vision_button = button(text("Vision").size(14))
+            .padding([8, 16])
+            .style(if self.active_tab == TabView::Vision {
+                button::primary
+            } else {
+                button::secondary
+            })
+            .on_press(Message::TabSelected(TabView::Vision));
 
-        let robots_button = button(
-            text("Robots")
-                .size(14)
-        )
-        .padding([8, 16])
-        .style(if self.active_tab == TabView::Robots {
-            button::primary
-        } else {
-            button::secondary
-        })
-        .on_press(Message::TabSelected(TabView::Robots));
+        let robots_button = button(text("Robots").size(14))
+            .padding([8, 16])
+            .style(if self.active_tab == TabView::Robots {
+                button::primary
+            } else {
+                button::secondary
+            })
+            .on_press(Message::TabSelected(TabView::Robots));
 
         let tabs = row![vision_button, robots_button]
             .spacing(5)
@@ -315,20 +310,18 @@ impl VisionGui {
 
         // Content based on active tab
         let content = match self.active_tab {
-            TabView::Vision => {
-                vision_status::view(
-                    self.connected,
-                    &self.vision_ip,
-                    &self.vision_port,
-                    self.packet_count,
-                    self.packet_frequency,
-                    self.last_ball_count,
-                    self.last_robot_count,
-                    &self.packet_history,
-                    &self.chart_cache,
-                    self.tracker_enabled,
-                )
-            }
+            TabView::Vision => vision_status::view(
+                self.connected,
+                &self.vision_ip,
+                &self.vision_port,
+                self.packet_count,
+                self.packet_frequency,
+                self.last_ball_count,
+                self.last_robot_count,
+                &self.packet_history,
+                &self.chart_cache,
+                self.tracker_enabled,
+            ),
             TabView::Robots => {
                 let field = Canvas::new(FieldCanvas {
                     robots: &self.robots,
@@ -362,12 +355,8 @@ pub fn run_gui(
     config_tx: mpsc::Sender<ConfigUpdate>,
     status_rx: mpsc::Receiver<StatusUpdate>,
 ) -> iced::Result {
-    iced::application(
-        VisionGui::title,
-        VisionGui::update,
-        VisionGui::view,
-    )
-    .subscription(VisionGui::subscription)
-    .theme(VisionGui::theme)
-    .run_with(move || VisionGui::new(ip, port, config_tx, status_rx))
+    iced::application(VisionGui::title, VisionGui::update, VisionGui::view)
+        .subscription(VisionGui::subscription)
+        .theme(VisionGui::theme)
+        .run_with(move || VisionGui::new(ip, port, config_tx, status_rx))
 }

@@ -1,14 +1,14 @@
-/// Entorno de prueba de movimiento para FIRASim.
-///
-/// Corre `cargo run --bin scenario --release` para ejecutar.
-/// No tiene GUI — solo logs por stderr y movimiento en FIRASim.
-///
-/// ────────────────────────────────────────────────────────────
-///  EDITA AQUÍ TU ESCENARIO
-/// ────────────────────────────────────────────────────────────
-/// Modifica `scenario_tick()` con lo que quieras probar.
-/// Algunos ejemplos están listos más abajo — descomenta el que quieras.
-/// ────────────────────────────────────────────────────────────
+// Entorno de prueba de movimiento para FIRASim.
+//
+// Corre `cargo run --bin scenario --release` para ejecutar.
+// No tiene GUI; solo logs por stderr y movimiento en FIRASim.
+//
+// ────────────────────────────────────────────────────────────
+//  EDITA AQUÍ TU ESCENARIO
+// ────────────────────────────────────────────────────────────
+// Modifica `scenario_tick()` con lo que quieras probar.
+// Algunos ejemplos están listos más abajo; descomenta el que quieras.
+// ────────────────────────────────────────────────────────────
 
 // ====== Parámetros del escenario ======
 /// Equipo que controla este escenario (0=azul, 1=amarillo)
@@ -17,9 +17,9 @@ const OWN_TEAM: i32 = 0;
 const ROBOT_ID: i32 = 0;
 // ======================================
 
+use glam::Vec2;
 use rustengine::motion::{Motion, MotionCommand};
 use rustengine::world::World;
-use glam::Vec2;
 
 /// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 /// FUNCIÓN PRINCIPAL DEL ESCENARIO — edita esto libremente.
@@ -29,9 +29,9 @@ use glam::Vec2;
 fn scenario_tick(world: &World, motion: &Motion) -> Vec<MotionCommand> {
     // ── Ejemplo 1: Robot 0 va a una posición fija ──────────────
     //go_to_point(world, motion, ROBOT_ID, Vec2::new(0.3, 0.2))
-    go_to_point(world, motion, ROBOT_ID, Vec2::new(0.0, 0.0))
+    //go_to_point(world, motion, ROBOT_ID, Vec2::new(0.0, 0.0))
     // ── Ejemplo 2: Robot 0 persigue la pelota ──────────────────
-    //chase_ball(world, motion, ROBOT_ID)
+    chase_ball(world, motion, ROBOT_ID)
 
     // ── Ejemplo 3: Robot 0 hace un circuito de 4 puntos ────────
     // circuit(world, motion, ROBOT_ID, &[
@@ -82,10 +82,15 @@ fn chase_ball(world: &World, motion: &Motion, robot_id: i32) -> Vec<MotionComman
 
 /// Hace un circuito de puntos (pasa al siguiente al llegar).
 #[allow(dead_code)]
-fn circuit(world: &World, motion: &Motion, robot_id: i32, waypoints: &[Vec2]) -> Vec<MotionCommand> {
+fn circuit(
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    waypoints: &[Vec2],
+) -> Vec<MotionCommand> {
     use std::cell::Cell;
     thread_local! {
-        static WAYPOINT_IDX: Cell<usize> = Cell::new(0);
+        static WAYPOINT_IDX: Cell<usize> = const { Cell::new(0) };
     }
 
     let team_robots = if OWN_TEAM == 0 {
@@ -126,10 +131,13 @@ fn all_to_center(world: &World, motion: &Motion) -> Vec<MotionCommand> {
 // Infraestructura — no necesitas editar lo que está debajo.
 // ─────────────────────────────────────────────────────────────
 
-use rustengine::{radio, vision::{Vision, VisionEvent}};
-use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock as TokioRwLock};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use rustengine::{
+    radio,
+    vision::{Vision, VisionEvent},
+};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
 fn main() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -143,7 +151,6 @@ async fn async_main() {
 
     // Visión
     {
-        let world = world.clone();
         let tracker_enabled = tracker_enabled.clone();
         tokio::spawn(async move {
             let mut vis = Vision::new("224.0.0.1".to_string(), 10002, tracker_enabled);
@@ -162,8 +169,14 @@ async fn async_main() {
                 let mut w = world.write().await;
                 match event {
                     VisionEvent::Robot(r) => {
-                        w.update_robot(r.id as i32, r.team as i32, r.position,
-                            r.orientation as f64, r.velocity, r.angular_velocity as f64);
+                        w.update_robot(
+                            r.id as i32,
+                            r.team as i32,
+                            r.position,
+                            r.orientation as f64,
+                            r.velocity,
+                            r.angular_velocity as f64,
+                        );
                     }
                     VisionEvent::Ball(b) => {
                         w.update_ball(b.position, b.velocity);
@@ -186,13 +199,14 @@ async fn async_main() {
     }
 
     // Radio
-    let radio = match radio::Radio::new(false, radio::SimulatorType::FIRASim, "127.0.0.1", 20011).await {
-        Ok(r) => Arc::new(TokioMutex::new(r)),
-        Err(e) => {
-            eprintln!("[scenario] error radio: {e}");
-            return;
-        }
-    };
+    let radio =
+        match radio::Radio::new(false, radio::SimulatorType::FIRASim, "127.0.0.1", 20011).await {
+            Ok(r) => Arc::new(TokioMutex::new(r)),
+            Err(e) => {
+                eprintln!("[scenario] error radio: {e}");
+                return;
+            }
+        };
 
     eprintln!("[scenario] conectado a FIRASim. Ejecutando scenario_tick() a 60 Hz...");
     eprintln!("[scenario] Ctrl+C para detener.");

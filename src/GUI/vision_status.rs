@@ -1,9 +1,8 @@
-use iced::{
-    widget::{canvas, column, container, row, text, text_input, button, Canvas},
-    Color, Element, Length, Point, Rectangle, Theme,
-    Border, font,
-};
 use iced::widget::canvas::{Cache, Geometry, Path, Stroke};
+use iced::{
+    Border, Color, Element, Length, Point, Rectangle, Theme, font,
+    widget::{Canvas, button, canvas, column, container, row, text, text_input},
+};
 use std::collections::VecDeque;
 
 use super::Message;
@@ -68,10 +67,7 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
             // Draw grid lines
             for i in 0..6 {
                 let y = padding + (height - 2.0 * padding) * i as f32 / 5.0;
-                let line = Path::line(
-                    Point::new(padding, y),
-                    Point::new(width - padding, y),
-                );
+                let line = Path::line(Point::new(padding, y), Point::new(width - padding, y));
                 frame.stroke(
                     &line,
                     Stroke::default()
@@ -83,10 +79,12 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
             // Draw data as bars (like Wireshark)
             if !self.history.is_empty() {
                 for &(time, packets) in self.history.iter() {
-                    let x = padding + ((time - time_min) / time_range * (width - 2.0 * padding) as f64) as f32;
-                    let bar_height = ((packets - packet_min) as f64 / packet_range) * (height - 2.0 * padding) as f64;
+                    let x = padding
+                        + ((time - time_min) / time_range * (width - 2.0 * padding) as f64) as f32;
+                    let bar_height = ((packets - packet_min) as f64 / packet_range)
+                        * (height - 2.0 * padding) as f64;
                     let y = height - padding - bar_height as f32;
-                    
+
                     // Draw wide adjacent bars
                     let bar = Path::rectangle(
                         Point::new(x, y),
@@ -98,7 +96,7 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
 
             // Draw axes labels
             let text_color = Color::from_rgb(0.8, 0.8, 0.8);
-            
+
             // Y-axis label (packets per second)
             frame.fill_text(iced::widget::canvas::Text {
                 content: format!("{}", packet_max),
@@ -107,7 +105,7 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
                 size: 12.0.into(),
                 ..Default::default()
             });
-            
+
             frame.fill_text(iced::widget::canvas::Text {
                 content: format!("{}", packet_min),
                 position: Point::new(5.0, height - padding),
@@ -124,7 +122,7 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
                 size: 12.0.into(),
                 ..Default::default()
             });
-            
+
             frame.fill_text(iced::widget::canvas::Text {
                 content: "Packets/1 seconds".to_string(),
                 position: Point::new(5.0, 10.0),
@@ -139,6 +137,7 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     connected: bool,
     vision_ip: &str,
@@ -174,21 +173,30 @@ pub fn view<'a>(
                 .font(font::Font::MONOSPACE),
             row![
                 text("Status: ").font(font::Font::MONOSPACE).size(12),
-                text(status_text).style(move |_theme: &Theme| {
-                    text::Style {
-                        color: Some(status_color),
-                    }
-                }).font(font::Font::MONOSPACE).size(12),
+                text(status_text)
+                    .style(move |_theme: &Theme| {
+                        text::Style {
+                            color: Some(status_color),
+                        }
+                    })
+                    .font(font::Font::MONOSPACE)
+                    .size(12),
             ]
             .spacing(5),
             row![
-                text("IP: ").font(font::Font::MONOSPACE).size(12).width(Length::Fixed(50.0)),
+                text("IP: ")
+                    .font(font::Font::MONOSPACE)
+                    .size(12)
+                    .width(Length::Fixed(50.0)),
                 text_input("", &ip_string)
                     .on_input(Message::ChangeIp)
                     .font(font::Font::MONOSPACE)
                     .size(12)
                     .width(Length::Fixed(120.0)),
-                text("Port: ").font(font::Font::MONOSPACE).size(12).width(Length::Fixed(50.0)),
+                text("Port: ")
+                    .font(font::Font::MONOSPACE)
+                    .size(12)
+                    .width(Length::Fixed(50.0)),
                 text_input("", &port_string)
                     .on_input(Message::ChangePort)
                     .font(font::Font::MONOSPACE)
@@ -201,51 +209,65 @@ pub fn view<'a>(
             .spacing(5)
             .align_y(iced::Alignment::Center),
             row![
-                text(format!("Frequency: {:.1} Hz", packet_frequency)).font(font::Font::MONOSPACE).size(12),
+                text(format!("Frequency: {:.1} Hz", packet_frequency))
+                    .font(font::Font::MONOSPACE)
+                    .size(12),
             ]
             .spacing(10),
             row![
-                text(format!("Balls: {}", last_ball_count)).font(font::Font::MONOSPACE).size(12),
-                text(format!("Robots: {}", last_robot_count)).font(font::Font::MONOSPACE).size(12),
+                text(format!("Balls: {}", last_ball_count))
+                    .font(font::Font::MONOSPACE)
+                    .size(12),
+                text(format!("Robots: {}", last_robot_count))
+                    .font(font::Font::MONOSPACE)
+                    .size(12),
             ]
             .spacing(10),
             row![
                 text("Filtro Kalman: ").font(font::Font::MONOSPACE).size(12),
-                button(text(if tracker_enabled { "Desactivar" } else { "Activar" })
-                    .font(font::Font::MONOSPACE)
-                    .size(12))
-                    .on_press(Message::ToggleTracker(!tracker_enabled))
-                    .padding([3, 10]),
-                text(if tracker_enabled { "Habilitado" } else { "Deshabilitado" })
+                button(
+                    text(if tracker_enabled {
+                        "Desactivar"
+                    } else {
+                        "Activar"
+                    })
                     .font(font::Font::MONOSPACE)
                     .size(12)
-                    .style(move |_theme: &Theme| {
-                        text::Style {
-                            color: Some(if tracker_enabled {
-                                Color::from_rgb(0.0, 0.8, 0.0)
-                            } else {
-                                Color::from_rgb(0.8, 0.0, 0.0)
-                            }),
-                        }
-                    }),
+                )
+                .on_press(Message::ToggleTracker(!tracker_enabled))
+                .padding([3, 10]),
+                text(if tracker_enabled {
+                    "Habilitado"
+                } else {
+                    "Deshabilitado"
+                })
+                .font(font::Font::MONOSPACE)
+                .size(12)
+                .style(move |_theme: &Theme| {
+                    text::Style {
+                        color: Some(if tracker_enabled {
+                            Color::from_rgb(0.0, 0.8, 0.0)
+                        } else {
+                            Color::from_rgb(0.8, 0.0, 0.0)
+                        }),
+                    }
+                }),
             ]
             .spacing(5)
             .align_y(iced::Alignment::Center),
         ]
         .spacing(8)
-        .padding(12)
+        .padding(12),
     )
     .padding(8)
-    .style(|_theme: &Theme| {
-        container::Style {
-            border: Border {
-                color: Color::from_rgb(0.3, 0.3, 0.3),
-                width: 2.0,
-                radius: 8.0.into(),
-            },
-            background: Some(Color::from_rgba(0.1, 0.1, 0.1, 0.5).into()),
-            ..Default::default()
-        }
+    .style(|_theme: &Theme| container::Style {
+        border: Border {
+            color: Color::from_rgb(0.3, 0.3, 0.3),
+            width: 2.0,
+            radius: 8.0.into(),
+        },
+        background: Some(Color::from_rgba(0.1, 0.1, 0.1, 0.5).into()),
+        ..Default::default()
     });
 
     let chart = Canvas::new(PacketChart {
@@ -255,8 +277,5 @@ pub fn view<'a>(
     .width(Length::Fill)
     .height(Length::Fixed(200.0));
 
-    column![status_info, chart]
-        .spacing(10)
-        .padding(10)
-        .into()
+    column![status_info, chart].spacing(10).padding(10).into()
 }

@@ -14,7 +14,7 @@ use crate::world::World;
 ///
 /// # Integración del modelo RL
 /// Para conectar el modelo entrenado, reemplazar `RuleBasedCoach` con `RlCoach`:
-/// ```rust
+/// ```ignore
 /// CoachPlay::new(Box::new(RlCoach::load("model.onnx")), 0)
 /// ```
 /// No se requieren otros cambios en el engine.
@@ -60,31 +60,40 @@ impl Play for CoachPlay {
         let robots: Vec<_> = if self.own_team == 0 {
             world.get_blue_team_active().into_iter().cloned().collect()
         } else {
-            world.get_yellow_team_active().into_iter().cloned().collect()
+            world
+                .get_yellow_team_active()
+                .into_iter()
+                .cloned()
+                .collect()
         };
 
         // 4. Ejecutar cada target con motion primitives (capa de ejecución)
-        robots.iter().map(|robot| {
-            let target = find_target(&targets, robot.id);
-            match target {
-                Some(t) => {
-                    let face = t.face_target.unwrap_or(t.position);
-                    motion.move_and_face(robot, t.position, face, world, self.kp, self.ki, self.kd)
+        robots
+            .iter()
+            .map(|robot| {
+                let target = find_target(&targets, robot.id);
+                match target {
+                    Some(t) => {
+                        let face = t.face_target.unwrap_or(t.position);
+                        motion.move_and_face(
+                            robot, t.position, face, world, self.kp, self.ki, self.kd,
+                        )
+                    }
+                    // Si el Coach no emitió target para este robot → mantener posición
+                    None => MotionCommand {
+                        id: robot.id,
+                        team: robot.team,
+                        vx: 0.0,
+                        vy: 0.0,
+                        omega: 0.0,
+                        orientation: robot.orientation,
+                    },
                 }
-                // Si el Coach no emitió target para este robot → mantener posición
-                None => MotionCommand {
-                    id: robot.id,
-                    team: robot.team,
-                    vx: 0.0,
-                    vy: 0.0,
-                    omega: 0.0,
-                    orientation: robot.orientation,
-                },
-            }
-        }).collect()
+            })
+            .collect()
     }
 }
 
-fn find_target<'a>(targets: &'a [RobotTarget], robot_id: i32) -> Option<&'a RobotTarget> {
+fn find_target(targets: &[RobotTarget], robot_id: i32) -> Option<&RobotTarget> {
     targets.iter().find(|t| t.robot_id == robot_id)
 }

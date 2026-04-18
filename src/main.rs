@@ -1,16 +1,19 @@
 // Módulos del engine vienen de la lib (src/lib.rs).
 // Solo la GUI se declara aquí porque es exclusiva del binario principal.
-use rustengine::{vision, world, motion, radio, plays, coach};
+use rustengine::{coach, motion, plays, radio, vision, world};
 #[path = "GUI/mod.rs"]
 mod gui;
 
-use tokio::sync::{mpsc, Mutex as TokioMutex, RwLock as TokioRwLock};
-use vision::{Vision, VisionEvent, BallData, RobotData};
 use gui::ConfigUpdate;
-use world::World;
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+use vision::{Vision, VisionEvent};
+use world::World;
 
 // ====== Flags de diagnóstico y constantes de campo ======
 const DEBUG_MOTION_LINE_STEP_TARGET: bool = false;
@@ -35,16 +38,19 @@ const DEBUG_MOTION_LOG_KPI: bool = false;
 const DEBUG_FIELD_AUDIT: bool = true;
 // ========================================================
 
+type RobotSnapshot = HashMap<i32, (glam::Vec2, glam::Vec2, f64)>;
+type MotionTickOutput = (glam::Vec2, RobotSnapshot, Vec<motion::MotionCommand>);
+
 fn main() {
     // Create channels
-    let (vision_tx, mut vision_rx) = mpsc::channel(100); 
+    let (vision_tx, mut vision_rx) = mpsc::channel(100);
     let (status_tx, status_rx) = mpsc::channel(100);
     let (config_tx, mut config_rx) = mpsc::channel(10);
 
     // Configuración para FIRASim (según configuración del simulador)
-    let vision_ip = "224.0.0.1".to_string();  // FIRASim usa 224.0.0.1 para visión multicast
-    let vision_port = 10002;                  // FIRASim usa puerto 10002 para visión
-    
+    let vision_ip = "224.0.0.1".to_string(); // FIRASim usa 224.0.0.1 para visión multicast
+    let vision_port = 10002; // FIRASim usa puerto 10002 para visión
+
     let gui_ip = vision_ip.clone();
     let gui_port = vision_port;
     let gui_config_tx = config_tx.clone();
@@ -57,7 +63,7 @@ fn main() {
         Arc::new(TokioMutex::new(HashMap::new()));
     let commands_sent_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let updates_received_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    
+
     // Create shared flag for tracker state
     let tracker_enabled = Arc::new(AtomicBool::new(true)); // Habilitado por defecto
     let tracker_enabled_clone = tracker_enabled.clone();
@@ -75,19 +81,22 @@ fn main() {
                 let mut current_ip = vision_ip;
                 let mut current_port = vision_port;
                 let tracker_enabled = tracker_enabled_clone;
-                let mut vision_tx = vision_tx_for_vision;
-                let mut status_tx = status_tx_for_vision;
+                let vision_tx = vision_tx_for_vision;
+                let status_tx = status_tx_for_vision;
 
                 let mut vision_handle: Option<tokio::task::JoinHandle<()>> = None;
 
                 loop {
                     // Solo crear un nuevo sistema de visión si no existe uno corriendo
-                    if vision_handle.is_none() || vision_handle.as_ref().unwrap().is_finished() {
+                    if vision_handle
+                        .as_ref()
+                        .is_none_or(|handle| handle.is_finished())
+                    {
                         eprintln!("[Main] Iniciando sistema de visión en {}:{}", current_ip, current_port);
                         let mut vision_system = Vision::new(current_ip.clone(), current_port, tracker_enabled.clone());
                         let vision_tx_clone = vision_tx.clone();
                         let status_tx_clone = status_tx.clone();
-                        
+
                         // Spawn vision task
                         vision_handle = Some(tokio::spawn(async move {
                             match vision_system.run(vision_tx_clone, status_tx_clone).await {
@@ -102,10 +111,7 @@ fn main() {
                     }
 
                     // Wait for config update or vision task to complete
-                    if let Some(ref mut handle) = vision_handle {
-                        // Guardar el estado antes del select para evitar problemas de borrow
-                        let handle_finished = handle.is_finished();
-                        
+                    if let Some(handle) = vision_handle.as_mut() {
                         tokio::select! {
                             Some(config) = config_rx.recv() => {
                                 // Update configuration
@@ -116,10 +122,10 @@ fn main() {
                                         current_port = new_port;
                                         // Abort and loop will restart with new config
                                         // Usar vision_handle directamente después del select
-                                        if let Some(ref mut h) = vision_handle {
-                                            if !h.is_finished() {
-                                                h.abort();
-                                            }
+                                        if let Some(ref mut h) = vision_handle
+                                            && !h.is_finished()
+                                        {
+                                            h.abort();
                                         }
                                         vision_handle = None; // Forzar recreación en la siguiente iteración
                                     }
@@ -163,7 +169,7 @@ fn main() {
             tokio::spawn(async move {
                 while let Some(event) = vision_rx.recv().await {
                     let mut world = world_for_vision.write().await;
-                    
+
                     match event {
                         VisionEvent::Robot(robot_data) => {
                             world.update_robot(
@@ -229,7 +235,7 @@ fn main() {
                     }
                 }
             };
-            
+
             // Crear robots en FIRASim antes de enviar comandos
             // VSS tiene 3 robots por equipo (IDs 0-2)
             // Esto asegura que los robots estén presentes en el simulador
@@ -269,7 +275,7 @@ fn main() {
                     eprintln!("[Main] Error enviando comandos neutros iniciales: {}", err);
                 }
             }
-            
+
             // Spawn a task to periodically compute motion commands and send them
             let world_for_motion = world_clone.clone();
             let radio_for_motion = radio.clone();
@@ -301,11 +307,7 @@ fn main() {
                 loop {
                     interval.tick().await;
 
-                    let (tick_target, robot_snapshot, computed_commands): (
-                        glam::Vec2,
-                        HashMap<i32, (glam::Vec2, glam::Vec2, f64)>,
-                        Vec<motion::MotionCommand>,
-                    ) = {
+                    let (tick_target, robot_snapshot, computed_commands): MotionTickOutput = {
                         let world = world_for_motion.read().await;
                         let ball_pos = if DEBUG_MOTION_LINE_STEP_TARGET {
                             glam::Vec2::new(DEBUG_MOTION_LINE_STEP_X, DEBUG_MOTION_LINE_STEP_Y)

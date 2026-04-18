@@ -3,3 +3,15 @@
 # Archivos markdown de documentación/guías (no subir al repositorio)
 *.md
 !README.md
+
+# Herramientas y asistentes de IA
+.codex
+.codex/
+.cursor/
+.claude/
+.aider*
+.continue/
+.roo/
+.windsurf/
+.copilot/
+.tabnine/
