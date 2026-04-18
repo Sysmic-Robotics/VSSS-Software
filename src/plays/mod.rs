@@ -1,8 +1,8 @@
-mod standard_play;
 mod coach_play;
+mod standard_play;
 
-pub use standard_play::StandardPlay;
 pub use coach_play::CoachPlay;
+pub use standard_play::StandardPlay;
 
 use crate::motion::{Motion, MotionCommand};
 use crate::world::World;

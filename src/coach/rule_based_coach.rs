@@ -1,7 +1,7 @@
-use glam::Vec2;
 use crate::coach::coach_trait::Coach;
-use crate::coach::observation::{Observation, FIELD_HALF_X, FIELD_HALF_Y};
+use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation};
 use crate::coach::robot_target::RobotTarget;
+use glam::Vec2;
 
 /// Coach clásico basado en reglas. Replica la lógica de `StandardPlay` expresada
 /// como targets de posición, sin llamar a motion primitives.
@@ -22,7 +22,10 @@ pub struct RuleBasedCoach {
 
 impl RuleBasedCoach {
     pub fn new(attack_goal: Vec2, own_goal: Vec2) -> Self {
-        Self { attack_goal, own_goal }
+        Self {
+            attack_goal,
+            own_goal,
+        }
     }
 
     /// Desnormaliza la posición de la pelota desde la observación.
@@ -33,7 +36,7 @@ impl RuleBasedCoach {
     fn attacker_target(&self, obs: &Observation) -> RobotTarget {
         let ball = Self::ball_pos(obs);
         let ball_to_goal = (self.attack_goal - ball).normalize_or_zero();
-        // Staging: 16cm detrás de la pelota (mismo valor que ChaseSkill::staging_offset)
+        // Staging: 16cm detrás de la pelota (mismo valor que ApproachBallBehindSkill::staging_offset)
         let staging = ball - ball_to_goal * 0.16;
         RobotTarget {
             robot_id: 0,
@@ -47,10 +50,7 @@ impl RuleBasedCoach {
         let to_own = (self.own_goal - ball).normalize_or_zero();
         let lateral = Vec2::new(-to_own.y, to_own.x) * 0.20;
         let raw = ball + to_own * 0.25 + lateral;
-        let pos = Vec2::new(
-            raw.x.clamp(-0.60, 0.60),
-            raw.y.clamp(-0.55, 0.55),
-        );
+        let pos = Vec2::new(raw.x.clamp(-0.60, 0.60), raw.y.clamp(-0.55, 0.55));
         RobotTarget {
             robot_id: 1,
             position: pos,
@@ -120,7 +120,10 @@ mod tests {
         let targets = coach.decide(&obs);
         let attacker = &targets[0];
         // staging_x = ball_x - (normalized ball_to_goal_x) * 0.16 = 0 - 1*0.16 = -0.16
-        assert!(attacker.position.x < 0.0, "staging debe estar detrás (izq) de la pelota");
+        assert!(
+            attacker.position.x < 0.0,
+            "staging debe estar detrás (izq) de la pelota"
+        );
         assert!(attacker.face_target.is_some());
     }
 
@@ -132,7 +135,10 @@ mod tests {
         let obs = make_obs(0.0, 0.15);
         let targets = coach.decide(&obs);
         let gk = &targets[2];
-        assert!((gk.position.y - 0.15).abs() < 0.01, "portero debe seguir y de la pelota");
+        assert!(
+            (gk.position.y - 0.15).abs() < 0.01,
+            "portero debe seguir y de la pelota"
+        );
         // defend_x = -0.75 + 1.0 * 0.12 = -0.63
         assert!((gk.position.x - (-0.63)).abs() < 0.01);
     }
@@ -143,6 +149,9 @@ mod tests {
         // Pelota en y=0.50 → portero debe clampear a ±0.20
         let obs = make_obs(0.0, 0.50);
         let targets = coach.decide(&obs);
-        assert!((targets[2].position.y - 0.20).abs() < 0.01, "debe clampear a 0.20");
+        assert!(
+            (targets[2].position.y - 0.20).abs() < 0.01,
+            "debe clampear a 0.20"
+        );
     }
 }

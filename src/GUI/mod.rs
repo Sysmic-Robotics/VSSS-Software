@@ -9,8 +9,7 @@ use iced::{
     Element, Length, Subscription, Task, Theme,
     widget::{Canvas, button, column, container, row, text},
 };
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -21,6 +20,9 @@ pub use rustengine::vision::StatusUpdate;
 
 /// `true` imprime cada actualización de robot en stderr (muy ruidoso). Dejar en `false` para auditar con `[FieldAudit]` en `main`.
 const GUI_LOG_EVERY_ROBOT_UPDATE: bool = false;
+/// Ritmo de refresco del campo en GUI. La visión/control siguen a tasa completa;
+/// solo la pintura del mapa se limita para evitar trabajo visual redundante.
+const GUI_FIELD_UPDATE_INTERVAL_MS: u64 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabView {
@@ -31,6 +33,7 @@ pub enum TabView {
 #[derive(Debug, Clone)]
 pub enum Message {
     StatusUpdate(StatusUpdate),
+    FieldSnapshot(FieldSnapshot),
     ChangeIp(String),
     ChangePort(String),
     Connect,
@@ -51,6 +54,73 @@ pub struct Robot {
 #[derive(Debug, Clone)]
 pub struct Ball {
     pub position: Vec2,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FieldSnapshot {
+    ball_count: Option<usize>,
+    robot_count: Option<usize>,
+    ball: Option<Ball>,
+    robots: Vec<Robot>,
+}
+
+#[derive(Debug, Default)]
+struct FieldSnapshotBuffer {
+    ball_count: Option<usize>,
+    robot_count: Option<usize>,
+    ball: Option<Ball>,
+    robots: BTreeMap<(u32, u32), Robot>,
+}
+
+impl FieldSnapshotBuffer {
+    fn push(&mut self, update: StatusUpdate) -> Option<StatusUpdate> {
+        match update {
+            StatusUpdate::Connected(_, _) | StatusUpdate::PacketReceived => Some(update),
+            StatusUpdate::BallDetected(count) => {
+                self.ball_count = Some(count);
+                None
+            }
+            StatusUpdate::RobotsDetected(count) => {
+                self.robot_count = Some(count);
+                None
+            }
+            StatusUpdate::BallPosition(position) => {
+                self.ball = Some(Ball { position });
+                None
+            }
+            StatusUpdate::RobotPosition(id, team, position, orientation) => {
+                self.robots.insert(
+                    (team, id),
+                    Robot {
+                        id,
+                        team,
+                        position,
+                        orientation,
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    fn drain_snapshot(&mut self) -> Option<FieldSnapshot> {
+        let snapshot = FieldSnapshot {
+            ball_count: self.ball_count.take(),
+            robot_count: self.robot_count.take(),
+            ball: self.ball.take(),
+            robots: std::mem::take(&mut self.robots).into_values().collect(),
+        };
+
+        if snapshot.ball_count.is_none()
+            && snapshot.robot_count.is_none()
+            && snapshot.ball.is_none()
+            && snapshot.robots.is_empty()
+        {
+            None
+        } else {
+            Some(snapshot)
+        }
+    }
 }
 
 pub struct VisionGui {
@@ -192,6 +262,28 @@ impl VisionGui {
                     }
                 }
             }
+            Message::FieldSnapshot(snapshot) => {
+                let mut field_changed = false;
+
+                if let Some(count) = snapshot.ball_count {
+                    self.last_ball_count = count;
+                }
+                if let Some(count) = snapshot.robot_count {
+                    self.last_robot_count = count;
+                }
+                if let Some(ball) = snapshot.ball {
+                    self.ball = Some(ball);
+                    field_changed = true;
+                }
+                for robot in snapshot.robots {
+                    self.robots.insert((robot.team, robot.id), robot);
+                    field_changed = true;
+                }
+
+                if field_changed {
+                    self.field_cache.clear();
+                }
+            }
             Message::ChangeIp(ip) => {
                 self.vision_ip = ip;
             }
@@ -263,8 +355,35 @@ impl VisionGui {
                 };
 
                 if let Some(mut rx) = receiver {
-                    while let Some(update) = rx.recv().await {
-                        let _ = output.send(Message::StatusUpdate(update)).await;
+                    let mut buffer = FieldSnapshotBuffer::default();
+                    let mut field_tick = tokio::time::interval(tokio::time::Duration::from_millis(
+                        GUI_FIELD_UPDATE_INTERVAL_MS,
+                    ));
+                    field_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                    loop {
+                        tokio::select! {
+                            maybe_update = rx.recv() => {
+                                match maybe_update {
+                                    Some(update) => {
+                                        if let Some(immediate) = buffer.push(update) {
+                                            let _ = output.send(Message::StatusUpdate(immediate)).await;
+                                        }
+                                    }
+                                    None => {
+                                        if let Some(snapshot) = buffer.drain_snapshot() {
+                                            let _ = output.send(Message::FieldSnapshot(snapshot)).await;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = field_tick.tick() => {
+                                if let Some(snapshot) = buffer.drain_snapshot() {
+                                    let _ = output.send(Message::FieldSnapshot(snapshot)).await;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -359,4 +478,56 @@ pub fn run_gui(
         .subscription(VisionGui::subscription)
         .theme(VisionGui::theme)
         .run_with(move || VisionGui::new(ip, port, config_tx, status_rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_snapshot_buffer_keeps_latest_visual_state() {
+        let mut buffer = FieldSnapshotBuffer::default();
+
+        assert!(matches!(
+            buffer.push(StatusUpdate::PacketReceived),
+            Some(StatusUpdate::PacketReceived)
+        ));
+
+        assert!(buffer.push(StatusUpdate::BallDetected(1)).is_none());
+        assert!(buffer.push(StatusUpdate::RobotsDetected(3)).is_none());
+        assert!(
+            buffer
+                .push(StatusUpdate::BallPosition(Vec2::new(10.0, 20.0)))
+                .is_none()
+        );
+        assert!(
+            buffer
+                .push(StatusUpdate::RobotPosition(0, 0, Vec2::new(1.0, 2.0), 0.1))
+                .is_none()
+        );
+        assert!(
+            buffer
+                .push(StatusUpdate::RobotPosition(0, 0, Vec2::new(3.0, 4.0), 0.2))
+                .is_none()
+        );
+
+        let snapshot = buffer.drain_snapshot().expect("snapshot should exist");
+        assert_eq!(snapshot.ball_count, Some(1));
+        assert_eq!(snapshot.robot_count, Some(3));
+        assert_eq!(
+            snapshot.ball.as_ref().map(|ball| ball.position),
+            Some(Vec2::new(10.0, 20.0))
+        );
+        assert_eq!(snapshot.robots.len(), 1);
+        assert_eq!(snapshot.robots[0].id, 0);
+        assert_eq!(snapshot.robots[0].team, 0);
+        assert_eq!(snapshot.robots[0].position, Vec2::new(3.0, 4.0));
+        assert_eq!(snapshot.robots[0].orientation, 0.2);
+    }
+
+    #[test]
+    fn field_snapshot_buffer_returns_none_when_empty() {
+        let mut buffer = FieldSnapshotBuffer::default();
+        assert!(buffer.drain_snapshot().is_none());
+    }
 }

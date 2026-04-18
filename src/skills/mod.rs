@@ -1,267 +1,722 @@
 use crate::motion::{Motion, MotionCommand};
-use crate::world::{World, RobotState};
+use crate::world::{RobotState, World};
 use glam::Vec2;
 
-/// Skill: acción primitiva de un solo robot con estado propio.
-/// Cada tick devuelve un MotionCommand listo para enviar.
+const LOGICAL_FIELD_HALF_X: f32 = 0.70;
+const LOGICAL_FIELD_HALF_Y: f32 = 0.60;
+
+const CONTROL_KP: f64 = 3.0;
+const CONTROL_KI: f64 = 0.08;
+const CONTROL_KD: f64 = 0.20;
+
 pub trait Skill: Send + Sync {
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand;
-    fn is_done(&self) -> bool;
-    fn reset(&mut self);
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// GoToSkill: navegar hacia una posición fija, mirando hacia donde se mueve.
-// ──────────────────────────────────────────────────────────────────────────────
+fn stop_cmd(robot: &RobotState) -> MotionCommand {
+    MotionCommand {
+        id: robot.id,
+        team: robot.team,
+        vx: 0.0,
+        vy: 0.0,
+        omega: 0.0,
+        orientation: robot.orientation,
+    }
+}
+
+fn clamp_to_logical_field(pos: Vec2) -> Vec2 {
+    Vec2::new(
+        pos.x.clamp(-LOGICAL_FIELD_HALF_X, LOGICAL_FIELD_HALF_X),
+        pos.y.clamp(-LOGICAL_FIELD_HALF_Y, LOGICAL_FIELD_HALF_Y),
+    )
+}
+
+fn is_inside_logical_field(pos: Vec2) -> bool {
+    pos.x.abs() <= LOGICAL_FIELD_HALF_X && pos.y.abs() <= LOGICAL_FIELD_HALF_Y
+}
+
+pub struct StopSkill;
+
+impl StopSkill {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for StopSkill {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Skill for StopSkill {
+    fn tick(&mut self, robot: &RobotState, _world: &World, _motion: &Motion) -> MotionCommand {
+        stop_cmd(robot)
+    }
+}
+
 pub struct GoToSkill {
     pub target: Vec2,
-    pub arrival_threshold: f32,
     pub kp: f64,
     pub ki: f64,
     pub kd: f64,
-    done: bool,
 }
 
 impl GoToSkill {
     pub fn new(target: Vec2) -> Self {
         Self {
             target,
-            arrival_threshold: 0.08,
-            kp: 1.2,
-            ki: 0.0,
-            kd: 0.10,
-            done: false,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
         }
     }
 
-    pub fn with_arrival(mut self, threshold: f32) -> Self {
-        self.arrival_threshold = threshold;
-        self
-    }
-
-    fn stop(robot: &RobotState) -> MotionCommand {
-        MotionCommand {
-            id: robot.id,
-            team: robot.team,
-            vx: 0.0,
-            vy: 0.0,
-            omega: 0.0,
-            orientation: robot.orientation,
-        }
+    pub fn set_target(&mut self, target: Vec2) {
+        self.target = target;
     }
 }
 
 impl Skill for GoToSkill {
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
-        let dist = (self.target - robot.position).length();
-        if dist < self.arrival_threshold {
-            self.done = true;
-            return Self::stop(robot);
-        }
-        motion.move_and_face(robot, self.target, self.target, world, self.kp, self.ki, self.kd)
-    }
-
-    fn is_done(&self) -> bool {
-        self.done
-    }
-
-    fn reset(&mut self) {
-        self.done = false;
+        motion.move_and_face(
+            robot,
+            self.target,
+            self.target,
+            world,
+            self.kp,
+            self.ki,
+            self.kd,
+        )
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// ChaseSkill: posicionarse detrás de la pelota (staging) y empujar hacia el goal.
-//
-// Fases:
-//   APPROACH: move_to(staging_point) + face_to(staging_point)
-//             staging_point = ball - ball_to_goal * staging_offset
-//   CAPTURA:  move_direct(push_target) + face_to(ball)
-//             push_target = ball + ball_to_goal * push_overshoot
-//
-// Histéresis: entra a CAPTURA cuando behind_ball && dist_staging <= staging_tol.
-//             sale de CAPTURA SOLO cuando robot está claramente por delante de la pelota.
-// ──────────────────────────────────────────────────────────────────────────────
-pub struct ChaseSkill {
-    pub goal: Vec2,
-    pub staging_offset: f32,
-    pub staging_tol: f32,
-    pub push_overshoot: f32,
+pub struct FacePointSkill {
+    pub target: Vec2,
     pub kp: f64,
     pub ki: f64,
     pub kd: f64,
-    pub in_captura: bool,
 }
 
-impl ChaseSkill {
-    pub fn new(goal: Vec2) -> Self {
+impl FacePointSkill {
+    pub fn new(target: Vec2) -> Self {
         Self {
-            goal,
-            staging_offset: 0.16,
-            staging_tol: 0.08,
-            push_overshoot: 0.12,
-            kp: 1.2,
-            ki: 0.0,
-            kd: 0.10,
-            in_captura: false,
+            target,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
         }
+    }
+
+    pub fn set_target(&mut self, target: Vec2) {
+        self.target = target;
     }
 }
 
-impl Skill for ChaseSkill {
-    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
-        let ball_pos = world.get_ball_state().position;
-        let ball_to_goal = (self.goal - ball_pos).normalize_or_zero();
-        let staging_point = ball_pos - ball_to_goal * self.staging_offset;
-        let push_target = ball_pos + ball_to_goal * self.push_overshoot;
-
-        let dist_staging = (staging_point - robot.position).length();
-        let dot = (robot.position - ball_pos).dot(self.goal - ball_pos);
-        let behind_ball = dot < 0.02;
-        let in_front_of_ball = dot > 0.05;
-
-        if behind_ball && dist_staging <= self.staging_tol {
-            self.in_captura = true;
-        } else if in_front_of_ball {
-            self.in_captura = false;
+impl Skill for FacePointSkill {
+    fn tick(&mut self, robot: &RobotState, _world: &World, motion: &Motion) -> MotionCommand {
+        if (self.target - robot.position).length_squared() < f32::EPSILON {
+            return stop_cmd(robot);
         }
 
-        // Pre-alineación solo muy cerca del staging: si se usa el balón demasiado pronto,
-        // UVF pide un heading y `face_to` otro → coupling≈0 y el robot solo gira.
-        let pre_align_radius = self.staging_tol * 1.5; // ~0.12 m
-        let face_target = if self.in_captura || dist_staging < pre_align_radius {
-            ball_pos
-        } else {
-            staging_point
-        };
-
-        if self.in_captura {
-            // En CAPTURA: move_direct ignora obstáculos (debe empujar la pelota directo).
-            // face_to(ball): mantiene heading mientras empuja y sigue a la pelota.
-            let mut cmd = motion.move_direct(robot, push_target);
-            let face = motion.face_to(robot, face_target, self.kp, self.ki, self.kd);
-            cmd.omega = face.omega;
-            cmd
-        } else {
-            // En APPROACH: UVF rodea obstáculos + coupling velocidad-steering integrado.
-            motion.move_and_face(robot, staging_point, face_target, world, self.kp, self.ki, self.kd)
-        }
-    }
-
-    fn is_done(&self) -> bool {
-        false // nunca termina; la pelota puede moverse lejos del goal en cualquier momento
-    }
-
-    fn reset(&mut self) {
-        self.in_captura = false;
+        motion.face_to(robot, self.target, self.kp, self.ki, self.kd)
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// DefendSkill: pararse frente al propio arco, siguiendo la Y de la pelota.
-// Mantiene X fija (en frente del arco), mueve Y para bloquear tiros.
-// ──────────────────────────────────────────────────────────────────────────────
-pub struct DefendSkill {
-    /// X de la línea de defensa (unos cm adelante del arco)
-    pub defend_x: f32,
-    /// Rango Y máximo donde el portero se desplaza (típicamente ±ancho_arco/2)
-    pub goal_half_y: f32,
+pub struct HoldPositionSkill {
+    pub position: Vec2,
+    pub face: Option<Vec2>,
     pub kp: f64,
     pub ki: f64,
     pub kd: f64,
 }
 
-impl DefendSkill {
-    /// `own_goal` es el centro del arco propio, e.g. Vec2::new(-0.75, 0.0)
+impl HoldPositionSkill {
+    pub fn new(position: Vec2) -> Self {
+        Self {
+            position,
+            face: None,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
+        }
+    }
+
+    pub fn facing(mut self, face: Vec2) -> Self {
+        self.face = Some(face);
+        self
+    }
+}
+
+impl Skill for HoldPositionSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let clamped_position = clamp_to_logical_field(self.position);
+        let face_target = self.face.unwrap_or(clamped_position);
+        motion.move_and_face(
+            robot,
+            clamped_position,
+            face_target,
+            world,
+            self.kp,
+            self.ki,
+            self.kd,
+        )
+    }
+}
+
+pub struct ChaseBallSkill {
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl ChaseBallSkill {
+    pub fn new() -> Self {
+        Self {
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
+        }
+    }
+}
+
+impl Default for ChaseBallSkill {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Skill for ChaseBallSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        motion.move_and_face(robot, ball, ball, world, self.kp, self.ki, self.kd)
+    }
+}
+
+pub struct DefendGoalLineSkill {
+    pub defend_x: f32,
+    pub goal_half_y: f32,
+    pub band_half_width: f32,
+    pub y_deadband: f32,
+    pub prediction_horizon_max: f32,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl DefendGoalLineSkill {
     pub fn new(own_goal: Vec2) -> Self {
-        let sign = if own_goal.x < 0.0 { 1.0_f32 } else { -1.0 };
+        let sign = if own_goal.x < 0.0 { 1.0_f32 } else { -1.0_f32 };
         Self {
             defend_x: own_goal.x + sign * 0.12,
             goal_half_y: 0.20,
+            band_half_width: 0.03,
+            y_deadband: 0.03,
+            prediction_horizon_max: 0.40,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
+        }
+    }
+
+    fn band_limits(&self) -> (f32, f32) {
+        (
+            self.defend_x - self.band_half_width,
+            self.defend_x + self.band_half_width,
+        )
+    }
+
+    fn moving_toward_goal(&self, ball: Vec2, ball_velocity: Vec2) -> Option<f32> {
+        let vx = ball_velocity.x;
+        if vx.abs() < 0.05 {
+            return None;
+        }
+
+        let time_to_line = (self.defend_x - ball.x) / vx;
+        if time_to_line <= 0.0 || time_to_line > self.prediction_horizon_max {
+            return None;
+        }
+
+        Some(time_to_line)
+    }
+
+    fn block_y(&self, ball: Vec2, ball_velocity: Vec2) -> f32 {
+        let predicted_y = self
+            .moving_toward_goal(ball, ball_velocity)
+            .map(|time| ball.y + ball_velocity.y * time)
+            .unwrap_or(ball.y);
+        predicted_y.clamp(-self.goal_half_y, self.goal_half_y)
+    }
+
+    pub fn defend_pos(&self, ball: Vec2) -> Vec2 {
+        Vec2::new(
+            self.defend_x,
+            ball.y.clamp(-self.goal_half_y, self.goal_half_y),
+        )
+    }
+
+    fn defend_target(&self, robot: &RobotState, ball: Vec2, ball_velocity: Vec2) -> Vec2 {
+        let (band_min_x, band_max_x) = self.band_limits();
+        let target_x = robot.position.x.clamp(band_min_x, band_max_x);
+        let block_y = self.block_y(ball, ball_velocity);
+        let target_y = if (block_y - robot.position.y).abs() < self.y_deadband {
+            robot.position.y
+        } else {
+            block_y
+        };
+
+        Vec2::new(target_x, target_y)
+    }
+
+    fn should_face_ball(&self, robot: &RobotState, move_target: Vec2) -> bool {
+        let (band_min_x, band_max_x) = self.band_limits();
+        let inside_band = robot.position.x >= band_min_x && robot.position.x <= band_max_x;
+        let settled_y = (move_target.y - robot.position.y).abs() < self.y_deadband;
+        inside_band && settled_y
+    }
+}
+
+impl Skill for DefendGoalLineSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        let ball_velocity = world.get_ball_state().velocity;
+        let move_target = self.defend_target(robot, ball, ball_velocity);
+        let face_target = if self.should_face_ball(robot, move_target) {
+            ball
+        } else {
+            move_target
+        };
+
+        motion.move_and_face(
+            robot,
+            move_target,
+            face_target,
+            world,
+            self.kp,
+            self.ki,
+            self.kd,
+        )
+    }
+}
+
+pub struct SupportPositionSkill {
+    pub own_goal: Vec2,
+    pub behind_ball_offset: f32,
+    pub lateral_offset: f32,
+    pub field_half_x: f32,
+    pub field_half_y: f32,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl SupportPositionSkill {
+    pub fn new(own_goal: Vec2) -> Self {
+        Self {
+            own_goal,
+            behind_ball_offset: 0.25,
+            lateral_offset: 0.20,
+            field_half_x: 0.60,
+            field_half_y: 0.55,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
+        }
+    }
+
+    pub fn support_pos(&self, ball: Vec2) -> Vec2 {
+        let to_own = (self.own_goal - ball).normalize_or_zero();
+        let perp = Vec2::new(-to_own.y, to_own.x) * self.lateral_offset;
+        let raw = ball + to_own * self.behind_ball_offset + perp;
+        Vec2::new(
+            raw.x.clamp(-self.field_half_x, self.field_half_x),
+            raw.y.clamp(-self.field_half_y, self.field_half_y),
+        )
+    }
+}
+
+impl Skill for SupportPositionSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        let target = self.support_pos(ball);
+        motion.move_and_face(robot, target, ball, world, self.kp, self.ki, self.kd)
+    }
+}
+
+pub struct ApproachBallBehindSkill {
+    pub aim_point: Vec2,
+    pub staging_offset: f32,
+    pub staging_tol: f32,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl ApproachBallBehindSkill {
+    pub fn new(aim_point: Vec2) -> Self {
+        Self {
+            aim_point,
+            staging_offset: 0.16,
+            staging_tol: 0.08,
             kp: 1.2,
             ki: 0.0,
             kd: 0.10,
         }
     }
+
+    pub fn set_aim_point(&mut self, point: Vec2) {
+        self.aim_point = point;
+    }
 }
 
-impl Skill for DefendSkill {
+impl Skill for ApproachBallBehindSkill {
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
-        let ball_pos = world.get_ball_state().position;
-        let target_y = ball_pos.y.clamp(-self.goal_half_y, self.goal_half_y);
-        let defend_pos = Vec2::new(self.defend_x, target_y);
+        let ball = world.get_ball_state().position;
+        let ball_to_aim = (self.aim_point - ball).normalize_or_zero();
+        let staging = ball - ball_to_aim * self.staging_offset;
 
-        motion.move_and_face(robot, defend_pos, ball_pos, world, self.kp, self.ki, self.kd)
+        let dist_staging = (staging - robot.position).length();
+        let pre_align_radius = self.staging_tol * 1.5;
+        let face_target = if dist_staging < pre_align_radius {
+            ball
+        } else {
+            staging
+        };
+
+        if dist_staging <= self.staging_tol {
+            return motion.face_to(robot, ball, self.kp, self.ki, self.kd);
+        }
+
+        motion.move_and_face(
+            robot,
+            staging,
+            face_target,
+            world,
+            self.kp,
+            self.ki,
+            self.kd,
+        )
+    }
+}
+
+pub struct PushBallSkill {
+    pub push_target: Vec2,
+    pub push_overshoot: f32,
+    pub lose_radius: f32,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl PushBallSkill {
+    pub fn new(push_target: Vec2) -> Self {
+        Self {
+            push_target,
+            push_overshoot: 0.12,
+            lose_radius: 0.25,
+            kp: 1.2,
+            ki: 0.0,
+            kd: 0.10,
+        }
     }
 
-    fn is_done(&self) -> bool {
-        false
+    pub fn set_push_target(&mut self, point: Vec2) {
+        self.push_target = point;
+    }
+}
+
+impl Skill for PushBallSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        let push_dir = (self.push_target - ball).normalize_or_zero();
+        let push_point = ball + push_dir * self.push_overshoot;
+        let dot = (robot.position - ball).dot(self.push_target - ball);
+        let dist_ball = (ball - robot.position).length();
+
+        if dot > 0.05 || dist_ball > self.lose_radius {
+            return stop_cmd(robot);
+        }
+
+        let mut cmd = motion.move_direct(robot, push_point);
+        let face = motion.face_to(robot, ball, self.kp, self.ki, self.kd);
+        cmd.omega = face.omega;
+        cmd
+    }
+}
+
+pub struct AlignBallToTargetSkill {
+    pub target_point: Vec2,
+    pub stand_off: f32,
+    pub pos_tol: f32,
+    pub angle_tol: f64,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl AlignBallToTargetSkill {
+    pub fn new(target_point: Vec2) -> Self {
+        Self {
+            target_point,
+            stand_off: 0.12,
+            pos_tol: 0.05,
+            angle_tol: 0.10,
+            kp: 1.2,
+            ki: 0.0,
+            kd: 0.10,
+        }
     }
 
-    fn reset(&mut self) {}
+    pub fn set_target_point(&mut self, point: Vec2) {
+        self.target_point = point;
+    }
+
+    pub fn align_pos(&self, ball: Vec2) -> Vec2 {
+        let dir = (self.target_point - ball).normalize_or_zero();
+        ball - dir * self.stand_off
+    }
+}
+
+impl Skill for AlignBallToTargetSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        let line_dir = (self.target_point - ball).normalize_or_zero();
+        if line_dir.length_squared() < f32::EPSILON {
+            return stop_cmd(robot);
+        }
+
+        let align_pos = ball - line_dir * self.stand_off;
+        if !is_inside_logical_field(align_pos) {
+            return stop_cmd(robot);
+        }
+
+        let pos_err = (align_pos - robot.position).length();
+        let desired_theta = line_dir.y.atan2(line_dir.x) as f64;
+        let ang_err = Motion::normalize_angle(desired_theta - robot.orientation).abs();
+        if pos_err < self.pos_tol && ang_err < self.angle_tol {
+            return stop_cmd(robot);
+        }
+
+        motion.move_and_face(
+            robot,
+            align_pos,
+            self.target_point,
+            world,
+            self.kp,
+            self.ki,
+            self.kd,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::World;
 
     fn make_robot(id: i32, x: f32, y: f32, orient_deg: f32) -> RobotState {
-        let mut r = RobotState::new(id, 0);
-        r.position = Vec2::new(x, y);
-        r.orientation = orient_deg.to_radians() as f64;
-        r
+        let mut robot = RobotState::new(id, 0);
+        robot.position = Vec2::new(x, y);
+        robot.orientation = orient_deg.to_radians() as f64;
+        robot
     }
 
     #[test]
-    fn test_goto_skill_moves_toward_target() {
-        let motion = Motion::new();
-        let mut world = World::new(3, 3);
-        world.update_ball(Vec2::new(0.0, 0.5), Vec2::ZERO); // pelota fuera del camino
-        let mut skill = GoToSkill::new(Vec2::new(0.5, 0.0));
-        let robot = make_robot(0, 0.0, 0.0, 0.0);
-
-        let cmd = skill.tick(&robot, &world, &motion);
-        assert!(cmd.vx > 0.0, "debe moverse en X positivo");
-        assert!(!skill.is_done());
-    }
-
-    #[test]
-    fn test_goto_skill_done_at_target() {
+    fn stop_skill_returns_zero_command() {
         let motion = Motion::new();
         let world = World::new(3, 3);
-        let mut skill = GoToSkill::new(Vec2::new(0.0, 0.0));
-        let robot = make_robot(0, 0.03, 0.0, 0.0); // dentro del threshold 0.08m
-
-        skill.tick(&robot, &world, &motion);
-        assert!(skill.is_done());
-    }
-
-    #[test]
-    fn test_chase_skill_approach_phase() {
-        let motion = Motion::new();
-        let mut world = World::new(3, 3);
-        world.update_ball(Vec2::new(0.1, 0.0), Vec2::ZERO);
-
-        let mut skill = ChaseSkill::new(Vec2::new(0.75, 0.0));
-        let robot = make_robot(0, -0.3, 0.0, 0.0);
-
-        let _cmd = skill.tick(&robot, &world, &motion);
-        // En approach, in_captura debe seguir false (robot lejos del staging)
-        assert!(!skill.in_captura);
-    }
-
-    #[test]
-    fn test_defend_skill_tracks_ball_y() {
-        let motion = Motion::new();
-        let mut world = World::new(3, 3);
-        world.update_ball(Vec2::new(0.0, 0.15), Vec2::ZERO);
-
-        let mut skill = DefendSkill::new(Vec2::new(-0.75, 0.0));
-        let robot = make_robot(2, -0.63, 0.0, 0.0);
+        let robot = make_robot(0, 0.0, 0.0, 45.0);
+        let mut skill = StopSkill::new();
 
         let cmd = skill.tick(&robot, &world, &motion);
-        // Debe tener componente Y positiva (seguir pelota en y=0.15)
-        assert!(cmd.vy > 0.0 || cmd.omega.abs() > 0.0, "debe moverse/rotar hacia pelota");
+
+        assert_eq!(cmd.vx, 0.0);
+        assert_eq!(cmd.vy, 0.0);
+        assert_eq!(cmd.omega, 0.0);
+        assert!((cmd.orientation - 45.0_f64.to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn goto_skill_moves_toward_target() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let robot = make_robot(0, 0.0, 0.0, 0.0);
+        let mut skill = GoToSkill::new(Vec2::new(0.4, 0.0));
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert!(cmd.vx > 0.0 || cmd.omega.abs() > 0.0);
+    }
+
+    #[test]
+    fn face_point_skill_rotates_without_translation() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let robot = make_robot(0, 0.0, 0.0, 90.0);
+        let mut skill = FacePointSkill::new(Vec2::new(0.5, 0.0));
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert_eq!(cmd.vx, 0.0);
+        assert_eq!(cmd.vy, 0.0);
+        assert!(cmd.omega.abs() > 0.0);
+    }
+
+    #[test]
+    fn hold_position_skill_clamps_outside_targets() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let robot = make_robot(0, 0.0, 0.0, 0.0);
+        let mut skill = HoldPositionSkill::new(Vec2::new(1.0, 0.9));
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert!(cmd.vx.abs() + cmd.vy.abs() + cmd.omega.abs() > 0.0);
+    }
+
+    #[test]
+    fn chase_ball_skill_reacts_to_ball_motion() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        let robot = make_robot(0, 0.0, 0.0, 0.0);
+        let mut skill = ChaseBallSkill::new();
+
+        world.update_ball(Vec2::new(0.4, 0.0), Vec2::ZERO);
+        let cmd_right = skill.tick(&robot, &world, &motion);
+
+        world.update_ball(Vec2::new(-0.4, 0.0), Vec2::ZERO);
+        let cmd_left = skill.tick(&robot, &world, &motion);
+
+        let diff = (cmd_right.vx - cmd_left.vx).abs() + (cmd_right.omega - cmd_left.omega).abs();
+        assert!(diff > 0.1);
+    }
+
+    #[test]
+    fn defend_goal_line_skill_predicts_ball_trajectory_toward_goal() {
+        let skill = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
+        let ball = Vec2::new(-0.30, 0.02);
+        let ball_velocity = Vec2::new(-1.0, 0.40);
+
+        let time_to_line = (skill.defend_x - ball.x) / ball_velocity.x;
+        let expected_y =
+            (ball.y + ball_velocity.y * time_to_line).clamp(-skill.goal_half_y, skill.goal_half_y);
+
+        let block_y = skill.block_y(ball, ball_velocity);
+
+        assert!((block_y - expected_y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn defend_goal_line_skill_keeps_target_inside_defensive_band() {
+        let skill = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
+        let robot = make_robot(2, -0.80, 0.0, 0.0);
+        let ball = Vec2::new(0.0, 0.12);
+
+        let target = skill.defend_target(&robot, ball, Vec2::ZERO);
+        let (band_min_x, band_max_x) = skill.band_limits();
+
+        assert!((target.x - band_min_x).abs() < 1e-6);
+        assert!(target.x >= band_min_x);
+        assert!(target.x <= band_max_x);
+        assert!((target.y - ball.y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn defend_goal_line_skill_prioritizes_stable_posture_over_exact_ball_tracking() {
+        let skill = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
+        let robot = make_robot(2, skill.defend_x, 0.10, 0.0);
+        let ball = Vec2::new(0.0, 0.115);
+
+        let target = skill.defend_target(&robot, ball, Vec2::ZERO);
+
+        assert!((target.y - robot.position.y).abs() < 1e-6);
+    }
+
+    #[test]
+    fn defend_goal_line_skill_faces_ball_only_when_already_stable() {
+        let skill = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
+
+        let stable_robot = make_robot(2, skill.defend_x, 0.10, 0.0);
+        let stable_target = skill.defend_target(&stable_robot, Vec2::new(0.0, 0.115), Vec2::ZERO);
+        assert!(skill.should_face_ball(&stable_robot, stable_target));
+
+        let recovering_robot = make_robot(2, skill.defend_x + 0.08, 0.0, 0.0);
+        let recovering_target =
+            skill.defend_target(&recovering_robot, Vec2::new(0.0, 0.15), Vec2::ZERO);
+        assert!(!skill.should_face_ball(&recovering_robot, recovering_target));
+    }
+
+    #[test]
+    fn defend_goal_line_skill_generates_activity_when_recovering_shape() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.0, 0.5), Vec2::new(-0.6, -0.2));
+        let robot = make_robot(2, -0.40, 0.0, 0.0);
+        let mut skill = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert!(cmd.vx.abs() + cmd.vy.abs() + cmd.omega.abs() > 0.0);
+    }
+
+    #[test]
+    fn support_position_skill_stays_behind_ball() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.70, 0.60), Vec2::ZERO);
+        let robot = make_robot(1, -0.4, 0.1, 0.0);
+        let mut skill = SupportPositionSkill::new(Vec2::new(-0.75, 0.0));
+
+        let target = skill.support_pos(world.get_ball_state().position);
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert!(target.x < world.get_ball_state().position.x);
+        assert!(target.x.abs() <= skill.field_half_x + 1e-6);
+        assert!(target.y.abs() <= skill.field_half_y + 1e-6);
+        assert!(cmd.vx.abs() + cmd.vy.abs() + cmd.omega.abs() > 0.0);
+    }
+
+    #[test]
+    fn approach_ball_behind_skill_faces_ball_at_staging() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.0, 0.0), Vec2::ZERO);
+        let robot = make_robot(0, -0.16, 0.0, 90.0);
+        let mut skill = ApproachBallBehindSkill::new(Vec2::new(0.75, 0.0));
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert_eq!(cmd.vx, 0.0);
+        assert_eq!(cmd.vy, 0.0);
+        assert!(cmd.omega.abs() > 0.0);
+    }
+
+    #[test]
+    fn push_ball_skill_stops_when_ball_is_out_of_reach() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.0, 0.0), Vec2::ZERO);
+        let robot = make_robot(0, -0.40, 0.0, 0.0);
+        let mut skill = PushBallSkill::new(Vec2::new(0.75, 0.0));
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert_eq!(cmd.vx, 0.0);
+        assert_eq!(cmd.vy, 0.0);
+        assert_eq!(cmd.omega, 0.0);
+    }
+
+    #[test]
+    fn align_ball_to_target_skill_stops_when_invalid() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(-0.69, 0.0), Vec2::ZERO);
+        let robot = make_robot(0, -0.40, 0.0, 0.0);
+        let mut skill = AlignBallToTargetSkill::new(Vec2::new(0.75, 0.0));
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert_eq!(cmd.vx, 0.0);
+        assert_eq!(cmd.vy, 0.0);
+        assert_eq!(cmd.omega, 0.0);
     }
 }

@@ -454,7 +454,7 @@ mod tests {
         let start_orient = std::f64::consts::PI / 3.0; // 60°
         let staging_offset = 0.16_f32;
         let staging_tol = 0.08_f32;
-        // Parámetros idénticos a ChaseSkill::new() en skills/mod.rs
+        // Parámetros idénticos a ApproachBallBehindSkill::new() en skills/mod.rs
         let kp = 1.2_f64;
         let ki = 0.0_f64;
         let kd = 0.10_f64;
@@ -538,7 +538,7 @@ mod tests {
                 motion.move_to(&robot, staging_point, &world)
             };
 
-            // face_to con pre-alineación (idéntico a ChaseSkill::tick):
+            // face_to con pre-alineación (idéntico a ApproachBallBehindSkill::tick):
             // cuando el robot está cerca del staging, empieza a mirar hacia la pelota
             // para llegar a CAPTURA ya apuntando en la dirección correcta.
             let pre_align_radius = staging_tol * 3.0; // 0.24m

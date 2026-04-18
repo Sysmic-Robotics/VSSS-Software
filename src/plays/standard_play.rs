@@ -7,11 +7,12 @@ use glam::Vec2;
 // ──────────────────────────────────────────────────────────────────────────────
 // StandardPlay: asignación fija de roles para el equipo azul.
 //
-//   Robot 0 → AttackerTactic  (persigue la pelota y la empuja al goal)
+//   Robot 0 → AttackerTactic  (se posiciona detrás de la pelota hacia el goal rival)
 //   Robot 1 → SupportTactic   (se posiciona como respaldo del atacante)
 //   Robot 2 → GoalkeeperTactic (defiende el arco propio)
 //
-// Conservado para A/B testing vs CoachPlay(RuleBasedCoach).
+// Conservado como camino alternativo frente a CoachPlay(RuleBasedCoach) y como base
+// para una futura capa de strategy.
 // ──────────────────────────────────────────────────────────────────────────────
 pub struct StandardPlay {
     attacker: AttackerTactic,
@@ -33,11 +34,7 @@ impl StandardPlay {
 
 impl Play for StandardPlay {
     fn tick(&mut self, world: &World, motion: &Motion) -> Vec<MotionCommand> {
-        let robots: Vec<_> = world
-            .get_blue_team_active()
-            .into_iter()
-            .cloned()
-            .collect();
+        let robots: Vec<_> = world.get_blue_team_active().into_iter().cloned().collect();
 
         robots
             .iter()

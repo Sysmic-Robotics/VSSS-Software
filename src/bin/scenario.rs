@@ -3,133 +3,261 @@
 // Corre `cargo run --bin scenario --release` para ejecutar.
 // No tiene GUI; solo logs por stderr y movimiento en FIRASim.
 //
-// ────────────────────────────────────────────────────────────
-//  EDITA AQUÍ TU ESCENARIO
-// ────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+//  EDITA AQUI TU ESCENARIO
+// ---------------------------------------------------------------------------
 // Modifica `scenario_tick()` con lo que quieras probar.
-// Algunos ejemplos están listos más abajo; descomenta el que quieras.
-// ────────────────────────────────────────────────────────────
+// Todas las primitives de abajo son skills reactivas simples.
+// ---------------------------------------------------------------------------
 
-// ====== Parámetros del escenario ======
-/// Equipo que controla este escenario (0=azul, 1=amarillo)
 const OWN_TEAM: i32 = 0;
-/// Robot que usas en el escenario (cuando el escenario controla uno solo)
 const ROBOT_ID: i32 = 0;
-// ======================================
 
 use glam::Vec2;
 use rustengine::motion::{Motion, MotionCommand};
-use rustengine::world::World;
+use rustengine::skills::{
+    AlignBallToTargetSkill, ApproachBallBehindSkill, ChaseBallSkill, DefendGoalLineSkill,
+    FacePointSkill, GoToSkill, HoldPositionSkill, PushBallSkill, Skill, StopSkill,
+    SupportPositionSkill,
+};
+use rustengine::world::{RobotState, World};
 
-/// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-/// FUNCIÓN PRINCIPAL DEL ESCENARIO — edita esto libremente.
-/// Se llama a ~60 Hz con el estado actual del mundo.
-/// Devuelve los comandos de movimiento que quieras aplicar.
-/// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-fn scenario_tick(world: &World, motion: &Motion) -> Vec<MotionCommand> {
-    // ── Ejemplo 1: Robot 0 va a una posición fija ──────────────
-    //go_to_point(world, motion, ROBOT_ID, Vec2::new(0.3, 0.2))
-    //go_to_point(world, motion, ROBOT_ID, Vec2::new(0.0, 0.0))
-    // ── Ejemplo 2: Robot 0 persigue la pelota ──────────────────
-    chase_ball(world, motion, ROBOT_ID)
-
-    // ── Ejemplo 3: Robot 0 hace un circuito de 4 puntos ────────
-    // circuit(world, motion, ROBOT_ID, &[
-    //     Vec2::new( 0.4,  0.3),
-    //     Vec2::new( 0.4, -0.3),
-    //     Vec2::new(-0.4, -0.3),
-    //     Vec2::new(-0.4,  0.3),
-    // ])
-
-    // ── Ejemplo 4: Todos los robots al centro ──────────────────
-    // all_to_center(world, motion)
+fn scenario_tick(world: &World, motion: &Motion, state: &mut ScenarioState) -> Vec<MotionCommand> {
+    //run_skill_chase_ball(state, world, motion, ROBOT_ID)
+    //run_skill_stop(state, world, motion, ROBOT_ID)
+    //run_skill_go_to_point(state, world, motion, ROBOT_ID, Vec2::new(0.3, 0.2))
+    //run_skill_face_point(state, world, motion, ROBOT_ID, world.get_ball_state().position)
+    //run_skill_hold_position(state, world, motion, ROBOT_ID, Vec2::new(0.0, 0.3), None)
+    run_skill_defend_goal_line(state, world, motion, ROBOT_ID, Vec2::new(-0.75, 0.0))
+    //run_skill_support_position(state, world, motion, ROBOT_ID, Vec2::new(-0.75, 0.0))
+    //run_skill_approach_to_goal(state, world, motion, ROBOT_ID, Vec2::new(0.75, 0.0))
+    //run_skill_push_to_goal(state, world, motion, ROBOT_ID, Vec2::new(0.75, 0.0))
+    //run_skill_align_to_goal(state, world, motion, ROBOT_ID, Vec2::new(0.75, 0.0))
 }
 
-// ─────────────────────────────────────────────────────────────
-// Funciones de ayuda — puedes usarlas o escribir las tuyas.
-//
-// NOTA: los robots VSS son diferenciales — sin omega (rotación)
-// el robot solo puede avanzar/retroceder en la dirección que ya
-// mira. Por eso todos los helpers usan move_and_face en lugar de
-// move_to, así el robot rota Y avanza al mismo tiempo.
-// Ganancias PID de heading: kp=1.2, ki=0.0, kd=0.10
-// ─────────────────────────────────────────────────────────────
+struct ScenarioState {
+    stop: StopSkill,
+    go_to_point: GoToSkill,
+    face_point: FacePointSkill,
+    hold_position: HoldPositionSkill,
+    chase_ball: ChaseBallSkill,
+    defend_goal_line: DefendGoalLineSkill,
+    support_position: SupportPositionSkill,
+    approach_to_goal: ApproachBallBehindSkill,
+    push_to_goal: PushBallSkill,
+    align_to_goal: AlignBallToTargetSkill,
+    circuit_index: usize,
+}
 
-const KP: f64 = 1.2;
-const KI: f64 = 0.0;
-const KD: f64 = 0.10;
+impl Default for ScenarioState {
+    fn default() -> Self {
+        Self {
+            stop: StopSkill::new(),
+            go_to_point: GoToSkill::new(Vec2::ZERO),
+            face_point: FacePointSkill::new(Vec2::ZERO),
+            hold_position: HoldPositionSkill::new(Vec2::ZERO),
+            chase_ball: ChaseBallSkill::new(),
+            defend_goal_line: DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0)),
+            support_position: SupportPositionSkill::new(Vec2::new(-0.75, 0.0)),
+            approach_to_goal: ApproachBallBehindSkill::new(Vec2::ZERO),
+            push_to_goal: PushBallSkill::new(Vec2::ZERO),
+            align_to_goal: AlignBallToTargetSkill::new(Vec2::ZERO),
+            circuit_index: 0,
+        }
+    }
+}
 
-/// Mueve un robot a una posición fija mirando hacia donde va.
-fn go_to_point(world: &World, motion: &Motion, robot_id: i32, target: Vec2) -> Vec<MotionCommand> {
-    let team_robots = if OWN_TEAM == 0 {
+fn find_robot(world: &World, robot_id: i32) -> Option<RobotState> {
+    let team = if OWN_TEAM == 0 {
         world.get_blue_team_active()
     } else {
         world.get_yellow_team_active()
     };
-    team_robots
-        .iter()
-        .filter(|r| r.id == robot_id)
-        .map(|r| motion.move_and_face(r, target, target, world, KP, KI, KD))
-        .collect()
+    team.into_iter().find(|robot| robot.id == robot_id).cloned()
 }
 
-/// Mueve un robot hacia donde está la pelota.
 #[allow(dead_code)]
-fn chase_ball(world: &World, motion: &Motion, robot_id: i32) -> Vec<MotionCommand> {
-    let ball_pos = world.get_ball_state().position;
-    go_to_point(world, motion, robot_id, ball_pos)
+fn run_skill_stop(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    vec![state.stop.tick(&robot, world, motion)]
 }
 
-/// Hace un circuito de puntos (pasa al siguiente al llegar).
+#[allow(dead_code)]
+fn run_skill_go_to_point(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    target: Vec2,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.go_to_point.set_target(target);
+    vec![state.go_to_point.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_face_point(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    target: Vec2,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.face_point.set_target(target);
+    vec![state.face_point.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_hold_position(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    position: Vec2,
+    face: Option<Vec2>,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.hold_position.position = position;
+    state.hold_position.face = face;
+    vec![state.hold_position.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_chase_ball(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    vec![state.chase_ball.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_defend_goal_line(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    own_goal: Vec2,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.defend_goal_line = DefendGoalLineSkill::new(own_goal);
+    vec![state.defend_goal_line.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_support_position(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    own_goal: Vec2,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.support_position = SupportPositionSkill::new(own_goal);
+    vec![state.support_position.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_approach_to_goal(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    target_point: Vec2,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.approach_to_goal.set_aim_point(target_point);
+    vec![state.approach_to_goal.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_push_to_goal(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    target_point: Vec2,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.push_to_goal.set_push_target(target_point);
+    vec![state.push_to_goal.tick(&robot, world, motion)]
+}
+
+#[allow(dead_code)]
+fn run_skill_align_to_goal(
+    state: &mut ScenarioState,
+    world: &World,
+    motion: &Motion,
+    robot_id: i32,
+    target_point: Vec2,
+) -> Vec<MotionCommand> {
+    let Some(robot) = find_robot(world, robot_id) else {
+        return vec![];
+    };
+    state.align_to_goal.set_target_point(target_point);
+    vec![state.align_to_goal.tick(&robot, world, motion)]
+}
+
 #[allow(dead_code)]
 fn circuit(
+    state: &mut ScenarioState,
     world: &World,
     motion: &Motion,
     robot_id: i32,
     waypoints: &[Vec2],
 ) -> Vec<MotionCommand> {
-    use std::cell::Cell;
-    thread_local! {
-        static WAYPOINT_IDX: Cell<usize> = const { Cell::new(0) };
-    }
-
-    let team_robots = if OWN_TEAM == 0 {
-        world.get_blue_team_active()
-    } else {
-        world.get_yellow_team_active()
-    };
-
-    let Some(robot) = team_robots.iter().find(|r| r.id == robot_id) else {
+    let Some(robot) = find_robot(world, robot_id) else {
         return vec![];
     };
 
-    WAYPOINT_IDX.with(|idx_cell| {
-        let idx = idx_cell.get();
-        let target = waypoints[idx % waypoints.len()];
-        if (target - robot.position).length() < 0.08 {
-            idx_cell.set((idx + 1) % waypoints.len());
-        }
-        vec![motion.move_and_face(robot, target, target, world, KP, KI, KD)]
-    })
+    let target = waypoints[state.circuit_index % waypoints.len()];
+    if (target - robot.position).length() < 0.08 {
+        state.circuit_index = (state.circuit_index + 1) % waypoints.len();
+    }
+    state.go_to_point.set_target(target);
+    vec![state.go_to_point.tick(&robot, world, motion)]
 }
 
-/// Mueve todos los robots del equipo al centro del campo.
 #[allow(dead_code)]
-fn all_to_center(world: &World, motion: &Motion) -> Vec<MotionCommand> {
+fn all_to_center(state: &mut ScenarioState, world: &World, motion: &Motion) -> Vec<MotionCommand> {
     let team_robots = if OWN_TEAM == 0 {
         world.get_blue_team_active()
     } else {
         world.get_yellow_team_active()
     };
+
+    state.go_to_point.set_target(Vec2::ZERO);
     team_robots
         .iter()
-        .map(|r| motion.move_and_face(r, Vec2::ZERO, Vec2::ZERO, world, KP, KI, KD))
+        .map(|robot| state.go_to_point.tick(robot, world, motion))
         .collect()
 }
-
-// ─────────────────────────────────────────────────────────────
-// Infraestructura — no necesitas editar lo que está debajo.
-// ─────────────────────────────────────────────────────────────
 
 use rustengine::{
     radio,
@@ -148,45 +276,43 @@ async fn async_main() {
     let (vision_tx, mut vision_rx) = mpsc::channel(100);
     let world = Arc::new(TokioRwLock::new(World::new(3, 3)));
     let tracker_enabled = Arc::new(AtomicBool::new(true));
+    let mut scenario = ScenarioState::default();
 
-    // Visión
     {
         let tracker_enabled = tracker_enabled.clone();
         tokio::spawn(async move {
             let mut vis = Vision::new("224.0.0.1".to_string(), 10002, tracker_enabled);
             let (dummy_status_tx, _) = mpsc::channel(1);
-            if let Err(e) = vis.run(vision_tx, dummy_status_tx).await {
-                eprintln!("[scenario] visión error: {e}");
+            if let Err(err) = vis.run(vision_tx, dummy_status_tx).await {
+                eprintln!("[scenario] vision error: {err}");
             }
         });
     }
 
-    // Actualizar mundo con eventos de visión
     {
         let world = world.clone();
         tokio::spawn(async move {
             while let Some(event) = vision_rx.recv().await {
-                let mut w = world.write().await;
+                let mut current_world = world.write().await;
                 match event {
-                    VisionEvent::Robot(r) => {
-                        w.update_robot(
-                            r.id as i32,
-                            r.team as i32,
-                            r.position,
-                            r.orientation as f64,
-                            r.velocity,
-                            r.angular_velocity as f64,
+                    VisionEvent::Robot(robot) => {
+                        current_world.update_robot(
+                            robot.id as i32,
+                            robot.team as i32,
+                            robot.position,
+                            robot.orientation as f64,
+                            robot.velocity,
+                            robot.angular_velocity as f64,
                         );
                     }
-                    VisionEvent::Ball(b) => {
-                        w.update_ball(b.position, b.velocity);
+                    VisionEvent::Ball(ball) => {
+                        current_world.update_ball(ball.position, ball.velocity);
                     }
                 }
             }
         });
     }
 
-    // Marcar robots inactivos cada 100ms
     {
         let world = world.clone();
         tokio::spawn(async move {
@@ -198,12 +324,11 @@ async fn async_main() {
         });
     }
 
-    // Radio
     let radio =
         match radio::Radio::new(false, radio::SimulatorType::FIRASim, "127.0.0.1", 20011).await {
-            Ok(r) => Arc::new(TokioMutex::new(r)),
-            Err(e) => {
-                eprintln!("[scenario] error radio: {e}");
+            Ok(radio) => Arc::new(TokioMutex::new(radio)),
+            Err(err) => {
+                eprintln!("[scenario] radio error: {err}");
                 return;
             }
         };
@@ -211,24 +336,25 @@ async fn async_main() {
     eprintln!("[scenario] conectado a FIRASim. Ejecutando scenario_tick() a 60 Hz...");
     eprintln!("[scenario] Ctrl+C para detener.");
 
-    let motion = rustengine::motion::Motion::new();
+    let motion = Motion::new();
     let mut interval = tokio::time::interval(Duration::from_millis(16));
 
     loop {
         interval.tick().await;
         let commands = {
             let world = world.read().await;
-            scenario_tick(&world, &motion)
+            scenario_tick(&world, &motion, &mut scenario)
         };
         if commands.is_empty() {
             continue;
         }
+
         let mut radio = radio.lock().await;
-        for cmd in commands {
-            radio.add_motion_command(cmd);
+        for command in commands {
+            radio.add_motion_command(command);
         }
-        if let Err(e) = radio.send_commands().await {
-            eprintln!("[scenario] error enviando: {e}");
+        if let Err(err) = radio.send_commands().await {
+            eprintln!("[scenario] error enviando: {err}");
         }
     }
 }
