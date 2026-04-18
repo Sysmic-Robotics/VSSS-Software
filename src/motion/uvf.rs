@@ -10,7 +10,7 @@ use glam::Vec2;
 /// frenar contra ellos. Este es el estándar en VSS/VSSS brasileño (ITAndroids, Rinobot, PEQUI-MEC).
 ///
 /// # Uso
-/// ```
+/// ```text
 /// let θ = uvf.compute(robot_pos, target, &obstacles);
 /// // θ → ángulo en [-π, π] hacia donde debe apuntar el robot
 /// ```
@@ -106,6 +106,12 @@ impl UniVectorField {
     }
 }
 
+impl Default for UniVectorField {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,7 +120,10 @@ mod tests {
     fn test_uvf_direct_path_no_obstacles() {
         let uvf = UniVectorField::new();
         let angle = uvf.compute(Vec2::ZERO, Vec2::new(1.0, 0.0), &[]);
-        assert!((angle - 0.0).abs() < 0.01, "sin obstáculos debe apuntar directo al target");
+        assert!(
+            (angle - 0.0).abs() < 0.01,
+            "sin obstáculos debe apuntar directo al target"
+        );
     }
 
     #[test]
@@ -136,16 +145,17 @@ mod tests {
         let uvf = UniVectorField::new();
         // Obstáculo muy lejos: sin deflexión
         let angle = uvf.compute(Vec2::ZERO, Vec2::new(1.0, 0.0), &[Vec2::new(5.0, 5.0)]);
-        assert!((angle - 0.0).abs() < 0.01, "obstáculo fuera de radio no debe deflectar");
+        assert!(
+            (angle - 0.0).abs() < 0.01,
+            "obstáculo fuera de radio no debe deflectar"
+        );
     }
 
     #[test]
     fn test_uvf_heading_error_normalization() {
         // Error cruzando ±π debe normalizarse correctamente
-        let err = UniVectorField::heading_error(
-            -std::f32::consts::PI + 0.1,
-            std::f64::consts::PI - 0.1,
-        );
+        let err =
+            UniVectorField::heading_error(-std::f32::consts::PI + 0.1, std::f64::consts::PI - 0.1);
         assert!(
             err.abs() < std::f64::consts::PI,
             "error debe estar en [-π, π], got {:.3}",

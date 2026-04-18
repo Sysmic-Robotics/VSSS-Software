@@ -1,5 +1,4 @@
 use crate::world::World;
-use glam::Vec2;
 
 // ── Constantes de normalización ───────────────────────────────────────────────
 // Estas constantes son el CONTRATO entre el engine Rust y el trainer Python.
@@ -20,10 +19,10 @@ const MAX_OMEGA_NORM: f32 = std::f32::consts::PI;
 /// Todos los campos en [-1, 1] aprox.
 #[derive(Debug, Clone, Default)]
 pub struct BallObs {
-    pub x: f32,   // position.x / FIELD_HALF_X
-    pub y: f32,   // position.y / FIELD_HALF_Y
-    pub vx: f32,  // velocity.x / MAX_VEL_NORM
-    pub vy: f32,  // velocity.y / MAX_VEL_NORM
+    pub x: f32,  // position.x / FIELD_HALF_X
+    pub y: f32,  // position.y / FIELD_HALF_Y
+    pub vx: f32, // velocity.x / MAX_VEL_NORM
+    pub vy: f32, // velocity.y / MAX_VEL_NORM
 }
 
 /// Estado normalizado de un robot.
@@ -95,7 +94,12 @@ impl Observation {
         let own_robots = Self::build_robot_obs(world, own_team);
         let opp_robots = Self::build_robot_obs(world, opp_team);
 
-        Self { ball, own_robots, opp_robots, own_team }
+        Self {
+            ball,
+            own_robots,
+            opp_robots,
+            own_team,
+        }
     }
 
     /// Serializa la observación a un Vec<f32> plano para pasarle al modelo.
@@ -121,21 +125,23 @@ impl Observation {
     /// Construye un Vec de 3 RobotObs (IDs 0, 1, 2) para un equipo.
     /// Robots inactivos o no encontrados → RobotObs con active = 0.0, resto = 0.0.
     fn build_robot_obs(world: &World, team: i32) -> Vec<RobotObs> {
-        (0..3).map(|id| {
-            match world.get_robot_state(id, team) {
-                Some(r) if r.active => RobotObs {
-                    x: r.position.x / FIELD_HALF_X,
-                    y: r.position.y / FIELD_HALF_Y,
-                    vx: r.velocity.x / MAX_VEL_NORM,
-                    vy: r.velocity.y / MAX_VEL_NORM,
-                    sin_theta: r.orientation.sin() as f32,
-                    cos_theta: r.orientation.cos() as f32,
-                    omega: r.angular_velocity as f32 / MAX_OMEGA_NORM,
-                    active: 1.0,
-                },
-                _ => RobotObs::default(), // active = 0.0, todo en 0.0
-            }
-        }).collect()
+        (0..3)
+            .map(|id| {
+                match world.get_robot_state(id, team) {
+                    Some(r) if r.active => RobotObs {
+                        x: r.position.x / FIELD_HALF_X,
+                        y: r.position.y / FIELD_HALF_Y,
+                        vx: r.velocity.x / MAX_VEL_NORM,
+                        vy: r.velocity.y / MAX_VEL_NORM,
+                        sin_theta: r.orientation.sin() as f32,
+                        cos_theta: r.orientation.cos() as f32,
+                        omega: r.angular_velocity as f32 / MAX_OMEGA_NORM,
+                        active: 1.0,
+                    },
+                    _ => RobotObs::default(), // active = 0.0, todo en 0.0
+                }
+            })
+            .collect()
     }
 
     fn push_robot_obs(v: &mut Vec<f32>, r: &RobotObs) {
@@ -159,8 +165,12 @@ mod tests {
     fn test_observation_flat_size() {
         let world = World::new(3, 3);
         let obs = Observation::from_world(&world, 0);
-        assert_eq!(obs.to_flat_vec().len(), Observation::FLAT_SIZE,
-            "to_flat_vec debe tener exactamente {} floats", Observation::FLAT_SIZE);
+        assert_eq!(
+            obs.to_flat_vec().len(),
+            Observation::FLAT_SIZE,
+            "to_flat_vec debe tener exactamente {} floats",
+            Observation::FLAT_SIZE
+        );
     }
 
     #[test]
@@ -177,12 +187,25 @@ mod tests {
     fn test_observation_active_robot_normalized() {
         let mut world = World::new(3, 3);
         // Robot en la esquina del campo (posición máxima)
-        world.update_robot(0, 0, glam::Vec2::new(0.75, 0.65), 0.0, glam::Vec2::ZERO, 0.0);
+        world.update_robot(
+            0,
+            0,
+            glam::Vec2::new(0.75, 0.65),
+            0.0,
+            glam::Vec2::ZERO,
+            0.0,
+        );
         let obs = Observation::from_world(&world, 0);
         let r = &obs.own_robots[0];
         assert_eq!(r.active, 1.0);
-        assert!((r.x - 1.0).abs() < 0.01, "x debería ser ~1.0 en el borde del campo");
-        assert!((r.y - 1.0).abs() < 0.01, "y debería ser ~1.0 en el borde del campo");
+        assert!(
+            (r.x - 1.0).abs() < 0.01,
+            "x debería ser ~1.0 en el borde del campo"
+        );
+        assert!(
+            (r.y - 1.0).abs() < 0.01,
+            "y debería ser ~1.0 en el borde del campo"
+        );
     }
 
     #[test]

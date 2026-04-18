@@ -20,7 +20,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 ```bash
 cargo build --release   # build optimizado (necesario para tiempo real)
 cargo run --release     # correr el engine
-cargo test              # 57 tests unitarios
+cargo test              # suite de tests
 cargo clippy            # lint
 cargo fmt               # formato
 ```
