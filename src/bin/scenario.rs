@@ -261,7 +261,7 @@ fn all_to_center(state: &mut ScenarioState, world: &World, motion: &Motion) -> V
 
 use rustengine::{
     radio,
-    vision::{Vision, VisionEvent},
+    vision::{Vision, VisionEvent, VisionSource},
 };
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
@@ -279,9 +279,11 @@ async fn async_main() {
     let mut scenario = ScenarioState::default();
 
     {
+        // scenario es sim-only (resetea poses en FIRASim), por eso ignora
+        // VSSL_VISION_SOURCE y fija FiraSim explícitamente.
         let tracker_enabled = tracker_enabled.clone();
         tokio::spawn(async move {
-            let mut vis = Vision::new("224.0.0.1".to_string(), 10002, tracker_enabled);
+            let mut vis = Vision::new(VisionSource::FiraSim, tracker_enabled);
             let (dummy_status_tx, _) = mpsc::channel(1);
             if let Err(err) = vis.run(vision_tx, dummy_status_tx).await {
                 eprintln!("[scenario] vision error: {err}");
@@ -324,14 +326,14 @@ async fn async_main() {
         });
     }
 
-    let radio =
-        match radio::Radio::new(false, radio::SimulatorType::FIRASim, "127.0.0.1", 20011).await {
-            Ok(radio) => Arc::new(TokioMutex::new(radio)),
-            Err(err) => {
-                eprintln!("[scenario] radio error: {err}");
-                return;
-            }
-        };
+    // scenario es sim-only: hardcodea FiraSim e ignora VSSL_RADIO_TARGET.
+    let radio = match radio::FiraSimTransport::new("127.0.0.1", 20011).await {
+        Ok(transport) => Arc::new(TokioMutex::new(radio::Radio::new(Box::new(transport)))),
+        Err(err) => {
+            eprintln!("[scenario] radio error: {err}");
+            return;
+        }
+    };
 
     eprintln!("[scenario] conectado a FIRASim. Ejecutando scenario_tick() a 60 Hz...");
     eprintln!("[scenario] Ctrl+C para detener.");

@@ -1,4 +1,5 @@
 use glam::Vec2;
+use std::collections::HashMap;
 use std::error::Error;
 use std::net::Ipv4Addr;
 use std::sync::{
@@ -38,6 +39,56 @@ const VISION_LOG_DETECTION_EVERY_N: u64 = 120;
 const VISION_LOG_PACKET_STATS_EVERY_N: u64 = 3000;
 /// Permite forzar una interfaz IPv4 concreta para multicast, por ejemplo `192.168.1.10`.
 const VISION_MULTICAST_INTERFACE_ENV: &str = "VSSL_MULTICAST_IFACE";
+/// Selecciona la fuente de visión (`firasim` | `sslvision`). Default: `firasim`.
+const VISION_SOURCE_ENV: &str = "VSSL_VISION_SOURCE";
+
+/// Fuente de paquetes de visión.
+///
+/// Cada variante encapsula su preset de multicast (IP + puerto) y determina
+/// qué parser de protobuf usar en el loop de recepción.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionSource {
+    /// FIRASim: multicast `224.0.0.1:10002`. Parsea FIRA con fallback a SSL_WrapperPacket.
+    FiraSim,
+    /// vsss-vision-sysmic (visión real): multicast `224.5.23.2:10015`. Solo SSL_WrapperPacket.
+    SslVision,
+}
+
+impl VisionSource {
+    pub fn multicast_ip(&self) -> &'static str {
+        match self {
+            VisionSource::FiraSim => "224.0.0.1",
+            VisionSource::SslVision => "224.5.23.2",
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        match self {
+            VisionSource::FiraSim => 10002,
+            VisionSource::SslVision => 10015,
+        }
+    }
+
+    /// Lee la fuente desde [`VISION_SOURCE_ENV`].
+    /// Valores aceptados (case-insensitive): `firasim`, `sslvision`.
+    /// Default y fallback ante valores inválidos: `FiraSim`.
+    pub fn from_env() -> Self {
+        match std::env::var(VISION_SOURCE_ENV) {
+            Ok(raw) => match raw.trim().to_lowercase().as_str() {
+                "firasim" => VisionSource::FiraSim,
+                "sslvision" => VisionSource::SslVision,
+                other => {
+                    eprintln!(
+                        "[Vision] ⚠ {}='{}' no reconocido, usando FiraSim",
+                        VISION_SOURCE_ENV, other
+                    );
+                    VisionSource::FiraSim
+                }
+            },
+            Err(_) => VisionSource::FiraSim,
+        }
+    }
+}
 
 // --- Data Structures ---
 
@@ -71,20 +122,37 @@ pub enum VisionEvent {
 // --- The Vision Module ---
 
 pub struct Vision {
-    multicast_ip: String,
-    port: u16,
+    source: VisionSource,
     tracker: Tracker,
     tracker_enabled: Arc<AtomicBool>, // Flag compartido para habilitar/deshabilitar el tracker
+    /// Último `Instant` visto por entidad. Key: `(team, id)`; pelota usa `(-1, -1)`.
+    /// Se usa para calcular `dt` por wall-clock en lugar de asumir 60 Hz fijos.
+    last_seen: HashMap<(i32, i32), Instant>,
 }
 
 impl Vision {
-    pub fn new(ip: String, port: u16, tracker_enabled: Arc<AtomicBool>) -> Self {
+    pub fn new(source: VisionSource, tracker_enabled: Arc<AtomicBool>) -> Self {
         Self {
-            multicast_ip: ip,
-            port,
+            source,
             tracker: Tracker::new(),
             tracker_enabled,
+            last_seen: HashMap::new(),
         }
+    }
+
+    /// Calcula el delta de tiempo desde la última vez que se vio esta entidad.
+    /// El primer frame y los gaps largos se acotan a un rango razonable
+    /// (5 ms – 100 ms) para que el EKF no se desestabilice.
+    fn compute_dt(&mut self, key: (i32, i32)) -> f32 {
+        let now = Instant::now();
+        let dt = self
+            .last_seen
+            .get(&key)
+            .map(|t| now.duration_since(*t).as_secs_f32())
+            .unwrap_or(0.016)
+            .clamp(0.005, 0.1);
+        self.last_seen.insert(key, now);
+        dt
     }
 
     fn resolve_multicast_interface() -> Result<Ipv4Addr, String> {
@@ -116,11 +184,14 @@ impl Vision {
         sender: mpsc::Sender<VisionEvent>,
         status_tx: mpsc::Sender<StatusUpdate>,
     ) -> Result<(), Box<dyn Error>> {
+        let multicast_ip = self.source.multicast_ip();
+        let port = self.source.port();
+
         // Crear socket UDP y unirse al grupo multicast
-        let bind_addr = format!("0.0.0.0:{}", self.port);
+        let bind_addr = format!("0.0.0.0:{}", port);
         eprintln!(
-            "[Vision] Configurando socket UDP en {} para multicast {}:{}",
-            bind_addr, self.multicast_ip, self.port
+            "[Vision] Fuente: {:?} — configurando socket UDP en {} para multicast {}:{}",
+            self.source, bind_addr, multicast_ip, port
         );
 
         let socket = UdpSocket::bind(&bind_addr)
@@ -129,21 +200,20 @@ impl Vision {
 
         eprintln!("[Vision] Socket creado exitosamente");
 
-        let multi_addr: Ipv4Addr = self
-            .multicast_ip
+        let multi_addr: Ipv4Addr = multicast_ip
             .parse()
-            .map_err(|e| format!("Error parseando IP multicast {}: {}", self.multicast_ip, e))?;
+            .map_err(|e| format!("Error parseando IP multicast {}: {}", multicast_ip, e))?;
 
         let interface = Self::resolve_multicast_interface()?;
         if interface.is_unspecified() {
             eprintln!(
                 "[Vision] Uniéndose al grupo multicast {}:{} usando la interfaz por defecto (0.0.0.0)",
-                self.multicast_ip, self.port
+                multicast_ip, port
             );
         } else {
             eprintln!(
                 "[Vision] Uniéndose al grupo multicast {}:{} con interfaz {}",
-                self.multicast_ip, self.port, interface
+                multicast_ip, port, interface
             );
         }
 
@@ -151,7 +221,7 @@ impl Vision {
             if interface.is_unspecified() {
                 let error_msg = format!(
                     "Error uniéndose al multicast {}:{}: {}",
-                    self.multicast_ip, self.port, first_error
+                    multicast_ip, port, first_error
                 );
                 eprintln!("[Vision] ✗ {}", error_msg);
                 return Err(error_msg.into());
@@ -164,8 +234,8 @@ impl Vision {
             if let Err(fallback_error) = socket.join_multicast_v4(multi_addr, Ipv4Addr::UNSPECIFIED)
             {
                 let error_msg = format!(
-                    "Error uniéndose al multicast {}:{}: {}. Revisa la configuración de FIRASim y, si necesitas fijar una interfaz, exporta {}=<ipv4_local>.",
-                    self.multicast_ip, self.port, fallback_error, VISION_MULTICAST_INTERFACE_ENV
+                    "Error uniéndose al multicast {}:{}: {}. Si necesitas fijar una interfaz, exporta {}=<ipv4_local>.",
+                    multicast_ip, port, fallback_error, VISION_MULTICAST_INTERFACE_ENV
                 );
                 eprintln!("[Vision] ✗ {}", error_msg);
                 return Err(error_msg.into());
@@ -181,25 +251,33 @@ impl Vision {
         // Send connection status
         Self::send_status_best_effort(
             &status_tx,
-            StatusUpdate::Connected(self.multicast_ip.clone(), self.port),
+            StatusUpdate::Connected(multicast_ip.to_string(), port),
         );
         eprintln!("[Vision] ========================================");
         eprintln!("[Vision] ✓ Sistema de visión inicializado");
         eprintln!(
-            "[Vision] Esperando paquetes de FIRASim en {}:{}",
-            self.multicast_ip, self.port
+            "[Vision] Esperando paquetes en {}:{} (fuente: {:?})",
+            multicast_ip, port, self.source
         );
         eprintln!("[Vision] ========================================");
-        eprintln!("[Vision] INSTRUCCIONES PARA VERIFICAR FIRASim:");
-        eprintln!("[Vision] 1. Abre FIRASim");
-        eprintln!("[Vision] 2. Ve a Configuración → Network");
-        eprintln!(
-            "[Vision] 3. Verifica que 'Vision multicast address' = {}",
-            self.multicast_ip
-        );
-        eprintln!("[Vision] 4. Verifica que 'Vision port' = {}", self.port);
-        eprintln!("[Vision] 5. Asegúrate de que hay robots habilitados en el campo");
-        eprintln!("[Vision] 6. Verifica que el simulador está corriendo (no pausado)");
+        match self.source {
+            VisionSource::FiraSim => {
+                eprintln!("[Vision] Modo FIRASim — verifica el simulador:");
+                eprintln!("[Vision] 1. FIRASim abierto y corriendo (no pausado)");
+                eprintln!(
+                    "[Vision] 2. Network → Vision multicast address = {}",
+                    multicast_ip
+                );
+                eprintln!("[Vision] 3. Network → Vision port = {}", port);
+                eprintln!("[Vision] 4. Robots habilitados en el campo");
+            }
+            VisionSource::SslVision => {
+                eprintln!("[Vision] Modo SslVision (vsss-vision-sysmic) — verifica:");
+                eprintln!("[Vision] 1. vsss-vision-sysmic corriendo y procesando frames");
+                eprintln!("[Vision] 2. Cámara conectada y calibración cargada");
+                eprintln!("[Vision] 3. Publicando en {}:{}", multicast_ip, port);
+            }
+        }
         eprintln!("[Vision] ========================================");
 
         let mut buf = [0u8; 65536];
@@ -212,7 +290,7 @@ impl Vision {
         eprintln!("[Vision] === INICIANDO RECEPCIÓN DE PAQUETES ===");
         eprintln!(
             "[Vision] Esperando paquetes multicast de {}:{}",
-            self.multicast_ip, self.port
+            multicast_ip, port
         );
 
         loop {
@@ -232,10 +310,14 @@ impl Vision {
 
                             Self::send_status_best_effort(&status_tx, StatusUpdate::PacketReceived);
 
-                            // FIRASim/VSSS envía protocolo FIRA: fira_message.sim_to_ref.Environment
-                            // (VSSSLeague/FIRAClient, VSSSProto). Probar primero ese formato.
                             let mut handled = false;
-                            if let Ok(env) = FiraEnvironment::parse_from_bytes(data)
+
+                            // En modo FIRASim, intentar primero el protocolo FIRA
+                            // (fira_message.sim_to_ref.Environment, VSSSLeague/FIRAClient).
+                            // En modo SslVision saltamos directo a SSL_WrapperPacket
+                            // para no pagar el parse-y-fallar por paquete.
+                            if matches!(self.source, VisionSource::FiraSim)
+                                && let Ok(env) = FiraEnvironment::parse_from_bytes(data)
                                 && let Some(frame) = env.frame.as_ref()
                             {
                                 detection_count += 1;
@@ -250,20 +332,20 @@ impl Vision {
                                 Self::send_status_best_effort(&status_tx, StatusUpdate::BallDetected(ball_count));
                                 Self::send_status_best_effort(&status_tx, StatusUpdate::RobotsDetected(robot_count));
 
-                                let dt = 0.016f32;
                                 if let Some(ball) = frame.ball.as_ref() {
-                                    let _ = self.process_ball_fira(&sender, &status_tx, ball, dt).await;
+                                    let _ = self.process_ball_fira(&sender, &status_tx, ball).await;
                                 }
                                 for robot in frame.robots_yellow.iter() {
-                                    let _ = self.process_robot_fira(&sender, &status_tx, robot, 1, dt).await;
+                                    let _ = self.process_robot_fira(&sender, &status_tx, robot, 1).await;
                                 }
                                 for robot in frame.robots_blue.iter() {
-                                    let _ = self.process_robot_fira(&sender, &status_tx, robot, 0, dt).await;
+                                    let _ = self.process_robot_fira(&sender, &status_tx, robot, 0).await;
                                 }
                                 handled = true;
                             }
 
-                            // Fallback: SSL Vision (grSim u otros)
+                            // SSL Vision: fuente principal en modo SslVision (vsss-vision-sysmic),
+                            // fallback en modo FiraSim si el paquete no parseó como FIRA.
                             if !handled {
                                 match SSL_WrapperPacket::parse_from_bytes(data) {
                                     Ok(packet) => {
@@ -280,15 +362,14 @@ impl Vision {
                                             Self::send_status_best_effort(&status_tx, StatusUpdate::BallDetected(ball_count));
                                             Self::send_status_best_effort(&status_tx, StatusUpdate::RobotsDetected(robot_count));
 
-                                            let dt = 0.016f32;
                                             for ball in detection.balls.iter() {
-                                                let _ = self.process_ball(&sender, &status_tx, ball, dt).await;
+                                                let _ = self.process_ball(&sender, &status_tx, ball).await;
                                             }
                                             for robot in detection.robots_yellow.iter() {
-                                                let _ = self.process_robot(&sender, &status_tx, robot, 1, dt).await;
+                                                let _ = self.process_robot(&sender, &status_tx, robot, 1).await;
                                             }
                                             for robot in detection.robots_blue.iter() {
-                                                let _ = self.process_robot(&sender, &status_tx, robot, 0, dt).await;
+                                                let _ = self.process_robot(&sender, &status_tx, robot, 0).await;
                                             }
                                         } else {
                                             geometry_only_count += 1;
@@ -314,8 +395,8 @@ impl Vision {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     if packet_count == 0 {
                         if last_status_print.elapsed() >= Duration::from_secs(5) {
-                            eprintln!("[Vision] ⚠ Sin paquetes. Verifica FIRASim está enviando a {}:{}",
-                                     self.multicast_ip, self.port);
+                            eprintln!("[Vision] ⚠ Sin paquetes. Verifica que la fuente {:?} esté publicando en {}:{}",
+                                     self.source, multicast_ip, port);
                             last_status_print = Instant::now();
                         }
                     } else if last_packet_time.elapsed() > Duration::from_secs(5) {
@@ -332,11 +413,10 @@ impl Vision {
         sender: &mpsc::Sender<VisionEvent>,
         status_tx: &mpsc::Sender<StatusUpdate>,
         ball: &FiraBall,
-        dt: f32,
     ) -> Result<(), Box<dyn Error>> {
         let x_m = ball.x;
         let y_m = ball.y;
-        let dt_f64 = dt as f64;
+        let dt_f64 = self.compute_dt((-1, -1)) as f64;
 
         let (xf_m, yf_m, vx, vy) = if self.tracker_enabled.load(Ordering::Relaxed) {
             let (xf, yf, _thetaf, vx, vy, _omega) =
@@ -371,13 +451,12 @@ impl Vision {
         status_tx: &mpsc::Sender<StatusUpdate>,
         robot: &FiraRobot,
         team: i32,
-        dt: f32,
     ) -> Result<(), Box<dyn Error>> {
         let id = robot.robot_id;
         let x_m = robot.x;
         let y_m = robot.y;
         let theta = robot.orientation;
-        let dt_f64 = dt as f64;
+        let dt_f64 = self.compute_dt((team, id as i32)) as f64;
 
         let (xf_m, yf_m, thetaf, vx, vy, omega) = if self.tracker_enabled.load(Ordering::Relaxed) {
             self.tracker.track(team, id as i32, x_m, y_m, theta, dt_f64)
@@ -411,7 +490,6 @@ impl Vision {
         sender: &mpsc::Sender<VisionEvent>,
         status_tx: &mpsc::Sender<StatusUpdate>,
         ball: &SSL_DetectionBall,
-        dt: f32,
     ) -> Result<(), Box<dyn Error>> {
         // SSL Vision coordinates are in millimeters
         let raw_x = ball.x();
@@ -420,7 +498,7 @@ impl Vision {
         // Convert to meters for internal processing (tracker works in meters)
         let x_m = raw_x as f64 / 1000.0;
         let y_m = raw_y as f64 / 1000.0;
-        let dt_f64 = dt as f64;
+        let dt_f64 = self.compute_dt((-1, -1)) as f64;
 
         // Usar tracker solo si está habilitado
         let (xf_m, yf_m, vx, vy) = if self.tracker_enabled.load(Ordering::Relaxed) {
@@ -461,7 +539,6 @@ impl Vision {
         status_tx: &mpsc::Sender<StatusUpdate>,
         robot: &SSL_DetectionRobot,
         team: i32,
-        dt: f32,
     ) -> Result<(), Box<dyn Error>> {
         // Check if required fields are present
         if !robot.has_x() || !robot.has_y() {
@@ -479,7 +556,7 @@ impl Vision {
         let x_m = raw_x as f64 / 1000.0;
         let y_m = raw_y as f64 / 1000.0;
         let theta = raw_theta as f64;
-        let dt_f64 = dt as f64;
+        let dt_f64 = self.compute_dt((team, id as i32)) as f64;
 
         // Usar tracker solo si está habilitado
         let (xf_m, yf_m, thetaf, vx, vy, omega) = if self.tracker_enabled.load(Ordering::Relaxed) {
@@ -536,5 +613,40 @@ mod tests {
             Ok(StatusUpdate::PacketReceived)
         ));
         assert!(status_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn vision_source_presets() {
+        assert_eq!(VisionSource::FiraSim.multicast_ip(), "224.0.0.1");
+        assert_eq!(VisionSource::FiraSim.port(), 10002);
+        assert_eq!(VisionSource::SslVision.multicast_ip(), "224.5.23.2");
+        assert_eq!(VisionSource::SslVision.port(), 10015);
+    }
+
+    /// Exercises `from_env` para todos los valores en un solo test para evitar
+    /// el race entre tests cuando se mutan variables de entorno globales.
+    #[test]
+    fn vision_source_from_env() {
+        // SAFETY: estos tests son single-thread por construcción (un solo #[test]
+        // toca esta env var). Si en el futuro se agregan otros tests que usen
+        // VSSL_VISION_SOURCE, hay que serializarlos.
+        unsafe {
+            std::env::remove_var(VISION_SOURCE_ENV);
+            assert_eq!(VisionSource::from_env(), VisionSource::FiraSim);
+
+            std::env::set_var(VISION_SOURCE_ENV, "firasim");
+            assert_eq!(VisionSource::from_env(), VisionSource::FiraSim);
+
+            std::env::set_var(VISION_SOURCE_ENV, "SslVision");
+            assert_eq!(VisionSource::from_env(), VisionSource::SslVision);
+
+            std::env::set_var(VISION_SOURCE_ENV, "  SSLVISION  ");
+            assert_eq!(VisionSource::from_env(), VisionSource::SslVision);
+
+            std::env::set_var(VISION_SOURCE_ENV, "garbage");
+            assert_eq!(VisionSource::from_env(), VisionSource::FiraSim);
+
+            std::env::remove_var(VISION_SOURCE_ENV);
+        }
     }
 }

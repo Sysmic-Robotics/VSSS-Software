@@ -34,7 +34,7 @@ fn scenario_tick(
 
 use rustengine::{
     radio,
-    vision::{Vision, VisionEvent},
+    vision::{Vision, VisionEvent, VisionSource},
 };
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
@@ -53,8 +53,15 @@ async fn async_main() {
     // Vision
     {
         let tracker_enabled = tracker_enabled.clone();
+        let source = VisionSource::from_env();
+        eprintln!(
+            "[main] Fuente de visión: {:?} ({}:{})",
+            source,
+            source.multicast_ip(),
+            source.port()
+        );
         tokio::spawn(async move {
-            let mut vis = Vision::new("224.0.0.1".to_string(), 10002, tracker_enabled);
+            let mut vis = Vision::new(source, tracker_enabled);
             let (dummy_status_tx, _) = mpsc::channel(1);
             if let Err(err) = vis.run(vision_tx, dummy_status_tx).await {
                 eprintln!("[main] vision error: {err}");
@@ -99,18 +106,15 @@ async fn async_main() {
         });
     }
 
-    let radio =
-        match radio::Radio::new(false, radio::SimulatorType::FIRASim, "127.0.0.1", 20011).await {
-            Ok(r) => Arc::new(TokioMutex::new(r)),
-            Err(err) => {
-                eprintln!("[main] radio error: {err}");
-                return;
-            }
-        };
+    let radio = match radio::Radio::from_env().await {
+        Ok(r) => Arc::new(TokioMutex::new(r)),
+        Err(err) => {
+            eprintln!("[main] radio error: {err}");
+            return;
+        }
+    };
 
-    eprintln!(
-        "[main] conectado a FIRASim. Ejecutando la misma base que scenario_tick() a 60 Hz..."
-    );
+    eprintln!("[main] radio listo. Ejecutando scenario_tick() a 60 Hz...");
     eprintln!("[main] sin GUI, sin plays. Ctrl+C para detener.");
 
     let motion = Motion::new();
