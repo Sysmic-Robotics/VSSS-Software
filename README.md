@@ -1,17 +1,29 @@
 # VSSL RustEngine
 
-Motor de control en Rust para robots de fútbol **VSS/VSSS (Very Small Size Soccer)** compatible con **FIRASim**. Recibe visión por multicast UDP, mantiene un modelo del mundo con filtrado Kalman, computa comandos de movimiento a ~60 Hz usando Univector Field y los envía al simulador por protobuf/UDP.
+Motor de control en Rust para robots de fútbol **VSS/VSSS (Very Small Size Soccer)** compatible con **FIRASim** y robots reales (firmware ESP32-C3 + base station ESP32). Recibe visión por multicast UDP, mantiene un modelo del mundo con filtrado Kalman, computa comandos de movimiento a ~60 Hz usando Univector Field y los envía al simulador (protobuf/UDP) o a los robots reales (frame ASCII por USB serial → ESP-NOW).
 
 ---
 
 ## Requisitos
 
 - **Rust** stable 1.70+
-- **FIRASim** corriendo con:
-  - Visión multicast en `224.0.0.1:10002`
-  - Control/actuadores en `127.0.0.1:20011`
+- Una fuente de visión (al menos una):
+  - **FIRASim** (default): visión multicast en `224.0.0.1:10002`, control/actuadores en `127.0.0.1:20011`.
+  - **vsss-vision-sysmic** (visión real): publica `SSL_WrapperPacket` en `224.5.23.2:10015`. Ver [NETWORK_PROTOCOL.md](NETWORK_PROTOCOL.md).
+- Para robots reales: base station USB (ESP32) flasheada + 3 robots con [VSSL-firmware](https://github.com/Sysmic-Robotics/VSSL-firmware) parcheado con el watchdog ([FIRMWARE_WATCHDOG.md](FIRMWARE_WATCHDOG.md)).
 
 No se necesita `protoc` — los bindings protobuf se generan en compilación vía `build.rs`.
+
+### Variables de entorno
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `VSSL_VISION_SOURCE` | `firasim` | `firasim` o `sslvision`. Selecciona la fuente y el parser del `vision_task`. |
+| `VSSL_MULTICAST_IFACE` | (auto) | IPv4 local para forzar la interfaz de multicast (útil si hay varias NICs). |
+| `VSSL_RADIO_TARGET` | `firasim` | `firasim`, `grsim` o `basestation`. Selecciona a quién se le envían los `MotionCommand`. |
+| `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Sólo afecta a `basestation`: filtra qué comandos van al frame serial. |
+| `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
+| `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
 
 ---
 
@@ -19,26 +31,68 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 
 ```bash
 cargo build --release   # build optimizado (necesario para tiempo real)
-cargo run --release     # correr el main headless actual
+cargo run --release     # correr el main headless actual (default: FIRASim)
 cargo run --bin scenario --release  # probar una skill manualmente en FIRASim
 cargo test              # suite de tests
 cargo clippy            # lint
 cargo fmt               # formato
 ```
 
+### Probar contra robots reales
+
+Pre-requisitos físicos:
+
+1. Cámara FLIR + `vsss-vision-sysmic` corriendo y calibrado en la misma PC. Validar primero con su cliente Python:
+   ```bash
+   cd vsss-vision-sysmic && python3 client/python/client.py
+   ```
+2. Base station enchufada por USB. Confirmar que aparece (ej. `/dev/ttyUSB0`):
+   ```bash
+   ls /dev/ttyUSB* /dev/ttyACM*
+   ```
+   Si necesita permisos: `sudo usermod -aG dialout $USER` (requiere re-login).
+3. 3 robots encendidos, dentro del campo, con firmware parcheado (ver [FIRMWARE_WATCHDOG.md](FIRMWARE_WATCHDOG.md)).
+
+Levantar el engine:
+
+```bash
+# Visión real + radio a la base station, equipo azul (default).
+VSSL_VISION_SOURCE=sslvision \
+VSSL_RADIO_TARGET=basestation \
+cargo run --release
+```
+
+Variantes:
+
+```bash
+# Equipo amarillo.
+VSSL_VISION_SOURCE=sslvision VSSL_RADIO_TARGET=basestation VSSL_TEAM_COLOR=yellow cargo run --release
+
+# Otro device serial.
+VSSL_VISION_SOURCE=sslvision VSSL_RADIO_TARGET=basestation VSSL_BASESTATION_DEVICE=/dev/ttyACM0 cargo run --release
+
+# Visión real, comandos a FIRASim (debug visual: ver qué decide el engine sin mover los robots).
+VSSL_VISION_SOURCE=sslvision cargo run --release
+```
+
+Smoke test del watchdog: con todo corriendo y los robots moviéndose, matar el proceso con `Ctrl+C`. Los robots deben detenerse en menos de 250 ms. Si no, revisar [FIRMWARE_WATCHDOG.md](FIRMWARE_WATCHDOG.md).
+
 ---
 
 ## Arquitectura
 
 ```
-FIRASim (multicast 224.0.0.1:10002)
-  └─ vision.rs         parse SSL-Vision protobuf
+Fuente de visión (FIRASim 224.0.0.1:10002 | vsss-vision-sysmic 224.5.23.2:10015)
+  └─ vision.rs         parse FIRA o SSL_WrapperPacket según VSSL_VISION_SOURCE
       └─ tracker/ekf   Extended Kalman Filter por robot/balón
           └─ world/    estado compartido Arc<RwLock<World>>
               └─ skills/   primitives reactivas simples
                   └─ motion/   UVF + PID → MotionCommand
-                      └─ radio/    serializa protobuf → UDP 127.0.0.1:20011
-                          └─ FIRASim recibe y aplica
+                      └─ radio/    despacha vía RobotTransport (VSSL_RADIO_TARGET):
+                                   ├─ FiraSimTransport  → UDP protobuf 127.0.0.1:20011
+                                   ├─ GrSimTransport    → UDP protobuf grSim
+                                   └─ BaseStationTransport → ASCII por USB serial
+                                                              └─ ESP32 base → ESP-NOW → robots
 
 Camino alternativo / futuro:
   world/ → coach/ → plays/ → motion/ → radio/
@@ -56,7 +110,7 @@ Camino alternativo / futuro:
 | `skills/` | Primitives reactivas simples con trait `Skill -> MotionCommand`: `ChaseBallSkill`, `GoToSkill`, `FacePointSkill`, `HoldPositionSkill`, etc. |
 | `tactics/` | Wrappers de rol sobre skills (`AttackerTactic`, `SupportTactic`, `GoalkeeperTactic`) con `StuckDetector`; útiles como base futura |
 | `motion/` | UVF para evasión de obstáculos, PID para heading y velocidad, braking profile |
-| `radio/` | Clientes UDP para FIRASim y GrSim; serializa `RobotCommand` a protobuf |
+| `radio/` | Trait `RobotTransport` + 3 implementaciones: `FiraSimTransport`, `GrSimTransport`, `BaseStationTransport` (USB serial → base station ESP32 → ESP-NOW). Selección por `VSSL_RADIO_TARGET` |
 | `GUI/` | Interfaz Iced para inspección visual. Sigue en el repo, pero el flujo actual de `main` y `scenario` es headless |
 | `protos/` | Bindings Rust generados en compilación desde `.proto` (FIRA, SSL-Vision, grSim) |
 
@@ -97,7 +151,9 @@ src/
 │   ├── commands.rs        # MotionCommand, KickerCommand, RobotCommand
 │   └── benchmark.rs       # KPI de movimiento (velocidad media, etc.)
 ├── radio/
-│   ├── mod.rs             # Radio: coordina clientes, cola de comandos
+│   ├── mod.rs             # Radio: cola de comandos + dispatch sobre Box<dyn RobotTransport>
+│   ├── transport.rs       # trait RobotTransport + FiraSimTransport / GrSimTransport
+│   ├── base_station.rs    # BaseStationTransport: serial USB → ESP32 base, frame ASCII "x,y,..."
 │   ├── firasim.rs         # FIRASimClient: UDP → 127.0.0.1:20011
 │   ├── grsim.rs           # GrSimClient: UDP → grSim (soporte parcial)
 │   └── commands.rs        # Serialización MotionCommand → protobuf
@@ -146,6 +202,19 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 | `push_overshoot` | `PushBallSkill` | `0.12 m` | Distancia más allá de la pelota al empujar |
 | `lose_radius` | `PushBallSkill` | `0.25 m` | Si el robot pierde demasiado la pelota, la skill pasa a frenar |
 | `kp/ki/kd` | `ApproachBallBehindSkill`, `PushBallSkill`, `AlignBallToTargetSkill` | `1.2/0.0/0.10` | Ganancias PID de heading para primitives orientadas a la pelota |
+
+### Parámetros de la base station (`src/radio/base_station.rs`)
+
+Convierte cada `MotionCommand` (frame mundial: `vx`, `vy`, `omega`, `orientation`) a el `(X, Y)` joystick que espera el firmware (`X` = giro diferencial, `Y` = avance en body frame, ambos `int8` ±100):
+
+| Constante | Valor | Descripción |
+|-----------|-------|-------------|
+| `SCALE_LIN` | `200.0` | Multiplicador de la velocidad longitudinal `(vx·cosθ + vy·sinθ)` antes del clamp |
+| `SCALE_ANG` | `15.0` | Multiplicador de `omega` antes del clamp |
+| `JOYSTICK_MAX` | `100` | Límite duro del frame (firmware satura en ±100) |
+| `SLOT_COUNT` | `5` | Slots del frame ASCII; slot index = robot id, ids fuera de rango se descartan |
+
+Frame serial: `"x1,y1,x2,y2,x3,y3,x4,y4,x5,y5\n"` a 115200 baud. Sólo se incluyen comandos del equipo propio (`VSSL_TEAM_COLOR`); los del rival se descartan.
 
 ---
 
@@ -213,7 +282,10 @@ La orientación se codifica como `(sin θ, cos θ)` (no ángulo crudo) para evit
   arco   │           arco
  amarillo│            azul
          │
-Azul ataca hacia +X (DEBUG_MOTION_CAPTURE_GOAL_X = 0.75)
+Por convención, "azul ataca hacia +X" en sim. En real, +X depende de cómo
+esté montada la cámara y de qué arco sea el propio en cada partido — se
+configura pasando `attack_goal` / `own_goal` a `StandardPlay::new` y
+`RuleBasedCoach::new`.
 ```
 
 - Campo físico: ±0.75 m × ±0.65 m

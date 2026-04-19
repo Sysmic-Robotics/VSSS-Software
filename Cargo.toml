@@ -12,6 +12,8 @@ iced = { version = "0.13", features = ["canvas", "tokio"] }
 nalgebra = "0.33" # Álgebra lineal para Kalman (similar a Eigen en C++)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+async-trait = "0.1"           # Permite dyn-dispatch sobre traits con métodos async
+tokio-serial = "5"            # Wrapper async de `serialport` para el BaseStation USB↔ESP32
 
 [build-dependencies]
 protobuf-codegen = "3" # Tool to generate Rust code from .proto files
