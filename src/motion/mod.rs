@@ -16,29 +16,67 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 const CONTROL_DT: f64 = 0.016; // ~60 Hz
-const MAX_LINEAR_SPEED: f64 = 1.2; // m/s
-const MIN_LINEAR_SPEED: f64 = 0.06; // m/s
-const ARRIVAL_THRESHOLD: f32 = 0.06; // m
-const BRAKE_DISTANCE: f32 = 0.50; // m
-const MAX_ANGULAR_SPEED: f64 = 3.0; // rad/s
 
-/// Mínimo de coupling velocidad–heading (0..1). Sin esto, `cos(error)→0` deja vx=vy=0
-/// mientras `face_to` pide ω alto (UVF vs mirar al balón), y el robot solo gira en el sitio.
-const COUPLING_FLOOR: f32 = 0.22;
+/// Parámetros tunables del sistema de movimiento.
+/// Usar `MotionConfig::default()` para los valores calibrados base,
+/// o construir uno propio y pasarlo a `Motion::with_config()`.
+#[derive(Debug, Clone)]
+pub struct MotionConfig {
+    /// Velocidad lineal máxima (m/s)
+    pub max_linear_speed: f64,
+    /// Velocidad lineal mínima — umbral bajo del perfil de frenado (m/s)
+    pub min_linear_speed: f64,
+    /// Velocidad angular máxima (rad/s)
+    pub max_angular_speed: f64,
+    /// Distancia al destino bajo la cual el robot se considera "llegado" (m)
+    pub arrival_threshold: f32,
+    /// Distancia desde la que empieza a frenar linealmente (m)
+    pub brake_distance: f32,
+    /// Mínimo de coupling velocidad–heading (0..1).
+    /// 0 = para completamente si no mira hacia donde va; 1 = ignora heading.
+    pub coupling_floor: f32,
+    /// Radio de influencia de obstáculos en UVF (m)
+    pub uvf_influence_radius: f32,
+    /// Ganancia repulsiva del UVF — más alto = deflexión más brusca
+    pub uvf_k_rep: f32,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self {
+            max_linear_speed: 1.2,
+            min_linear_speed: 0.06,
+            max_angular_speed: 3.0,
+            arrival_threshold: 0.06,
+            brake_distance: 0.50,
+            coupling_floor: 0.22,
+            uvf_influence_radius: 0.20,
+            uvf_k_rep: 1.5,
+        }
+    }
+}
 
 /// Módulo principal de control de movimiento
 pub struct Motion {
     uvf: UniVectorField,
+    pub config: MotionConfig,
     pid_x_by_robot: Mutex<HashMap<(i32, i32), PIDController>>,
     pid_y_by_robot: Mutex<HashMap<(i32, i32), PIDController>>,
     pid_theta_by_robot: Mutex<HashMap<(i32, i32), PIDController>>,
 }
 
 impl Motion {
-    /// Crea un nuevo sistema de movimiento
     pub fn new() -> Self {
+        Self::with_config(MotionConfig::default())
+    }
+
+    pub fn with_config(config: MotionConfig) -> Self {
+        let mut uvf = UniVectorField::new();
+        uvf.influence_radius = config.uvf_influence_radius;
+        uvf.k_rep = config.uvf_k_rep;
         Self {
-            uvf: UniVectorField::new(),
+            uvf,
+            config,
             pid_x_by_robot: Mutex::new(HashMap::new()),
             pid_y_by_robot: Mutex::new(HashMap::new()),
             pid_theta_by_robot: Mutex::new(HashMap::new()),
@@ -68,7 +106,7 @@ impl Motion {
     pub fn move_to(&self, robot_state: &RobotState, target: Vec2, world: &World) -> MotionCommand {
         let dist_to_goal = (target - robot_state.position).length();
 
-        if dist_to_goal < ARRIVAL_THRESHOLD {
+        if dist_to_goal < self.config.arrival_threshold {
             return MotionCommand {
                 id: robot_state.id,
                 team: robot_state.team,
@@ -85,7 +123,7 @@ impl Motion {
         // La pelota se excluye si el target está cerca de ella (staging_point justo detrás
         // de la pelota): incluir la pelota haría que el UVF deflecte al robot lejos del staging.
         let ball_pos = env.get_ball_position();
-        let target_near_ball = (target - ball_pos).length() < self.uvf.influence_radius * 1.5;
+        let target_near_ball = (target - ball_pos).length() < self.config.uvf_influence_radius * 1.5;
         let mut obstacles: Vec<Vec2> = if target_near_ball {
             env.get_robots().to_vec()
         } else {
@@ -98,7 +136,7 @@ impl Motion {
         // Cuando el robot se acerca a una pared, el UVF lo deflecta tangencialmente
         // igual que con robots. Sin esto, los robots se quedan pegados a las paredes.
         let rp = robot_state.position;
-        let wall_threshold = self.uvf.influence_radius * 1.5;
+        let wall_threshold = self.config.uvf_influence_radius * 1.5;
         const WALL_X: f32 = 0.70;
         const WALL_Y: f32 = 0.60;
         if (WALL_X - rp.x.abs()) < wall_threshold {
@@ -114,12 +152,11 @@ impl Motion {
         // (si no, con `move_and_face` + UVF≠mirada al balón, cos→0 y el robot solo rota).
         let heading_error = UniVectorField::heading_error(theta_uvf, robot_state.orientation);
         let cos_align = (heading_error.cos() as f32).max(0.0);
-        let coupling = COUPLING_FLOOR + (1.0 - COUPLING_FLOOR) * cos_align;
+        let coupling = self.config.coupling_floor + (1.0 - self.config.coupling_floor) * cos_align;
 
-        // Perfil de frenado basado en distancia al goal final
-        let normalized = (dist_to_goal / BRAKE_DISTANCE).clamp(0.0, 1.0);
-        let v_max =
-            (MIN_LINEAR_SPEED as f32) + normalized * ((MAX_LINEAR_SPEED - MIN_LINEAR_SPEED) as f32);
+        let normalized = (dist_to_goal / self.config.brake_distance).clamp(0.0, 1.0);
+        let v_max = (self.config.min_linear_speed as f32)
+            + normalized * ((self.config.max_linear_speed - self.config.min_linear_speed) as f32);
         let speed = v_max * coupling;
 
         MotionCommand {
@@ -164,7 +201,7 @@ impl Motion {
         let distance = diff.length();
 
         // Si está muy cerca del objetivo, detenerse
-        if !distance.is_finite() || distance < ARRIVAL_THRESHOLD {
+        if !distance.is_finite() || distance < self.config.arrival_threshold {
             return MotionCommand {
                 id: robot_state.id,
                 team: robot_state.team,
@@ -177,9 +214,9 @@ impl Motion {
 
         let direction = diff / distance;
         // Perfil proporcional con zona de frenado: ágil lejos del objetivo y suave al aproximar.
-        let normalized = (distance / BRAKE_DISTANCE).clamp(0.0, 1.0);
-        let speed =
-            (MIN_LINEAR_SPEED as f32) + normalized * ((MAX_LINEAR_SPEED - MIN_LINEAR_SPEED) as f32);
+        let normalized = (distance / self.config.brake_distance).clamp(0.0, 1.0);
+        let speed = (self.config.min_linear_speed as f32)
+            + normalized * ((self.config.max_linear_speed - self.config.min_linear_speed) as f32);
 
         MotionCommand {
             id: robot_state.id,
@@ -225,7 +262,7 @@ impl Motion {
         };
 
         // Limitar velocidad máxima
-        let max_speed = MAX_LINEAR_SPEED;
+        let max_speed = self.config.max_linear_speed;
         let speed = (vx * vx + vy * vy).sqrt();
         let (vx_limited, vy_limited) = if speed > max_speed {
             let scale = max_speed / speed;
@@ -293,7 +330,7 @@ impl Motion {
         };
 
         // Limitar velocidad angular máxima
-        let max_omega = MAX_ANGULAR_SPEED;
+        let max_omega = self.config.max_angular_speed;
         let omega_limited = omega.clamp(-max_omega, max_omega);
 
         MotionCommand {
