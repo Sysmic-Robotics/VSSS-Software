@@ -46,16 +46,15 @@ pub const SCALE_LIN: f64 = 200.0;
 pub const SCALE_ANG: f64 = 15.0;
 pub const JOYSTICK_MAX: i32 = 100;
 
-/// Convierte un MotionCommand (frame mundial) a (X, Y) firmware
-/// donde Y = velocidad de avance (body frame) y X = giro diferencial.
+/// Convierte un MotionCommand (frame mundial) a (X, Y) firmware.
+/// Tras PR#4 del firmware: X = velocidad lineal, Y = velocidad angular.
 pub fn command_to_xy(motion: &crate::motion::MotionCommand) -> (i32, i32) {
     let cos_t = motion.orientation.cos();
     let sin_t = motion.orientation.sin();
-    // Velocidad longitudinal en body frame (proyección del vector global sobre el heading).
     let v_forward = motion.vx * cos_t + motion.vy * sin_t;
 
-    let y_raw = (v_forward * SCALE_LIN).round() as i32;
-    let x_raw = (motion.omega * SCALE_ANG).round() as i32;
+    let x_raw = (v_forward * SCALE_LIN).round() as i32; // X = lineal
+    let y_raw = (motion.omega * SCALE_ANG).round() as i32; // Y = angular
 
     (
         x_raw.clamp(-JOYSTICK_MAX, JOYSTICK_MAX),
@@ -165,7 +164,7 @@ mod tests {
     #[test]
     fn xy_forward_along_heading() {
         // Robot mirando hacia +X (theta=0), velocidad global +X.
-        // v_forward = 1.0 m/s → Y = 200 → clamp 100. Sin omega → X = 0.
+        // v_forward = 1.0 m/s → X = 200 → clamp 100. Sin omega → Y = 0.
         let cmd = MotionCommand {
             id: 0,
             team: 0,
@@ -174,7 +173,7 @@ mod tests {
             omega: 0.0,
             orientation: 0.0,
         };
-        assert_eq!(command_to_xy(&cmd), (0, 100));
+        assert_eq!(command_to_xy(&cmd), (100, 0));
     }
 
     #[test]
@@ -189,8 +188,8 @@ mod tests {
             orientation: std::f64::consts::FRAC_PI_2,
         };
         let (x, y) = command_to_xy(&cmd);
-        assert_eq!(x, 0);
-        assert_eq!(y, 80); // 0.4 * 200
+        assert_eq!(x, 80); // 0.4 * 200 → X = lineal
+        assert_eq!(y, 0);
     }
 
     #[test]
