@@ -15,8 +15,20 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use field::FieldCanvas;
-// StatusUpdate vive en vision.rs para que la lib no dependa de gui.
 pub use rustengine::vision::StatusUpdate;
+
+/// Datos de motion de un robot para debug visual.
+/// Se envía desde el control loop al GUI cada tick.
+#[derive(Debug, Clone)]
+pub struct RobotMotionDebug {
+    pub team: u32,
+    pub id: u32,
+    /// Velocidad en frame mundial (m/s)
+    pub vx: f32,
+    pub vy: f32,
+    /// Destino del skill activo (metros, frame mundial). None si no aplica.
+    pub target: Option<Vec2>,
+}
 
 /// `true` imprime cada actualización de robot en stderr (muy ruidoso). Dejar en `false` para auditar con `[FieldAudit]` en `main`.
 const GUI_LOG_EVERY_ROBOT_UPDATE: bool = false;
@@ -34,10 +46,11 @@ pub enum TabView {
 pub enum Message {
     StatusUpdate(StatusUpdate),
     FieldSnapshot(FieldSnapshot),
+    MotionUpdate(Vec<RobotMotionDebug>),
     ChangeIp(String),
     ChangePort(String),
     Connect,
-    ToggleTracker(bool), // Nuevo mensaje para toggle del tracker
+    ToggleTracker(bool),
     Tick,
     TabSelected(TabView),
 }
@@ -133,16 +146,18 @@ pub struct VisionGui {
     last_robot_count: usize,
     robots: HashMap<(u32, u32), Robot>,
     ball: Option<Ball>,
+    motion_debug: HashMap<(u32, u32), RobotMotionDebug>,
     field_cache: Cache,
     chart_cache: Cache,
     config_tx: Option<mpsc::Sender<ConfigUpdate>>,
     status_rx: Arc<Mutex<Option<mpsc::Receiver<StatusUpdate>>>>,
+    motion_rx: Arc<Mutex<Option<mpsc::Receiver<Vec<RobotMotionDebug>>>>>,
     active_tab: TabView,
-    packet_history: VecDeque<(f64, u64)>, // (time_seconds, packets_in_that_second)
+    packet_history: VecDeque<(f64, u64)>,
     start_time: Instant,
     last_second: u64,
     current_second_count: u64,
-    tracker_enabled: bool, // Estado del filtro Kalman
+    tracker_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +172,7 @@ impl VisionGui {
         port: u16,
         config_tx: mpsc::Sender<ConfigUpdate>,
         status_rx: mpsc::Receiver<StatusUpdate>,
+        motion_rx: mpsc::Receiver<Vec<RobotMotionDebug>>,
     ) -> (Self, Task<Message>) {
         (
             VisionGui {
@@ -169,16 +185,18 @@ impl VisionGui {
                 last_robot_count: 0,
                 robots: HashMap::new(),
                 ball: None,
+                motion_debug: HashMap::new(),
                 field_cache: Cache::default(),
                 chart_cache: Cache::default(),
                 config_tx: Some(config_tx),
                 status_rx: Arc::new(Mutex::new(Some(status_rx))),
+                motion_rx: Arc::new(Mutex::new(Some(motion_rx))),
                 active_tab: TabView::Vision,
                 packet_history: VecDeque::new(),
                 start_time: Instant::now(),
                 last_second: 0,
                 current_second_count: 0,
-                tracker_enabled: true, // Habilitado por defecto
+                tracker_enabled: true,
             },
             Task::none(),
         )
@@ -284,6 +302,12 @@ impl VisionGui {
                     self.field_cache.clear();
                 }
             }
+            Message::MotionUpdate(updates) => {
+                for m in updates {
+                    self.motion_debug.insert((m.team, m.id), m);
+                }
+                self.field_cache.clear();
+            }
             Message::ChangeIp(ip) => {
                 self.vision_ip = ip;
             }
@@ -345,6 +369,7 @@ impl VisionGui {
 
     fn subscription(&self) -> Subscription<Message> {
         let rx = self.status_rx.clone();
+        let motion_rx = self.motion_rx.clone();
 
         let status_subscription = Subscription::run_with_id(
             "status_updates",
@@ -393,10 +418,30 @@ impl VisionGui {
             }),
         );
 
+        let motion_subscription = Subscription::run_with_id(
+            "motion_updates",
+            stream::channel(32, move |mut output| async move {
+                let receiver = {
+                    let mut rx_lock = motion_rx.lock().unwrap();
+                    rx_lock.take()
+                };
+
+                if let Some(mut rx) = receiver {
+                    while let Some(updates) = rx.recv().await {
+                        let _ = output.send(Message::MotionUpdate(updates)).await;
+                    }
+                }
+
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }),
+        );
+
         let tick_subscription =
             iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::Tick);
 
-        Subscription::batch([status_subscription, tick_subscription])
+        Subscription::batch([status_subscription, motion_subscription, tick_subscription])
     }
 
     fn theme(&self) -> Theme {
@@ -445,6 +490,7 @@ impl VisionGui {
                 let field = Canvas::new(FieldCanvas {
                     robots: &self.robots,
                     ball: &self.ball,
+                    motion: &self.motion_debug,
                     cache: &self.field_cache,
                 })
                 .width(Length::Fill)
@@ -473,11 +519,12 @@ pub fn run_gui(
     port: u16,
     config_tx: mpsc::Sender<ConfigUpdate>,
     status_rx: mpsc::Receiver<StatusUpdate>,
+    motion_rx: mpsc::Receiver<Vec<RobotMotionDebug>>,
 ) -> iced::Result {
     iced::application(VisionGui::title, VisionGui::update, VisionGui::view)
         .subscription(VisionGui::subscription)
         .theme(VisionGui::theme)
-        .run_with(move || VisionGui::new(ip, port, config_tx, status_rx))
+        .run_with(move || VisionGui::new(ip, port, config_tx, status_rx, motion_rx))
 }
 
 #[cfg(test)]
