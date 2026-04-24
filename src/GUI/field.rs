@@ -3,7 +3,7 @@ use iced::widget::canvas::{self, Cache, Geometry, Path, Stroke};
 use iced::{Color, Point, Rectangle, Size, Theme};
 use std::collections::HashMap;
 
-use super::{Ball, Message, Robot};
+use super::{Ball, Message, Robot, RobotMotionDebug};
 
 // Dimensiones del campo VSS (Very Small Size League) — alineadas con FIRASim
 const FIELD_LENGTH: f32 = 1500.0; // mm - Campo VSS 1.5m x 1.3m
@@ -20,9 +20,13 @@ const ROBOT_RADIUS_MM: f32 = 38.0; // mm - radio para dibujo (~76mm diámetro)
 const BALL_RADIUS_MM: f32 = 22.0; // mm - radio para dibujo (~44mm diámetro)
 const ORIENTATION_LINE_MM: f32 = 55.0; // mm - longitud de la línea de orientación
 
+/// mm por cada m/s — a 1.2 m/s la flecha mide 360 mm (bien visible en el campo)
+const VELOCITY_SCALE_MM: f32 = 300.0;
+
 pub struct FieldCanvas<'a> {
     pub robots: &'a HashMap<(u32, u32), Robot>,
     pub ball: &'a Option<Ball>,
+    pub motion: &'a HashMap<(u32, u32), RobotMotionDebug>,
     pub cache: &'a Cache,
 }
 
@@ -203,7 +207,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     Stroke::default().with_width(1.0).with_color(Color::BLACK),
                 );
 
-                // Línea de orientación (proporcionada al tamaño del robot)
+                // Línea de orientación
                 let dx = robot.orientation.cos() * ORIENTATION_LINE_MM * scale;
                 let dy = -robot.orientation.sin() * ORIENTATION_LINE_MM * scale;
                 let orientation_line =
@@ -212,6 +216,62 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     &orientation_line,
                     Stroke::default().with_width(2.0).with_color(Color::BLACK),
                 );
+
+                // Vector de velocidad comandada (flecha blanca) + punto target (círculo cyan)
+                if let Some(m) = self.motion.get(&(robot.team, robot.id)) {
+                    // Flecha de velocidad
+                    let speed = (m.vx * m.vx + m.vy * m.vy).sqrt();
+                    if speed > 0.01 {
+                        let arrow_dx = m.vx * VELOCITY_SCALE_MM * scale;
+                        let arrow_dy = -m.vy * VELOCITY_SCALE_MM * scale;
+                        let tip = Point::new(robot_pos.x + arrow_dx, robot_pos.y + arrow_dy);
+
+                        let shaft = Path::line(robot_pos, tip);
+                        frame.stroke(
+                            &shaft,
+                            Stroke::default().with_width(2.5).with_color(Color::WHITE),
+                        );
+
+                        // Cabeza de flecha (dos líneas cortas)
+                        let head_len = 12.0_f32;
+                        let angle = m.vy.atan2(m.vx);
+                        for side in [-0.5_f32, 0.5] {
+                            let hx = tip.x - head_len * (angle + side).cos();
+                            let hy = tip.y + head_len * (angle + side).sin();
+                            frame.stroke(
+                                &Path::line(tip, Point::new(hx, hy)),
+                                Stroke::default().with_width(2.5).with_color(Color::WHITE),
+                            );
+                        }
+                    }
+
+                    // Punto target (círculo cyan pequeño)
+                    if let Some(target) = m.target {
+                        let target_pos = Point::new(
+                            center.x + target.x * 1000.0 * scale,
+                            center.y - target.y * 1000.0 * scale,
+                        );
+                        let target_circle = Path::circle(target_pos, 8.0);
+                        frame.stroke(
+                            &target_circle,
+                            Stroke::default()
+                                .with_width(2.0)
+                                .with_color(Color::from_rgb(0.0, 1.0, 1.0)),
+                        );
+                        // Cruz en el centro del target
+                        for (dx, dy) in [(-5.0_f32, 0.0), (5.0, 0.0), (0.0, -5.0_f32), (0.0, 5.0)] {
+                            frame.stroke(
+                                &Path::line(
+                                    Point::new(target_pos.x - dx, target_pos.y - dy),
+                                    Point::new(target_pos.x + dx, target_pos.y + dy),
+                                ),
+                                Stroke::default()
+                                    .with_width(1.5)
+                                    .with_color(Color::from_rgb(0.0, 1.0, 1.0)),
+                            );
+                        }
+                    }
+                }
             }
         });
 
