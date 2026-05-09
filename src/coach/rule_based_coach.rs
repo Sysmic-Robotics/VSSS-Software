@@ -1,36 +1,43 @@
 use crate::coach::coach_trait::Coach;
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation};
-use crate::coach::robot_target::RobotTarget;
+use crate::coach::skill_choice::SkillChoice;
+use crate::skills::SkillId;
 use glam::Vec2;
 
-/// **A REESCRIBIR — Fase 3 del plan RL.**
+/// **Baseline clásico contra el cual comparar el modelo RL** (A/B obligatorio).
 ///
-/// Hoy retorna `Vec<RobotTarget>` (interfaz target-espacial). Cuando se introduzca
-/// `SkillChoice` en Fase 3, este coach se reescribe contra la nueva firma:
-/// los targets se traducen a llamadas explícitas del catálogo
-/// `{ GoTo, FacePoint, ChaseBall, Spin }`. Esto lo deja como **baseline directamente
-/// comparable** contra el `RlCoach` (mismo catálogo, distinta policy).
+/// Reescrito en Fase 3 del plan RL contra la nueva firma `Coach<SkillChoice>`.
+/// La lógica táctica subyacente es la misma que la versión vieja
+/// (`StandardPlay`): roles fijos atacante/soporte/portero. La diferencia es
+/// que ahora se expresa como **selección de skill del catálogo cerrado**,
+/// idéntica al output que va a producir el `RlCoach`. Esto permite
+/// comparar las dos policies bajo exactamente el mismo path de ejecución
+/// (mismo dispatcher, mismas skills, mismas constantes).
 ///
-/// **Importante**: no borrar este coach. Es la métrica A/B obligatoria para
-/// validar que el modelo RL aprendió algo más que reglas obvias.
+/// Roles fijos (no se reasignan dinámicamente en este baseline):
+/// - **Robot 0 → Atacante**: `GoTo` al staging point detrás de la pelota
+///   en dirección al goal rival; conmuta a `ChaseBall` cuando ya está cerca
+///   del staging (≤10 cm). Esto reproduce el patrón "approach then chase"
+///   de la striker LARC 2019.
+/// - **Robot 1 → Soporte**: `GoTo` a una posición 25 cm detrás de la pelota
+///   con offset lateral de 20 cm, clampeada al campo lógico.
+/// - **Robot 2 → Portero**: `GoTo` a un punto sobre la línea defensiva
+///   (12 cm delante del propio arco), siguiendo la `y` de la pelota
+///   clampeada a ±20 cm.
 ///
-/// ─────────────────────────────────────────────────────────────────────────────
-///
-/// Coach clásico basado en reglas. Replica la lógica de `StandardPlay` expresada
-/// como targets de posición, sin llamar a motion primitives.
-///
-/// Roles fijos:
-/// - Robot 0 → Atacante: staging point detrás de la pelota en dirección al goal rival
-/// - Robot 1 → Soporte: 25cm detrás + 20cm lateral respecto a la pelota
-/// - Robot 2 → Portero: x fija delante del arco propio, y siguiendo la pelota
-///
-/// Este coach sirve para:
-/// 1. Validar que el pipeline Coach → CoachPlay → Motion funciona correctamente.
-/// 2. A/B testing frente a StandardPlay para verificar paridad de comportamiento.
-/// 3. Fallback clásico si el modelo RL no está disponible.
+/// **Importante**: este coach solo usa skills del catálogo (`GoTo`,
+/// `ChaseBall`). No usa `FacePoint` ni `Spin` — esas las ejercerá el
+/// modelo RL cuando aprenda situaciones donde son útiles. Si el RL no
+/// las usa nunca, el catálogo crecía sobre suposiciones equivocadas.
 pub struct RuleBasedCoach {
     pub attack_goal: Vec2,
     pub own_goal: Vec2,
+    /// Distancia al staging por debajo de la cual el atacante conmuta a
+    /// `ChaseBall`. 10 cm es generoso pero estable.
+    pub attacker_chase_radius: f32,
+    /// Offset detrás de la pelota en dirección al goal rival (m).
+    /// Mismo valor que `ApproachBallBehindSkill::staging_offset`.
+    pub attacker_staging_offset: f32,
 }
 
 impl RuleBasedCoach {
@@ -38,6 +45,8 @@ impl RuleBasedCoach {
         Self {
             attack_goal,
             own_goal,
+            attacker_chase_radius: 0.10,
+            attacker_staging_offset: 0.16,
         }
     }
 
@@ -46,50 +55,51 @@ impl RuleBasedCoach {
         Vec2::new(obs.ball.x * FIELD_HALF_X, obs.ball.y * FIELD_HALF_Y)
     }
 
-    fn attacker_target(&self, obs: &Observation) -> RobotTarget {
+    /// Desnormaliza la posición del robot propio en el slot `idx` (0..3).
+    fn own_robot_pos(obs: &Observation, idx: usize) -> Vec2 {
+        let r = &obs.own_robots[idx];
+        Vec2::new(r.x * FIELD_HALF_X, r.y * FIELD_HALF_Y)
+    }
+
+    fn attacker_choice(&self, obs: &Observation) -> SkillChoice {
         let ball = Self::ball_pos(obs);
+        let robot = Self::own_robot_pos(obs, 0);
         let ball_to_goal = (self.attack_goal - ball).normalize_or_zero();
-        // Staging: 16cm detrás de la pelota (mismo valor que ApproachBallBehindSkill::staging_offset)
-        let staging = ball - ball_to_goal * 0.16;
-        RobotTarget {
-            robot_id: 0,
-            position: staging,
-            face_target: Some(ball),
+        let staging = ball - ball_to_goal * self.attacker_staging_offset;
+
+        if (robot - staging).length() < self.attacker_chase_radius {
+            // Cerca del staging → empujar la pelota persiguiéndola.
+            SkillChoice::chase_ball(0)
+        } else {
+            // Lejos del staging → ir al staging primero.
+            SkillChoice::goto(0, staging)
         }
     }
 
-    fn support_target(&self, obs: &Observation) -> RobotTarget {
+    fn support_choice(&self, obs: &Observation) -> SkillChoice {
         let ball = Self::ball_pos(obs);
         let to_own = (self.own_goal - ball).normalize_or_zero();
         let lateral = Vec2::new(-to_own.y, to_own.x) * 0.20;
         let raw = ball + to_own * 0.25 + lateral;
         let pos = Vec2::new(raw.x.clamp(-0.60, 0.60), raw.y.clamp(-0.55, 0.55));
-        RobotTarget {
-            robot_id: 1,
-            position: pos,
-            face_target: Some(ball),
-        }
+        SkillChoice::goto(1, pos)
     }
 
-    fn goalkeeper_target(&self, obs: &Observation) -> RobotTarget {
+    fn goalkeeper_choice(&self, obs: &Observation) -> SkillChoice {
         let ball = Self::ball_pos(obs);
         let sign = if self.own_goal.x < 0.0 { 1.0_f32 } else { -1.0 };
         let defend_x = self.own_goal.x + sign * 0.12;
         let target_y = ball.y.clamp(-0.20, 0.20);
-        RobotTarget {
-            robot_id: 2,
-            position: Vec2::new(defend_x, target_y),
-            face_target: Some(ball),
-        }
+        SkillChoice::goto(2, Vec2::new(defend_x, target_y))
     }
 }
 
 impl Coach for RuleBasedCoach {
-    fn decide(&mut self, obs: &Observation) -> Vec<RobotTarget> {
+    fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice> {
         vec![
-            self.attacker_target(obs),
-            self.support_target(obs),
-            self.goalkeeper_target(obs),
+            self.attacker_choice(obs),
+            self.support_choice(obs),
+            self.goalkeeper_choice(obs),
         ]
     }
 }
@@ -113,58 +123,98 @@ mod tests {
         }
     }
 
+    fn make_obs_with_robot(ball: Vec2, robot_idx: usize, robot_pos: Vec2) -> Observation {
+        let mut obs = make_obs(ball.x, ball.y);
+        obs.own_robots[robot_idx] = RobotObs {
+            x: robot_pos.x / FIELD_HALF_X,
+            y: robot_pos.y / FIELD_HALF_Y,
+            vx: 0.0,
+            vy: 0.0,
+            sin_theta: 0.0,
+            cos_theta: 1.0,
+            omega: 0.0,
+            active: 1.0,
+        };
+        obs
+    }
+
     #[test]
-    fn test_rule_based_returns_three_targets() {
+    fn rule_based_returns_three_choices() {
         let mut coach = RuleBasedCoach::new(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0));
         let obs = make_obs(0.1, 0.0);
-        let targets = coach.decide(&obs);
-        assert_eq!(targets.len(), 3);
-        assert_eq!(targets[0].robot_id, 0);
-        assert_eq!(targets[1].robot_id, 1);
-        assert_eq!(targets[2].robot_id, 2);
+        let choices = coach.decide(&obs);
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[0].robot_id, 0);
+        assert_eq!(choices[1].robot_id, 1);
+        assert_eq!(choices[2].robot_id, 2);
     }
 
     #[test]
-    fn test_attacker_staging_behind_ball() {
+    fn attacker_uses_goto_to_staging_when_far() {
         let attack_goal = Vec2::new(0.75, 0.0);
         let mut coach = RuleBasedCoach::new(attack_goal, Vec2::new(-0.75, 0.0));
-        // Pelota en el centro, goal a la derecha → staging debe estar a la izquierda de la pelota
-        let obs = make_obs(0.0, 0.0);
-        let targets = coach.decide(&obs);
-        let attacker = &targets[0];
-        // staging_x = ball_x - (normalized ball_to_goal_x) * 0.16 = 0 - 1*0.16 = -0.16
+        // Pelota en el centro, robot 0 lejos del staging.
+        let obs = make_obs_with_robot(Vec2::new(0.0, 0.0), 0, Vec2::new(-0.5, 0.0));
+        let choices = coach.decide(&obs);
+        let attacker = &choices[0];
+
+        assert_eq!(attacker.skill_id, SkillId::GoTo);
+        // staging_x = 0 - 1*0.16 = -0.16 (detrás de la pelota respecto al goal)
         assert!(
-            attacker.position.x < 0.0,
-            "staging debe estar detrás (izq) de la pelota"
+            attacker.target.x < 0.0,
+            "staging debe estar detrás (izq) de la pelota: target={:?}",
+            attacker.target
         );
-        assert!(attacker.face_target.is_some());
+        assert!((attacker.target.x - (-0.16)).abs() < 0.01);
     }
 
     #[test]
-    fn test_goalkeeper_tracks_ball_y() {
+    fn attacker_chases_ball_when_close_to_staging() {
+        let attack_goal = Vec2::new(0.75, 0.0);
+        let mut coach = RuleBasedCoach::new(attack_goal, Vec2::new(-0.75, 0.0));
+        // Pelota en el centro → staging en (-0.16, 0). Robot ya en (-0.18, 0),
+        // dentro del attacker_chase_radius=0.10.
+        let obs = make_obs_with_robot(Vec2::new(0.0, 0.0), 0, Vec2::new(-0.18, 0.0));
+        let choices = coach.decide(&obs);
+        let attacker = &choices[0];
+
+        assert_eq!(attacker.skill_id, SkillId::ChaseBall);
+    }
+
+    #[test]
+    fn support_targets_a_lateral_position_behind_ball() {
+        let mut coach = RuleBasedCoach::new(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0));
+        let obs = make_obs(0.0, 0.0);
+        let choices = coach.decide(&obs);
+        let support = &choices[1];
+
+        assert_eq!(support.skill_id, SkillId::GoTo);
+        // Pelota en centro, own_goal a la izquierda → support va detrás (x<0)
+        // y con offset lateral.
+        assert!(support.target.x < 0.0);
+    }
+
+    #[test]
+    fn goalkeeper_tracks_ball_y_via_goto() {
         let own_goal = Vec2::new(-0.75, 0.0);
         let mut coach = RuleBasedCoach::new(Vec2::new(0.75, 0.0), own_goal);
-        // Pelota en y=0.15 → portero debe ir a y=0.15 (dentro del clamp ±0.20)
         let obs = make_obs(0.0, 0.15);
-        let targets = coach.decide(&obs);
-        let gk = &targets[2];
-        assert!(
-            (gk.position.y - 0.15).abs() < 0.01,
-            "portero debe seguir y de la pelota"
-        );
+        let choices = coach.decide(&obs);
+        let gk = &choices[2];
+
+        assert_eq!(gk.skill_id, SkillId::GoTo);
+        assert!((gk.target.y - 0.15).abs() < 0.01);
         // defend_x = -0.75 + 1.0 * 0.12 = -0.63
-        assert!((gk.position.x - (-0.63)).abs() < 0.01);
+        assert!((gk.target.x - (-0.63)).abs() < 0.01);
     }
 
     #[test]
-    fn test_goalkeeper_clamps_ball_y() {
+    fn goalkeeper_clamps_ball_y() {
         let mut coach = RuleBasedCoach::new(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0));
-        // Pelota en y=0.50 → portero debe clampear a ±0.20
         let obs = make_obs(0.0, 0.50);
-        let targets = coach.decide(&obs);
-        assert!(
-            (targets[2].position.y - 0.20).abs() < 0.01,
-            "debe clampear a 0.20"
-        );
+        let choices = coach.decide(&obs);
+        let gk = &choices[2];
+
+        assert!((gk.target.y - 0.20).abs() < 0.01, "debe clampear a 0.20");
     }
 }

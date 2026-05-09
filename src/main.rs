@@ -5,28 +5,84 @@ mod GUI;
 
 // ====== Parámetros ======
 const OWN_TEAM: i32 = 0; // 0=azul, 1=amarillo
-const ROBOT_ID: i32 = 0;
+const NUM_ROBOTS: usize = 3;
+
+// Frame-skip del coach (Fase 3 — opción E del horizonte de decisión).
+// El coach se consulta una vez cada COACH_DECISION_PERIOD ticks; entre medio
+// el dispatcher reusa la última decisión y solo refresca las skills (que sí
+// corren a 60 Hz para suavidad de control). Con período=6 a 60 Hz, la policy
+// decide a 10 Hz (≈ 100 ms por decisión), valor estándar en VSSS-RL.
+const COACH_DECISION_PERIOD: u32 = 6;
 // ========================
 
+use rustengine::coach::{Coach, Observation, RuleBasedCoach, SkillChoice};
 use rustengine::motion::{Motion, MotionCommand};
-use rustengine::skills::{ChaseBallSkill, Skill};
+use rustengine::skills::SkillCatalog;
 use rustengine::world::World;
+use glam::Vec2;
 
-fn scenario_tick(
+/// Direcciones de ataque convencionales según el equipo propio.
+/// Azul ataca a +X, amarillo ataca a -X.
+fn goals_for_team(own_team: i32) -> (Vec2, Vec2) {
+    if own_team == 0 {
+        (Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0))
+    } else {
+        (Vec2::new(-0.75, 0.0), Vec2::new(0.75, 0.0))
+    }
+}
+
+/// Construye el coach inicial. Soporta selección por env var:
+/// - `VSSL_COACH=rule_based` (default): baseline clásico.
+/// - `VSSL_COACH=none`: no emite decisiones (útil para test de visión/radio).
+///
+/// El día que llegue Fase 7, este factory va a aceptar también `VSSL_COACH=rl`
+/// para cargar un modelo ONNX.
+fn make_coach(own_team: i32) -> Option<Box<dyn Coach>> {
+    let kind = std::env::var("VSSL_COACH").unwrap_or_else(|_| "rule_based".to_string());
+    let (attack_goal, own_goal) = goals_for_team(own_team);
+    match kind.as_str() {
+        "rule_based" => Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal))),
+        "none" => None,
+        other => {
+            eprintln!("[main] VSSL_COACH='{other}' inválido, usando 'rule_based'");
+            Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal)))
+        }
+    }
+}
+
+/// Para cada `SkillChoice`, busca el robot correspondiente en el equipo
+/// activo y dispatcha la skill via el catálogo. Robots no encontrados
+/// (porque están inactivos) se ignoran silenciosamente.
+fn dispatch_choices(
+    choices: &[SkillChoice],
+    catalog: &mut SkillCatalog,
     world: &World,
     motion: &Motion,
-    chase_ball: &mut ChaseBallSkill,
+    own_team: i32,
 ) -> Vec<MotionCommand> {
-    let team_robots = if OWN_TEAM == 0 {
-        world.get_blue_team_active()
+    let team_robots: Vec<_> = if own_team == 0 {
+        world.get_blue_team_active().into_iter().cloned().collect()
     } else {
-        world.get_yellow_team_active()
+        world
+            .get_yellow_team_active()
+            .into_iter()
+            .cloned()
+            .collect()
     };
-    team_robots
-        .iter()
-        .find(|robot| robot.id == ROBOT_ID)
-        .map(|robot| vec![chase_ball.tick(robot, world, motion)])
-        .unwrap_or_default()
+
+    let mut commands = Vec::with_capacity(choices.len());
+    for choice in choices {
+        let Some(robot) = team_robots.iter().find(|r| r.id == choice.robot_id) else {
+            continue; // robot inactivo o id fuera de rango
+        };
+        let robot_idx = choice.robot_id as usize;
+        if robot_idx >= catalog.num_robots() {
+            continue; // catálogo no tiene slot para este id
+        }
+        let cmd = catalog.tick(robot_idx, choice.skill_id, choice.target, robot, world, motion);
+        commands.push(cmd);
+    }
+    commands
 }
 
 use rustengine::{
@@ -69,6 +125,19 @@ fn run_with_gui() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pipeline principal (headless o con canales para GUI)
+//
+//  Estructura del control loop a 60 Hz (Fase 3 del plan RL):
+//
+//    cada tick (16 ms):
+//      ├─ si tick % COACH_DECISION_PERIOD == 0:
+//      │     obs ← Observation::from_world(world, OWN_TEAM)
+//      │     last_choices ← coach.decide(&obs)
+//      └─ commands ← dispatch_choices(last_choices, catalog, ...)
+//         radio.send(commands)
+//
+//  El coach decide a 10 Hz; las skills (UVF + PID) corren a 60 Hz dentro del
+//  catálogo. Esto matchea la opción E del horizonte (frame-skip transparente
+//  a la policy RL futura) y replica el patrón de rSoccer / Bassani 2020.
 // ─────────────────────────────────────────────────────────────────────────────
 async fn async_main(
     gui_channels: Option<(
@@ -151,10 +220,26 @@ async fn async_main(
         }
     };
 
-    eprintln!("[main] listo. 60 Hz. Ctrl+C para detener.");
+    let mut coach = make_coach(OWN_TEAM);
+    eprintln!(
+        "[main] coach: {}",
+        if coach.is_some() {
+            std::env::var("VSSL_COACH").unwrap_or_else(|_| "rule_based".to_string())
+        } else {
+            "none".to_string()
+        }
+    );
+    eprintln!(
+        "[main] decisión cada {} ticks ({:.0} Hz)",
+        COACH_DECISION_PERIOD,
+        60.0 / COACH_DECISION_PERIOD as f64
+    );
+    eprintln!("[main] listo. 60 Hz control loop. Ctrl+C para detener.");
 
     let motion = Motion::new();
-    let mut chase_ball = ChaseBallSkill::new();
+    let mut catalog = SkillCatalog::new(NUM_ROBOTS);
+    let mut last_choices: Vec<SkillChoice> = Vec::new();
+    let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
 
     loop {
@@ -162,8 +247,19 @@ async fn async_main(
 
         let commands = {
             let world = world.read().await;
-            scenario_tick(&world, &motion, &mut chase_ball)
+
+            // Cada COACH_DECISION_PERIOD ticks, refrescamos la decisión.
+            if tick_counter.is_multiple_of(COACH_DECISION_PERIOD) {
+                if let Some(coach) = coach.as_mut() {
+                    let obs = Observation::from_world(&world, OWN_TEAM);
+                    last_choices = coach.decide(&obs);
+                }
+            }
+
+            // Cada tick, dispatch sobre las choices vigentes.
+            dispatch_choices(&last_choices, &mut catalog, &world, &motion, OWN_TEAM)
         };
+        tick_counter = tick_counter.wrapping_add(1);
 
         if commands.is_empty() {
             continue;
@@ -178,7 +274,7 @@ async fn async_main(
                     id: cmd.id as u32,
                     vx: cmd.vx as f32,
                     vy: cmd.vy as f32,
-                    target: None, // ChaseBallSkill no expone target estático
+                    target: None,
                 })
                 .collect();
             let _ = tx.try_send(updates);
