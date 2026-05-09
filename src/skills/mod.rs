@@ -35,6 +35,94 @@ fn is_inside_logical_field(pos: Vec2) -> bool {
     pos.x.abs() <= LOGICAL_FIELD_HALF_X && pos.y.abs() <= LOGICAL_FIELD_HALF_Y
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  StuckDetector — recuperación local de skills
+// ─────────────────────────────────────────────────────────────────────────────
+/// Detecta cuando un robot que intenta llegar a un target deja de avanzar y
+/// propone un punto de escape lateral para destrabarlo.
+///
+/// Migrado desde `tactics/` en Fase 1 del plan RL: aquí queda como utilidad
+/// reutilizable por cualquier skill que quiera recovery local sin depender
+/// de que el coach (clásico o RL) cambie de decisión.
+///
+/// # Uso típico
+/// ```ignore
+/// let escape = self.stuck.update(robot.position, target);
+/// let effective_target = escape.unwrap_or(target);
+/// ```
+///
+/// # Política
+/// - Considera al robot "atascado" si lleva 30 ticks moviéndose < 6 mm/tick
+///   mientras está a más de 8 cm del target.
+/// - Al activarse, fuerza 35 ticks de movimiento perpendicular al target,
+///   con dirección lateral elegida según el cuadrante actual del robot.
+/// - El punto de escape se clampea al campo lógico (±0.68, ±0.58) para no
+///   sugerir destinos fuera de cancha.
+pub struct StuckDetector {
+    stuck_ticks: u32,
+    yield_ticks: u32,
+    last_pos: Vec2,
+    yield_dir: f32,
+}
+
+impl StuckDetector {
+    pub fn new() -> Self {
+        Self {
+            stuck_ticks: 0,
+            yield_ticks: 0,
+            last_pos: Vec2::ZERO,
+            yield_dir: 1.0,
+        }
+    }
+
+    /// Devuelve `Some(escape_pos)` si el robot está atascado y debe yield-ear,
+    /// `None` si puede seguir hacia el target normalmente.
+    pub fn update(&mut self, robot_pos: Vec2, target: Vec2) -> Option<Vec2> {
+        let dist_to_target = (target - robot_pos).length();
+        let moved = (robot_pos - self.last_pos).length();
+        self.last_pos = robot_pos;
+
+        if dist_to_target > 0.08 {
+            if moved < 0.006 {
+                self.stuck_ticks += 1;
+            } else {
+                self.stuck_ticks = 0;
+            }
+        } else {
+            self.stuck_ticks = 0;
+        }
+
+        if self.stuck_ticks >= 30 && self.yield_ticks == 0 {
+            self.yield_dir = if (robot_pos.x + robot_pos.y) >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
+            self.yield_ticks = 35;
+            self.stuck_ticks = 0;
+        }
+
+        if self.yield_ticks > 0 {
+            self.yield_ticks -= 1;
+            let to_target = (target - robot_pos).normalize_or_zero();
+            let perp = Vec2::new(-to_target.y, to_target.x) * self.yield_dir;
+            let escape = robot_pos + perp * 0.18;
+            Some(Vec2::new(
+                escape.x.clamp(-0.68, 0.68),
+                escape.y.clamp(-0.58, 0.58),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for StuckDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct StopSkill;
 
 impl StopSkill {
@@ -718,5 +806,73 @@ mod tests {
         assert_eq!(cmd.vx, 0.0);
         assert_eq!(cmd.vy, 0.0);
         assert_eq!(cmd.omega, 0.0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  StuckDetector
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stuck_detector_does_not_yield_when_robot_is_advancing() {
+        let mut detector = StuckDetector::new();
+        let target = Vec2::new(0.5, 0.0);
+
+        // El robot avanza claramente cada tick (0.02 m > umbral de 0.006 m).
+        let mut pos = Vec2::new(-0.2, 0.0);
+        for _ in 0..200 {
+            assert!(detector.update(pos, target).is_none());
+            pos.x += 0.02;
+        }
+    }
+
+    #[test]
+    fn stuck_detector_yields_after_thirty_static_ticks() {
+        let mut detector = StuckDetector::new();
+        let target = Vec2::new(0.5, 0.0);
+        let robot_pos = Vec2::new(-0.2, 0.0);
+
+        // Primera llamada inicializa last_pos; las 29 siguientes acumulan stuck.
+        // En la llamada #31 (stuck_ticks alcanza 30) debe disparar el escape.
+        for _ in 0..30 {
+            assert!(detector.update(robot_pos, target).is_none());
+        }
+        let escape = detector.update(robot_pos, target);
+        assert!(escape.is_some(), "el detector debe disparar a los 30 ticks");
+    }
+
+    #[test]
+    fn stuck_detector_escape_position_stays_inside_field() {
+        let mut detector = StuckDetector::new();
+        // Target lejos del robot (>0.08 m) para que se acumule stuck_ticks.
+        // El robot pegado a la esquina superior derecha del campo lógico tiene
+        // que recibir un escape que NO se salga del clamp ±0.68/±0.58.
+        let target = Vec2::new(-0.5, -0.5);
+        let robot_pos = Vec2::new(0.65, 0.55);
+
+        for _ in 0..30 {
+            detector.update(robot_pos, target);
+        }
+        let escape = detector
+            .update(robot_pos, target)
+            .expect("debe disparar escape tras 30 ticks atascado");
+
+        assert!(
+            escape.x.abs() <= 0.68 + 1e-6 && escape.y.abs() <= 0.58 + 1e-6,
+            "escape {:?} fuera del campo lógico clampeado",
+            escape
+        );
+    }
+
+    #[test]
+    fn stuck_detector_resets_when_close_to_target() {
+        let mut detector = StuckDetector::new();
+        let target = Vec2::new(0.0, 0.0);
+        // Robot dentro del radio de llegada (8 cm) — no debe acumular stuck
+        // aunque esté quieto.
+        let robot_pos = Vec2::new(0.05, 0.0);
+
+        for _ in 0..100 {
+            assert!(detector.update(robot_pos, target).is_none());
+        }
     }
 }
