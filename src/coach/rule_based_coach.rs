@@ -3,6 +3,19 @@ use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation};
 use crate::coach::robot_target::RobotTarget;
 use glam::Vec2;
 
+/// **A REESCRIBIR — Fase 3 del plan RL.**
+///
+/// Hoy retorna `Vec<RobotTarget>` (interfaz target-espacial). Cuando se introduzca
+/// `SkillChoice` en Fase 3, este coach se reescribe contra la nueva firma:
+/// los targets se traducen a llamadas explícitas del catálogo
+/// `{ GoTo, FacePoint, ChaseBall, Spin }`. Esto lo deja como **baseline directamente
+/// comparable** contra el `RlCoach` (mismo catálogo, distinta policy).
+///
+/// **Importante**: no borrar este coach. Es la métrica A/B obligatoria para
+/// validar que el modelo RL aprendió algo más que reglas obvias.
+///
+/// ─────────────────────────────────────────────────────────────────────────────
+///
 /// Coach clásico basado en reglas. Replica la lógica de `StandardPlay` expresada
 /// como targets de posición, sin llamar a motion primitives.
 ///

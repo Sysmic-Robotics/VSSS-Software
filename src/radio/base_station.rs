@@ -193,7 +193,8 @@ mod tests {
     }
 
     #[test]
-    fn xy_omega_drives_x() {
+    fn xy_omega_drives_y() {
+        // Tras PR#4 del firmware: X = lineal, Y = angular.
         let cmd = MotionCommand {
             id: 0,
             team: 0,
@@ -203,8 +204,8 @@ mod tests {
             orientation: 0.0,
         };
         let (x, y) = command_to_xy(&cmd);
-        assert_eq!(x, 30); // 2.0 * 15
-        assert_eq!(y, 0);
+        assert_eq!(x, 0);
+        assert_eq!(y, 30); // 2.0 * 15
     }
 
     #[test]
@@ -222,13 +223,14 @@ mod tests {
 
     #[test]
     fn frame_slots_by_id_and_filters_team() {
+        // Tras PR#4 del firmware: X = lineal, Y = angular.
         let cmds = vec![
-            make_cmd(0, 0, 0.5, 0.0, 0.0, 0.0), // own slot 0 → Y=100
-            make_cmd(0, 2, 0.0, 0.0, 1.0, 0.0), // own slot 2 → X=15
+            make_cmd(0, 0, 0.5, 0.0, 0.0, 0.0), // own slot 0 → X=100, Y=0
+            make_cmd(0, 2, 0.0, 0.0, 1.0, 0.0), // own slot 2 → X=0,   Y=15
             make_cmd(1, 1, 1.0, 0.0, 0.0, 0.0), // opp, ignorar
         ];
         let frame = build_frame(&cmds, TeamColor::Blue);
-        assert_eq!(frame, "0,100,0,0,15,0,0,0,0,0\n");
+        assert_eq!(frame, "100,0,0,0,0,15,0,0,0,0\n");
     }
 
     #[test]
@@ -240,11 +242,12 @@ mod tests {
 
     #[test]
     fn frame_yellow_team_filters_blue_out() {
+        // Tras PR#4 del firmware: X = lineal, Y = angular.
         let cmds = vec![
             make_cmd(0, 0, 1.0, 0.0, 0.0, 0.0), // azul → ignorar
-            make_cmd(1, 1, 0.5, 0.0, 0.0, 0.0), // amarillo → Y=100
+            make_cmd(1, 1, 0.5, 0.0, 0.0, 0.0), // amarillo slot 1 → X=100, Y=0
         ];
         let frame = build_frame(&cmds, TeamColor::Yellow);
-        assert_eq!(frame, "0,0,0,100,0,0,0,0,0,0\n");
+        assert_eq!(frame, "0,0,100,0,0,0,0,0,0,0\n");
     }
 }
