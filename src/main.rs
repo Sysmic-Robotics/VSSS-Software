@@ -1,7 +1,7 @@
 // Modo base: headless por defecto.
 // Con VSSL_DEBUG_GUI=1 lanza la interfaz gráfica con vectores de velocidad y targets.
 
-mod GUI;
+use rustengine::GUI;
 
 // ====== Parámetros ======
 const OWN_TEAM: i32 = 0; // 0=azul, 1=amarillo
@@ -17,7 +17,7 @@ const COACH_DECISION_PERIOD: u32 = 6;
 
 use rustengine::coach::{Coach, Observation, RuleBasedCoach, SkillChoice};
 use rustengine::motion::{Motion, MotionCommand};
-use rustengine::skills::SkillCatalog;
+use rustengine::skills::{SkillCatalog, SkillId};
 use rustengine::world::World;
 use glam::Vec2;
 
@@ -50,16 +50,29 @@ fn make_coach(own_team: i32) -> Option<Box<dyn Coach>> {
     }
 }
 
+/// Punto visible (en coordenadas de campo, m) que la skill activa está usando
+/// como destino para el overlay de debug en la GUI. Devuelve `None` para skills
+/// que no tienen target espacial (Spin).
+fn debug_target_for(choice: &SkillChoice, world: &World) -> Option<Vec2> {
+    match choice.skill_id {
+        SkillId::GoTo | SkillId::FacePoint => Some(choice.target),
+        SkillId::ChaseBall => Some(world.get_ball_state().position),
+        SkillId::Spin => None,
+    }
+}
+
 /// Para cada `SkillChoice`, busca el robot correspondiente en el equipo
 /// activo y dispatcha la skill via el catálogo. Robots no encontrados
 /// (porque están inactivos) se ignoran silenciosamente.
+///
+/// Devuelve el comando junto con el target visible para overlay (cyan dot en la GUI).
 fn dispatch_choices(
     choices: &[SkillChoice],
     catalog: &mut SkillCatalog,
     world: &World,
     motion: &Motion,
     own_team: i32,
-) -> Vec<MotionCommand> {
+) -> Vec<(MotionCommand, Option<Vec2>)> {
     let team_robots: Vec<_> = if own_team == 0 {
         world.get_blue_team_active().into_iter().cloned().collect()
     } else {
@@ -80,7 +93,8 @@ fn dispatch_choices(
             continue; // catálogo no tiene slot para este id
         }
         let cmd = catalog.tick(robot_idx, choice.skill_id, choice.target, robot, world, motion);
-        commands.push(cmd);
+        let target = debug_target_for(choice, world);
+        commands.push((cmd, target));
     }
     commands
 }
@@ -269,19 +283,19 @@ async fn async_main(
         if let Some(ref tx) = motion_tx {
             let updates: Vec<GUI::RobotMotionDebug> = commands
                 .iter()
-                .map(|cmd| GUI::RobotMotionDebug {
+                .map(|(cmd, target)| GUI::RobotMotionDebug {
                     team: cmd.team as u32,
                     id: cmd.id as u32,
                     vx: cmd.vx as f32,
                     vy: cmd.vy as f32,
-                    target: None,
+                    target: *target,
                 })
                 .collect();
             let _ = tx.try_send(updates);
         }
 
         let mut radio = radio.lock().await;
-        for cmd in commands {
+        for (cmd, _target) in commands {
             radio.add_motion_command(cmd);
         }
         if let Err(err) = radio.send_commands().await {

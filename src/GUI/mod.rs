@@ -15,7 +15,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use field::FieldCanvas;
-pub use rustengine::vision::StatusUpdate;
+pub use crate::vision::StatusUpdate;
 
 /// Datos de motion de un robot para debug visual.
 /// Se envía desde el control loop al GUI cada tick.

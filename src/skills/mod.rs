@@ -35,6 +35,14 @@ pub trait Skill: Send + Sync {
     fn is_done(&self, _robot: &RobotState, _world: &World) -> bool {
         false
     }
+
+    /// Punto del campo (en metros) que la skill está usando como destino
+    /// visible. Solo para overlay de debug en la GUI: el cyan target dot.
+    /// Las skills puramente rotacionales (Spin) o de detención (Stop) deben
+    /// devolver `None`.
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        None
+    }
 }
 
 fn stop_cmd(robot: &RobotState) -> MotionCommand {
@@ -201,6 +209,10 @@ impl Skill for GoToSkill {
             self.kd,
         )
     }
+
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        Some(self.target)
+    }
 }
 
 pub struct FacePointSkill {
@@ -232,6 +244,10 @@ impl Skill for FacePointSkill {
         }
 
         motion.face_to(robot, self.target, self.kp, self.ki, self.kd)
+    }
+
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        Some(self.target)
     }
 }
 
@@ -274,6 +290,10 @@ impl Skill for HoldPositionSkill {
             self.kd,
         )
     }
+
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        Some(clamp_to_logical_field(self.position))
+    }
 }
 
 pub struct ChaseBallSkill {
@@ -302,6 +322,10 @@ impl Skill for ChaseBallSkill {
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
         let ball = world.get_ball_state().position;
         motion.move_and_face(robot, ball, ball, world, self.kp, self.ki, self.kd)
+    }
+
+    fn current_target(&self, world: &World) -> Option<Vec2> {
+        Some(world.get_ball_state().position)
     }
 }
 
