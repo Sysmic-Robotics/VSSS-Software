@@ -119,18 +119,23 @@ impl Motion {
 
         let env = Environment::new(world, robot_state);
 
-        // Obstáculos: robots siempre incluidos.
-        // La pelota se excluye si el target está cerca de ella (staging_point justo detrás
-        // de la pelota): incluir la pelota haría que el UVF deflecte al robot lejos del staging.
+        // Obstáculos: robots y pelota, EXCEPTO los que estén plantados sobre el target.
+        // Un obstáculo encima del destino haría que el UVF deflecte tangencialmente y nunca
+        // llegue (regla "no me esquives del lugar al que voy"). Esto cubre dos casos reales:
+        //   - staging_point detrás de la pelota → pelota cerca del target → no obstaculizar.
+        //   - fantasma de visión sentado en (0,0) cuando el target es (0,0) → ignorarlo.
+        let near_target_threshold = self.config.uvf_influence_radius * 1.5;
         let ball_pos = env.get_ball_position();
-        let target_near_ball = (target - ball_pos).length() < self.config.uvf_influence_radius * 1.5;
-        let mut obstacles: Vec<Vec2> = if target_near_ball {
-            env.get_robots().to_vec()
-        } else {
-            let mut obs = env.get_robots().to_vec();
-            obs.push(ball_pos);
-            obs
-        };
+        let target_near_ball = (target - ball_pos).length() < near_target_threshold;
+        let mut obstacles: Vec<Vec2> = env
+            .get_robots()
+            .iter()
+            .copied()
+            .filter(|&r| (target - r).length() >= near_target_threshold)
+            .collect();
+        if !target_near_ball {
+            obstacles.push(ball_pos);
+        }
 
         // Wall avoidance: obstáculos virtuales en los límites del campo lógico.
         // Cuando el robot se acerca a una pared, el UVF lo deflecta tangencialmente
@@ -425,11 +430,14 @@ mod tests {
     /// Verifica que move_to con UVF produce velocidad razonable en trayectoria larga con obstáculo.
     /// Con dist_to_goal ≈ 0.80m >> BRAKE_DISTANCE, la velocidad base es MAX_LINEAR_SPEED.
     /// El coupling puede reducirla si el robot debe desviarse, pero debe ser > 0.3 m/s.
+    ///
+    /// Nota: el obstáculo está al **medio** del camino (no pegado al target) para que la
+    /// regla "ignorar obstáculos sobre el destino" no lo filtre y haya deflexión real.
     #[test]
     fn test_move_to_speed_with_obstacle_detour() {
         let motion = Motion::new();
         let mut world = World::new(3, 3);
-        world.update_robot(1, 0, Vec2::new(0.20, 0.0), 0.0, Vec2::ZERO, 0.0);
+        world.update_robot(1, 0, Vec2::new(0.0, 0.0), 0.0, Vec2::ZERO, 0.0);
         world.update_ball(Vec2::new(0.0, 0.5), Vec2::ZERO);
 
         let mut robot = RobotState::new(0, 0);
@@ -444,6 +452,34 @@ mod tests {
         // La dirección debe desviarse del eje directo al target (obstáculo en el camino)
         // vx solo no puede ser la velocidad completa — debe haber componente vy de desviación
         // (test estructural: si no hay deflexión, cmd.vy ≈ 0; con deflexión, |vy| > threshold)
+    }
+
+    /// Regresión: un robot obstáculo sentado encima del target no debe deflectar al UVF.
+    /// Caso real: vision-sysmic emite un fantasma sobre (0,0) y el robot intenta ir ahí.
+    /// Antes del fix, el UVF tomaba una tangente y mandaba al robot hacia algún arco.
+    /// Después, el obstáculo se filtra (regla simétrica con la pelota) y el comando apunta
+    /// directo al target.
+    #[test]
+    fn test_move_to_ignores_obstacle_on_target() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        // Fantasma enemigo plantado en (0,0) — exactamente nuestro target.
+        world.update_robot(0, 1, Vec2::new(0.0, 0.0), 0.0, Vec2::ZERO, 0.0);
+
+        let mut robot = RobotState::new(0, 0);
+        robot.position = Vec2::new(-0.40, -0.30);
+        let target = Vec2::new(0.0, 0.0);
+
+        let cmd = motion.move_to(&robot, target, &world);
+        // Dirección esperada hacia (0,0) desde (-0.40, -0.30): vx > 0 y vy > 0.
+        // Si el fantasma se contara como obstáculo, la tangente del UVF mandaría
+        // al menos una de las componentes al signo contrario.
+        assert!(
+            cmd.vx > 0.0 && cmd.vy > 0.0,
+            "comando hacia el target debe tener vx>0 vy>0, no ({:.3}, {:.3})",
+            cmd.vx,
+            cmd.vy
+        );
     }
 
     /// Verifica que move_to con UVF produce un vector no-cero cuando hay obstáculos cercanos.
