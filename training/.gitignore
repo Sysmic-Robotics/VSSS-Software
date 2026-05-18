@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+checkpoints/
+logs/
+tb_logs/
+runs/
+*.zip
+*.pt
+*.onnx
+
+# Material académico personal del curso INF398 (no va al repo del equipo).
+# Estos archivos son apuntes/presentaciones/informes del integrante del curso
+# y se mantienen solo localmente.
+PRESENTACION.md
+EXPLICACION_RED.md
+RESULTADOS_FASE1.md
+GUIA_REVISION.md
+informe_latex/
+
+# Sobreescribe la regla *.md del .gitignore raíz solo para README.md,
+# que sí es documentación técnica del proyecto.
+!README.md

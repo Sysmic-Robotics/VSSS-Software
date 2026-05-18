@@ -1,0 +1,9 @@
+[project]
+name = "vsss-rl"
+version = "0.1.0"
+description = "Deep RL trainer for Sysmic Robotics VSSS engine (INF398 project)"
+requires-python = ">=3.10,<3.13"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vsss_rl*"]

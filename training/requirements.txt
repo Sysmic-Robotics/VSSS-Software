@@ -1,0 +1,15 @@
+# Núcleo numérico
+numpy>=1.24,<2.0
+
+# RL stack
+gymnasium>=0.29,<1.0
+stable-baselines3>=2.3,<3.0
+tensorboard>=2.15
+
+# Simulador: mini-sim propio en vsss_rl/env_phase1.py (sin deps nativas).
+# rSoccer requiere VS Build Tools en Windows — descartado para Fase 1.
+# Considerarlo para Fase 2/3 si pasamos a WSL/Linux.
+
+# Utilidades
+matplotlib
+tqdm
