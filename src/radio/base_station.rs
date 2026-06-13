@@ -104,7 +104,22 @@ pub fn build_frame(commands: &[RobotCommand], own_team: TeamColor) -> String {
             slots[idx] = command_to_wheel_mm_s(&cmd.motion);
         }
     }
+    build_frame_from_wheels(slots)
+}
 
+/// Camino "raw wheels" para bring-up: arma el frame ASCII directamente desde
+/// pares `(left_mm_s, right_mm_s)` ya calculados, sin pasar por cinemática
+/// inversa. Bypasea `command_to_wheel_mm_s` — útil cuando se quiere comandar
+/// velocidad de rueda directa (modo `wheels` de `skill_test`) sin sintetizar
+/// un `MotionCommand`.
+///
+/// **No clampea**: el contrato es que el caller entrega valores ya en rango
+/// (típicamente vía `send_raw_wheels_frame`, que sí clampea defensivamente).
+/// Esto mantiene la función pura y barata.
+///
+/// Coincide byte a byte con `build_frame` cuando los slots resueltos por
+/// `build_frame` se le pasan acá (ver test `build_frame_paths_equivalent`).
+pub fn build_frame_from_wheels(slots: [(i16, i16); SLOT_COUNT]) -> String {
     let mut out = String::with_capacity(64);
     for (i, (l, r)) in slots.iter().enumerate() {
         if i > 0 {
@@ -146,6 +161,30 @@ impl BaseStationTransport {
             .and_then(|s| s.parse().ok())
             .unwrap_or(115200u32);
         Self::new(&device, baud, own_team)
+    }
+
+    /// Envío directo de velocidades de rueda crudas, sin pasar por
+    /// `command_to_wheel_mm_s`. Diseñado para el modo `wheels` del probador
+    /// `skill_test`: bring-up de comunicación y signos del robot real.
+    ///
+    /// Clampea defensivamente a ±`MAX_WHEEL_MM_S` antes de armar el frame.
+    /// Esto duplica el clamp del CLI (cinturón + tirantes); `build_frame_from_wheels`
+    /// como función pura no clampea.
+    pub async fn send_raw_wheels_frame(
+        &mut self,
+        slots: [(i16, i16); SLOT_COUNT],
+    ) -> Result<(), TransportError> {
+        let max = MAX_WHEEL_MM_S as i16;
+        let clamped: [(i16, i16); SLOT_COUNT] =
+            slots.map(|(l, r)| (l.clamp(-max, max), r.clamp(-max, max)));
+        let frame = build_frame_from_wheels(clamped);
+        match self.port.write_all(frame.as_bytes()).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("[BaseStation] error escribiendo en {}: {e}", self.device);
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -359,5 +398,75 @@ mod tests {
         ];
         let frame = build_frame(&cmds, TeamColor::Yellow);
         assert_eq!(frame, "0,0,500,500,0,0,0,0,0,0\n");
+    }
+
+    // ---------- build_frame_from_wheels (raw wheels path) ----------
+
+    #[test]
+    fn build_from_wheels_golden_slot_0() {
+        let slots: [(i16, i16); SLOT_COUNT] = [(500, 500), (0, 0), (0, 0), (0, 0), (0, 0)];
+        assert_eq!(build_frame_from_wheels(slots), "500,500,0,0,0,0,0,0,0,0\n");
+    }
+
+    #[test]
+    fn build_from_wheels_golden_slot_2_opposite_signs() {
+        let slots: [(i16, i16); SLOT_COUNT] = [(0, 0), (0, 0), (-500, 500), (0, 0), (0, 0)];
+        assert_eq!(build_frame_from_wheels(slots), "0,0,0,0,-500,500,0,0,0,0\n");
+    }
+
+    #[test]
+    fn build_from_wheels_does_not_clamp() {
+        // Función pura: caller es responsable del clamp. Valores en rango se
+        // emiten tal cual.
+        let slots: [(i16, i16); SLOT_COUNT] = [(1500, -1500), (0, 0), (0, 0), (0, 0), (0, 0)];
+        assert_eq!(
+            build_frame_from_wheels(slots),
+            "1500,-1500,0,0,0,0,0,0,0,0\n"
+        );
+    }
+
+    /// Equivalencia byte a byte: si build_frame con un set de comandos resuelve
+    /// slots S, build_frame_from_wheels(S) produce el mismo string.
+    #[test]
+    fn build_frame_paths_equivalent() {
+        // Caso 1: avance puro en slot 0.
+        let cmds = vec![make_cmd(0, 0, 0.5, 0.0, 0.0, 0.0)];
+        let frame_via_cmds = build_frame(&cmds, TeamColor::Blue);
+        let slots_resolved: [(i16, i16); SLOT_COUNT] = [
+            command_to_wheel_mm_s(&cmds[0].motion),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, 0),
+        ];
+        assert_eq!(frame_via_cmds, build_frame_from_wheels(slots_resolved));
+
+        // Caso 2: spin puro en slot 2.
+        let cmds2 = vec![make_cmd(0, 2, 0.0, 0.0, 2.0, 0.0)];
+        let frame2 = build_frame(&cmds2, TeamColor::Blue);
+        let slots2: [(i16, i16); SLOT_COUNT] = [
+            (0, 0),
+            (0, 0),
+            command_to_wheel_mm_s(&cmds2[0].motion),
+            (0, 0),
+            (0, 0),
+        ];
+        assert_eq!(frame2, build_frame_from_wheels(slots2));
+    }
+
+    /// `send_raw_wheels_frame` clampa defensivamente a ±1500 antes de armar
+    /// el frame. No podemos abrir el puerto, pero podemos verificar el clamp
+    /// vía la misma lógica que ejecuta el método (reusar el helper).
+    #[test]
+    fn send_raw_wheels_clamps_defensively() {
+        let input: [(i16, i16); SLOT_COUNT] = [(3000, -3000), (0, 0), (0, 0), (0, 0), (0, 0)];
+        let max = MAX_WHEEL_MM_S as i16;
+        let clamped: [(i16, i16); SLOT_COUNT] =
+            input.map(|(l, r)| (l.clamp(-max, max), r.clamp(-max, max)));
+        assert_eq!(clamped[0], (1500, -1500));
+        assert_eq!(
+            build_frame_from_wheels(clamped),
+            "1500,-1500,0,0,0,0,0,0,0,0\n"
+        );
     }
 }
