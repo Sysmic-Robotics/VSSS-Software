@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 default-run = "rustengine"
 
+[[bin]]
+name = "skill_test"
+path = "src/bin/skill_test.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 protobuf = "3.2" # Matches C++ ParseFromArray style
