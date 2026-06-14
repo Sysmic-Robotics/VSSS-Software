@@ -28,6 +28,10 @@ pub struct RobotMotionDebug {
     pub vy: f32,
     /// Destino del skill activo (metros, frame mundial). None si no aplica.
     pub target: Option<Vec2>,
+    /// Velocidades de rueda que LLEGAN al robot (mm/s), ya clampadas a ±1500.
+    /// Mismo cálculo que el CSV de auditoría (`command_to_wheel_mm_s`).
+    pub wheel_l_mm_s: i16,
+    pub wheel_r_mm_s: i16,
 }
 
 /// `true` imprime cada actualización de robot en stderr (muy ruidoso). Dejar en `false` para auditar con `[FieldAudit]` en `main`.

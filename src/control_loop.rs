@@ -345,12 +345,20 @@ pub async fn run_control_loop(
             let updates: Vec<GUI::RobotMotionDebug> = commands
                 .iter()
                 .zip(targets.iter())
-                .map(|(cmd, target)| GUI::RobotMotionDebug {
-                    team: cmd.team as u32,
-                    id: cmd.id as u32,
-                    vx: cmd.vx as f32,
-                    vy: cmd.vy as f32,
-                    target: *target,
+                .map(|(cmd, target)| {
+                    // Mismo cálculo que el CSV de auditoría (skill_log) → overlay y log
+                    // no pueden divergir. `cmd` ya es un MotionCommand aquí.
+                    let (wheel_l_mm_s, wheel_r_mm_s) =
+                        crate::radio::base_station::command_to_wheel_mm_s(cmd);
+                    GUI::RobotMotionDebug {
+                        team: cmd.team as u32,
+                        id: cmd.id as u32,
+                        vx: cmd.vx as f32,
+                        vy: cmd.vy as f32,
+                        target: *target,
+                        wheel_l_mm_s,
+                        wheel_r_mm_s,
+                    }
                 })
                 .collect();
             let _ = tx.try_send(updates);
