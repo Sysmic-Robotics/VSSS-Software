@@ -1,5 +1,8 @@
 /target
 
+# CSV del banco scenario (logs/scenario_<skill>_<epoch>.csv) — no son código.
+/logs
+
 # Archivos markdown de documentación/guías (no subir al repositorio)
 *.md
 !README.md
