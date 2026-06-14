@@ -121,13 +121,14 @@ fn main() {
     let team: TeamColor = TeamColor::Blue;
     let vision: VisionSource = VisionSource::FiraSim;
     let transport: RadioTarget = RadioTarget::FiraSim;
-    let log_path: PathBuf = scenario_log_path(&scenario);
+    let log: Option<PathBuf> = Some(scenario_log_path(&scenario));
+    //                  None = no escribe CSV (la GUI y el resumen humano 1 Hz a stderr siguen).
     let dur_s: Option<f64> = None; // None = corre hasta cerrar la ventana o Ctrl-C
 
     // ╔══════════════════════════════════════════════════════════════════════╗
     // ║  FIN ZONA DE EDICIÓN — abajo viene el wiring estándar                ║
     // ╚══════════════════════════════════════════════════════════════════════╝
-    run_bench(scenario, robot_id, team, vision, transport, log_path, dur_s);
+    run_bench(scenario, robot_id, team, vision, transport, log, dur_s);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ fn run_bench(
     team: TeamColor,
     vision: VisionSource,
     transport: RadioTarget,
-    log_path: PathBuf,
+    log: Option<PathBuf>,
     dur_s: Option<f64>,
 ) {
     let (status_tx, status_rx) = mpsc::channel(100);
@@ -151,20 +152,19 @@ fn run_bench(
     let ip = vision.multicast_ip().to_string();
     let port = vision.port();
 
+    let log_desc = log
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(off)".to_string());
     eprintln!(
         "[scenario] skill={} robot={} team={:?} transport={:?} vision={:?} log={}",
-        scenario.name,
-        robot_id,
-        team,
-        transport,
-        vision,
-        log_path.display()
+        scenario.name, robot_id, team, transport, vision, log_desc
     );
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async_run(
-            scenario, robot_id, team, vision, transport, log_path, dur_s, status_tx, motion_tx,
+            scenario, robot_id, team, vision, transport, log, dur_s, status_tx, motion_tx,
         ));
     });
 
@@ -178,7 +178,7 @@ async fn async_run(
     team: TeamColor,
     vision: VisionSource,
     transport: RadioTarget,
-    log_path: PathBuf,
+    log: Option<PathBuf>,
     dur_s: Option<f64>,
     status_tx: mpsc::Sender<GUI::StatusUpdate>,
     motion_tx: mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
@@ -211,11 +211,17 @@ async fn async_run(
         vision_timeout: None,
     };
 
-    let mut csv = match CsvLogger::new(&log_path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[scenario] error abriendo CSV {}: {e}", log_path.display());
-            return;
+    let mut csv: Option<CsvLogger> = match &log {
+        Some(p) => match CsvLogger::new(p) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("[scenario] error abriendo CSV {}: {e}", p.display());
+                return;
+            }
+        },
+        None => {
+            eprintln!("[scenario] CSV desactivado (log=None)");
+            None
         }
     };
     let mut last_print = Instant::now() - Duration::from_secs(2);
@@ -230,7 +236,9 @@ async fn async_run(
 
     let on_tick: Box<dyn FnMut(&TickRecord<'_>) + Send> = Box::new(move |rec: &TickRecord<'_>| {
         let row = ctx.build_skill_row(rec);
-        let _ = csv.write_row(&row);
+        if let Some(ref mut log) = csv {
+            let _ = log.write_row(&row);
+        }
         if last_print.elapsed() >= Duration::from_secs(1) {
             eprintln!("{}", format_human_summary(&row));
             last_print = Instant::now();

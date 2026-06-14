@@ -9,8 +9,8 @@ Motor de control en Rust para robots de fútbol **VSS/VSSS (Very Small Size Socc
 - **Rust** stable 1.70+
 - Una fuente de visión (al menos una):
   - **FIRASim** (default): visión multicast en `224.0.0.1:10002`, control/actuadores en `127.0.0.1:20011`.
-  - **vsss-vision-sysmic** (visión real): publica `SSL_WrapperPacket` en `224.5.23.2:10015`. Ver [NETWORK_PROTOCOL.md](NETWORK_PROTOCOL.md).
-- Para robots reales: base station USB (ESP32) flasheada + 3 robots con [VSSL-firmware](https://github.com/Sysmic-Robotics/VSSL-firmware) parcheado con el watchdog ([FIRMWARE_WATCHDOG.md](FIRMWARE_WATCHDOG.md)).
+  - **vsss-vision-sysmic** (visión real): publica `SSL_WrapperPacket` en `224.5.23.2:10015`.
+- Para robots reales: base station USB (ESP32) flasheada + robots con [VSSL-firmware](https://github.com/Sysmic-Robotics/VSSL-firmware) en modo ESP-NOW (`#define MODO_BASESTATION` activo en `config.h`).
 
 No se necesita `protoc` — los bindings protobuf se generan en compilación vía `build.rs`.
 
@@ -30,13 +30,20 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 ## Comandos rápidos
 
 ```bash
-cargo build --release   # build optimizado (necesario para tiempo real)
-cargo run --release     # correr el main headless actual (default: FIRASim)
-cargo run --bin scenario --release  # probar una skill manualmente en FIRASim
-cargo test              # suite de tests
-cargo clippy            # lint
-cargo fmt               # formato
+cargo build --release                # build optimizado (necesario para tiempo real)
+cargo run --release                  # main headless (coach decide) — default FIRASim
+VSSL_DEBUG_GUI=1 cargo run --release # main con GUI Iced
+cargo run --bin scenario --release   # banco "editar y correr" para 1 skill, GUI siempre on, CSV opcional a logs/
+cargo run --bin skill_test --release -- --help   # probador CLI (modo skill o wheels)
+cargo test                           # suite completa (lib + bin + doctests)
+cargo clippy                         # lint
+cargo fmt                            # formato
 ```
+
+**3 binarios:**
+- `rustengine` (default): producción headless o con `VSSL_DEBUG_GUI=1`. Coach decide qué skill correr.
+- `scenario`: banco de pruebas tipo "editar y correr". Una skill a la vez, configurada como constantes en la zona de edición al inicio de `src/bin/scenario.rs`. GUI siempre activa. CSV opcional a `logs/scenario_<skill>_<epoch>.csv` (toggle con la constante `log: Option<PathBuf>`: `Some(scenario_log_path(&scenario))` escribe, `None` desactiva el archivo y deja solo el resumen humano a stderr).
+- `skill_test`: probador CLI. Modo `skill` (lazo cerrado, sim o real) y modo `wheels` (lazo abierto, mm/s directos al robot real para bring-up). Ver `--help`.
 
 ### Probar contra robots reales
 
@@ -46,19 +53,24 @@ Pre-requisitos físicos:
    ```bash
    cd vsss-vision-sysmic && python3 client/python/client.py
    ```
-2. Base station enchufada por USB. Confirmar que aparece (ej. `/dev/ttyUSB0`):
+2. Base station enchufada por USB. Confirmar **qué device asignó el kernel** (NO siempre es `/dev/ttyUSB0`):
    ```bash
-   ls /dev/ttyUSB* /dev/ttyACM*
+   ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
+   # Si recién la enchufaste: dmesg | tail -20
    ```
-   Si necesita permisos: `sudo usermod -aG dialout $USER` (requiere re-login).
-3. 3 robots encendidos, dentro del campo, con firmware parcheado (ver [FIRMWARE_WATCHDOG.md](FIRMWARE_WATCHDOG.md)).
+   Si aparece `/dev/ttyUSB1` (u otro), exportá `VSSL_BASESTATION_DEVICE=/dev/ttyUSB1` antes de correr el engine. El default es `/dev/ttyUSB0` y si no existe vas a ver `[control_loop] radio error: No such file or directory` y todo se cae (incluida la visión, porque el runtime termina).
+   Si necesita permisos: `sudo usermod -aG dialout $USER` (requiere re-login) o `sudo chmod 666 /dev/ttyUSB1` como parche puntual.
+3. Robots encendidos con firmware en modo ESP-NOW (`#define MODO_BASESTATION` activo en `VSSL-firmware/include/config.h` y `MI_ROBOT_ID` asignado por robot).
 
 Levantar el engine:
 
 ```bash
 # Visión real + radio a la base station, equipo azul (default).
+# Ajustar VSSL_BASESTATION_DEVICE al device que el kernel le asignó a la base.
 VSSL_VISION_SOURCE=sslvision \
 VSSL_RADIO_TARGET=basestation \
+VSSL_BASESTATION_DEVICE=/dev/ttyUSB0 \
+VSSL_DEBUG_GUI=1 \
 cargo run --release
 ```
 
@@ -68,14 +80,19 @@ Variantes:
 # Equipo amarillo.
 VSSL_VISION_SOURCE=sslvision VSSL_RADIO_TARGET=basestation VSSL_TEAM_COLOR=yellow cargo run --release
 
-# Otro device serial.
-VSSL_VISION_SOURCE=sslvision VSSL_RADIO_TARGET=basestation VSSL_BASESTATION_DEVICE=/dev/ttyACM0 cargo run --release
-
 # Visión real, comandos a FIRASim (debug visual: ver qué decide el engine sin mover los robots).
 VSSL_VISION_SOURCE=sslvision cargo run --release
+
+# Bring-up de hardware: mandar L/R mm/s directos a un robot sin pasar por visión ni skills.
+# Útil para diagnosticar signos de rueda, comunicación y unidades.
+# Secuencia recomendada para descubrir signos invertidos:
+cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 500  --right 0    --dur 1   # solo izquierda → pivota a la derecha
+cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 0    --right 500  --dur 1   # solo derecha → pivota a la izquierda
+cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 500  --right 500  --dur 1   # ambas → debe AVANZAR RECTO (si gira: signo invertido en alguna rueda)
+cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left -500 --right 500  --dur 1   # giro CCW sobre el eje (confirma convención Spin)
 ```
 
-Smoke test del watchdog: con todo corriendo y los robots moviéndose, matar el proceso con `Ctrl+C`. Los robots deben detenerse en menos de 250 ms. Si no, revisar [FIRMWARE_WATCHDOG.md](FIRMWARE_WATCHDOG.md).
+Smoke test del watchdog (200 ms en firmware, `COMM_TIMEOUT_MS` en `config.h`): con los robots moviéndose, `Ctrl+C` y deben detenerse rápido.
 
 ---
 
@@ -83,35 +100,41 @@ Smoke test del watchdog: con todo corriendo y los robots moviéndose, matar el p
 
 ```
 Fuente de visión (FIRASim 224.0.0.1:10002 | vsss-vision-sysmic 224.5.23.2:10015)
-  └─ vision.rs         parse FIRA o SSL_WrapperPacket según VSSL_VISION_SOURCE
-      └─ tracker/ekf   Extended Kalman Filter por robot/balón
-          └─ world/    estado compartido Arc<RwLock<World>>
-              └─ skills/   primitives reactivas simples
-                  └─ motion/   UVF + PID → MotionCommand
-                      └─ radio/    despacha vía RobotTransport (VSSL_RADIO_TARGET):
-                                   ├─ FiraSimTransport  → UDP protobuf 127.0.0.1:20011
-                                   ├─ GrSimTransport    → UDP protobuf grSim
-                                   └─ BaseStationTransport → ASCII por USB serial
-                                                              └─ ESP32 base → ESP-NOW → robots
-
-Camino alternativo / futuro:
-  world/ → coach/ → plays/ → motion/ → radio/
+  └─ vision.rs           parse FIRA o SSL_WrapperPacket según VSSL_VISION_SOURCE
+      └─ tracker/ekf     Extended Kalman Filter por robot/balón
+          └─ world/      estado compartido Arc<RwLock<World>>
+              ↓
+       control_loop.rs   ← TickDecider decide qué skill correr para cada robot
+              │            ├─ CoachDecider (main): RuleBasedCoach o RL futuro, frame-skip 6 (10 Hz)
+              │            ├─ FixedSkillDecider (scenario, skill_test): una skill fija por CLI/constante
+              │            └─ NoOpDecider (main con VSSL_COACH=none)
+              ↓
+       skills/catalog.rs ← SkillCatalog::tick(robot_id, skill_id, target, robot, world, motion)
+              ↓
+          motion/        UVF + PID → MotionCommand (vx, vy, omega)
+              ↓
+          radio/         despacha vía RobotTransport (VSSL_RADIO_TARGET):
+                         ├─ FiraSimTransport     → UDP protobuf 127.0.0.1:20011
+                         ├─ GrSimTransport       → UDP protobuf grSim
+                         └─ BaseStationTransport → cinemática inversa diferencial
+                                                   → ASCII "L,R mm/s" por USB serial
+                                                   → ESP32 base → ESP-NOW → robots
 ```
 
 ### Módulos principales
 
 | Módulo | Función |
 |--------|---------|
-| `vision.rs` | Receptor UDP multicast; parsea SSL-Vision protobuf; emite `VisionEvent` al resto del sistema |
-| `tracker/` | EKF por entidad (robot/balón). Estado: posición + orientación + velocidades. Activable desde GUI |
+| `vision.rs` | Receptor UDP multicast; parsea FIRA o SSL_WrapperPacket según `VSSL_VISION_SOURCE`; emite `VisionEvent` |
+| `tracker/` | EKF por entidad (robot/balón). Estado: posición + orientación + velocidades |
 | `world/` | Estado canónico del juego: poses de robots, posición/velocidad del balón, flags de inactividad |
-| `coach/` | Base futura para estrategia/RL. Hoy expone observaciones y coaches, pero no es la ruta por defecto del `main` |
-| `plays/` | Orquestación de alto nivel (`StandardPlay`, `CoachPlay`). Quedó como base futura; el `main` actual no entra por aquí |
-| `skills/` | Primitives reactivas simples con trait `Skill -> MotionCommand`: `ChaseBallSkill`, `GoToSkill`, `FacePointSkill`, `HoldPositionSkill`, etc. |
-| `tactics/` | Wrappers de rol sobre skills (`AttackerTactic`, `SupportTactic`, `GoalkeeperTactic`) con `StuckDetector`; útiles como base futura |
+| `coach/` | Coach trait + `RuleBasedCoach` baseline + contrato `Observation` (52 floats) para el modelo RL futuro |
+| `skills/` | Catálogo congelado RL: `SkillId::{GoTo, FacePoint, ChaseBall, Spin}` (`SkillCatalog::tick`). Skills out-of-catalog viven en `skills/mod.rs` para otros usos |
 | `motion/` | UVF para evasión de obstáculos, PID para heading y velocidad, braking profile |
-| `radio/` | Trait `RobotTransport` + 3 implementaciones: `FiraSimTransport`, `GrSimTransport`, `BaseStationTransport` (USB serial → base station ESP32 → ESP-NOW). Selección por `VSSL_RADIO_TARGET` |
-| `GUI/` | Interfaz Iced para inspección visual. Sigue en el repo, pero el flujo actual de `main` y `scenario` es headless |
+| `radio/` | Trait `RobotTransport` + 3 implementaciones (`FiraSimTransport`, `GrSimTransport`, `BaseStationTransport`). Selección por `VSSL_RADIO_TARGET`. `Radio::from_target` explícito |
+| `control_loop.rs` | **Loop 60 Hz único** que `main`, `scenario` y `skill_test` invocan. `TickDecider` (`CoachDecider`/`FixedSkillDecider`/etc) decide qué skill; el resto del lazo (visión → world → dispatch → transport) es el mismo |
+| `skill_log.rs` | `CsvLogger`, `CsvRow`, `SkillLogCtx::build_skill_row` — fuente única del formato CSV compartida por `scenario` y `skill_test` |
+| `GUI/` | Interfaz Iced para inspección visual. Encendida siempre en `scenario`, opcional en `main` (`VSSL_DEBUG_GUI=1`) |
 | `protos/` | Bindings Rust generados en compilación desde `.proto` (FIRA, SSL-Vision, grSim) |
 
 ---
@@ -120,48 +143,28 @@ Camino alternativo / futuro:
 
 ```
 src/
-├── main.rs                # Entry point headless actual: visión + world + una skill simple + radio
-├── vision.rs              # Recepción y parsing de visión
-├── world/
-│   ├── mod.rs             # World struct, Arc<RwLock> state
-│   ├── robot_state.rs     # RobotState: posición, velocidad, orientación, active
-│   └── ball_state.rs      # BallState: posición, velocidad
-├── tracker/
-│   ├── mod.rs             # Tracker: despacha EKFs por (team, id)
-│   └── ekf.rs             # Extended Kalman Filter
-├── coach/                 # ── CAPA DE ESTRATEGIA (RL-ready) ──
-│   ├── mod.rs
-│   ├── observation.rs     # Observation: 52 floats normalizados para el modelo RL
-│   ├── robot_target.rs    # RobotTarget: {robot_id, position, face_target}
-│   ├── coach_trait.rs     # Coach trait — el único trait que implementa el modelo RL
-│   └── rule_based_coach.rs # Implementación clásica del Coach (fallback y A/B testing)
-├── plays/
-│   ├── mod.rs             # Play trait
-│   ├── standard_play.rs   # Orquestación fija de tácticas (camino alternativo, no default)
-│   └── coach_play.rs      # Puente Coach → Motion para integración futura de strategy/RL
-├── skills/
-│   └── mod.rs             # trait Skill -> MotionCommand + primitives reactivas simples
-├── tactics/
-│   └── mod.rs             # AttackerTactic, SupportTactic, GoalkeeperTactic, StuckDetector
-├── motion/
-│   ├── mod.rs             # Motion struct: move_to, move_and_face, move_direct, face_to
-│   ├── uvf.rs             # Univector Field — evasión de obstáculos tangencial
-│   ├── environment.rs     # Environment: obstáculos (robots + pelota) + límites de campo
-│   ├── pid.rs             # PIDController con anti-windup e initialized flag
-│   ├── commands.rs        # MotionCommand, KickerCommand, RobotCommand
-│   └── benchmark.rs       # KPI de movimiento (velocidad media, etc.)
+├── main.rs                # Wrapper: lee env, arma CoachDecider, llama run_control_loop
+├── lib.rs
+├── control_loop.rs        # Loop 60 Hz único. TickDecider trait + CoachDecider + FixedSkillDecider
+├── skill_log.rs           # CsvLogger + CsvRow + SkillLogCtx::build_skill_row (fuente única del CSV)
+├── vision.rs              # Recepción multicast (FIRA o SSL_WrapperPacket) + filtros
+├── bin/
+│   ├── scenario.rs        # Banco "editar y correr": 1 skill, GUI on, CSV a logs/
+│   └── skill_test.rs      # Probador CLI: --mode skill|wheels (bring-up real)
+├── world/                 # World, RobotState, BallState (Arc<RwLock>)
+├── tracker/               # EKF por entidad
+├── coach/                 # Coach trait + RuleBasedCoach + Observation (52 floats RL)
+├── skills/                # SkillCatalog congelado (GoTo, FacePoint, ChaseBall, Spin) + skills out-of-catalog
+├── motion/                # UVF + PID + MotionCommand
 ├── radio/
-│   ├── mod.rs             # Radio: cola de comandos + dispatch sobre Box<dyn RobotTransport>
+│   ├── mod.rs             # Radio + RadioTarget. Radio::from_target explícito.
 │   ├── transport.rs       # trait RobotTransport + FiraSimTransport / GrSimTransport
-│   ├── base_station.rs    # BaseStationTransport: serial USB → ESP32 base, frame ASCII "x,y,..."
+│   ├── base_station.rs    # BaseStationTransport: cinemática inversa diferencial → ASCII "L1,R1,...,L5,R5\n" mm/s
 │   ├── firasim.rs         # FIRASimClient: UDP → 127.0.0.1:20011
-│   ├── grsim.rs           # GrSimClient: UDP → grSim (soporte parcial)
+│   ├── grsim.rs           # GrSimClient: UDP protobuf
 │   └── commands.rs        # Serialización MotionCommand → protobuf
-├── GUI/
-│   ├── mod.rs             # App Iced, update/view principal
-│   ├── field.rs           # Canvas 2D del campo
-│   └── vision_status.rs   # Panel de estado de visión
-└── protos/                # Bindings auto-generados — NO editar manualmente
+├── GUI/                   # App Iced (campo 2D + paneles de visión / robots)
+└── protos/                # Bindings auto-generados — NO editar
 ```
 
 ---
@@ -171,9 +174,10 @@ src/
 | Constante | Valor | Descripción |
 |-----------|-------|-------------|
 | `OWN_TEAM` | `0` | Equipo controlado por el binario principal (`0` azul, `1` amarillo) |
-| `ROBOT_ID` | `0` | Robot que controla la base mínima actual |
+| `NUM_ROBOTS` | `3` | Cantidad de slots de `SkillCatalog` (un slot por robot del equipo propio) |
+| `COACH_DECISION_PERIOD` | `6` | Frame-skip del coach: decide cada 6 ticks (10 Hz) a 60 Hz de control |
 
-El `main` actual es deliberadamente pequeño: usa la misma base headless que `scenario`, sin GUI ni plays.
+`main` arma un `CoachDecider` con esos parámetros y delega TODO el lazo en `run_control_loop`. Los demás binarios (`scenario`, `skill_test`) corren el mismo loop con un decisor distinto.
 
 ### Parámetros de movimiento (`src/motion/mod.rs`)
 
@@ -205,16 +209,27 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 
 ### Parámetros de la base station (`src/radio/base_station.rs`)
 
-Convierte cada `MotionCommand` (frame mundial: `vx`, `vy`, `omega`, `orientation`) a el `(X, Y)` joystick que espera el firmware (`X` = giro diferencial, `Y` = avance en body frame, ambos `int8` ±100):
+`BaseStationTransport` hace la **cinemática inversa diferencial en Rust** y envía velocidades de rueda en mm/s a la base ESP32 nueva (`base_station2.ino` en la raíz del repo monorepo). La base reenvía un binario de 24 bytes por ESP-NOW al robot, que las aplica directamente con su PID interno.
 
 | Constante | Valor | Descripción |
 |-----------|-------|-------------|
-| `SCALE_LIN` | `200.0` | Multiplicador de la velocidad longitudinal `(vx·cosθ + vy·sinθ)` antes del clamp |
-| `SCALE_ANG` | `15.0` | Multiplicador de `omega` antes del clamp |
-| `JOYSTICK_MAX` | `100` | Límite duro del frame (firmware satura en ±100) |
-| `SLOT_COUNT` | `5` | Slots del frame ASCII; slot index = robot id, ids fuera de rango se descartan |
+| `WHEEL_BASE_M` | `0.07` | Separación física entre ruedas del robot real, en metros (medida 2026-06-13). Calibración fina del giro pendiente de validar |
+| `MAX_WHEEL_MM_S` | `1500` | Clamp duro de seguridad (mismo límite que aplica la base en `base_station2.ino`) |
+| `SLOT_COUNT` | `5` | Slots del frame ASCII; el robot físico con `MI_ROBOT_ID = N` (firmware, 1-based) lee `slots[N-1]` |
 
-Frame serial: `"x1,y1,x2,y2,x3,y3,x4,y4,x5,y5\n"` a 115200 baud. Sólo se incluyen comandos del equipo propio (`VSSL_TEAM_COLOR`); los del rival se descartan.
+**Cinemática inversa** (en `command_to_wheel_mm_s`):
+```
+v     = vx·cos(orientation) + vy·sin(orientation)   // m/s (proyección al heading)
+v_izq = v − (omega · WHEEL_BASE_M) / 2              // m/s
+v_der = v + (omega · WHEEL_BASE_M) / 2              // m/s
+```
+Convención: `omega > 0` → CCW visto desde arriba → rueda derecha más rápida (matchea la convención `Spin` del catálogo).
+
+**Frame serial:** `"L1,R1,L2,R2,L3,R3,L4,R4,L5,R5\n"` (enteros decimales, mm/s, terminador `\n`), 115200 baud. Solo se incluyen comandos del equipo propio (`VSSL_TEAM_COLOR`).
+
+**NaN/Inf safety:** si cualquier campo del `MotionCommand` es no-finito, `command_to_wheel_mm_s` devuelve `(0, 0)` sin pánico (estado seguro, igual al watchdog del firmware).
+
+**Bring-up directo de ruedas** (sin pasar por cinemática inversa): `BaseStationTransport::send_raw_wheels_frame(slots)` o el binario `skill_test --mode wheels`.
 
 ---
 
@@ -227,7 +242,8 @@ El engine está diseñado para recibir un modelo de RL con cambios mínimos. El 
 **1.** Crear `src/coach/rl_coach.rs`:
 
 ```rust
-use crate::coach::{Coach, Observation, RobotTarget};
+use crate::coach::{Coach, Observation, SkillChoice};
+use crate::skills::SkillId;
 
 pub struct RlCoach { /* model handle */ }
 
@@ -236,16 +252,17 @@ impl RlCoach {
 }
 
 impl Coach for RlCoach {
-    fn decide(&mut self, obs: &Observation) -> Vec<RobotTarget> {
+    fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice> {
         let input = obs.to_flat_vec(); // 52 floats — ver contrato abajo
-        // inferencia → Vec<RobotTarget>
+        // inferencia → Vec<SkillChoice { robot_id, skill_id, target }>
+        // skill_id ∈ {GoTo=0, FacePoint=1, ChaseBall=2, Spin=3} (catálogo congelado)
     }
 }
 ```
 
-**2.** Conectar ese coach a un entry point que instancie `CoachPlay` o a tu futuro módulo `strategy`.
+**2.** En `make_coach` (`src/main.rs`) agregar la rama `VSSL_COACH=rl` que carga `RlCoach::load(...)`. El `CoachDecider` ya envuelve cualquier `Box<dyn Coach>` con el frame-skip de 10 Hz, sin más cambios.
 
-Hoy `main.rs` no tiene un switch para `CoachPlay`; el seam RL sigue existiendo en `coach/` y `plays/`, pero la ruta por defecto del runtime es la base headless de skills simples.
+El contrato discreto es **`SkillId` con orden congelado** (CLAUDE.md §5): no renumerar ni eliminar entradas, solo agregar al final.
 
 ### Contrato de la observación (`Observation::to_flat_vec()`)
 
@@ -297,23 +314,49 @@ configura pasando `attack_goal` / `own_goal` a `StandardPlay::new` y
 
 ## Concurrencia
 
+Toda esta topología vive en `run_control_loop` (`src/control_loop.rs`) y la invocan los 3 binarios:
+
 ```
-Tokio runtime:
-  ├─ vision_task      (event-driven) UDP multicast → World
-  ├─ world_updater    (100 ms)       marca robots inactivos
-  └─ control_loop     (16 ms, 60 Hz) Skill → Radio → FIRASim
+Tokio runtime (un solo loop común para main, scenario y skill_test):
+  ├─ vision_task        (event-driven) UDP multicast → World
+  ├─ world_updater      (100 ms)       marca robots inactivos
+  ├─ vision_watchdog    (opcional)     aborta si --vision real no recibe paquetes en N s
+  └─ control_loop       (16 ms, 60 Hz) TickDecider → SkillCatalog::tick → Radio → transport
 ```
 
 Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales `mpsc`.
-La GUI sigue en el repo, pero no forma parte del flujo por defecto del `main`.
 
 ---
 
 ## Tests
 
 ```bash
-cargo test                                              # todos los tests
-cargo test test_robot_motion_simulation -- --nocapture  # simulación headless 8s
+cargo test                       # toda la suite
+cargo test --lib                 # solo lib (132 tests)
+cargo test --bin scenario        # constructores de Scenario (6 tests)
+cargo test --bin skill_test      # parser del CLI (15 tests)
 ```
 
-68 tests unitarios que cubren: UVF, motion, PID, Environment, radio, skills, tactics, observation/coach, world, tracker y vision.
+**153 tests** cubriendo: UVF, motion, PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station), skills (catálogo congelado), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip), skill_log (CsvLogger + row-builder compartido).
+
+### Plotting de runs (`tools/plot_run.py`)
+
+Convierte el CSV de un run (`scenario` con `log = Some(...)` o `skill_test --log`) en 4 paneles: trayectoria pose vs target, errores en el tiempo, velocidades de rueda L/R, y comando (vx, vy, omega).
+
+```bash
+python tools/plot_run.py logs/scenario_go_to_<epoch>.csv            # abre ventana
+python tools/plot_run.py logs/run.csv --save run.png                # guarda PNG y muestra
+python tools/plot_run.py logs/run.csv --save run.png --no-show      # solo guarda (headless / WSL)
+```
+
+Requiere `matplotlib` (`pip install matplotlib`). Sin `matplotlib` funciona el resumen de texto que imprime stats por columna.
+
+### Troubleshooting
+
+| Síntoma | Causa probable | Fix |
+|---|---|---|
+| `[control_loop] radio error: No such file or directory` | Base station no enchufada o `VSSL_BASESTATION_DEVICE` mal | `ls /dev/ttyUSB* /dev/ttyACM*`; exportar la ruta correcta |
+| `[control_loop] radio error: Permission denied` | Usuario no está en grupo `dialout` | `sudo usermod -aG dialout $USER` + re-login, o `sudo chmod 666 /dev/ttyUSBX` |
+| `[Vision] Sin paquetes` con `sslvision` | Publisher caído, grupo/puerto equivocado, o multicast en interfaz que no es | Verificar con `sudo tcpdump -ni any udp port 10015`; si llega pero el Rust no ve, probar `VSSL_MULTICAST_IFACE=<ip_local>` |
+| Robots detectados en GUI pero no se mueven | `MI_ROBOT_ID` (firmware) no matchea el id que la visión asigna; o `#define MODO_BASESTATION` comentado en firmware | Confirmar IDs en GUI y en `config.h`. Probar bring-up directo: `cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 500 --right 500 --dur 1` |
+| Frame `?,?,?,?,...` en consola pero robot inerte | `#define MODO_BASESTATION` está comentado → firmware compila en modo BLE/RemoteXY y no escucha ESP-NOW | Descomentar línea en `VSSL-firmware/include/config.h:10` y reflashear |
