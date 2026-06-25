@@ -1,3 +1,9 @@
+pub mod catalog;
+pub mod config;
+
+pub use catalog::{SkillCatalog, SkillId};
+pub use config::SkillConfig;
+
 use crate::motion::{Motion, MotionCommand};
 use crate::world::{RobotState, World};
 use glam::Vec2;
@@ -10,7 +16,33 @@ const CONTROL_KI: f64 = 0.08;
 const CONTROL_KD: f64 = 0.20;
 
 pub trait Skill: Send + Sync {
+    /// Genera el comando de movimiento para este tick.
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand;
+
+    /// Indica si la skill terminó intrínsecamente (no por timeout externo).
+    ///
+    /// Por defecto retorna `false`: la skill nunca termina sola y debe ser
+    /// preempt-eada por el coach o por timeout externo. Skills con criterios
+    /// naturales de terminación (e.g. GoTo cuando llega al target, FacePoint
+    /// cuando alinea heading) pueden override esta función.
+    ///
+    /// **Estado actual (Fase 2)**: el dispatcher de Fase 3 va a ignorar
+    /// `is_done` porque vamos por **opción E** del horizonte (frame-skip
+    /// K=6, decisión cada 100ms sin importar status del skill). El contrato
+    /// queda definido para una eventual migración a **opción C** (event-based
+    /// con timeout) en una segunda generación del modelo RL, sin breaking
+    /// changes en el trait.
+    fn is_done(&self, _robot: &RobotState, _world: &World) -> bool {
+        false
+    }
+
+    /// Punto del campo (en metros) que la skill está usando como destino
+    /// visible. Solo para overlay de debug en la GUI: el cyan target dot.
+    /// Las skills puramente rotacionales (Spin) o de detención (Stop) deben
+    /// devolver `None`.
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        None
+    }
 }
 
 fn stop_cmd(robot: &RobotState) -> MotionCommand {
@@ -33,6 +65,94 @@ fn clamp_to_logical_field(pos: Vec2) -> Vec2 {
 
 fn is_inside_logical_field(pos: Vec2) -> bool {
     pos.x.abs() <= LOGICAL_FIELD_HALF_X && pos.y.abs() <= LOGICAL_FIELD_HALF_Y
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  StuckDetector — recuperación local de skills
+// ─────────────────────────────────────────────────────────────────────────────
+/// Detecta cuando un robot que intenta llegar a un target deja de avanzar y
+/// propone un punto de escape lateral para destrabarlo.
+///
+/// Migrado desde `tactics/` en Fase 1 del plan RL: aquí queda como utilidad
+/// reutilizable por cualquier skill que quiera recovery local sin depender
+/// de que el coach (clásico o RL) cambie de decisión.
+///
+/// # Uso típico
+/// ```ignore
+/// let escape = self.stuck.update(robot.position, target);
+/// let effective_target = escape.unwrap_or(target);
+/// ```
+///
+/// # Política
+/// - Considera al robot "atascado" si lleva 30 ticks moviéndose < 6 mm/tick
+///   mientras está a más de 8 cm del target.
+/// - Al activarse, fuerza 35 ticks de movimiento perpendicular al target,
+///   con dirección lateral elegida según el cuadrante actual del robot.
+/// - El punto de escape se clampea al campo lógico (±0.68, ±0.58) para no
+///   sugerir destinos fuera de cancha.
+pub struct StuckDetector {
+    stuck_ticks: u32,
+    yield_ticks: u32,
+    last_pos: Vec2,
+    yield_dir: f32,
+}
+
+impl StuckDetector {
+    pub fn new() -> Self {
+        Self {
+            stuck_ticks: 0,
+            yield_ticks: 0,
+            last_pos: Vec2::ZERO,
+            yield_dir: 1.0,
+        }
+    }
+
+    /// Devuelve `Some(escape_pos)` si el robot está atascado y debe yield-ear,
+    /// `None` si puede seguir hacia el target normalmente.
+    pub fn update(&mut self, robot_pos: Vec2, target: Vec2) -> Option<Vec2> {
+        let dist_to_target = (target - robot_pos).length();
+        let moved = (robot_pos - self.last_pos).length();
+        self.last_pos = robot_pos;
+
+        if dist_to_target > 0.08 {
+            if moved < 0.006 {
+                self.stuck_ticks += 1;
+            } else {
+                self.stuck_ticks = 0;
+            }
+        } else {
+            self.stuck_ticks = 0;
+        }
+
+        if self.stuck_ticks >= 30 && self.yield_ticks == 0 {
+            self.yield_dir = if (robot_pos.x + robot_pos.y) >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
+            self.yield_ticks = 35;
+            self.stuck_ticks = 0;
+        }
+
+        if self.yield_ticks > 0 {
+            self.yield_ticks -= 1;
+            let to_target = (target - robot_pos).normalize_or_zero();
+            let perp = Vec2::new(-to_target.y, to_target.x) * self.yield_dir;
+            let escape = robot_pos + perp * 0.18;
+            Some(Vec2::new(
+                escape.x.clamp(-0.68, 0.68),
+                escape.y.clamp(-0.58, 0.58),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for StuckDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct StopSkill;
@@ -89,6 +209,10 @@ impl Skill for GoToSkill {
             self.kd,
         )
     }
+
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        Some(self.target)
+    }
 }
 
 pub struct FacePointSkill {
@@ -120,6 +244,10 @@ impl Skill for FacePointSkill {
         }
 
         motion.face_to(robot, self.target, self.kp, self.ki, self.kd)
+    }
+
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        Some(self.target)
     }
 }
 
@@ -162,6 +290,10 @@ impl Skill for HoldPositionSkill {
             self.kd,
         )
     }
+
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        Some(clamp_to_logical_field(self.position))
+    }
 }
 
 pub struct ChaseBallSkill {
@@ -190,6 +322,88 @@ impl Skill for ChaseBallSkill {
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
         let ball = world.get_ball_state().position;
         motion.move_and_face(robot, ball, ball, world, self.kp, self.ki, self.kd)
+    }
+
+    fn current_target(&self, world: &World) -> Option<Vec2> {
+        Some(world.get_ball_state().position)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SpinSkill — rotación pura en el lugar
+// ─────────────────────────────────────────────────────────────────────────────
+/// Hace girar al robot en su sitio sin trasladarse.
+///
+/// **Por qué existe como skill atómica** (ItAndroids LARC 2019, Bassani 2020):
+/// el robot diff-drive sin dribbler no puede cambiar de dirección de empuje
+/// sin antes alinear su cuerpo. Cuando la policy detecta que el robot está
+/// mal orientado respecto a la pelota o al target, conmutar a `Spin` por
+/// algunos ticks es más rápido y más confiable que esperar a que `GoTo` o
+/// `FacePoint` resuelvan el alineamiento mientras también intentan moverse.
+///
+/// Comando: `vx = vy = 0`, `omega = direction * spin_omega`.
+///
+/// **Convención de signo (CONTRATO con la policy RL)**:
+/// - `direction = +1.0` → rotación CCW (omega positivo).
+/// - `direction = -1.0` → rotación CW (omega negativo).
+/// - `direction = 0.0` → no spin (no command movement).
+///
+/// La policy emite el sentido a través del signo de `target.x` cuando elige
+/// `SkillId::Spin`: `target.x > 0` → CCW, `target.x < 0` → CW. El catálogo
+/// hace la traducción.
+pub struct SpinSkill {
+    /// Sentido y magnitud relativa del giro: típicamente -1.0, 0.0, o +1.0.
+    /// Valores intermedios escalan la velocidad angular linealmente.
+    pub direction: f32,
+    /// Velocidad angular máxima (rad/s). Default: `SkillConfig::default().spin_omega`.
+    pub omega_max: f64,
+}
+
+impl SpinSkill {
+    pub fn new() -> Self {
+        Self {
+            direction: 1.0,
+            omega_max: SkillConfig::default().spin_omega,
+        }
+    }
+
+    /// Construye con un `SkillConfig` específico.
+    pub fn with_config(cfg: &SkillConfig) -> Self {
+        Self {
+            direction: 1.0,
+            omega_max: cfg.spin_omega,
+        }
+    }
+
+    /// Setea el sentido del spin a partir del signo de `target.x`.
+    /// Esta es la traducción canónica policy → SpinSkill que usa el catálogo.
+    pub fn set_direction_from(&mut self, target: Vec2) {
+        self.direction = if target.x > 0.0 {
+            1.0
+        } else if target.x < 0.0 {
+            -1.0
+        } else {
+            0.0
+        };
+    }
+}
+
+impl Default for SpinSkill {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Skill for SpinSkill {
+    fn tick(&mut self, robot: &RobotState, _world: &World, _motion: &Motion) -> MotionCommand {
+        MotionCommand {
+            id: robot.id,
+            team: robot.team,
+            vx: 0.0,
+            vy: 0.0,
+            omega: self.omega_max * self.direction as f64,
+            orientation: robot.orientation,
+        }
     }
 }
 
@@ -718,5 +932,208 @@ mod tests {
         assert_eq!(cmd.vx, 0.0);
         assert_eq!(cmd.vy, 0.0);
         assert_eq!(cmd.omega, 0.0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  StuckDetector
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stuck_detector_does_not_yield_when_robot_is_advancing() {
+        let mut detector = StuckDetector::new();
+        let target = Vec2::new(0.5, 0.0);
+
+        // El robot avanza claramente cada tick (0.02 m > umbral de 0.006 m).
+        let mut pos = Vec2::new(-0.2, 0.0);
+        for _ in 0..200 {
+            assert!(detector.update(pos, target).is_none());
+            pos.x += 0.02;
+        }
+    }
+
+    #[test]
+    fn stuck_detector_yields_after_thirty_static_ticks() {
+        let mut detector = StuckDetector::new();
+        let target = Vec2::new(0.5, 0.0);
+        let robot_pos = Vec2::new(-0.2, 0.0);
+
+        // Primera llamada inicializa last_pos; las 29 siguientes acumulan stuck.
+        // En la llamada #31 (stuck_ticks alcanza 30) debe disparar el escape.
+        for _ in 0..30 {
+            assert!(detector.update(robot_pos, target).is_none());
+        }
+        let escape = detector.update(robot_pos, target);
+        assert!(escape.is_some(), "el detector debe disparar a los 30 ticks");
+    }
+
+    #[test]
+    fn stuck_detector_escape_position_stays_inside_field() {
+        let mut detector = StuckDetector::new();
+        // Target lejos del robot (>0.08 m) para que se acumule stuck_ticks.
+        // El robot pegado a la esquina superior derecha del campo lógico tiene
+        // que recibir un escape que NO se salga del clamp ±0.68/±0.58.
+        let target = Vec2::new(-0.5, -0.5);
+        let robot_pos = Vec2::new(0.65, 0.55);
+
+        for _ in 0..30 {
+            detector.update(robot_pos, target);
+        }
+        let escape = detector
+            .update(robot_pos, target)
+            .expect("debe disparar escape tras 30 ticks atascado");
+
+        assert!(
+            escape.x.abs() <= 0.68 + 1e-6 && escape.y.abs() <= 0.58 + 1e-6,
+            "escape {:?} fuera del campo lógico clampeado",
+            escape
+        );
+    }
+
+    #[test]
+    fn stuck_detector_resets_when_close_to_target() {
+        let mut detector = StuckDetector::new();
+        let target = Vec2::new(0.0, 0.0);
+        // Robot dentro del radio de llegada (8 cm) — no debe acumular stuck
+        // aunque esté quieto.
+        let robot_pos = Vec2::new(0.05, 0.0);
+
+        for _ in 0..100 {
+            assert!(detector.update(robot_pos, target).is_none());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Stress tests del catálogo (Fase 2)
+    //
+    //  La policy RL puede emitir targets en cualquier punto del rango
+    //  normalizado, incluyendo casos degenerados. Estos tests verifican que
+    //  las 4 skills del catálogo no producen NaN/Inf, no divergen y no
+    //  pegan al robot a las paredes en ningún caso patológico.
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn assert_command_finite(cmd: &MotionCommand, label: &str) {
+        assert!(cmd.vx.is_finite(), "{label}: vx no-finito ({:?})", cmd.vx);
+        assert!(cmd.vy.is_finite(), "{label}: vy no-finito ({:?})", cmd.vy);
+        assert!(
+            cmd.omega.is_finite(),
+            "{label}: omega no-finito ({:?})",
+            cmd.omega
+        );
+        assert!(
+            cmd.orientation.is_finite(),
+            "{label}: orientation no-finita"
+        );
+    }
+
+    #[test]
+    fn goto_skill_stays_finite_with_extreme_targets() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let robot = make_robot(0, 0.0, 0.0, 0.0);
+
+        // Targets en las cuatro esquinas del campo lógico, plus puntos fuera
+        // del campo (la policy RL puede emitir cualquiera de éstos).
+        let targets = [
+            Vec2::new(0.70, 0.60),
+            Vec2::new(-0.70, -0.60),
+            Vec2::new(0.70, -0.60),
+            Vec2::new(-0.70, 0.60),
+            Vec2::new(2.0, 2.0),    // fuera del campo: GoTo debe sobrevivir
+            Vec2::new(-5.0, -5.0),  // muy fuera del campo
+        ];
+        for target in targets {
+            let mut skill = GoToSkill::new(target);
+            for tick in 0..200 {
+                let cmd = skill.tick(&robot, &world, &motion);
+                assert_command_finite(&cmd, &format!("target={target:?} tick={tick}"));
+            }
+        }
+    }
+
+    #[test]
+    fn goto_skill_target_at_robot_position_is_safe() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let robot = make_robot(0, 0.3, 0.2, 45.0);
+        let mut skill = GoToSkill::new(robot.position);
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        // Target = posición actual → no debe pedir velocidad significativa.
+        // (Puede haber un pequeño residuo del PID de heading si el robot no
+        // mira al target; lo aceptamos pero verificamos que está acotado.)
+        assert_command_finite(&cmd, "target_at_robot");
+        let speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
+        assert!(speed < 0.5, "speed {speed} demasiado alta con target sobre robot");
+    }
+
+    #[test]
+    fn face_point_target_at_robot_position_is_safe() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let robot = make_robot(0, 0.2, 0.1, 30.0);
+        let mut skill = FacePointSkill::new(robot.position);
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert_command_finite(&cmd, "face_at_robot");
+        // Caso degenerado: dirección indefinida → la skill debe responder
+        // con un comando seguro (cero translación, omega acotado).
+        assert_eq!(cmd.vx, 0.0);
+        assert_eq!(cmd.vy, 0.0);
+    }
+
+    #[test]
+    fn chase_ball_handles_ball_at_robot_position() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        let robot = make_robot(0, 0.2, -0.1, 0.0);
+        world.update_ball(robot.position, Vec2::ZERO);
+        let mut skill = ChaseBallSkill::new();
+
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert_command_finite(&cmd, "ball_at_robot");
+    }
+
+    #[test]
+    fn chase_ball_stable_under_200_ticks_with_static_ball() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.30, 0.10), Vec2::ZERO);
+        let robot = make_robot(0, -0.20, 0.0, 0.0);
+        let mut skill = ChaseBallSkill::new();
+
+        // 200 ticks sin que cambie el robot ni la pelota: el comando
+        // resultante debe permanecer finito (no debe explotar el integral del PID).
+        for tick in 0..200 {
+            let cmd = skill.tick(&robot, &world, &motion);
+            assert_command_finite(&cmd, &format!("chase_ball tick={tick}"));
+        }
+    }
+
+    #[test]
+    fn spin_skill_omega_uses_config_magnitude() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let robot = make_robot(0, 0.0, 0.0, 0.0);
+        let cfg = SkillConfig::default();
+        let mut skill = SpinSkill::with_config(&cfg);
+
+        skill.set_direction_from(Vec2::new(1.0, 0.0));
+        let cmd = skill.tick(&robot, &world, &motion);
+
+        assert!((cmd.omega - cfg.spin_omega).abs() < 1e-9);
+        assert_eq!(cmd.vx, 0.0);
+        assert_eq!(cmd.vy, 0.0);
+    }
+
+    #[test]
+    fn spin_skill_set_direction_handles_zero_explicitly() {
+        let mut skill = SpinSkill::new();
+        skill.set_direction_from(Vec2::new(0.0, 5.0)); // x = 0 explícito
+        let robot = make_robot(0, 0.0, 0.0, 0.0);
+        let cmd = skill.tick(&robot, &World::new(3, 3), &Motion::new());
+        assert_eq!(cmd.omega, 0.0, "x=0 debe traducir a no-spin");
     }
 }

@@ -1,418 +1,320 @@
-// Harness de pruebas — usa variables de entorno igual que main.rs.
-// Ejecutar: VSSL_VISION_SOURCE=sslvision VSSL_RADIO_TARGET=basestation cargo run --bin scenario --release
-//
-// ─────────────────────────────────────────────────────────────────────────────
-//  PASO 1: elige el robot y equipo
-// ─────────────────────────────────────────────────────────────────────────────
-const OWN_TEAM: i32 = 0; // 0 = azul, 1 = amarillo
-const ROBOT_ID: i32 = 0;
+//! Banco de pruebas "editar y correr" para las 4 skills congeladas.
+//!
+//! Comparte el lazo de control con `main.rs` (vía `rustengine::control_loop::run_control_loop`),
+//! la cinemática inversa, el dispatcher de skills y el formato CSV con `skill_test`. La única
+//! diferencia con producción es el decisor: este banco usa `FixedSkillDecider` parametrizado
+//! por la línea descomentada en la zona de edición.
+//!
+//! Para auditar visualmente, la GUI se lanza SIEMPRE (sin `VSSL_DEBUG_GUI`). El CSV se escribe
+//! SIEMPRE a `logs/scenario_<skill>_<YYYYmmdd_HHMMSS>.csv`.
+//!
+//! Referencias: `VSSS-Software/docs/probador_skills_diseno.md`, `CLAUDE.md §5`.
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  PASO 2: elige el escenario (descomenta UNA línea en scenario_tick())
-// ─────────────────────────────────────────────────────────────────────────────
-//  run_skill_go_to_point  → ir a un punto fijo
-//  run_skill_chase_ball   → perseguir la pelota
-//  run_skill_stop         → detenerse
-//  run_skill_face_point   → girar hacia un punto sin moverse
-//  run_skill_hold_position→ mantener posición mirando a un punto
-//  run_skill_defend_goal_line → goalkeeper simple
-//  circuit                → recorrer waypoints en orden
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  PASO 3: tuning de velocidad
-// ─────────────────────────────────────────────────────────────────────────────
-const MAX_LINEAR_SPEED: f64 = 0.5; // m/s — bajar para primeras pruebas físicas
-const MIN_LINEAR_SPEED: f64 = 0.06; // m/s — velocidad mínima antes de frenar
-const MAX_ANGULAR_SPEED: f64 = 2.0; // rad/s
-const BRAKE_DISTANCE: f32 = 0.40; // m — distancia donde empieza a frenar
-const ARRIVAL_THRESHOLD: f32 = 0.06; // m — margen para considerar "llegó"
-/// 0.0 = para si no mira hacia donde va  |  1.0 = ignora heading, siempre a tope
-const COUPLING_FLOOR: f32 = 0.22;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  PASO 4: tuning de evasión de obstáculos (UVF)
-// ─────────────────────────────────────────────────────────────────────────────
-const UVF_INFLUENCE_RADIUS: f32 = 0.20; // m — radio de deflexión por obstáculo
-const UVF_K_REP: f32 = 1.5; // ganancia repulsiva — más alto = más brusco
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  PASO 5: tuning PID de orientación
-//  Aplica a: GoToSkill, ChaseBallSkill, FacePointSkill, HoldPositionSkill, etc.
-// ─────────────────────────────────────────────────────────────────────────────
-const PID_KP: f64 = 3.0;
-const PID_KI: f64 = 0.08;
-const PID_KD: f64 = 0.20;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  ESCENARIO
-// ─────────────────────────────────────────────────────────────────────────────
 use glam::Vec2;
-use rustengine::motion::{Motion, MotionCommand, MotionConfig};
-use rustengine::skills::{
-    AlignBallToTargetSkill, ApproachBallBehindSkill, ChaseBallSkill, DefendGoalLineSkill,
-    FacePointSkill, GoToSkill, HoldPositionSkill, PushBallSkill, Skill, StopSkill,
-    SupportPositionSkill,
+use rustengine::GUI;
+use rustengine::control_loop::{
+    ControlLoopConfig, FixedSkillDecider, GuiChannels, TickRecord, run_control_loop,
 };
-use rustengine::world::{RobotState, World};
-
-fn scenario_tick(world: &World, motion: &Motion, state: &mut ScenarioState) -> Vec<MotionCommand> {
-    run_skill_go_to_point(state, world, motion, ROBOT_ID, Vec2::new(0.0, 0.0))
-    //run_skill_chase_ball(state, world, motion, ROBOT_ID)
-    //run_skill_stop(state, world, motion, ROBOT_ID)
-    //run_skill_face_point(state, world, motion, ROBOT_ID, world.get_ball_state().position)
-    //run_skill_hold_position(state, world, motion, ROBOT_ID, Vec2::new(0.0, 0.0), None)
-    //run_skill_defend_goal_line(state, world, motion, ROBOT_ID, Vec2::new(-0.75, 0.0))
-    //run_skill_support_position(state, world, motion, ROBOT_ID, Vec2::new(-0.75, 0.0))
-    //run_skill_approach_to_goal(state, world, motion, ROBOT_ID, Vec2::new(0.75, 0.0))
-    //run_skill_push_to_goal(state, world, motion, ROBOT_ID, Vec2::new(0.75, 0.0))
-    //run_skill_align_to_goal(state, world, motion, ROBOT_ID, Vec2::new(0.75, 0.0))
-    //circuit(state, world, motion, ROBOT_ID, &[
-    //    Vec2::new( 0.5,  0.4),
-    //    Vec2::new( 0.5, -0.4),
-    //    Vec2::new(-0.5, -0.4),
-    //    Vec2::new(-0.5,  0.4),
-    //])
-    //all_to_center(state, world, motion)
-}
-
-fn build_motion() -> Motion {
-    Motion::with_config(MotionConfig {
-        max_linear_speed: MAX_LINEAR_SPEED,
-        min_linear_speed: MIN_LINEAR_SPEED,
-        max_angular_speed: MAX_ANGULAR_SPEED,
-        brake_distance: BRAKE_DISTANCE,
-        arrival_threshold: ARRIVAL_THRESHOLD,
-        coupling_floor: COUPLING_FLOOR,
-        uvf_influence_radius: UVF_INFLUENCE_RADIUS,
-        uvf_k_rep: UVF_K_REP,
-    })
-}
-
-fn apply_pid(state: &mut ScenarioState) {
-    state.go_to_point.kp = PID_KP;
-    state.go_to_point.ki = PID_KI;
-    state.go_to_point.kd = PID_KD;
-    state.face_point.kp = PID_KP;
-    state.face_point.ki = PID_KI;
-    state.face_point.kd = PID_KD;
-    state.hold_position.kp = PID_KP;
-    state.hold_position.ki = PID_KI;
-    state.hold_position.kd = PID_KD;
-    state.chase_ball.kp = PID_KP;
-    state.chase_ball.ki = PID_KI;
-    state.chase_ball.kd = PID_KD;
-}
+use rustengine::radio::{RadioTarget, TeamColor, base_station::SLOT_COUNT};
+use rustengine::skill_log::{CsvLogger, SkillLogCtx, format_human_summary};
+use rustengine::skills::SkillId;
+use rustengine::vision::VisionSource;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Estado del escenario (una instancia de cada skill)
+//  Scenario: wrapper privado al bin sobre (SkillId, Vec2).
+//  Codifica la convención de cada skill (CLAUDE.md §5).
 // ─────────────────────────────────────────────────────────────────────────────
-struct ScenarioState {
-    stop: StopSkill,
-    go_to_point: GoToSkill,
-    face_point: FacePointSkill,
-    hold_position: HoldPositionSkill,
-    chase_ball: ChaseBallSkill,
-    defend_goal_line: DefendGoalLineSkill,
-    support_position: SupportPositionSkill,
-    approach_to_goal: ApproachBallBehindSkill,
-    push_to_goal: PushBallSkill,
-    align_to_goal: AlignBallToTargetSkill,
-    circuit_index: usize,
+
+#[derive(Debug, Clone, Copy)]
+struct Scenario {
+    skill_id: SkillId,
+    target: Vec2,
+    name: &'static str,
 }
 
-impl Default for ScenarioState {
-    fn default() -> Self {
+// Los 5 constructores son la "zona de edición": uno está activo en main()
+// y los otros están comentados. Rust no ve los comentados → suprimimos dead_code.
+#[allow(dead_code)]
+impl Scenario {
+    fn go_to(target: Vec2) -> Self {
         Self {
-            stop: StopSkill::new(),
-            go_to_point: GoToSkill::new(Vec2::ZERO),
-            face_point: FacePointSkill::new(Vec2::ZERO),
-            hold_position: HoldPositionSkill::new(Vec2::ZERO),
-            chase_ball: ChaseBallSkill::new(),
-            defend_goal_line: DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0)),
-            support_position: SupportPositionSkill::new(Vec2::new(-0.75, 0.0)),
-            approach_to_goal: ApproachBallBehindSkill::new(Vec2::ZERO),
-            push_to_goal: PushBallSkill::new(Vec2::ZERO),
-            align_to_goal: AlignBallToTargetSkill::new(Vec2::ZERO),
-            circuit_index: 0,
+            skill_id: SkillId::GoTo,
+            target,
+            name: "go_to",
+        }
+    }
+    fn face_point(target: Vec2) -> Self {
+        Self {
+            skill_id: SkillId::FacePoint,
+            target,
+            name: "face_point",
+        }
+    }
+    fn chase_ball() -> Self {
+        Self {
+            skill_id: SkillId::ChaseBall,
+            target: Vec2::ZERO,
+            name: "chase_ball",
+        }
+    }
+    fn spin_ccw() -> Self {
+        // Convención: target.x > 0 → CCW (omega > 0).
+        Self {
+            skill_id: SkillId::Spin,
+            target: Vec2::new(1.0, 0.0),
+            name: "spin_ccw",
+        }
+    }
+    fn spin_cw() -> Self {
+        // Convención: target.x < 0 → CW (omega < 0).
+        Self {
+            skill_id: SkillId::Spin,
+            target: Vec2::new(-1.0, 0.0),
+            name: "spin_cw",
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Helpers de skills
-// ─────────────────────────────────────────────────────────────────────────────
-fn find_robot(world: &World, robot_id: i32) -> Option<RobotState> {
-    let team = if OWN_TEAM == 0 {
-        world.get_blue_team_active()
-    } else {
-        world.get_yellow_team_active()
-    };
-    team.into_iter().find(|robot| robot.id == robot_id).cloned()
-}
-
-#[allow(dead_code)]
-fn run_skill_stop(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    vec![state.stop.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_go_to_point(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    target: Vec2,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.go_to_point.set_target(target);
-    vec![state.go_to_point.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_face_point(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    target: Vec2,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.face_point.set_target(target);
-    vec![state.face_point.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_hold_position(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    position: Vec2,
-    face: Option<Vec2>,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.hold_position.position = position;
-    state.hold_position.face = face;
-    vec![state.hold_position.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_chase_ball(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    vec![state.chase_ball.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_defend_goal_line(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    own_goal: Vec2,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.defend_goal_line = DefendGoalLineSkill::new(own_goal);
-    vec![state.defend_goal_line.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_support_position(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    own_goal: Vec2,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.support_position = SupportPositionSkill::new(own_goal);
-    vec![state.support_position.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_approach_to_goal(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    target_point: Vec2,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.approach_to_goal.set_aim_point(target_point);
-    vec![state.approach_to_goal.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_push_to_goal(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    target_point: Vec2,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.push_to_goal.set_push_target(target_point);
-    vec![state.push_to_goal.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn run_skill_align_to_goal(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    target_point: Vec2,
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    state.align_to_goal.set_target_point(target_point);
-    vec![state.align_to_goal.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn circuit(
-    state: &mut ScenarioState,
-    world: &World,
-    motion: &Motion,
-    robot_id: i32,
-    waypoints: &[Vec2],
-) -> Vec<MotionCommand> {
-    let Some(robot) = find_robot(world, robot_id) else { return vec![] };
-    let target = waypoints[state.circuit_index % waypoints.len()];
-    if (target - robot.position).length() < 0.08 {
-        state.circuit_index = (state.circuit_index + 1) % waypoints.len();
-    }
-    state.go_to_point.set_target(target);
-    vec![state.go_to_point.tick(&robot, world, motion)]
-}
-
-#[allow(dead_code)]
-fn all_to_center(state: &mut ScenarioState, world: &World, motion: &Motion) -> Vec<MotionCommand> {
-    let team_robots = if OWN_TEAM == 0 {
-        world.get_blue_team_active()
-    } else {
-        world.get_yellow_team_active()
-    };
-    state.go_to_point.set_target(Vec2::ZERO);
-    team_robots
-        .iter()
-        .map(|robot| state.go_to_point.tick(robot, world, motion))
-        .collect()
+/// Default del log_path: `logs/scenario_<skill>_<epoch_secs>.csv`.
+/// Crea el directorio `logs/` si no existe.
+///
+/// `<epoch_secs>` es Unix epoch en segundos (numérico). Sort por filename = sort
+/// por tiempo. Evita la dep `chrono` por una formatting humana del timestamp.
+fn scenario_log_path(scenario: &Scenario) -> PathBuf {
+    let _ = fs::create_dir_all("logs");
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    PathBuf::from(format!("logs/scenario_{}_{}.csv", scenario.name, secs))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Runtime
+//  Entry point
 // ─────────────────────────────────────────────────────────────────────────────
-use rustengine::{
-    radio,
-    vision::{Vision, VisionEvent, VisionSource},
-};
-use std::sync::{Arc, atomic::AtomicBool};
-use std::time::Duration;
-use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
 fn main() {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async_main());
+    // ╔══════════════════════════════════════════════════════════════════════╗
+    // ║  ZONA DE EDICIÓN — descomenta UNA línea para elegir la skill         ║
+    // ╚══════════════════════════════════════════════════════════════════════╝
+
+    let scenario = Scenario::go_to(Vec2::new(0.3, 0.0));
+    //                  navega a (0.3, 0); audita err_dist → 0 y pose_x → 0.3
+    // let scenario = Scenario::face_point(Vec2::new(0.5, 0.0));
+    //                  rota a mirar (0.5, 0); audita err_heading → 0
+    // let scenario = Scenario::chase_ball();
+    //                  persigue la pelota; ponla en FIRASim antes de correr
+    // let scenario = Scenario::spin_ccw();
+    //                  gira CCW; audita cmd_omega > 0
+    // let scenario = Scenario::spin_cw();
+    //                  gira CW; audita cmd_omega < 0
+
+    let robot_id: i32 = 0;
+    let team: TeamColor = TeamColor::Blue;
+    let vision: VisionSource = VisionSource::FiraSim;
+    let transport: RadioTarget = RadioTarget::FiraSim;
+    let log: Option<PathBuf> = Some(scenario_log_path(&scenario));
+    //                  None = no escribe CSV (la GUI y el resumen humano 1 Hz a stderr siguen).
+    let dur_s: Option<f64> = None; // None = corre hasta cerrar la ventana o Ctrl-C
+
+    // ╔══════════════════════════════════════════════════════════════════════╗
+    // ║  FIN ZONA DE EDICIÓN — abajo viene el wiring estándar                ║
+    // ╚══════════════════════════════════════════════════════════════════════╝
+    run_bench(scenario, robot_id, team, vision, transport, log, dur_s);
 }
 
-async fn async_main() {
-    let (vision_tx, mut vision_rx) = mpsc::channel(100);
-    let world = Arc::new(TokioRwLock::new(World::new(3, 3)));
-    let tracker_enabled = Arc::new(AtomicBool::new(true));
-    let mut scenario = ScenarioState::default();
-    apply_pid(&mut scenario);
+// ─────────────────────────────────────────────────────────────────────────────
+//  Wiring: GUI en hilo principal, control loop en background (mismo patrón
+//  que `src/main.rs::run_with_gui`).
+// ─────────────────────────────────────────────────────────────────────────────
 
+fn run_bench(
+    scenario: Scenario,
+    robot_id: i32,
+    team: TeamColor,
+    vision: VisionSource,
+    transport: RadioTarget,
+    log: Option<PathBuf>,
+    dur_s: Option<f64>,
+) {
+    let (status_tx, status_rx) = mpsc::channel(100);
+    let (motion_tx, motion_rx) = mpsc::channel::<Vec<GUI::RobotMotionDebug>>(32);
+    let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
+
+    let ip = vision.multicast_ip().to_string();
+    let port = vision.port();
+
+    let log_desc = log
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(off)".to_string());
+    eprintln!(
+        "[scenario] skill={} robot={} team={:?} transport={:?} vision={:?} log={}",
+        scenario.name, robot_id, team, transport, vision, log_desc
+    );
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async_run(
+            scenario, robot_id, team, vision, transport, log, dur_s, status_tx, motion_tx,
+        ));
+    });
+
+    GUI::run_gui(ip, port, config_tx, status_rx, motion_rx).expect("GUI terminó con error");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn async_run(
+    scenario: Scenario,
+    robot_id: i32,
+    team: TeamColor,
+    vision: VisionSource,
+    transport: RadioTarget,
+    log: Option<PathBuf>,
+    dur_s: Option<f64>,
+    status_tx: mpsc::Sender<GUI::StatusUpdate>,
+    motion_tx: mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
+) {
+    let shutdown = Arc::new(AtomicBool::new(false));
     {
-        let tracker_enabled = tracker_enabled.clone();
-        let source = VisionSource::from_env();
-        eprintln!(
-            "[scenario] visión: {:?} ({}:{})",
-            source,
-            source.multicast_ip(),
-            source.port()
-        );
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut vis = Vision::new(source, tracker_enabled);
-            let (dummy_status_tx, _) = mpsc::channel(1);
-            if let Err(err) = vis.run(vision_tx, dummy_status_tx).await {
-                eprintln!("[scenario] vision error: {err}");
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("[scenario] Ctrl-C recibido, deteniendo...");
+                shutdown.store(true, Ordering::Relaxed);
             }
         });
     }
 
-    {
-        let world = world.clone();
-        tokio::spawn(async move {
-            while let Some(event) = vision_rx.recv().await {
-                let mut w = world.write().await;
-                match event {
-                    VisionEvent::Robot(r) => {
-                        w.update_robot(
-                            r.id as i32,
-                            r.team as i32,
-                            r.position,
-                            r.orientation as f64,
-                            r.velocity,
-                            r.angular_velocity as f64,
-                        );
-                    }
-                    VisionEvent::Ball(b) => {
-                        w.update_ball(b.position, b.velocity);
-                    }
-                }
-            }
-        });
-    }
+    let decider = Box::new(FixedSkillDecider::new(
+        robot_id,
+        scenario.skill_id,
+        scenario.target,
+    ));
 
-    {
-        let world = world.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
-            loop {
-                interval.tick().await;
-                world.write().await.update();
-            }
-        });
-    }
+    let max_ticks = dur_s.map(|s| (s * 60.0).ceil() as u32);
 
-    let radio = match radio::Radio::from_env().await {
-        Ok(r) => Arc::new(TokioMutex::new(r)),
-        Err(err) => {
-            eprintln!("[scenario] radio error: {err}");
-            return;
-        }
+    let config = ControlLoopConfig {
+        own_team: team.as_team_id(),
+        num_robots: SLOT_COUNT,
+        vision_source: vision,
+        radio_target: transport,
+        max_ticks,
+        vision_timeout: None,
     };
 
-    eprintln!("[scenario] listo. Ejecutando scenario_tick() a 60 Hz... (Ctrl+C para detener)");
+    let mut csv: Option<CsvLogger> = match &log {
+        Some(p) => match CsvLogger::new(p) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("[scenario] error abriendo CSV {}: {e}", p.display());
+                return;
+            }
+        },
+        None => {
+            eprintln!("[scenario] CSV desactivado (log=None)");
+            None
+        }
+    };
+    let mut last_print = Instant::now() - Duration::from_secs(2);
 
-    let motion = build_motion();
-    let mut interval = tokio::time::interval(Duration::from_millis(16));
+    let ctx = SkillLogCtx {
+        transport,
+        vision: Some(vision),
+        robot: robot_id as usize,
+        team,
+        skill: scenario.skill_id,
+    };
 
-    loop {
-        interval.tick().await;
-        let commands = {
-            let world = world.read().await;
-            scenario_tick(&world, &motion, &mut scenario)
-        };
-        if commands.is_empty() {
-            continue;
+    let on_tick: Box<dyn FnMut(&TickRecord<'_>) + Send> = Box::new(move |rec: &TickRecord<'_>| {
+        let row = ctx.build_skill_row(rec);
+        if let Some(ref mut log) = csv {
+            let _ = log.write_row(&row);
         }
-        let mut radio = radio.lock().await;
-        for cmd in commands {
-            radio.add_motion_command(cmd);
+        if last_print.elapsed() >= Duration::from_secs(1) {
+            eprintln!("{}", format_human_summary(&row));
+            last_print = Instant::now();
         }
-        if let Err(err) = radio.send_commands().await {
-            eprintln!("[scenario] error enviando: {err}");
-        }
+    });
+
+    let gui = Some(GuiChannels {
+        status_tx,
+        motion_tx,
+    });
+
+    if let Err(err) = run_control_loop(config, decider, Some(on_tick), gui, shutdown).await {
+        eprintln!("[scenario] control loop error: {err}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_to_sets_target_and_skill() {
+        let s = Scenario::go_to(Vec2::new(0.3, 0.5));
+        assert_eq!(s.skill_id, SkillId::GoTo);
+        assert_eq!(s.target, Vec2::new(0.3, 0.5));
+        assert_eq!(s.name, "go_to");
+    }
+
+    #[test]
+    fn face_point_sets_target_and_skill() {
+        let s = Scenario::face_point(Vec2::new(0.7, -0.2));
+        assert_eq!(s.skill_id, SkillId::FacePoint);
+        assert_eq!(s.target, Vec2::new(0.7, -0.2));
+        assert_eq!(s.name, "face_point");
+    }
+
+    #[test]
+    fn chase_ball_ignores_target() {
+        let s = Scenario::chase_ball();
+        assert_eq!(s.skill_id, SkillId::ChaseBall);
+        assert_eq!(s.target, Vec2::ZERO);
+        assert_eq!(s.name, "chase_ball");
+    }
+
+    #[test]
+    fn spin_ccw_target_x_positive() {
+        let s = Scenario::spin_ccw();
+        assert_eq!(s.skill_id, SkillId::Spin);
+        assert!(s.target.x > 0.0, "spin_ccw target.x debe ser > 0");
+        assert_eq!(s.name, "spin_ccw");
+    }
+
+    #[test]
+    fn spin_cw_target_x_negative() {
+        let s = Scenario::spin_cw();
+        assert_eq!(s.skill_id, SkillId::Spin);
+        assert!(s.target.x < 0.0, "spin_cw target.x debe ser < 0");
+        assert_eq!(s.name, "spin_cw");
+    }
+
+    #[test]
+    fn scenario_log_path_creates_dir_and_uses_name() {
+        let s = Scenario::go_to(Vec2::ZERO);
+        let path = scenario_log_path(&s);
+        // El path comienza con "logs/scenario_go_to_"
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.starts_with("logs/scenario_go_to_"),
+            "got: {path_str}"
+        );
+        assert!(path_str.ends_with(".csv"), "got: {path_str}");
+        // El directorio logs/ debe existir tras la llamada
+        assert!(std::path::Path::new("logs").exists());
     }
 }

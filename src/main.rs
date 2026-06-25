@@ -1,41 +1,69 @@
 // Modo base: headless por defecto.
 // Con VSSL_DEBUG_GUI=1 lanza la interfaz gráfica con vectores de velocidad y targets.
 
-mod GUI;
+use rustengine::GUI;
 
 // ====== Parámetros ======
 const OWN_TEAM: i32 = 0; // 0=azul, 1=amarillo
-const ROBOT_ID: i32 = 0;
+const NUM_ROBOTS: usize = 3;
+
+// Frame-skip del coach (Fase 3 — opción E del horizonte de decisión).
+// El coach se consulta una vez cada COACH_DECISION_PERIOD ticks; entre medio
+// el dispatcher reusa la última decisión y solo refresca las skills (que sí
+// corren a 60 Hz para suavidad de control). Con período=6 a 60 Hz, la policy
+// decide a 10 Hz (≈ 100 ms por decisión), valor estándar en VSSS-RL.
+const COACH_DECISION_PERIOD: u32 = 6;
 // ========================
 
-use rustengine::motion::{Motion, MotionCommand};
-use rustengine::skills::{ChaseBallSkill, Skill};
+use glam::Vec2;
+use rustengine::coach::{Coach, RuleBasedCoach, SkillChoice};
+use rustengine::control_loop::{
+    CoachDecider, ControlLoopConfig, GuiChannels, TickDecider, run_control_loop,
+};
+use rustengine::radio::RadioTarget;
+use rustengine::vision::VisionSource;
 use rustengine::world::World;
 
-fn scenario_tick(
-    world: &World,
-    motion: &Motion,
-    chase_ball: &mut ChaseBallSkill,
-) -> Vec<MotionCommand> {
-    let team_robots = if OWN_TEAM == 0 {
-        world.get_blue_team_active()
-    } else {
-        world.get_yellow_team_active()
-    };
-    team_robots
-        .iter()
-        .find(|robot| robot.id == ROBOT_ID)
-        .map(|robot| vec![chase_ball.tick(robot, world, motion)])
-        .unwrap_or_default()
+/// Decider que nunca emite skills. Preserva el modo `VSSL_COACH=none` del
+/// pre-refactor: visión y radio siguen vivos, pero no se mandan comandos.
+struct NoOpDecider;
+impl TickDecider for NoOpDecider {
+    fn decide(&mut self, _tick: u32, _world: &World) -> Vec<SkillChoice> {
+        Vec::new()
+    }
 }
 
-use rustengine::{
-    radio,
-    vision::{Vision, VisionEvent, VisionSource},
-};
+/// Direcciones de ataque convencionales según el equipo propio.
+/// Azul ataca a +X, amarillo ataca a -X.
+fn goals_for_team(own_team: i32) -> (Vec2, Vec2) {
+    if own_team == 0 {
+        (Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0))
+    } else {
+        (Vec2::new(-0.75, 0.0), Vec2::new(0.75, 0.0))
+    }
+}
+
+/// Construye el coach inicial. Soporta selección por env var:
+/// - `VSSL_COACH=rule_based` (default): baseline clásico.
+/// - `VSSL_COACH=none`: no emite decisiones (útil para test de visión/radio).
+///
+/// El día que llegue Fase 7, este factory va a aceptar también `VSSL_COACH=rl`
+/// para cargar un modelo ONNX.
+fn make_coach(own_team: i32) -> Option<Box<dyn Coach>> {
+    let kind = std::env::var("VSSL_COACH").unwrap_or_else(|_| "rule_based".to_string());
+    let (attack_goal, own_goal) = goals_for_team(own_team);
+    match kind.as_str() {
+        "rule_based" => Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal))),
+        "none" => None,
+        other => {
+            eprintln!("[main] VSSL_COACH='{other}' inválido, usando 'rule_based'");
+            Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal)))
+        }
+    }
+}
+
 use std::sync::{Arc, atomic::AtomicBool};
-use std::time::Duration;
-use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+use tokio::sync::mpsc;
 
 fn main() {
     if std::env::var("VSSL_DEBUG_GUI").unwrap_or_default() == "1" {
@@ -63,12 +91,20 @@ fn run_with_gui() {
         rt.block_on(async_main(Some((status_tx, motion_tx))));
     });
 
-    GUI::run_gui(ip, port, config_tx, status_rx, motion_rx)
-        .expect("GUI terminó con error");
+    GUI::run_gui(ip, port, config_tx, status_rx, motion_rx).expect("GUI terminó con error");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Pipeline principal (headless o con canales para GUI)
+//  Pipeline principal: wrapper sobre `run_control_loop` del módulo común.
+//
+//  Comportamiento observable IDÉNTICO al pre-refactor:
+//    - Lee env (VSSL_COACH, VSSL_VISION_SOURCE, VSSL_RADIO_TARGET) una sola vez.
+//    - Arma un CoachDecider con frame-skip COACH_DECISION_PERIOD=6.
+//    - Delega en run_control_loop (60 Hz, dispatcher idéntico al pre-refactor).
+//    - GUI recibe los mismos RobotMotionDebug por canal.
+//
+//  Si necesitas cambiar el lazo de control, edita src/control_loop.rs — esta
+//  función solo arma la configuración.
 // ─────────────────────────────────────────────────────────────────────────────
 async fn async_main(
     gui_channels: Option<(
@@ -76,120 +112,52 @@ async fn async_main(
         mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
     )>,
 ) {
-    let (vision_tx, mut vision_rx) = mpsc::channel(100);
-    let world = Arc::new(TokioRwLock::new(World::new(3, 3)));
-    let tracker_enabled = Arc::new(AtomicBool::new(true));
+    let vision_source = VisionSource::from_env();
+    let radio_target = RadioTarget::from_env();
+    eprintln!(
+        "[main] visión: {:?} ({}:{})",
+        vision_source,
+        vision_source.multicast_ip(),
+        vision_source.port()
+    );
 
-    let (status_tx, motion_tx) = match gui_channels {
-        Some((s, m)) => (Some(s), Some(m)),
-        None => (None, None),
+    let coach = make_coach(OWN_TEAM);
+    eprintln!(
+        "[main] coach: {}",
+        if coach.is_some() {
+            std::env::var("VSSL_COACH").unwrap_or_else(|_| "rule_based".to_string())
+        } else {
+            "none".to_string()
+        }
+    );
+    eprintln!(
+        "[main] decisión cada {} ticks ({:.0} Hz)",
+        COACH_DECISION_PERIOD,
+        60.0 / COACH_DECISION_PERIOD as f64
+    );
+
+    let decider: Box<dyn TickDecider> = match coach {
+        Some(c) => Box::new(CoachDecider::new(c, OWN_TEAM, COACH_DECISION_PERIOD)),
+        None => Box::new(NoOpDecider),
     };
 
-    // Vision
-    {
-        let tracker_enabled = tracker_enabled.clone();
-        let source = VisionSource::from_env();
-        eprintln!(
-            "[main] visión: {:?} ({}:{})",
-            source,
-            source.multicast_ip(),
-            source.port()
-        );
-        let status_tx_vis = status_tx.clone();
-        tokio::spawn(async move {
-            let mut vis = Vision::new(source, tracker_enabled);
-            let (dummy_tx, _) = mpsc::channel(1);
-            let tx = status_tx_vis.unwrap_or(dummy_tx);
-            if let Err(err) = vis.run(vision_tx, tx).await {
-                eprintln!("[main] vision error: {err}");
-            }
-        });
-    }
-
-    // World updater desde visión
-    {
-        let world = world.clone();
-        tokio::spawn(async move {
-            while let Some(event) = vision_rx.recv().await {
-                let mut w = world.write().await;
-                match event {
-                    VisionEvent::Robot(r) => {
-                        w.update_robot(
-                            r.id as i32,
-                            r.team as i32,
-                            r.position,
-                            r.orientation as f64,
-                            r.velocity,
-                            r.angular_velocity as f64,
-                        );
-                    }
-                    VisionEvent::Ball(b) => {
-                        w.update_ball(b.position, b.velocity);
-                    }
-                }
-            }
-        });
-    }
-
-    // Marcar robots inactivos
-    {
-        let world = world.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
-            loop {
-                interval.tick().await;
-                world.write().await.update();
-            }
-        });
-    }
-
-    let radio = match radio::Radio::from_env().await {
-        Ok(r) => Arc::new(TokioMutex::new(r)),
-        Err(err) => {
-            eprintln!("[main] radio error: {err}");
-            return;
-        }
+    let config = ControlLoopConfig {
+        own_team: OWN_TEAM,
+        num_robots: NUM_ROBOTS,
+        vision_source,
+        radio_target,
+        max_ticks: None,
+        vision_timeout: None,
     };
 
-    eprintln!("[main] listo. 60 Hz. Ctrl+C para detener.");
+    let gui = gui_channels.map(|(status_tx, motion_tx)| GuiChannels {
+        status_tx,
+        motion_tx,
+    });
 
-    let motion = Motion::new();
-    let mut chase_ball = ChaseBallSkill::new();
-    let mut interval = tokio::time::interval(Duration::from_millis(16));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    loop {
-        interval.tick().await;
-
-        let commands = {
-            let world = world.read().await;
-            scenario_tick(&world, &motion, &mut chase_ball)
-        };
-
-        if commands.is_empty() {
-            continue;
-        }
-
-        // Enviar debug al GUI si está activo
-        if let Some(ref tx) = motion_tx {
-            let updates: Vec<GUI::RobotMotionDebug> = commands
-                .iter()
-                .map(|cmd| GUI::RobotMotionDebug {
-                    team: cmd.team as u32,
-                    id: cmd.id as u32,
-                    vx: cmd.vx as f32,
-                    vy: cmd.vy as f32,
-                    target: None, // ChaseBallSkill no expone target estático
-                })
-                .collect();
-            let _ = tx.try_send(updates);
-        }
-
-        let mut radio = radio.lock().await;
-        for cmd in commands {
-            radio.add_motion_command(cmd);
-        }
-        if let Err(err) = radio.send_commands().await {
-            eprintln!("[main] error enviando: {err}");
-        }
+    if let Err(err) = run_control_loop(config, decider, None, gui, shutdown).await {
+        eprintln!("[main] control loop error: {err}");
     }
 }

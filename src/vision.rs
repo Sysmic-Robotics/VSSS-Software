@@ -491,6 +491,16 @@ impl Vision {
         status_tx: &mpsc::Sender<StatusUpdate>,
         ball: &SSL_DetectionBall,
     ) -> Result<(), Box<dyn Error>> {
+        // Filtrar placeholders del fork vsss-vision-sysmic (mismo problema que en
+        // process_robot): emite un ball entry siempre, con confidence=0 y pixel=(0,0)
+        // cuando no hay pelota detectada. Sin filtro, queda una pelota fantasma en
+        // (0,0) que el UVF de motion::move_to trata como obstáculo permanente.
+        if ball.confidence() <= 0.0
+            || (ball.pixel_x() == 0.0 && ball.pixel_y() == 0.0)
+        {
+            return Ok(());
+        }
+
         // SSL Vision coordinates are in millimeters
         let raw_x = ball.x();
         let raw_y = ball.y();
@@ -543,6 +553,20 @@ impl Vision {
         // Check if required fields are present
         if !robot.has_x() || !robot.has_y() {
             // Skip robots without valid coordinates
+            return Ok(());
+        }
+
+        // Filtrar placeholders del fork vsss-vision-sysmic.
+        //
+        // SSL Vision standard: si un robot no se detecta en el frame, se OMITE del
+        // SSL_DetectionFrame. El fork de sysmic en su lugar emite los 3 slots por
+        // equipo siempre, rellenando los no detectados con confidence=0, x=0, y=0,
+        // pixel_x=0, pixel_y=0. Sin este filtro, esos placeholders entran al world
+        // como robots fantasma sentados en (0,0) — exactamente el bug que confirmó
+        // el log de pkt#3751 (2026-05-14): 6 placeholders + 1 detección real.
+        if robot.confidence() <= 0.0
+            || (robot.pixel_x() == 0.0 && robot.pixel_y() == 0.0)
+        {
             return Ok(());
         }
 

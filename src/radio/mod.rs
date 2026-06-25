@@ -1,4 +1,4 @@
-mod base_station;
+pub mod base_station;
 mod commands;
 mod firasim;
 mod grsim;
@@ -57,13 +57,19 @@ impl Radio {
 
     /// Construye el transport correspondiente a `VSSL_RADIO_TARGET` y lo envuelve en `Radio`.
     /// Para `BaseStation` lee también `VSSL_TEAM_COLOR`, `VSSL_BASESTATION_DEVICE`, `VSSL_BASESTATION_BAUD`.
+    /// Atajo equivalente a `Self::from_target(RadioTarget::from_env()).await`.
     pub async fn from_env() -> Result<Self, TransportError> {
         let target = RadioTarget::from_env();
+        Self::from_target(target).await
+    }
+
+    /// Construye el transport para un `RadioTarget` explícito, sin leer env.
+    /// `BaseStation` sigue leyendo `VSSL_TEAM_COLOR` / `VSSL_BASESTATION_DEVICE` / `VSSL_BASESTATION_BAUD`
+    /// porque son configuración de hardware, no selección de destino.
+    pub async fn from_target(target: RadioTarget) -> Result<Self, TransportError> {
         eprintln!("[Radio] target = {target:?}");
         let transport: Box<dyn RobotTransport> = match target {
-            RadioTarget::FiraSim => {
-                Box::new(FiraSimTransport::new("127.0.0.1", 20011).await?)
-            }
+            RadioTarget::FiraSim => Box::new(FiraSimTransport::new("127.0.0.1", 20011).await?),
             RadioTarget::GrSim => Box::new(GrSimTransport::new("127.0.0.1", 20011).await?),
             RadioTarget::BaseStation => {
                 let team = TeamColor::from_env();
@@ -137,10 +143,7 @@ mod tests {
 
     #[async_trait]
     impl RobotTransport for MockTransport {
-        async fn send_commands(
-            &mut self,
-            commands: &[RobotCommand],
-        ) -> Result<(), TransportError> {
+        async fn send_commands(&mut self, commands: &[RobotCommand]) -> Result<(), TransportError> {
             self.sent.lock().unwrap().push(commands.to_vec());
             Ok(())
         }
