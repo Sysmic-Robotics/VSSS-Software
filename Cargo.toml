@@ -18,6 +18,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"           # Permite dyn-dispatch sobre traits con métodos async
 tokio-serial = "5"            # Wrapper async de `serialport` para el BaseStation USB↔ESP32
+tract-onnx = { version = "0.21", optional = true } # Motor de inferencia ONNX en Rust puro (deploy RL)
+
+[features]
+# Compila el RlCoach (deploy del modelo RL vía ONNX). Off por defecto para no
+# inflar el build del equipo con tract-onnx. Activar con: --features rl
+rl = ["dep:tract-onnx"]
 
 [build-dependencies]
 protobuf-codegen = "3" # Tool to generate Rust code from .proto files

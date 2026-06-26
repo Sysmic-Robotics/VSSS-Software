@@ -55,11 +55,37 @@ fn make_coach(own_team: i32) -> Option<Box<dyn Coach>> {
     match kind.as_str() {
         "rule_based" => Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal))),
         "none" => None,
+        "rl" => make_rl_coach(attack_goal, own_goal),
         other => {
             eprintln!("[main] VSSL_COACH='{other}' inválido, usando 'rule_based'");
             Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal)))
         }
     }
+}
+
+/// Carga el RlCoach (modelo ONNX) cuando el binario se compiló con `--features rl`.
+/// Path del modelo vía `VSSL_RL_MODEL` (default: training/models/policy.onnx).
+/// Si no se compiló con la feature o falla la carga, cae a rule_based.
+#[cfg(feature = "rl")]
+fn make_rl_coach(attack_goal: Vec2, own_goal: Vec2) -> Option<Box<dyn Coach>> {
+    let path =
+        std::env::var("VSSL_RL_MODEL").unwrap_or_else(|_| "training/models/policy.onnx".to_string());
+    match rustengine::coach::RlCoach::load(&path, own_goal, true) {
+        Ok(c) => {
+            eprintln!("[main] RlCoach cargado desde {path}");
+            Some(Box::new(c))
+        }
+        Err(e) => {
+            eprintln!("[main] error cargando RlCoach ({e}); usando rule_based");
+            Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal)))
+        }
+    }
+}
+
+#[cfg(not(feature = "rl"))]
+fn make_rl_coach(attack_goal: Vec2, own_goal: Vec2) -> Option<Box<dyn Coach>> {
+    eprintln!("[main] VSSL_COACH=rl pero el binario no se compiló con --features rl; usando rule_based");
+    Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal)))
 }
 
 use std::sync::{Arc, atomic::AtomicBool};

@@ -1,14 +1,10 @@
 """
-Evaluación de una política entrenada.
+Evaluación cuantitativa de una política entrenada sobre el env skill-based.
+Reporta los KPIs del documento INF398: tasa de goles, tiempo medio, estabilidad.
 
 Uso:
-    python eval.py --checkpoint checkpoints/phase1_final.zip --episodes 100
-
-Reporta:
-- Tasa de goles (KPI del documento INF398)
-- Tiempo medio por episodio
-- Desviación estándar entre episodios (estabilidad — KPI del documento)
-- Recompensa media
+    python eval.py --checkpoint checkpoints/phase1_final.zip --phase 1 --episodes 100
+    python eval.py --checkpoint checkpoints/phase3_final.zip --phase 3 --episodes 100
 """
 
 from __future__ import annotations
@@ -19,56 +15,62 @@ from pathlib import Path
 
 from stable_baselines3 import PPO
 
-from vsss_rl.env_phase1 import VsssPhase1Env
+from vsss_rl.soccer_env import VsssSoccerEnv, phase1_config, phase2_config, phase3_config
+
+PHASE_CONFIGS = {1: phase1_config, 2: phase2_config, 3: phase3_config}
+
+
+def evaluate(model, env, episodes: int, seed: int) -> dict:
+    rewards, lengths, goals, concedes = [], [], [], []
+    for ep in range(episodes):
+        obs, _ = env.reset(seed=seed + ep)
+        done = False
+        total_r, steps, scored, conceded = 0.0, 0, 0, 0
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, r, term, trunc, info = env.step(action)
+            total_r += float(r)
+            steps += 1
+            if info.get("goal_scored"):
+                scored = 1
+            if info.get("conceded"):
+                conceded = 1
+            done = term or trunc
+        rewards.append(total_r)
+        lengths.append(steps)
+        goals.append(scored)
+        concedes.append(conceded)
+    return {
+        "goal_rate": sum(goals) / episodes,
+        "concede_rate": sum(concedes) / episodes,
+        "reward_mean": statistics.mean(rewards),
+        "reward_std": statistics.stdev(rewards) if episodes > 1 else 0.0,
+        "len_mean": statistics.mean(lengths),
+        "len_std": statistics.stdev(lengths) if episodes > 1 else 0.0,
+    }
 
 
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True, type=Path)
+    p.add_argument("--phase", type=int, choices=[1, 2, 3], default=1)
     p.add_argument("--episodes", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--render", action="store_true")
     args = p.parse_args()
 
-    render_mode = "human" if args.render else None
-    env = VsssPhase1Env(render_mode=render_mode)
-    model = PPO.load(str(args.checkpoint), env=env)
-
-    rewards: list[float] = []
-    lengths: list[int] = []
-    goals: list[int] = []
-
-    for ep in range(args.episodes):
-        obs, _ = env.reset(seed=args.seed + ep)
-        done = False
-        total_r = 0.0
-        steps = 0
-        scored = 0
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, r, terminated, truncated, info = env.step(action)
-            total_r += float(r)
-            steps += 1
-            done = terminated or truncated
-            if info.get("goal_scored"):
-                scored = 1
-        rewards.append(total_r)
-        lengths.append(steps)
-        goals.append(scored)
-
+    env = VsssSoccerEnv(config=PHASE_CONFIGS[args.phase]())
+    model = PPO.load(str(args.checkpoint), device="cpu")
+    m = evaluate(model, env, args.episodes, args.seed)
     env.close()
 
-    goal_rate = sum(goals) / len(goals)
-    print("── Evaluación ─────────────────────────────")
-    print(f"Checkpoint: {args.checkpoint}")
-    print(f"Episodios: {args.episodes}")
-    print(f"Tasa de goles:           {goal_rate:.1%}")
-    print(f"Recompensa media:        {statistics.mean(rewards):.3f}")
-    print(f"Recompensa std:          {statistics.stdev(rewards):.3f}")
-    print(f"Largo medio (steps):     {statistics.mean(lengths):.1f}")
-    print(f"Largo std (steps):       {statistics.stdev(lengths):.1f}")
-    print(f"Tiempo medio (s @ 60Hz): {statistics.mean(lengths) / 60:.2f}")
-
+    decision_hz = 10.0  # frame-skip K=6 a 60 Hz
+    print(f"── Evaluación Fase {args.phase} ({args.episodes} episodios) ──")
+    print(f"Checkpoint:          {args.checkpoint.name}")
+    print(f"Tasa de goles:       {m['goal_rate']:.1%}")
+    print(f"Tasa de goles recib: {m['concede_rate']:.1%}")
+    print(f"Recompensa media:    {m['reward_mean']:.3f}  (std {m['reward_std']:.3f})")
+    print(f"Largo medio:         {m['len_mean']:.1f} decisiones  (std {m['len_std']:.1f})")
+    print(f"Tiempo medio:        {m['len_mean'] / decision_hz:.2f} s")
     return 0
 
 
