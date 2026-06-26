@@ -54,19 +54,25 @@ def main() -> int:
             print(f"[curriculum] fase '{key}' YA completa ({final.name}) → salto.")
             continue
 
-        cmd = [VENV_PY, "train.py", "--phase", key, "--total-steps", str(total),
-               "--n-envs", "4", "--device", "cpu", "--run-name", f"adv_{key}"]
-
         ck, done = latest_checkpoint(key)
         if ck is not None and done > 0:
-            print(f"[curriculum] REANUDAR fase '{key}' desde {ck.name} ({done:,}/{total:,})")
-            cmd += ["--resume", str(ck)]
+            # train.py usa reset_num_timesteps=False al reanudar → SB3 SUMA al
+            # contador. Por eso pasamos SOLO lo que falta (total - done), así el
+            # contador llega exacto a `total` y no entrena de más.
+            total_arg = max(total - done, 8192)
+            print(f"[curriculum] REANUDAR fase '{key}' desde {ck.name} ({done:,}/{total:,}) → faltan {total_arg:,}")
+            extra = ["--resume", str(ck)]
         elif warm:
+            total_arg = total
             print(f"[curriculum] fase '{key}' fresca, warm-start de {warm}")
-            cmd += ["--warm-start", str(CK / warm)]
+            extra = ["--warm-start", str(CK / warm)]
         else:
+            total_arg = total
             print(f"[curriculum] fase '{key}' fresca (sin warm-start)")
+            extra = []
 
+        cmd = [VENV_PY, "train.py", "--phase", key, "--total-steps", str(total_arg),
+               "--n-envs", "4", "--device", "cpu", "--run-name", f"adv_{key}"] + extra
         print(f"[curriculum] >>> {' '.join(cmd)}", flush=True)
         child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         result = subprocess.run(cmd, env=child_env)
