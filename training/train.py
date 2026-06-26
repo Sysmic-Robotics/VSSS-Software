@@ -93,7 +93,7 @@ def main() -> int:
     p.add_argument("--warm-start", default=None, help="checkpoint .zip para warm-start parcial (cross-fase)")
     p.add_argument("--resume", default=None, help="checkpoint .zip para REANUDAR esta misma fase (modelo+optimizador, continúa el contador)")
     p.add_argument("--run-name", default=None)
-    p.add_argument("--learning-rate", type=float, default=3e-4)
+    p.add_argument("--learning-rate", type=float, default=1e-4)  # bajado de 3e-4: estabilidad self-play
     args = p.parse_args()
 
     root = Path(__file__).resolve().parent
@@ -126,6 +126,7 @@ def main() -> int:
             ent_coef=0.001,  # bajado de 0.01: el bonus de entropía alto infló el std en self-play
             vf_coef=0.5,
             max_grad_norm=0.5,
+            target_kl=0.05,  # corta los epochs si approx_kl supera esto → evita que el KL se dispare
             verbose=1,
             tensorboard_log=str(runs_dir),
             device=args.device,
