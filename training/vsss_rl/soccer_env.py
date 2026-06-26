@@ -54,6 +54,9 @@ TIME_PENALTY = -0.001          # por tick de física
 BALL_PROGRESS_W = 3.0          # × Δ(distancia pelota→arco rival)
 ROBOT_TO_BALL_W = 0.3          # × Δ(distancia robot más cercano→pelota)
 BALL_VEL_TO_GOAL_W = 0.1       # × componente de v_pelota hacia el arco rival
+SURVIVE_REWARD = 0.05          # defensa (arquero): premio por decisión sin conceder
+DEFENSE_PROGRESS_W = 1.5       # defensa: × Δ(distancia pelota→arco propio), + si se aleja
+SELFPLAY_RB_PROB = 0.2         # self-play: prob. de usar rule-based (anti-forgetting)
 
 OUT_X = 0.74
 OUT_Y = 0.64
@@ -83,6 +86,9 @@ class EnvConfig:
     opponent_mode: str = "none"                     # none | rulebased | selfplay
     max_seconds: float = 30.0
     domain_randomization: bool = False
+    reward_mode: str = "attack"                     # attack (campo) | defense (arquero)
+    randomize_opponents: bool = False               # samplear nº de oponentes por episodio (escenario mixto)
+    gk_area: tuple[float, float, float, float] | None = None  # (xmin,xmax,ymin,ymax) confina al arquero (id 2)
 
 
 def phase1_config() -> EnvConfig:
@@ -95,8 +101,35 @@ def phase2_config() -> EnvConfig:
     return EnvConfig(controlled_field_ids=(0,), own_gk_id=None, opp_active_ids=(2,), opponent_mode="rulebased")
 
 
+def phase_2v1_config() -> EnvConfig:
+    """2v1 — 2 jugadores de campo controlados (cooperación) vs 1 defensor.
+    Acción Box(6). Aquí 'nacen las jugadas' (pase/desmarque) antes del 3v3."""
+    return EnvConfig(
+        controlled_field_ids=(0, 1),
+        own_gk_id=None,
+        opp_active_ids=(2,),
+        opponent_mode="rulebased",
+        max_seconds=30.0,
+    )
+
+
+def phase_mixed_config(opponent_mode: str = "rulebased") -> EnvConfig:
+    """Escenario MIXTO — 2 jugadores de campo controlados (Box 6) + portero
+    propio rule-based, contra un nº de oponentes RANDOMIZADO (1-3) por episodio.
+    Cubre 2v1/2v2/2v3 con una sola red robusta. Es el escenario del run largo."""
+    return EnvConfig(
+        controlled_field_ids=(0, 1),
+        own_gk_id=2,
+        opp_active_ids=(0, 1, 2),
+        opponent_mode=opponent_mode,
+        max_seconds=40.0,
+        randomize_opponents=True,
+        gk_area=GK_AREA,
+    )
+
+
 def phase3_config(opponent_mode: str = "rulebased") -> EnvConfig:
-    """3v3 — 2 jugadores de campo controlados + portero propio rule-based,
+    """3v3 fijo — 2 jugadores de campo controlados + portero propio rule-based,
     contra 3 oponentes. opponent_mode: rulebased o selfplay."""
     return EnvConfig(
         controlled_field_ids=(0, 1),
@@ -104,12 +137,34 @@ def phase3_config(opponent_mode: str = "rulebased") -> EnvConfig:
         opp_active_ids=(0, 1, 2),
         opponent_mode=opponent_mode,
         max_seconds=40.0,
+        gk_area=GK_AREA,
+    )
+
+
+def goalkeeper_config() -> EnvConfig:
+    """Arquero — la política CONTROLA el arquero (id 2) defendiendo el arco
+    propio (−X) contra un atacante rule-based. Recompensa de DEFENSA.
+    Red separada (arquitectura asimétrica). Acción Box(3)."""
+    return EnvConfig(
+        controlled_field_ids=(2,),
+        own_gk_id=None,
+        opp_active_ids=(0,),
+        opponent_mode="rulebased",
+        max_seconds=20.0,
+        reward_mode="defense",
+        gk_area=GK_AREA,
     )
 
 
 # Arcos por equipo (own ataca +X)
 OWN_ATTACK_GOAL = (FIELD_HALF_X, 0.0)
 OWN_OWN_GOAL = (-FIELD_HALF_X, 0.0)
+
+# Área del arquero propio (delante del arco en −X). El arquero (id 2) se clampea
+# a esta caja: NO puede salir de su área (restricción dura, regla VSSS).
+# ⚠️ DIMENSIONES POR CONFIRMAR contra el reglamento. Default razonable:
+# 0.15 m de profundidad desde la línea de fondo, 0.70 m de ancho.
+GK_AREA = (-FIELD_HALF_X, -FIELD_HALF_X + 0.15, -0.35, 0.35)
 
 
 class VsssSoccerEnv(gym.Env):
@@ -131,8 +186,11 @@ class VsssSoccerEnv(gym.Env):
         # Coaches rule-based: propio (para el portero) y oponente.
         self._own_coach = RuleBasedCoach(attack_goal=OWN_ATTACK_GOAL, own_goal=OWN_OWN_GOAL)
         self._opp_coach = RuleBasedCoach(attack_goal=OWN_OWN_GOAL, own_goal=OWN_ATTACK_GOAL)
-        # Hook self-play: fn(obs_opp_frame: np.ndarray) -> action np.ndarray para opp campo.
-        self._opp_policy: Callable[[np.ndarray], np.ndarray] | None = None
+        # Self-play: el oponente de campo carga un snapshot congelado desde disco
+        # (compatible con SubprocVecEnv — cada worker carga su propia copia).
+        self._opp_model = None
+        self._opp_model_path: str | None = None
+        self._use_rb_this_ep: bool = True  # por episodio: usar rule-based vs snapshot
 
         self._own: dict[int, RobotBody] = {}
         self._opp: dict[int, RobotBody] = {}
@@ -141,9 +199,12 @@ class VsssSoccerEnv(gym.Env):
         self._ticks = 0
 
     # ── API pública para self-play ───────────────────────────────────────
-    def set_opponent_policy(self, policy: Callable[[np.ndarray], np.ndarray] | None) -> None:
-        """Setea un snapshot congelado como oponente de campo (Fase 3 self-play)."""
-        self._opp_policy = policy
+    def set_opponent_snapshot(self, path: str | None) -> None:
+        """Apunta el oponente de campo a un snapshot congelado en disco. El
+        modelo se (re)carga perezosamente. None → siempre rule-based.
+        Llamado por SelfPlayCallback vía VecEnv.env_method()."""
+        self._opp_model_path = path
+        self._opp_model = None  # forzar recarga en el próximo uso
 
     # ── API gym ──────────────────────────────────────────────────────────
     def reset(self, *, seed: int | None = None, options: dict | None = None):
@@ -154,10 +215,20 @@ class VsssSoccerEnv(gym.Env):
         self._own.clear()
         self._opp.clear()
 
+        # Self-play: por episodio, usar rule-based (anti-forgetting) o el snapshot.
+        self._use_rb_this_ep = (
+            self._opp_model_path is None or float(self._rng.random()) < SELFPLAY_RB_PROB
+        )
+
         own_ids = set(self.cfg.controlled_field_ids) | ({self.cfg.own_gk_id} if self.cfg.own_gk_id is not None else set())
         for rid in own_ids:
             self._own[rid] = self._spawn_own(rid)
-        for rid in self.cfg.opp_active_ids:
+        # Escenario mixto: samplear cuántos oponentes activar este episodio (1..N).
+        opp_ids = self.cfg.opp_active_ids
+        if self.cfg.randomize_opponents and opp_ids:
+            k = int(self._rng.integers(1, len(opp_ids) + 1))
+            opp_ids = tuple(opp_ids[:k])
+        for rid in opp_ids:
             self._opp[rid] = self._spawn_opp(rid)
 
         self._ball = np.array(
@@ -173,11 +244,14 @@ class VsssSoccerEnv(gym.Env):
         ctrl_choices = self._decode_action(action)
 
         prev_ball_to_goal = self._dist_ball_to(OWN_ATTACK_GOAL)
+        prev_ball_to_own = self._dist_ball_to(OWN_OWN_GOAL)
         prev_min_robot_ball = self._min_ctrl_dist_to_ball()
+        defense = self.cfg.reward_mode == "defense"
 
         reward = 0.0
         comp = {"goal": 0.0, "concede": 0.0, "oob": 0.0, "time": 0.0,
-                "ball_progress": 0.0, "robot_to_ball": 0.0, "ball_vel_to_goal": 0.0}
+                "ball_progress": 0.0, "robot_to_ball": 0.0, "ball_vel_to_goal": 0.0,
+                "survive": 0.0, "defense_progress": 0.0}
         terminated = False
         goal_scored = conceded = False
 
@@ -189,8 +263,12 @@ class VsssSoccerEnv(gym.Env):
             self._apply_controlled(ctrl_choices)
             self._apply_gk(gk_choice)
             self._apply_opponent(opp_choices)
+            self._confine_goalkeeper()
             self._step_ball()
-            comp["time"] += TIME_PENALTY
+            # En defensa NO hay time penalty (incentivaría conceder rápido para
+            # terminar el episodio); se reemplaza por survive reward abajo.
+            if not defense:
+                comp["time"] += TIME_PENALTY
 
             bx, by = float(self._ball[0]), float(self._ball[1])
             # Línea de fondo rival (+X): gol si está en la boca del arco, si no out.
@@ -218,16 +296,27 @@ class VsssSoccerEnv(gym.Env):
 
         # Shaping (por decisión).
         if not terminated:
-            now_ball_to_goal = self._dist_ball_to(OWN_ATTACK_GOAL)
-            comp["ball_progress"] = BALL_PROGRESS_W * (prev_ball_to_goal - now_ball_to_goal)
-            now_min_robot_ball = self._min_ctrl_dist_to_ball()
-            comp["robot_to_ball"] = ROBOT_TO_BALL_W * (prev_min_robot_ball - now_min_robot_ball)
-            bvx, bvy = float(self._ball_vel[0]), float(self._ball_vel[1])
-            gx, gy = OWN_ATTACK_GOAL[0] - self._ball[0], OWN_ATTACK_GOAL[1] - self._ball[1]
-            gn = math.hypot(gx, gy)
-            if gn > 1e-6:
-                dot = (bvx * gx + bvy * gy) / gn
-                comp["ball_vel_to_goal"] = BALL_VEL_TO_GOAL_W * max(0.0, dot)
+            if defense:
+                # Arquero: premio por sobrevivir + por mantener la pelota lejos
+                # del arco propio (Δ positivo si la pelota se aleja). El robot
+                # más cercano a la pelota es el propio arquero.
+                comp["survive"] = SURVIVE_REWARD
+                now_ball_to_own = self._dist_ball_to(OWN_OWN_GOAL)
+                comp["defense_progress"] = DEFENSE_PROGRESS_W * (now_ball_to_own - prev_ball_to_own)
+                comp["robot_to_ball"] = ROBOT_TO_BALL_W * (
+                    prev_min_robot_ball - self._min_ctrl_dist_to_ball()
+                )
+            else:
+                now_ball_to_goal = self._dist_ball_to(OWN_ATTACK_GOAL)
+                comp["ball_progress"] = BALL_PROGRESS_W * (prev_ball_to_goal - now_ball_to_goal)
+                now_min_robot_ball = self._min_ctrl_dist_to_ball()
+                comp["robot_to_ball"] = ROBOT_TO_BALL_W * (prev_min_robot_ball - now_min_robot_ball)
+                bvx, bvy = float(self._ball_vel[0]), float(self._ball_vel[1])
+                gx, gy = OWN_ATTACK_GOAL[0] - self._ball[0], OWN_ATTACK_GOAL[1] - self._ball[1]
+                gn = math.hypot(gx, gy)
+                if gn > 1e-6:
+                    dot = (bvx * gx + bvy * gy) / gn
+                    comp["ball_vel_to_goal"] = BALL_VEL_TO_GOAL_W * max(0.0, dot)
 
         reward = sum(comp.values())
         self._ticks += COACH_DECISION_PERIOD
@@ -309,6 +398,18 @@ class VsssSoccerEnv(gym.Env):
             v, omega = dispatch_skill(skill_id, tx, ty, body.x, body.y, body.theta, bx, by)
             self._integrate(body, v, omega)
 
+    def _confine_goalkeeper(self) -> None:
+        """Restricción dura: el arquero propio (id 2) no puede salir de su área.
+        Clampa su posición a `gk_area`. Aplica tanto al arquero entrenado
+        (modo defensa) como al rule-based en campo (3v3/mixto)."""
+        area = self.cfg.gk_area
+        if area is None or 2 not in self._own:
+            return
+        xmin, xmax, ymin, ymax = area
+        b = self._own[2]
+        b.x = float(min(max(b.x, xmin), xmax))
+        b.y = float(min(max(b.y, ymin), ymax))
+
     def _integrate(self, body: RobotBody, v: float, omega: float) -> None:
         omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, omega))
         body.theta = _wrap_pi(body.theta + omega * DT)
@@ -348,31 +449,43 @@ class VsssSoccerEnv(gym.Env):
         return self._own_coach.goalkeeper_choice(ball)
 
     def _opponent_choices(self) -> dict[int, tuple[int, float, float]]:
-        if not self.cfg.opp_active_ids or self.cfg.opponent_mode == "none":
+        # Usa los oponentes realmente spawneados este episodio (el escenario
+        # mixto puede activar 1-3), no la config fija.
+        active = sorted(self._opp.keys())
+        if not active or self.cfg.opponent_mode == "none":
             return {}
         ball = (float(self._ball[0]), float(self._ball[1]))
         out: dict[int, tuple[int, float, float]] = {}
-        if self.cfg.opponent_mode == "selfplay" and self._opp_policy is not None:
-            # El snapshot ve la obs en SU marco (espejo en X) y controla campo.
-            act = self._opp_policy(self._build_obs_opp_frame())
-            field_opp = [r for r in self.cfg.opp_active_ids if r != 2]
-            for j, rid in enumerate(field_opp):
-                a = act[3 * j: 3 * j + 3]
-                sid = self._bin_skill(float(a[0]))
-                # des-espejar el target del marco opp al marco global
-                tx = -float(a[1]) * FIELD_HALF_X
-                ty = float(a[2]) * FIELD_HALF_Y
-                out[rid] = (sid, tx, ty)
-            if 2 in self.cfg.opp_active_ids:
-                gk = self._opp_coach.goalkeeper_choice(ball)
-                out[2] = (gk.skill_id, gk.target_x, gk.target_y)
-            return out
+        if self.cfg.opponent_mode == "selfplay" and not self._use_rb_this_ep:
+            # Cargar el snapshot perezosamente (una vez por worker/ruta).
+            if self._opp_model is None and self._opp_model_path:
+                try:
+                    from stable_baselines3 import PPO
+                    self._opp_model = PPO.load(self._opp_model_path, device="cpu")
+                except Exception:
+                    self._opp_model = None
+            if self._opp_model is not None:
+                # El snapshot ve la obs en SU marco (espejo en X) y controla campo.
+                act, _ = self._opp_model.predict(self._build_obs_opp_frame(), deterministic=True)
+                act = np.asarray(act, dtype=np.float32).flatten()
+                field_opp = [r for r in active if r != 2]
+                for j, rid in enumerate(field_opp):
+                    a = act[3 * j: 3 * j + 3]
+                    sid = self._bin_skill(float(a[0]))
+                    # des-espejar el target del marco opp al marco global
+                    tx = -float(a[1]) * FIELD_HALF_X
+                    ty = float(a[2]) * FIELD_HALF_Y
+                    out[rid] = (sid, tx, ty)
+                if 2 in self._opp:
+                    gk = self._opp_coach.goalkeeper_choice(ball)
+                    out[2] = (gk.skill_id, gk.target_x, gk.target_y)
+                return out
         # rule-based: cada opp activo toma su rol (0 atacante, 1 soporte, 2 portero)
         opp_positions = [
             (self._opp[r].x, self._opp[r].y) if r in self._opp else (0.0, 0.0) for r in range(3)
         ]
         choices = self._opp_coach.decide(ball, opp_positions)
-        for rid in self.cfg.opp_active_ids:
+        for rid in active:
             c = choices[rid]
             out[rid] = (c.skill_id, c.target_x, c.target_y)
         return out

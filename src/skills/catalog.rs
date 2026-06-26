@@ -23,7 +23,9 @@
 //! herramientas de debugging y experimentación manual desde `scenario.rs`.
 
 use crate::motion::{Motion, MotionCommand};
-use crate::skills::{ChaseBallSkill, FacePointSkill, GoToSkill, Skill, SkillConfig, SpinSkill};
+use crate::skills::{
+    ChaseBallSkill, FacePointSkill, GoToSkill, PushBallSkill, Skill, SkillConfig, SpinSkill,
+};
 use crate::world::{RobotState, World};
 use glam::Vec2;
 
@@ -43,12 +45,14 @@ pub enum SkillId {
     ChaseBall = 2,
     /// Rotar en el lugar. Usa el signo de `target.x` para definir sentido.
     Spin = 3,
+    /// Empuje DIRIGIDO de la pelota hacia `target` (tiro/pase). Usa target completo.
+    PushBall = 4,
 }
 
 impl SkillId {
     /// Cantidad de skills en el catálogo. Este es el tamaño del action space
     /// discreto que la policy debe respetar.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 5;
 
     /// Construye una `SkillId` a partir del entero que emite la policy.
     /// Retorna `None` si el id está fuera del rango del catálogo.
@@ -58,6 +62,7 @@ impl SkillId {
             1 => Some(Self::FacePoint),
             2 => Some(Self::ChaseBall),
             3 => Some(Self::Spin),
+            4 => Some(Self::PushBall),
             _ => None,
         }
     }
@@ -70,7 +75,7 @@ impl SkillId {
     /// Útil para logging y para el wrapper Python: skills que ignoran target
     /// no necesitan que la policy emita un punto significativo.
     pub fn uses_target(self) -> bool {
-        matches!(self, SkillId::GoTo | SkillId::FacePoint)
+        matches!(self, SkillId::GoTo | SkillId::FacePoint | SkillId::PushBall)
     }
 
     /// Indica si la skill usa el signo de `target.x` como parámetro discreto
@@ -98,6 +103,7 @@ pub struct SkillCatalog {
     face_point: Vec<FacePointSkill>,
     chase_ball: Vec<ChaseBallSkill>,
     spin: Vec<SpinSkill>,
+    push_ball: Vec<PushBallSkill>,
     config: SkillConfig,
 }
 
@@ -117,11 +123,15 @@ impl SkillCatalog {
         let spin = (0..num_robots)
             .map(|_| SpinSkill::with_config(&config))
             .collect();
+        let push_ball = (0..num_robots)
+            .map(|_| PushBallSkill::new(Vec2::ZERO))
+            .collect();
         Self {
             go_to,
             face_point,
             chase_ball,
             spin,
+            push_ball,
             config,
         }
     }
@@ -179,6 +189,11 @@ impl SkillCatalog {
                 skill.set_direction_from(target);
                 skill.tick(robot, world, motion)
             }
+            SkillId::PushBall => {
+                let skill = &mut self.push_ball[robot_id];
+                skill.set_push_target(target);
+                skill.tick(robot, world, motion)
+            }
         }
     }
 }
@@ -214,6 +229,7 @@ mod tests {
             SkillId::FacePoint,
             SkillId::ChaseBall,
             SkillId::Spin,
+            SkillId::PushBall,
         ];
         assert_eq!(known.len(), SkillId::COUNT);
     }
