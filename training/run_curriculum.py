@@ -8,10 +8,16 @@ Uso (desde training/, con el venv):
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+# Forzar UTF-8 en la salida para no crashear en consolas Windows (cp1252) al
+# imprimir acentos/símbolos. errors='replace' es a prueba de balas.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CK = Path("checkpoints")
 VENV_PY = sys.executable  # corre bajo el python del venv
@@ -62,7 +68,8 @@ def main() -> int:
             print(f"[curriculum] fase '{key}' fresca (sin warm-start)")
 
         print(f"[curriculum] >>> {' '.join(cmd)}", flush=True)
-        result = subprocess.run(cmd)
+        child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        result = subprocess.run(cmd, env=child_env)
         if result.returncode != 0:
             print(f"[curriculum] fase '{key}' devolvió código {result.returncode} → aborto.", flush=True)
             return result.returncode
