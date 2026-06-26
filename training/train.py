@@ -85,7 +85,8 @@ def main() -> int:
     p.add_argument("--n-envs", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--warm-start", default=None, help="checkpoint .zip para warm-start parcial")
+    p.add_argument("--warm-start", default=None, help="checkpoint .zip para warm-start parcial (cross-fase)")
+    p.add_argument("--resume", default=None, help="checkpoint .zip para REANUDAR esta misma fase (modelo+optimizador, continúa el contador)")
     p.add_argument("--run-name", default=None)
     p.add_argument("--learning-rate", type=float, default=3e-4)
     args = p.parse_args()
@@ -103,31 +104,34 @@ def main() -> int:
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns, start_method="spawn")
     eval_env = DummyVecEnv([make_env(args.phase, args.seed + 999)])
 
-    model = PPO(
-        policy=VsssActorCriticPolicy,
-        env=vec_env,
-        learning_rate=args.learning_rate,
-        n_steps=2048,
-        batch_size=256,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        verbose=1,
-        tensorboard_log=str(runs_dir),
-        device=args.device,
-        seed=args.seed,
-    )
-
-    if args.warm_start:
-        warm_start(model, args.warm_start, args.device)
+    if args.resume:
+        print(f"[resume] cargando modelo completo (con optimizador) desde {args.resume}")
+        model = PPO.load(args.resume, env=vec_env, device=args.device)
+    else:
+        model = PPO(
+            policy=VsssActorCriticPolicy,
+            env=vec_env,
+            learning_rate=args.learning_rate,
+            n_steps=2048,
+            batch_size=256,
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            verbose=1,
+            tensorboard_log=str(runs_dir),
+            device=args.device,
+            seed=args.seed,
+        )
+        if args.warm_start:
+            warm_start(model, args.warm_start, args.device)
 
     callbacks = [
         CheckpointCallback(
-            save_freq=max(200_000 // args.n_envs, 1),
+            save_freq=max(100_000 // args.n_envs, 1),  # guardado frecuente (pausa/resume)
             save_path=str(ckpt_dir),
             name_prefix=f"phase{args.phase}",
         ),
@@ -152,7 +156,8 @@ def main() -> int:
 
     try:
         model.learn(total_timesteps=args.total_steps, callback=callbacks,
-                    tb_log_name=run_name, progress_bar=True)
+                    tb_log_name=run_name, progress_bar=True,
+                    reset_num_timesteps=(args.resume is None))
     finally:
         final_path = ckpt_dir / f"phase{args.phase}_final.zip"
         model.save(str(final_path))

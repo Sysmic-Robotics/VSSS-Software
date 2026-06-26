@@ -40,6 +40,7 @@ from .engine_constants import (
     FIELD_HALF_Y,
     GOAL_HALF_WIDTH,
     MAX_ANGULAR_SPEED,
+    MAX_LINEAR_SPEED,
     ROBOT_RADIUS,
 )
 from .observation import FLAT_SIZE, Observation, normalize_ball, normalize_robot
@@ -64,6 +65,13 @@ OUT_Y = 0.64
 # Pelota
 BALL_FRICTION_PER_TICK = 0.94
 IMPULSE_TRANSFER = 0.7
+SPIN_KICK_GAIN = 4.0   # amplifica el impulso tangencial por giro (representa el
+                       # canto del robot; sin esto un robot circular no "patea" girando)
+
+# Áreas de meta (reglamento LARC: rectángulo 70x15 cm frente a cada arco).
+OWN_AREA = (-FIELD_HALF_X, -FIELD_HALF_X + 0.15, -0.35, 0.35)   # arco propio (−X)
+RIVAL_AREA = (FIELD_HALF_X - 0.15, FIELD_HALF_X, -0.35, 0.35)   # arco rival (+X)
+ILLEGAL_AREA_PENALTY = -0.3   # por decisión: 2+ robots propios en un área de meta
 
 
 @dataclass
@@ -74,6 +82,7 @@ class RobotBody:
     vx: float = 0.0
     vy: float = 0.0
     omega: float = 0.0
+    spinning: bool = False  # True si este tick ejecuta la skill Spin (para el pelotazo)
 
 
 @dataclass
@@ -251,7 +260,7 @@ class VsssSoccerEnv(gym.Env):
         reward = 0.0
         comp = {"goal": 0.0, "concede": 0.0, "oob": 0.0, "time": 0.0,
                 "ball_progress": 0.0, "robot_to_ball": 0.0, "ball_vel_to_goal": 0.0,
-                "survive": 0.0, "defense_progress": 0.0}
+                "survive": 0.0, "defense_progress": 0.0, "illegal_area": 0.0}
         terminated = False
         goal_scored = conceded = False
 
@@ -318,6 +327,12 @@ class VsssSoccerEnv(gym.Env):
                     dot = (bvx * gx + bvy * gy) / gn
                     comp["ball_vel_to_goal"] = BALL_VEL_TO_GOAL_W * max(0.0, dot)
 
+        # Regla VSSS: máx. 1 robot propio por área de meta (2+ = defensa/ataque
+        # ilegal → penal). Penalizamos cada área en infracción.
+        violations = (1 if self._own_in_area(OWN_AREA) >= 2 else 0) + \
+                     (1 if self._own_in_area(RIVAL_AREA) >= 2 else 0)
+        comp["illegal_area"] = ILLEGAL_AREA_PENALTY * violations
+
         reward = sum(comp.values())
         self._ticks += COACH_DECISION_PERIOD
         truncated = self._ticks >= self._max_ticks
@@ -376,6 +391,7 @@ class VsssSoccerEnv(gym.Env):
         bx, by = float(self._ball[0]), float(self._ball[1])
         for rid, skill_id, tx, ty in choices:
             body = self._own[rid]
+            body.spinning = (skill_id == int(SkillId.SPIN))
             v, omega = dispatch_skill(skill_id, tx, ty, body.x, body.y, body.theta, bx, by)
             self._integrate(body, v, omega)
 
@@ -384,6 +400,7 @@ class VsssSoccerEnv(gym.Env):
             return
         rid = self.cfg.own_gk_id
         body = self._own[rid]
+        body.spinning = (gk_choice.skill_id == int(SkillId.SPIN))
         bx, by = float(self._ball[0]), float(self._ball[1])
         v, omega = dispatch_skill(gk_choice.skill_id, gk_choice.target_x, gk_choice.target_y,
                                   body.x, body.y, body.theta, bx, by)
@@ -395,6 +412,7 @@ class VsssSoccerEnv(gym.Env):
         bx, by = float(self._ball[0]), float(self._ball[1])
         for rid, (skill_id, tx, ty) in opp_choices.items():
             body = self._opp[rid]
+            body.spinning = (skill_id == int(SkillId.SPIN))
             v, omega = dispatch_skill(skill_id, tx, ty, body.x, body.y, body.theta, bx, by)
             self._integrate(body, v, omega)
 
@@ -435,9 +453,17 @@ class VsssSoccerEnv(gym.Env):
                 # Empujar la pelota al borde de contacto a lo largo de robot→pelota.
                 self._ball[0] = body.x + nx * contact
                 self._ball[1] = body.y + ny * contact
-                # Transferir la velocidad del robot a la pelota (shove).
-                self._ball_vel[0] = body.vx * IMPULSE_TRANSFER + self._ball_vel[0] * 0.3
-                self._ball_vel[1] = body.vy * IMPULSE_TRANSFER + self._ball_vel[1] * 0.3
+                # (1) Empuje por TRASLACIÓN (shove) — modelo probado: transfiere
+                #     la velocidad del robot a la pelota.
+                # (2) SPIN-KICK: impulso TANGENCIAL por velocidad angular (ω × radio),
+                #     lo que hace el "pelotazo" al girar; sin esto Spin no patea.
+                tang_x, tang_y = -ny, nx  # tangente (sentido CCW para ω>0)
+                # El pelotazo tangencial SOLO aplica al robot que ejecuta la skill
+                # Spin — no al giro de ajuste de heading de GoTo/ChaseBall (que si
+                # no, desviaría la pelota durante el empuje normal).
+                spin = body.omega * ROBOT_RADIUS * SPIN_KICK_GAIN if body.spinning else 0.0
+                self._ball_vel[0] = body.vx * IMPULSE_TRANSFER + tang_x * spin + self._ball_vel[0] * 0.3
+                self._ball_vel[1] = body.vy * IMPULSE_TRANSFER + tang_y * spin + self._ball_vel[1] * 0.3
         self._ball_vel *= BALL_FRICTION_PER_TICK
         self._ball = self._ball + self._ball_vel * DT
 
@@ -522,6 +548,12 @@ class VsssSoccerEnv(gym.Env):
     # ── Helpers de recompensa ────────────────────────────────────────────
     def _dist_ball_to(self, goal: tuple[float, float]) -> float:
         return math.hypot(self._ball[0] - goal[0], self._ball[1] - goal[1])
+
+    def _own_in_area(self, area: tuple[float, float, float, float]) -> int:
+        """Cuántos robots propios están dentro de la caja `area`."""
+        xmin, xmax, ymin, ymax = area
+        return sum(1 for b in self._own.values()
+                   if xmin <= b.x <= xmax and ymin <= b.y <= ymax)
 
     def _min_ctrl_dist_to_ball(self) -> float:
         ds = [math.hypot(self._own[r].x - self._ball[0], self._own[r].y - self._ball[1])
