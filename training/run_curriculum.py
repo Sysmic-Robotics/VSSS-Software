@@ -21,6 +21,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 CK = Path("checkpoints")
 VENV_PY = sys.executable  # corre bajo el python del venv
+N_ENVS = os.environ.get("N_ENVS", "4")  # en la VM con muchos núcleos: export N_ENVS=32
 
 # (phase_key, total_steps, warm_from_final | None)
 PHASES = [
@@ -72,7 +73,7 @@ def main() -> int:
             extra = []
 
         cmd = [VENV_PY, "train.py", "--phase", key, "--total-steps", str(total_arg),
-               "--n-envs", "4", "--device", "cpu", "--run-name", f"adv_{key}"] + extra
+               "--n-envs", N_ENVS, "--device", "cpu", "--run-name", f"adv_{key}"] + extra
         print(f"[curriculum] >>> {' '.join(cmd)}", flush=True)
         child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
         result = subprocess.run(cmd, env=child_env)
