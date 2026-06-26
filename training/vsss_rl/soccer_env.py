@@ -272,7 +272,8 @@ class VsssSoccerEnv(gym.Env):
             self._apply_controlled(ctrl_choices)
             self._apply_gk(gk_choice)
             self._apply_opponent(opp_choices)
-            self._confine_goalkeeper()
+            self._confine_goalkeeper()         # arquero a su área primero (regla dura)
+            self._resolve_robot_collisions()  # cuerpos rígidos: no se solapan (como FIRASim)
             self._step_ball()
             # En defensa NO hay time penalty (incentivaría conceder rápido para
             # terminar el episodio); se reemplaza por survive reward abajo.
@@ -435,6 +436,51 @@ class VsssSoccerEnv(gym.Env):
         body.vx, body.vy, body.omega = v * ct, v * st, omega
         body.x = float(np.clip(body.x + body.vx * DT, -OUT_X, OUT_X))
         body.y = float(np.clip(body.y + body.vy * DT, -OUT_Y, OUT_Y))
+
+    def _resolve_robot_collisions(self) -> None:
+        """Separación posicional robot-robot: los robots son cuerpos rígidos y NO
+        pueden solaparse (igual que en FIRASim y en la realidad). Si dos se solapan,
+        empuja a cada uno la mitad de la penetración por la línea que los une. Sin
+        esto los robots se atraviesan — comportamiento no físico que NO transfiere
+        a FIRASim. (Equivale al bloqueo físico; no es una penalización de reward.)"""
+        min_dist = 2 * ROBOT_RADIUS
+        # El arquero propio está confinado a su área (regla dura): lo tratamos como
+        # INMÓVIL en la colisión — mantiene su posición y los demás se separan de
+        # él (si no, separarlo y reconfinarlo reintroduce solapamiento).
+        gk_body = self._own.get(2) if self.cfg.gk_area is not None else None
+        bodies = list(self._own.values()) + list(self._opp.values())
+        n = len(bodies)
+        # Varias pasadas: con 3+ robots amontonados, separar de a pares en una
+        # sola pasada no converge (separar A-B puede volver a meter A en C).
+        for _ in range(6):
+            moved = False
+            for i in range(n):
+                a = bodies[i]
+                for j in range(i + 1, n):
+                    b = bodies[j]
+                    dx, dy = b.x - a.x, b.y - a.y
+                    dist = math.hypot(dx, dy)
+                    if dist < min_dist:
+                        if dist > 1e-6:
+                            nx, ny = dx / dist, dy / dist
+                        else:
+                            nx, ny = 1.0, 0.0  # superpuestos exactos: separar en +x
+                        pen = min_dist - dist
+                        # Reparto del empuje: si uno es el arquero (inmóvil), el otro
+                        # absorbe toda la penetración; si no, mitad y mitad.
+                        if a is gk_body:
+                            wa, wb = 0.0, 1.0
+                        elif b is gk_body:
+                            wa, wb = 1.0, 0.0
+                        else:
+                            wa, wb = 0.5, 0.5
+                        a.x = float(np.clip(a.x - nx * pen * wa, -OUT_X, OUT_X))
+                        a.y = float(np.clip(a.y - ny * pen * wa, -OUT_Y, OUT_Y))
+                        b.x = float(np.clip(b.x + nx * pen * wb, -OUT_X, OUT_X))
+                        b.y = float(np.clip(b.y + ny * pen * wb, -OUT_Y, OUT_Y))
+                        moved = True
+            if not moved:
+                break
 
     def _step_ball(self) -> None:
         # Contacto robot-pelota con resolución POSICIONAL: cuando el robot
