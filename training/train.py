@@ -19,8 +19,13 @@ Características (endurecimiento Workstream A):
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from pathlib import Path
+
+# UTF-8 a prueba de consolas Windows (cp1252) — evita UnicodeEncodeError en prints.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import gymnasium as gym
 from stable_baselines3 import PPO
