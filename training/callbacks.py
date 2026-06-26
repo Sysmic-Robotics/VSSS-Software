@@ -9,7 +9,28 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import torch
 from stable_baselines3.common.callbacks import BaseCallback
+
+
+class ClipLogStdCallback(BaseCallback):
+    """Limita el log_std de la política tras cada rollout para que el desvío de
+    las acciones (std) NO explote — fue la causa de la divergencia del self-play
+    (std creció 1 → 1e14). Cap duro: std ∈ [e^min, e^max] ≈ [0.14, 2.0]."""
+
+    def __init__(self, min_log_std: float = -2.0, max_log_std: float = 0.7, verbose: int = 0):
+        super().__init__(verbose)
+        self.min_log_std = min_log_std
+        self.max_log_std = max_log_std
+
+    def _on_rollout_end(self) -> None:
+        ls = getattr(self.model.policy, "log_std", None)
+        if ls is not None:
+            with torch.no_grad():
+                ls.clamp_(self.min_log_std, self.max_log_std)
+
+    def _on_step(self) -> bool:
+        return True
 
 
 class RewardComponentCallback(BaseCallback):

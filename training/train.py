@@ -33,7 +33,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-from callbacks import RewardComponentCallback, SelfPlayCallback
+from callbacks import ClipLogStdCallback, RewardComponentCallback, SelfPlayCallback
 from vsss_rl.policy import VsssActorCriticPolicy
 from vsss_rl.soccer_env import (
     VsssSoccerEnv,
@@ -123,7 +123,7 @@ def main() -> int:
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.01,
+            ent_coef=0.001,  # bajado de 0.01: el bonus de entropía alto infló el std en self-play
             vf_coef=0.5,
             max_grad_norm=0.5,
             verbose=1,
@@ -150,6 +150,7 @@ def main() -> int:
             verbose=0,
         ),
         RewardComponentCallback(log_freq=20_480),
+        ClipLogStdCallback(min_log_std=-2.0, max_log_std=0.7),  # evita explosión del std
     ]
 
     # Self-play: si el escenario lo pide, agregar el pool de snapshots.

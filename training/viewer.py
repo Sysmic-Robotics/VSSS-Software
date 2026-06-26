@@ -20,9 +20,15 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 from vsss_rl.engine_constants import FIELD_HALF_X, FIELD_HALF_Y, GOAL_HALF_WIDTH, ROBOT_RADIUS, BALL_RADIUS
-from vsss_rl.soccer_env import VsssSoccerEnv, phase1_config, phase2_config, phase3_config
+from vsss_rl.soccer_env import (
+    VsssSoccerEnv, phase1_config, phase2_config, phase_2v1_config,
+    phase_mixed_config, phase3_config, goalkeeper_config,
+)
 
-PHASE_CONFIGS = {1: phase1_config, 2: phase2_config, 3: phase3_config}
+PHASE_CONFIGS = {
+    "1": phase1_config, "2": phase2_config, "2v1": phase_2v1_config,
+    "mixed": phase_mixed_config, "3": phase3_config, "gk": goalkeeper_config,
+}
 
 
 def setup_field(ax):
@@ -41,7 +47,7 @@ def setup_field(ax):
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--phase", type=int, choices=[1, 2, 3], default=1)
+    p.add_argument("--phase", type=str, choices=list(PHASE_CONFIGS.keys()), default="1")
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--random", action="store_true")
     p.add_argument("--episodes", type=int, default=5)
