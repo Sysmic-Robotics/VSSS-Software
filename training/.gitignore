@@ -21,3 +21,5 @@ informe_latex/
 # Sobreescribe la regla *.md del .gitignore raíz solo para README.md,
 # que sí es documentación técnica del proyecto.
 !README.md
+# Guía de setup AWS (documentación técnica, sí se versiona).
+!aws/AWS_SETUP.md

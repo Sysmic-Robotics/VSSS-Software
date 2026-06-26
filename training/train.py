@@ -28,14 +28,32 @@ from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-from callbacks import RewardComponentCallback
+from callbacks import RewardComponentCallback, SelfPlayCallback
 from vsss_rl.policy import VsssActorCriticPolicy
-from vsss_rl.soccer_env import VsssSoccerEnv, phase1_config, phase2_config, phase3_config
+from vsss_rl.soccer_env import (
+    VsssSoccerEnv,
+    phase1_config,
+    phase2_config,
+    phase_2v1_config,
+    phase_mixed_config,
+    phase3_config,
+    goalkeeper_config,
+)
 
-PHASE_CONFIGS = {1: phase1_config, 2: phase2_config, 3: phase3_config}
+# Fases del currículo (campo) + arquero. Strings para poder nombrarlas.
+PHASE_CONFIGS = {
+    "1": phase1_config,         # 1v0
+    "2": phase2_config,         # 1v1
+    "2v1": phase_2v1_config,    # 2v1 cooperación (Box 6)
+    "mixed": phase_mixed_config,  # 2vN randomizado (run largo de campo)
+    "3": phase3_config,         # 3v3 fijo (oponente rule-based)
+    "3sp": lambda: phase3_config("selfplay"),       # 3v3 self-play
+    "mixedsp": lambda: phase_mixed_config("selfplay"),  # 2vN mixto self-play (run largo)
+    "gk": goalkeeper_config,    # arquero (red separada, recompensa defensa)
+}
 
 
-def make_env(phase: int, seed: int):
+def make_env(phase: str, seed: int):
     def _init():
         cfg = PHASE_CONFIGS[phase]()
         env = VsssSoccerEnv(config=cfg, seed=seed)
@@ -62,7 +80,7 @@ def warm_start(model: PPO, ckpt_path: str, device: str) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--phase", type=int, choices=[1, 2, 3], required=True)
+    p.add_argument("--phase", type=str, choices=list(PHASE_CONFIGS.keys()), required=True)
     p.add_argument("--total-steps", type=int, default=1_500_000)
     p.add_argument("--n-envs", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
@@ -124,6 +142,13 @@ def main() -> int:
         ),
         RewardComponentCallback(log_freq=20_480),
     ]
+
+    # Self-play: si el escenario lo pide, agregar el pool de snapshots.
+    if PHASE_CONFIGS[args.phase]().opponent_mode == "selfplay":
+        callbacks.append(SelfPlayCallback(
+            pool_dir=str(ckpt_dir / f"{run_name}_pool"),
+            snapshot_freq=300_000, seed=args.seed, verbose=1,
+        ))
 
     try:
         model.learn(total_timesteps=args.total_steps, callback=callbacks,

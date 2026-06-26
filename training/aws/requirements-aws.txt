@@ -1,0 +1,11 @@
+# Versiones validadas localmente (Windows) — fijar en AWS Linux para reproducibilidad.
+# torch se instala aparte (build CPU para instancia c7i sin GPU): ver AWS_SETUP.md
+numpy==1.26.4
+gymnasium==1.2.3
+stable-baselines3==2.8.0
+tensorboard==2.20.0
+rich
+tqdm
+matplotlib
+onnx
+onnxruntime

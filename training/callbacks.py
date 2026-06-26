@@ -6,6 +6,8 @@ Fase 1 inicial.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -52,4 +54,43 @@ class RewardComponentCallback(BaseCallback):
             self._acc.clear()
             self._n = 0
             self._goals = self._concedes = self._episodes = 0
+        return True
+
+
+class SelfPlayCallback(BaseCallback):
+    """Self-play con pool de snapshots congelados.
+
+    Cada `snapshot_freq` pasos guarda una copia de la política actual al pool y
+    apunta a todos los envs (vía VecEnv.env_method) a un snapshot muestreado del
+    pool. El env, por episodio, usa ese snapshot o rule-based (20%, anti-forgetting,
+    controlado por SELFPLAY_RB_PROB en el env). Así el oponente va escalando con
+    la política y mantiene diversidad de versiones pasadas.
+    """
+
+    def __init__(self, pool_dir: str, snapshot_freq: int = 300_000, seed: int = 0, verbose: int = 0):
+        super().__init__(verbose)
+        self.pool_dir = Path(pool_dir)
+        self.snapshot_freq = snapshot_freq
+        self._last_snap = 0
+        self._pool: list[str] = []
+        self._rng = np.random.default_rng(seed)
+
+    def _on_training_start(self) -> None:
+        self.pool_dir.mkdir(parents=True, exist_ok=True)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last_snap >= self.snapshot_freq:
+            self._last_snap = self.num_timesteps
+            path = self.pool_dir / f"snap_{self.num_timesteps}.zip"
+            self.model.save(str(path))
+            self._pool.append(str(path))
+            # Muestrear un oponente del pool (sesgo a versiones recientes: 50%
+            # la última, 50% una histórica uniforme).
+            if len(self._pool) == 1 or self._rng.random() < 0.5:
+                chosen = self._pool[-1]
+            else:
+                chosen = self._pool[int(self._rng.integers(0, len(self._pool)))]
+            self.training_env.env_method("set_opponent_snapshot", chosen)
+            if self.verbose:
+                print(f"[selfplay] pool={len(self._pool)} oponente={Path(chosen).name}")
         return True

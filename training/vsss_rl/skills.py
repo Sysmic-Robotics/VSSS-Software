@@ -42,10 +42,11 @@ class SkillId(IntEnum):
     FACE_POINT = 1
     CHASE_BALL = 2
     SPIN = 3
+    PUSH_BALL = 4   # empuje DIRIGIDO de la pelota hacia el target (tiro/pase)
 
     @classmethod
     def count(cls) -> int:
-        return 4
+        return 5
 
 
 # Ganancia proporcional del controlador de heading. El motor Rust usa un PID
@@ -105,6 +106,31 @@ def _face_point(
     return 0.0, _heading_omega(theta, desired_angle)
 
 
+def _push_ball(
+    robot_x: float, robot_y: float, theta: float, tx: float, ty: float, ball_x: float, ball_y: float
+) -> tuple[float, float]:
+    """Empuje DIRIGIDO: lleva la pelota hacia el target (tx, ty). Espejo
+    cinemático de `PushBallSkill`. Si el robot está bien posicionado (detrás de
+    la pelota respecto al target y cerca), conduce a través de la pelota hacia
+    el target → la empuja en esa dirección. Si está mal posicionado, se detiene
+    (la policy debe usar GoTo para acomodarse detrás primero).
+    """
+    dxg, dyg = tx - ball_x, ty - ball_y
+    n = math.hypot(dxg, dyg)
+    if n < 1e-6:
+        return 0.0, 0.0
+    ux, uy = dxg / n, dyg / n
+    # ¿robot detrás de la pelota respecto al target?  dot((robot-ball),(target-ball))
+    dot = (robot_x - ball_x) * ux + (robot_y - ball_y) * uy
+    dist_ball = math.hypot(ball_x - robot_x, ball_y - robot_y)
+    if dot > 0.05 or dist_ball > 0.25:
+        return 0.0, 0.0  # mal posicionado → reposicionar con GoTo (lo decide la policy)
+    # punto un poco más allá de la pelota en dirección al target (overshoot 0.12)
+    push_x = ball_x + ux * 0.12
+    push_y = ball_y + uy * 0.12
+    return _go_to(robot_x, robot_y, theta, push_x, push_y)
+
+
 def _spin(target_x: float) -> tuple[float, float]:
     """Rotar en el lugar. Sentido por el signo de target_x. Espejo de `SpinSkill`.
     target_x > 0 → CCW (omega>0); < 0 → CW; == 0 → no spin.
@@ -145,5 +171,7 @@ def dispatch_skill(
         return _go_to(robot_x, robot_y, robot_theta, ball_x, ball_y)
     if sid == SkillId.SPIN:
         return _spin(target_x)
+    if sid == SkillId.PUSH_BALL:
+        return _push_ball(robot_x, robot_y, robot_theta, target_x, target_y, ball_x, ball_y)
     # id fuera de catálogo → comando seguro (el dispatcher Rust valida antes)
     return 0.0, 0.0
