@@ -1,6 +1,8 @@
-# Versiones validadas localmente (Windows) — fijar en AWS Linux para reproducibilidad.
-# torch se instala aparte (build CPU para instancia c7i sin GPU): ver AWS_SETUP.md
-numpy==1.26.4
+# Versiones validadas localmente (Windows) — fijar en Linux para reproducibilidad.
+# torch se instala aparte (build CPU sin GPU): ver AWS_SETUP.md
+# numpy 2.x es OBLIGATORIO: los checkpoints se guardan con numpy 2.4.4; cargarlos
+# con numpy 1.x falla (ModuleNotFoundError: numpy._core — ruta interna de 2.x).
+numpy==2.4.4
 gymnasium==1.2.3
 stable-baselines3==2.8.0
 tensorboard==2.20.0
