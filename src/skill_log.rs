@@ -123,6 +123,7 @@ pub fn skill_label(s: Option<SkillId>) -> &'static str {
         Some(SkillId::FacePoint) => "facepoint",
         Some(SkillId::ChaseBall) => "chaseball",
         Some(SkillId::Spin) => "spin",
+        Some(SkillId::PushBall) => "pushball",
         None => "",
     }
 }
