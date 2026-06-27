@@ -9,7 +9,7 @@
 //! - Input: 52 floats = `Observation::to_flat_vec()`.
 //! - Output: `3·N` floats para N robots de campo controlados. Cada tripleta
 //!   `[skill_sel, tx, ty]`:
-//!     - `skill_sel` → `SkillId` por binning en 4 (idéntico al env Python).
+//!     - `skill_sel` → `SkillId` por binning en 5 (idéntico al env Python).
 //!     - `(tx, ty)`  → target en coords de campo: `tx·FIELD_HALF_X`, `ty·FIELD_HALF_Y`.
 //! - El portero (robot id 2) lo resuelve una regla fija (no lo controla la
 //!   política de campo), igual que en el entrenamiento (1 política de campo
@@ -49,7 +49,7 @@ impl RlCoach {
     }
 
     /// Discretiza el valor continuo `skill_sel ∈ [-1, 1]` a un `SkillId`
-    /// (binning en 4, idéntico a `VsssSoccerEnv._bin_skill`).
+    /// (binning en `SkillId::COUNT`=5, idéntico a `VsssSoccerEnv._bin_skill`).
     fn bin_skill(v: f32) -> SkillId {
         let v = v.clamp(-1.0, 1.0);
         let idx = (((v + 1.0) / 2.0) * SkillId::COUNT as f32).floor() as i64;
