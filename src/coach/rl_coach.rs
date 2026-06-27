@@ -130,10 +130,13 @@ impl Coach for RlCoach {
 
         for i in 0..num_field {
             let skill_id = Self::bin_skill(action[3 * i]);
-            let target = Vec2::new(
-                action[3 * i + 1] * FIELD_HALF_X,
-                action[3 * i + 2] * FIELD_HALF_Y,
-            );
+            // Clamp del target a [-1,1] ANTES de escalar — igual que el env de
+            // entrenamiento (`np.clip(action,-1,1)`). Sin esto, la media μ de la
+            // gaussiana (sin bound) manda targets fuera del campo y el robot se
+            // vuelve loco. bin_skill ya clampea el skill_sel.
+            let tx = action[3 * i + 1].clamp(-1.0, 1.0);
+            let ty = action[3 * i + 2].clamp(-1.0, 1.0);
+            let target = Vec2::new(tx * FIELD_HALF_X, ty * FIELD_HALF_Y);
             choices.push(SkillChoice::new(i as i32, skill_id, target));
         }
 
@@ -144,7 +147,9 @@ impl Coach for RlCoach {
                 let gk_action = Self::run_model(gk, obs);
                 if gk_action.len() >= 3 {
                     let skill_id = Self::bin_skill(gk_action[0]);
-                    let target = Vec2::new(gk_action[1] * FIELD_HALF_X, gk_action[2] * FIELD_HALF_Y);
+                    let tx = gk_action[1].clamp(-1.0, 1.0);
+                    let ty = gk_action[2].clamp(-1.0, 1.0);
+                    let target = Vec2::new(tx * FIELD_HALF_X, ty * FIELD_HALF_Y);
                     choices.push(SkillChoice::new(2, skill_id, target));
                 } else if self.with_goalkeeper {
                     choices.push(self.goalkeeper_choice(obs)); // fallback si falla la inferencia
