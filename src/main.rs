@@ -4,7 +4,7 @@
 use rustengine::GUI;
 
 // ====== Parámetros ======
-const OWN_TEAM: i32 = 0; // 0=azul, 1=amarillo
+// Equipo propio configurable por VSSL_TEAM_COLOR (ver own_team_from_env). Default azul.
 const NUM_ROBOTS: usize = 3;
 
 // Frame-skip del coach (Fase 3 — opción E del horizonte de decisión).
@@ -40,6 +40,16 @@ fn goals_for_team(own_team: i32) -> (Vec2, Vec2) {
         (Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0))
     } else {
         (Vec2::new(-0.75, 0.0), Vec2::new(0.75, 0.0))
+    }
+}
+
+/// Equipo propio desde `VSSL_TEAM_COLOR` (blue|yellow). Default azul (0).
+/// Permite correr DOS instancias (una por color) para un partido completo:
+/// p.ej. RL en azul vs rule-based en amarillo.
+fn own_team_from_env() -> i32 {
+    match std::env::var("VSSL_TEAM_COLOR").as_deref() {
+        Ok("yellow") | Ok("amarillo") | Ok("1") => 1,
+        _ => 0,
     }
 }
 
@@ -152,7 +162,12 @@ async fn async_main(
         vision_source.port()
     );
 
-    let coach = make_coach(OWN_TEAM);
+    let own_team = own_team_from_env();
+    eprintln!(
+        "[main] equipo propio: {}",
+        if own_team == 0 { "azul (blue)" } else { "amarillo (yellow)" }
+    );
+    let coach = make_coach(own_team);
     eprintln!(
         "[main] coach: {}",
         if coach.is_some() {
@@ -173,7 +188,7 @@ async fn async_main(
     };
 
     let config = ControlLoopConfig {
-        own_team: OWN_TEAM,
+        own_team,
         num_robots: NUM_ROBOTS,
         vision_source,
         radio_target,
