@@ -19,6 +19,7 @@ Características (endurecimiento Workstream A):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -73,14 +74,21 @@ def warm_start(model: PPO, ckpt_path: str, device: str) -> None:
     old = PPO.load(ckpt_path, device=device)
     new_sd = model.policy.state_dict()
     old_sd = old.policy.state_dict()
+    # VSSL_RESET_HEAD=1: NO transferir la cabeza de acción (action_net) → queda
+    # reinicializada (pesos chicos → media interior, sin saturación). El tronco y la
+    # value function SÍ se transfieren. Cura la saturación de un modelo previo.
+    reset_head = os.environ.get("VSSL_RESET_HEAD") == "1"
     transferred, total = 0, 0
     for k, v in new_sd.items():
         total += 1
+        if reset_head and "action_net" in k:
+            continue
         if k in old_sd and old_sd[k].shape == v.shape:
             new_sd[k] = old_sd[k]
             transferred += 1
     model.policy.load_state_dict(new_sd)
-    print(f"[warm-start] transferidos {transferred}/{total} tensores desde {ckpt_path}")
+    extra = "  (action_net reinicializada)" if reset_head else ""
+    print(f"[warm-start] transferidos {transferred}/{total} tensores desde {ckpt_path}{extra}")
 
 
 def main() -> int:

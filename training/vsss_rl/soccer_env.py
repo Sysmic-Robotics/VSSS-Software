@@ -87,6 +87,13 @@ SPIN_KICK_GAIN = 4.0   # amplifica el impulso tangencial por giro (representa el
 OWN_AREA = (-FIELD_HALF_X, -FIELD_HALF_X + 0.15, -0.35, 0.35)   # arco propio (−X)
 RIVAL_AREA = (FIELD_HALF_X - 0.15, FIELD_HALF_X, -0.35, 0.35)   # arco rival (+X)
 ILLEGAL_AREA_PENALTY = -0.3   # por decisión: 2+ robots propios en un área de meta
+# Anti-saturación: penaliza (lineal) por cuánto la acción CRUDA de la política se
+# pasa de [-1,1]. Sin esto la media de la gaussiana se va a ±∞ (la región recortada
+# no tiene gradiente) y la política colapsa a targets de esquina (juego crudo).
+ACTION_SAT_W = 0.02
+# Posición defensiva (recompensa más rica, respaldada por la investigación VSSS):
+# premio chico por tener un robot de campo entre la pelota y el arco propio.
+DEF_POSITION_W = 0.01
 
 
 @dataclass
@@ -283,7 +290,8 @@ class VsssSoccerEnv(gym.Env):
         return self._observe(), self._info()
 
     def step(self, action: np.ndarray):
-        action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        raw_action = np.asarray(action, dtype=np.float32)
+        action = np.clip(raw_action, -1.0, 1.0)
         # Decodificar SkillChoice por robot controlado.
         ctrl_choices = self._decode_action(action)
 
@@ -295,7 +303,8 @@ class VsssSoccerEnv(gym.Env):
         reward = 0.0
         comp = {"goal": 0.0, "concede": 0.0, "oob": 0.0, "time": 0.0,
                 "ball_progress": 0.0, "robot_to_ball": 0.0, "ball_vel_to_goal": 0.0,
-                "survive": 0.0, "defense_progress": 0.0, "illegal_area": 0.0}
+                "survive": 0.0, "defense_progress": 0.0, "illegal_area": 0.0,
+                "action_sat": 0.0, "def_position": 0.0}
         terminated = False
         goal_scored = conceded = False
 
@@ -362,12 +371,25 @@ class VsssSoccerEnv(gym.Env):
                 if gn > 1e-6:
                     dot = (bvx * gx + bvy * gy) / gn
                     comp["ball_vel_to_goal"] = BALL_VEL_TO_GOAL_W * max(0.0, dot)
+                # Posición defensiva: con la pelota en campo propio (−X), premio
+                # chico si un robot de campo está entre la pelota y el arco propio.
+                if float(self._ball[0]) < 0.0:
+                    bx = float(self._ball[0])
+                    if any(self._own[r].x < bx
+                           for r in self.cfg.controlled_field_ids if r in self._own):
+                        comp["def_position"] = DEF_POSITION_W
 
         # Regla VSSS: máx. 1 robot propio por área de meta (2+ = defensa/ataque
         # ilegal → penal). Penalizamos cada área en infracción.
         violations = (1 if self._own_in_area(OWN_AREA) >= 2 else 0) + \
                      (1 if self._own_in_area(RIVAL_AREA) >= 2 else 0)
         comp["illegal_area"] = ILLEGAL_AREA_PENALTY * violations
+
+        # Penalización de saturación (ver ACTION_SAT_W): castiga cuánto la acción
+        # CRUDA se pasó de [-1,1]. Restaura el gradiente para que la política
+        # aprenda targets interiores en vez de saturar en las esquinas.
+        overflow = np.maximum(0.0, np.abs(raw_action) - 1.0)
+        comp["action_sat"] = -ACTION_SAT_W * float(np.sum(overflow))
 
         reward = sum(comp.values())
         self._ticks += COACH_DECISION_PERIOD
