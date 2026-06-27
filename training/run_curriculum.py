@@ -22,15 +22,18 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 CK = Path("checkpoints")
 VENV_PY = sys.executable  # corre bajo el python del venv
 N_ENVS = os.environ.get("N_ENVS", "4")  # en la VM con muchos núcleos: export N_ENVS=32
+# Pasos del self-play (donde más ayuda entrenar más, con compute disponible).
+# Default 25M; extensible con MIXEDSP_STEPS=50000000 (o más) sin tocar código.
+MIXEDSP_STEPS = int(os.environ.get("MIXEDSP_STEPS", "25000000"))
 
 # (phase_key, total_steps, warm_from_final | None)
 PHASES = [
-    ("1",       2_000_000,  None),
-    ("2",       2_000_000,  "phase1_final.zip"),
-    ("2v1",     4_000_000,  "phase2_final.zip"),
-    ("mixed",  10_000_000,  "phase2v1_final.zip"),
-    ("mixedsp", 25_000_000, "phasemixed_final.zip"),
-    ("gk",      6_000_000,  None),
+    ("1",       2_000_000,    None),
+    ("2",       2_000_000,    "phase1_final.zip"),
+    ("2v1",     4_000_000,    "phase2_final.zip"),
+    ("mixed",  10_000_000,    "phase2v1_final.zip"),
+    ("mixedsp", MIXEDSP_STEPS, "phasemixed_final.zip"),
+    ("gk",      6_000_000,    None),
 ]
 
 
