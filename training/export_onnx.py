@@ -4,7 +4,7 @@ Exporta una política PPO entrenada a ONNX para deploy en el motor Rust (RlCoach
 El modelo ONNX recibe la observación de 52 floats y devuelve la acción
 DETERMINISTA (la media μ de la gaussiana), con forma (batch, 3·N) donde N es el
 número de robots de campo controlados. Cada tripleta es `[skill_sel, tx, ty]`:
-- `skill_sel` → SkillId por binning en 4 (mismo binning que el env).
+- `skill_sel` → SkillId por binning en 5 (mismo binning que el env).
 - `(tx, ty)`  → target en coords de campo: `tx·0.75`, `ty·0.65`.
 
 Esto es exactamente lo que `RlCoach::decide` debe leer y convertir en

@@ -4,7 +4,7 @@
 //! entrenado en Python. Cualquier cambio en `SkillId` (agregar, sacar,
 //! reordenar) rompe el modelo y obliga a reentrenar.
 //!
-//! El catálogo de Fase 2 contiene 4 skills, siguiendo el patrón de Bassani
+//! El catálogo contiene 5 skills, siguiendo el patrón de Bassani
 //! 2020 (3 skills: go-to-ball, turn-and-shoot, shoot-goalie) más la striker
 //! de LARC 2019 (4 behaviors: spin, approach, push, idle), adaptado a las
 //! atómicas que ya tenemos funcionando bien:
@@ -15,10 +15,11 @@
 //! | 1  | FacePoint    | sí (xy)    | rotar para mirar a un punto          |
 //! | 2  | ChaseBall    | no         | perseguir la posición actual del balón |
 //! | 3  | Spin         | sí (signo) | rotar en el lugar (signo de x → CCW/CW) |
+//! | 4  | PushBall     | sí (xy)    | empuje dirigido de la pelota al target (tiro/pase) |
 //!
 //! Skills "out-of-catalog" que viven en el módulo pero no son llamables vía
 //! catálogo: `DefendGoalLineSkill` (reservada para portero en Fase 6),
-//! `SupportPositionSkill`, `ApproachBallBehindSkill`, `PushBallSkill`,
+//! `SupportPositionSkill`, `ApproachBallBehindSkill`,
 //! `AlignBallToTargetSkill`, `HoldPositionSkill`, `StopSkill`. Quedan como
 //! herramientas de debugging y experimentación manual desde `scenario.rs`.
 

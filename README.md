@@ -21,6 +21,8 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_VISION_SOURCE` | `firasim` | `firasim` o `sslvision`. Selecciona la fuente y el parser del `vision_task`. |
 | `VSSL_MULTICAST_IFACE` | (auto) | IPv4 local para forzar la interfaz de multicast (útil si hay varias NICs). |
 | `VSSL_RADIO_TARGET` | `firasim` | `firasim`, `grsim` o `basestation`. Selecciona a quién se le envían los `MotionCommand`. |
+| `VSSL_COACH` | `rule_based` | `rule_based`, `rl` o `none`. `rl` carga el modelo ONNX entrenado (requiere compilar con `--features rl`). |
+| `VSSL_RL_MODEL` | `training/models/policy.onnx` | Path al ONNX de la política de campo (sólo con `VSSL_COACH=rl`). |
 | `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Sólo afecta a `basestation`: filtra qué comandos van al frame serial. |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
 | `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
@@ -129,7 +131,7 @@ Fuente de visión (FIRASim 224.0.0.1:10002 | vsss-vision-sysmic 224.5.23.2:10015
 | `tracker/` | EKF por entidad (robot/balón). Estado: posición + orientación + velocidades |
 | `world/` | Estado canónico del juego: poses de robots, posición/velocidad del balón, flags de inactividad |
 | `coach/` | Coach trait + `RuleBasedCoach` baseline + contrato `Observation` (52 floats) para el modelo RL futuro |
-| `skills/` | Catálogo congelado RL: `SkillId::{GoTo, FacePoint, ChaseBall, Spin}` (`SkillCatalog::tick`). Skills out-of-catalog viven en `skills/mod.rs` para otros usos |
+| `skills/` | Catálogo congelado RL: `SkillId::{GoTo, FacePoint, ChaseBall, Spin, PushBall}` (`SkillCatalog::tick`). Skills out-of-catalog viven en `skills/mod.rs` para otros usos |
 | `motion/` | UVF para evasión de obstáculos, PID para heading y velocidad, braking profile |
 | `radio/` | Trait `RobotTransport` + 3 implementaciones (`FiraSimTransport`, `GrSimTransport`, `BaseStationTransport`). Selección por `VSSL_RADIO_TARGET`. `Radio::from_target` explícito |
 | `control_loop.rs` | **Loop 60 Hz único** que `main`, `scenario` y `skill_test` invocan. `TickDecider` (`CoachDecider`/`FixedSkillDecider`/etc) decide qué skill; el resto del lazo (visión → world → dispatch → transport) es el mismo |
@@ -154,7 +156,7 @@ src/
 ├── world/                 # World, RobotState, BallState (Arc<RwLock>)
 ├── tracker/               # EKF por entidad
 ├── coach/                 # Coach trait + RuleBasedCoach + Observation (52 floats RL)
-├── skills/                # SkillCatalog congelado (GoTo, FacePoint, ChaseBall, Spin) + skills out-of-catalog
+├── skills/                # SkillCatalog congelado (GoTo, FacePoint, ChaseBall, Spin, PushBall) + skills out-of-catalog
 ├── motion/                # UVF + PID + MotionCommand
 ├── radio/
 │   ├── mod.rs             # Radio + RadioTarget. Radio::from_target explícito.
@@ -235,34 +237,55 @@ Convención: `omega > 0` → CCW visto desde arriba → rueda derecha más rápi
 
 ## Integración del modelo RL
 
-El engine está diseñado para recibir un modelo de RL con cambios mínimos. El seam de integración es el trait `Coach` en `src/coach/coach_trait.rs`.
+El engine **ya integra** el modelo de RL entrenado en Python. El seam es el trait
+`Coach` (`src/coach/coach_trait.rs`); la implementación viva está en
+`src/coach/rl_coach.rs`, gateada tras el feature `rl` (usa `tract-onnx`, motor de
+inferencia ONNX en Rust puro — no se fuerza en el build por defecto).
 
-### Cómo conectar el modelo (cuando esté listo)
+### Arquitectura del deploy
 
-**1.** Crear `src/coach/rl_coach.rs`:
+- **1 política de campo compartida** (entrenada con self-play): recibe la
+  observación de 52 floats y controla los **2 robots de campo** (salida de 6
+  floats = 2 × `[skill_sel, tx, ty]`).
+- **Arquero (robot id 2) aparte.** Hoy `RlCoach` usa un arquero **rule-based**
+  (`RlCoach::load(path, own_goal, with_goalkeeper=true)`). El arquero
+  **entrenado** se deploya cargando un 2º ONNX — pendiente (ver TODO abajo).
 
-```rust
-use crate::coach::{Coach, Observation, SkillChoice};
-use crate::skills::SkillId;
+### Correr el modelo contra FIRASim (turnkey)
 
-pub struct RlCoach { /* model handle */ }
+Visión y radio ya hacen default a FiraSim, así que sólo hace falta la feature
+`rl`, el modelo ONNX y `VSSL_COACH=rl`:
 
-impl RlCoach {
-    pub fn load(path: &str) -> Self { ... }
-}
-
-impl Coach for RlCoach {
-    fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice> {
-        let input = obs.to_flat_vec(); // 52 floats — ver contrato abajo
-        // inferencia → Vec<SkillChoice { robot_id, skill_id, target }>
-        // skill_id ∈ {GoTo=0, FacePoint=1, ChaseBall=2, Spin=3} (catálogo congelado)
-    }
-}
+```bash
+# 1. Levantar FIRASim.
+# 2. Compilar con la feature rl (trae tract-onnx).
+cargo build --release --features rl
+# 3. Correr el engine con el coach RL. El modelo se lee de
+#    training/models/policy.onnx (override con VSSL_RL_MODEL).
+VSSL_COACH=rl cargo run --release --features rl
+#    (GUI de debug: anteponer VSSL_DEBUG_GUI=1)
 ```
 
-**2.** En `make_coach` (`src/main.rs`) agregar la rama `VSSL_COACH=rl` que carga `RlCoach::load(...)`. El `CoachDecider` ya envuelve cualquier `Box<dyn Coach>` con el frame-skip de 10 Hz, sin más cambios.
+El ONNX (`training/models/policy.onnx`) viene **versionado en el repo** (forzado
+pese a `*.onnx` en .gitignore) — no hace falta el entorno Python para correrlo.
+Para re-exportarlo desde un checkpoint:
 
-El contrato discreto es **`SkillId` con orden congelado** (CLAUDE.md §5): no renumerar ni eliminar entradas, solo agregar al final.
+```bash
+cd training && python export_onnx.py --checkpoint checkpoints/phasemixedsp_final.zip --out models/policy.onnx
+```
+
+### Contrato discreto de skills (CONGELADO)
+
+`skill_id ∈ {GoTo=0, FacePoint=1, ChaseBall=2, Spin=3, PushBall=4}` — binning del
+`skill_sel ∈ [-1,1]` en `SkillId::COUNT`=5, idéntico en Python
+(`VsssSoccerEnv._bin_skill`) y Rust (`RlCoach::bin_skill`). Nunca renumerar ni
+eliminar entradas; sólo agregar al final (cambia el mapeo y obliga a re-fine-tune).
+
+### TODO — deploy del arquero entrenado
+
+Para usar la red de arquero (`phasegk_final`) en lugar del rule-based: agregar a
+`RlCoach` la carga de un 2º ONNX (salida Box 3) y correrlo para el robot id 2,
+reemplazando `goalkeeper_choice`. Usa la misma observación de 52 floats.
 
 ### Contrato de la observación (`Observation::to_flat_vec()`)
 
