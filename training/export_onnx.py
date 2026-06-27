@@ -16,6 +16,13 @@ Uso:
 
 from __future__ import annotations
 
+import sys
+
+# UTF-8 a prueba de consolas Windows (cp1252) — evita UnicodeEncodeError al
+# imprimir "→" y demás (mismo fix que train.py / run_curriculum.py).
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import argparse
 from pathlib import Path
 
