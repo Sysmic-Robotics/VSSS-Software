@@ -183,7 +183,7 @@ async fn async_main(
     );
 
     let decider: Box<dyn TickDecider> = match coach {
-        Some(c) => Box::new(CoachDecider::new(c, OWN_TEAM, COACH_DECISION_PERIOD)),
+        Some(c) => Box::new(CoachDecider::new(c, own_team, COACH_DECISION_PERIOD)),
         None => Box::new(NoOpDecider),
     };
 
