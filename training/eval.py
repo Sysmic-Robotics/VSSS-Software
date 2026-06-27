@@ -9,6 +9,12 @@ Uso:
 
 from __future__ import annotations
 
+import sys
+
+# UTF-8 a prueba de consolas Windows (cp1252) — evita UnicodeEncodeError al imprimir.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import argparse
 import statistics
 from pathlib import Path
