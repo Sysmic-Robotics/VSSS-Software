@@ -594,6 +594,10 @@ class VsssSoccerEnv(gym.Env):
         active = sorted(self._opp.keys())
         if not active or self.cfg.opponent_mode == "none":
             return {}
+        if self.cfg.opponent_mode == "ballchaser":
+            # Rival agresivo FIJO: todos persiguen la pelota. Baseline diverso para
+            # la evaluación por win-tendency (no se usa para entrenar).
+            return {rid: (int(SkillId.CHASE_BALL), 0.0, 0.0) for rid in active}
         ball = (float(self._ball[0]), float(self._ball[1]))
         out: dict[int, tuple[int, float, float]] = {}
         if self.cfg.opponent_mode == "selfplay" and not self._use_rb_this_ep:
