@@ -34,6 +34,9 @@ pub struct RlCoach {
     /// Si true, agrega un portero (RL si `gk_model` está, si no rule-based) en el
     /// robot id 2 cuando la política de campo controla menos de 3 robots.
     with_goalkeeper: bool,
+    /// Diagnóstico (VSSL_RL_DEBUG=1): loguea obs + acciones cada ~20 decisiones.
+    dbg: bool,
+    dbg_count: u32,
 }
 
 impl RlCoach {
@@ -61,11 +64,14 @@ impl RlCoach {
             },
             None => None,
         };
+        let dbg = std::env::var("VSSL_RL_DEBUG").map(|v| v == "1").unwrap_or(false);
         Ok(Self {
             model,
             gk_model,
             own_goal,
             with_goalkeeper,
+            dbg,
+            dbg_count: 0,
         })
     }
 
@@ -145,6 +151,24 @@ impl Coach for RlCoach {
                 }
             } else if self.with_goalkeeper {
                 choices.push(self.goalkeeper_choice(obs)); // rule-based
+            }
+        }
+
+        // Diagnóstico throttleado: ¿qué percibe y qué decide la red? (VSSL_RL_DEBUG=1)
+        if self.dbg {
+            self.dbg_count = self.dbg_count.wrapping_add(1);
+            if self.dbg_count % 20 == 0 {
+                let f = obs.to_flat_vec();
+                eprintln!(
+                    "[rl-dbg] nf={} ball=({:.2},{:.2}) own0=({:.2},{:.2} act{:.0}) own1=({:.2},{:.2} act{:.0}) own2=({:.2},{:.2} act{:.0})",
+                    num_field, f[0], f[1], f[4], f[5], f[11], f[12], f[13], f[19], f[20], f[21], f[27]
+                );
+                for c in &choices {
+                    eprintln!(
+                        "[rl-dbg]   robot {} -> {:?} tgt=({:.2},{:.2})",
+                        c.robot_id, c.skill_id, c.target.x, c.target.y
+                    );
+                }
             }
         }
 
