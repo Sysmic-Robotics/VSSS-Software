@@ -11,9 +11,10 @@
 //!   `[skill_sel, tx, ty]`:
 //!     - `skill_sel` → `SkillId` por binning en 5 (idéntico al env Python).
 //!     - `(tx, ty)`  → target en coords de campo: `tx·FIELD_HALF_X`, `ty·FIELD_HALF_Y`.
-//! - El portero (robot id 2) lo resuelve una regla fija (no lo controla la
-//!   política de campo), igual que en el entrenamiento (1 política de campo
-//!   compartida + arquero aparte).
+//! - El portero (robot id 2) lo controla una red de arquero entrenada aparte
+//!   (2º ONNX, `VSSL_RL_GK_MODEL`); si no carga, cae a una regla fija. La
+//!   política de campo NO controla al arquero (arquitectura: 1 red de campo
+//!   compartida + 1 red de arquero).
 
 use crate::coach::coach_trait::Coach;
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation};
@@ -26,26 +27,56 @@ type OnnxModel = TypedRunnableModel<TypedModel>;
 
 pub struct RlCoach {
     model: OnnxModel,
+    /// Arquero entrenado (opcional). Si está, controla el robot id 2 con su
+    /// propia red; si es `None`, se usa el arquero rule-based (`goalkeeper_choice`).
+    gk_model: Option<OnnxModel>,
     own_goal: Vec2,
-    /// Si true, agrega un portero rule-based en el robot id 2 cuando la política
-    /// controla menos de 3 robots de campo.
+    /// Si true, agrega un portero (RL si `gk_model` está, si no rule-based) en el
+    /// robot id 2 cuando la política de campo controla menos de 3 robots.
     with_goalkeeper: bool,
 }
 
 impl RlCoach {
-    /// Carga el modelo ONNX desde `path`. `own_goal` se usa para el portero
-    /// rule-based. Pánico si el modelo no carga (error de setup, no de runtime).
-    pub fn load(path: &str, own_goal: Vec2, with_goalkeeper: bool) -> TractResult<Self> {
-        let model = tract_onnx::onnx()
-            .model_for_path(path)?
-            .with_input_fact(0, f32::fact([1, Observation::FLAT_SIZE]).into())?
-            .into_optimized()?
-            .into_runnable()?;
+    /// Carga el modelo ONNX de campo desde `path`. Si `gk_path` es `Some` y carga
+    /// bien, el arquero (robot id 2) lo controla esa red entrenada; si es `None` o
+    /// falla la carga, se usa el arquero rule-based. `own_goal` se usa para el
+    /// rule-based. Error de carga del modelo de campo = error de setup (no runtime).
+    pub fn load(
+        path: &str,
+        gk_path: Option<&str>,
+        own_goal: Vec2,
+        with_goalkeeper: bool,
+    ) -> TractResult<Self> {
+        let model = Self::load_model(path)?;
+        let gk_model = match gk_path {
+            Some(p) => match Self::load_model(p) {
+                Ok(m) => {
+                    eprintln!("[RlCoach] arquero RL cargado desde {p}");
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!("[RlCoach] no se pudo cargar arquero RL ({e}); uso rule-based");
+                    None
+                }
+            },
+            None => None,
+        };
         Ok(Self {
             model,
+            gk_model,
             own_goal,
             with_goalkeeper,
         })
+    }
+
+    /// Carga un modelo ONNX (campo o arquero) fijando el input a la observación
+    /// de 52 floats. Ambas redes comparten el mismo contrato de entrada.
+    fn load_model(path: &str) -> TractResult<OnnxModel> {
+        tract_onnx::onnx()
+            .model_for_path(path)?
+            .with_input_fact(0, f32::fact([1, Observation::FLAT_SIZE]).into())?
+            .into_optimized()?
+            .into_runnable()
     }
 
     /// Discretiza el valor continuo `skill_sel ∈ [-1, 1]` a un `SkillId`
@@ -67,15 +98,15 @@ impl RlCoach {
         SkillChoice::goto(2, Vec2::new(defend_x, target_y))
     }
 
-    /// Corre la inferencia ONNX sobre la observación. Devuelve el vector de
-    /// acción crudo, o un vector vacío si la inferencia falla (estado seguro).
-    fn infer(&self, obs: &Observation) -> Vec<f32> {
+    /// Corre la inferencia ONNX de `model` sobre la observación. Devuelve el
+    /// vector de acción crudo, o vacío si la inferencia falla (estado seguro).
+    fn run_model(model: &OnnxModel, obs: &Observation) -> Vec<f32> {
         let flat = obs.to_flat_vec();
         let input = match tract_ndarray::Array2::from_shape_vec((1, flat.len()), flat) {
             Ok(arr) => arr.into_tensor(),
             Err(_) => return Vec::new(),
         };
-        match self.model.run(tvec!(input.into())) {
+        match model.run(tvec!(input.into())) {
             Ok(result) => match result[0].to_array_view::<f32>() {
                 Ok(view) => view.iter().copied().collect(),
                 Err(_) => Vec::new(),
@@ -87,7 +118,7 @@ impl RlCoach {
 
 impl Coach for RlCoach {
     fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice> {
-        let action = self.infer(obs);
+        let action = Self::run_model(&self.model, obs);
         let num_field = action.len() / 3;
         let mut choices = Vec::with_capacity(num_field + 1);
 
@@ -100,9 +131,21 @@ impl Coach for RlCoach {
             choices.push(SkillChoice::new(i as i32, skill_id, target));
         }
 
-        // Portero aparte (no lo controla la política de campo).
-        if self.with_goalkeeper && num_field < 3 {
-            choices.push(self.goalkeeper_choice(obs));
+        // Arquero (robot id 2), si la política de campo controla <3 robots.
+        if num_field < 3 {
+            if let Some(gk) = self.gk_model.as_ref() {
+                // Arquero entrenado: misma observación de 52 floats → [skill, tx, ty].
+                let gk_action = Self::run_model(gk, obs);
+                if gk_action.len() >= 3 {
+                    let skill_id = Self::bin_skill(gk_action[0]);
+                    let target = Vec2::new(gk_action[1] * FIELD_HALF_X, gk_action[2] * FIELD_HALF_Y);
+                    choices.push(SkillChoice::new(2, skill_id, target));
+                } else if self.with_goalkeeper {
+                    choices.push(self.goalkeeper_choice(obs)); // fallback si falla la inferencia
+                }
+            } else if self.with_goalkeeper {
+                choices.push(self.goalkeeper_choice(obs)); // rule-based
+            }
         }
 
         choices

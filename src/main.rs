@@ -70,7 +70,12 @@ fn make_coach(own_team: i32) -> Option<Box<dyn Coach>> {
 fn make_rl_coach(attack_goal: Vec2, own_goal: Vec2) -> Option<Box<dyn Coach>> {
     let path =
         std::env::var("VSSL_RL_MODEL").unwrap_or_else(|_| "training/models/policy.onnx".to_string());
-    match rustengine::coach::RlCoach::load(&path, own_goal, true) {
+    // Arquero entrenado: por defecto training/models/policy_gk.onnx (si carga).
+    // Poné VSSL_RL_GK_MODEL=none para forzar el arquero rule-based.
+    let gk_env = std::env::var("VSSL_RL_GK_MODEL")
+        .unwrap_or_else(|_| "training/models/policy_gk.onnx".to_string());
+    let gk_path: Option<&str> = if gk_env == "none" { None } else { Some(gk_env.as_str()) };
+    match rustengine::coach::RlCoach::load(&path, gk_path, own_goal, true) {
         Ok(c) => {
             eprintln!("[main] RlCoach cargado desde {path}");
             Some(Box::new(c))
