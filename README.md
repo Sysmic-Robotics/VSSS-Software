@@ -23,6 +23,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_RADIO_TARGET` | `firasim` | `firasim`, `grsim` o `basestation`. Selecciona a quién se le envían los `MotionCommand`. |
 | `VSSL_COACH` | `rule_based` | `rule_based`, `rl` o `none`. `rl` carga el modelo ONNX entrenado (requiere compilar con `--features rl`). |
 | `VSSL_RL_MODEL` | `training/models/policy.onnx` | Path al ONNX de la política de campo (sólo con `VSSL_COACH=rl`). |
+| `VSSL_RL_GK_MODEL` | `training/models/policy_gk.onnx` | ONNX del arquero entrenado (sólo con `VSSL_COACH=rl`). `none` fuerza el arquero rule-based. |
 | `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Sólo afecta a `basestation`: filtra qué comandos van al frame serial. |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
 | `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
@@ -247,9 +248,9 @@ inferencia ONNX en Rust puro — no se fuerza en el build por defecto).
 - **1 política de campo compartida** (entrenada con self-play): recibe la
   observación de 52 floats y controla los **2 robots de campo** (salida de 6
   floats = 2 × `[skill_sel, tx, ty]`).
-- **Arquero (robot id 2) aparte.** Hoy `RlCoach` usa un arquero **rule-based**
-  (`RlCoach::load(path, own_goal, with_goalkeeper=true)`). El arquero
-  **entrenado** se deploya cargando un 2º ONNX — pendiente (ver TODO abajo).
+- **Arquero (robot id 2) aparte.** `RlCoach` carga un 2º ONNX para el arquero
+  **entrenado** (`policy_gk.onnx`, por defecto). Si el archivo no carga, o con
+  `VSSL_RL_GK_MODEL=none`, cae al arquero **rule-based**.
 
 ### Correr el modelo contra FIRASim (turnkey)
 
@@ -281,11 +282,15 @@ cd training && python export_onnx.py --checkpoint checkpoints/phasemixedsp_final
 (`VsssSoccerEnv._bin_skill`) y Rust (`RlCoach::bin_skill`). Nunca renumerar ni
 eliminar entradas; sólo agregar al final (cambia el mapeo y obliga a re-fine-tune).
 
-### TODO — deploy del arquero entrenado
+### Arquero entrenado (deploy)
 
-Para usar la red de arquero (`phasegk_final`) en lugar del rule-based: agregar a
-`RlCoach` la carga de un 2º ONNX (salida Box 3) y correrlo para el robot id 2,
-reemplazando `goalkeeper_choice`. Usa la misma observación de 52 floats.
+`RlCoach` carga `policy_gk.onnx` (Box 3) y lo corre para el robot id 2 con la
+misma observación de 52 floats. Override con `VSSL_RL_GK_MODEL`; `none` vuelve al
+arquero rule-based. Para re-exportarlo desde el checkpoint:
+
+```bash
+cd training && python export_onnx.py --checkpoint checkpoints/phasegk_final.zip --out models/policy_gk.onnx
+```
 
 ### Contrato de la observación (`Observation::to_flat_vec()`)
 
