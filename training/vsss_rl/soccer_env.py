@@ -25,6 +25,7 @@ un snapshot congelado seteado vía set_opponent_policy).
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -58,6 +59,15 @@ BALL_VEL_TO_GOAL_W = 0.1       # × componente de v_pelota hacia el arco rival
 SURVIVE_REWARD = 0.05          # defensa (arquero): premio por decisión sin conceder
 DEFENSE_PROGRESS_W = 1.5       # defensa: × Δ(distancia pelota→arco propio), + si se aleja
 SELFPLAY_RB_PROB = 0.2         # self-play: prob. de usar rule-based (anti-forgetting)
+
+# ── Domain randomization (Fase 3): fidelidad sensorial realista ──────────────
+# Números de los papers VSSS (Brandão: σ_pos≈1.7-1.9 mm, σ_θ≈1.79°; cámara ~90 ms).
+# Se activa con domain_randomization=True o la env var VSSL_DOMAIN_RAND=1 (fine-tune).
+OBS_POS_NOISE_STD = 0.002      # m (~2 mm): ruido gaussiano en posiciones
+OBS_THETA_NOISE_STD = 0.03     # rad (~1.7°): ruido en orientación
+OBS_VEL_NOISE_STD = 0.03       # m/s: ruido en velocidades (derivadas → más ruidosas)
+OBS_DELAY_MIN = 1              # latencia: obs vieja en pasos de decisión (1 ≈ 100 ms a 10 Hz)
+OBS_DELAY_MAX = 2              # hasta ~200 ms (se samplea por episodio)
 
 OUT_X = 0.74
 OUT_Y = 0.64
@@ -206,6 +216,12 @@ class VsssSoccerEnv(gym.Env):
         self._ball = np.zeros(2, dtype=np.float32)
         self._ball_vel = np.zeros(2, dtype=np.float32)
         self._ticks = 0
+        # Domain randomization (Fase 3): activable por env var para fine-tunear sin
+        # tocar los configs de fase. Buffer para la latencia de observación.
+        if os.environ.get("VSSL_DOMAIN_RAND") == "1":
+            self.cfg.domain_randomization = True
+        self._obs_buffer: list[np.ndarray] = []
+        self._obs_delay = 0
 
     # ── API pública para self-play ───────────────────────────────────────
     def set_opponent_snapshot(self, path: str | None) -> None:
@@ -245,7 +261,13 @@ class VsssSoccerEnv(gym.Env):
         )
         self._ball_vel = np.zeros(2, dtype=np.float32)
         self._ticks = 0
-        return self._build_obs(), self._info()
+        # Latencia: vaciar el buffer y samplear cuántos pasos de obs vieja este episodio.
+        self._obs_buffer = []
+        self._obs_delay = (
+            int(self._rng.integers(OBS_DELAY_MIN, OBS_DELAY_MAX + 1))
+            if self.cfg.domain_randomization else 0
+        )
+        return self._observe(), self._info()
 
     def step(self, action: np.ndarray):
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
@@ -342,7 +364,7 @@ class VsssSoccerEnv(gym.Env):
         info["goal_scored"] = goal_scored
         info["conceded"] = conceded
         info["reward_components"] = comp
-        return self._build_obs(), float(reward), bool(terminated), bool(truncated), info
+        return self._observe(), float(reward), bool(terminated), bool(truncated), info
 
     def close(self):
         pass
@@ -566,29 +588,52 @@ class VsssSoccerEnv(gym.Env):
     def _build_obs(self) -> np.ndarray:
         return self._build_obs_frame(mirror=False)
 
+    def _observe(self) -> np.ndarray:
+        """Observación para la política, con latencia (obs vieja) si DR está activo.
+        El ruido se aplica dentro de _build_obs_frame. La física y el `info` usan el
+        estado VERDADERO — solo la percepción de la política es ruidosa/tardía."""
+        obs = self._build_obs()
+        if not self.cfg.domain_randomization:
+            return obs
+        self._obs_buffer.append(obs)
+        idx = max(0, len(self._obs_buffer) - 1 - self._obs_delay)
+        return self._obs_buffer[idx]
+
     def _build_obs_opp_frame(self) -> np.ndarray:
         return self._build_obs_frame(mirror=True)
 
     def _build_obs_frame(self, mirror: bool) -> np.ndarray:
         s = -1.0 if mirror else 1.0
+        dr = self.cfg.domain_randomization
+
+        def nz(std: float) -> float:
+            return float(self._rng.normal(0.0, std)) if dr else 0.0
+
         obs = Observation(own_team=0)
-        obs.ball = normalize_ball(s * float(self._ball[0]), float(self._ball[1]),
-                                  s * float(self._ball_vel[0]), float(self._ball_vel[1]))
+        obs.ball = normalize_ball(
+            s * float(self._ball[0]) + nz(OBS_POS_NOISE_STD), float(self._ball[1]) + nz(OBS_POS_NOISE_STD),
+            s * float(self._ball_vel[0]) + nz(OBS_VEL_NOISE_STD), float(self._ball_vel[1]) + nz(OBS_VEL_NOISE_STD))
         # En marco espejo, "own" y "opp" se intercambian.
         own_src = self._opp if mirror else self._own
         opp_src = self._own if mirror else self._opp
         for rid in range(3):
             if rid in own_src:
                 b = own_src[rid]
+                theta = _wrap_pi(math.pi - b.theta) if mirror else b.theta
                 obs.own_robots[rid] = normalize_robot(
-                    s * b.x, b.y, _wrap_pi(math.pi - b.theta) if mirror else b.theta,
-                    s * b.vx, b.vy, b.omega, active=True)
+                    s * b.x + nz(OBS_POS_NOISE_STD), b.y + nz(OBS_POS_NOISE_STD),
+                    _wrap_pi(theta + nz(OBS_THETA_NOISE_STD)),
+                    s * b.vx + nz(OBS_VEL_NOISE_STD), b.vy + nz(OBS_VEL_NOISE_STD),
+                    b.omega + nz(OBS_VEL_NOISE_STD), active=True)
         for rid in range(3):
             if rid in opp_src:
                 b = opp_src[rid]
+                theta = _wrap_pi(math.pi - b.theta) if mirror else b.theta
                 obs.opp_robots[rid] = normalize_robot(
-                    s * b.x, b.y, _wrap_pi(math.pi - b.theta) if mirror else b.theta,
-                    s * b.vx, b.vy, b.omega, active=True)
+                    s * b.x + nz(OBS_POS_NOISE_STD), b.y + nz(OBS_POS_NOISE_STD),
+                    _wrap_pi(theta + nz(OBS_THETA_NOISE_STD)),
+                    s * b.vx + nz(OBS_VEL_NOISE_STD), b.vy + nz(OBS_VEL_NOISE_STD),
+                    b.omega + nz(OBS_VEL_NOISE_STD), active=True)
         return obs.to_flat()
 
     # ── Helpers de recompensa ────────────────────────────────────────────
