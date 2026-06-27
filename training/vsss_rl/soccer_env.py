@@ -68,6 +68,11 @@ OBS_THETA_NOISE_STD = 0.03     # rad (~1.7°): ruido en orientación
 OBS_VEL_NOISE_STD = 0.03       # m/s: ruido en velocidades (derivadas → más ruidosas)
 OBS_DELAY_MIN = 1              # latencia: obs vieja en pasos de decisión (1 ≈ 100 ms a 10 Hz)
 OBS_DELAY_MAX = 2              # hasta ~200 ms (se samplea por episodio)
+# Inercia/settling del executor real (PID/UVF) — Fase 3b: el robot NO aplica la
+# velocidad al instante, la rampa con un límite de aceleración. Randomizado por episodio.
+MAX_LINEAR_ACCEL = 6.0         # m/s² (≈ alcanza 1.2 m/s en ~0.2 s)
+MAX_ANGULAR_ACCEL = 20.0       # rad/s² (≈ alcanza 3 rad/s en ~0.15 s)
+ACCEL_RAND_RANGE = (0.7, 1.3)  # multiplicador del accel por episodio (domain randomization)
 
 OUT_X = 0.74
 OUT_Y = 0.64
@@ -92,6 +97,8 @@ class RobotBody:
     vx: float = 0.0
     vy: float = 0.0
     omega: float = 0.0
+    v_cur: float = 0.0      # velocidad lineal ACTUAL (rampa hacia el comando con DR → inercia)
+    omega_cur: float = 0.0  # velocidad angular ACTUAL (idem)
     spinning: bool = False  # True si este tick ejecuta la skill Spin (para el pelotazo)
 
 
@@ -222,6 +229,7 @@ class VsssSoccerEnv(gym.Env):
             self.cfg.domain_randomization = True
         self._obs_buffer: list[np.ndarray] = []
         self._obs_delay = 0
+        self._accel_mult = 1.0
 
     # ── API pública para self-play ───────────────────────────────────────
     def set_opponent_snapshot(self, path: str | None) -> None:
@@ -266,6 +274,11 @@ class VsssSoccerEnv(gym.Env):
         self._obs_delay = (
             int(self._rng.integers(OBS_DELAY_MIN, OBS_DELAY_MAX + 1))
             if self.cfg.domain_randomization else 0
+        )
+        # Fase 3b: multiplicador de aceleración del executor para este episodio.
+        self._accel_mult = (
+            float(self._rng.uniform(*ACCEL_RAND_RANGE))
+            if self.cfg.domain_randomization else 1.0
         )
         return self._observe(), self._info()
 
@@ -452,10 +465,21 @@ class VsssSoccerEnv(gym.Env):
         b.y = float(min(max(b.y, ymin), ymax))
 
     def _integrate(self, body: RobotBody, v: float, omega: float) -> None:
-        omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, omega))
+        # Fase 3b: con DR, modelar la inercia/settling del executor real (PID/UVF)
+        # rampando la velocidad hacia el comando con un límite de aceleración, en
+        # vez de aplicarla al instante (lo que hace el sim cinemático puro). Así la
+        # red aprende targets que tienen en cuenta el momento, como en FIRASim/real.
+        if self.cfg.domain_randomization:
+            max_dv = MAX_LINEAR_ACCEL * self._accel_mult * DT
+            max_dw = MAX_ANGULAR_ACCEL * self._accel_mult * DT
+            body.v_cur += float(np.clip(v - body.v_cur, -max_dv, max_dv))
+            body.omega_cur += float(np.clip(omega - body.omega_cur, -max_dw, max_dw))
+        else:
+            body.v_cur, body.omega_cur = v, omega
+        omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, body.omega_cur))
         body.theta = _wrap_pi(body.theta + omega * DT)
         ct, st = math.cos(body.theta), math.sin(body.theta)
-        body.vx, body.vy, body.omega = v * ct, v * st, omega
+        body.vx, body.vy, body.omega = body.v_cur * ct, body.v_cur * st, omega
         body.x = float(np.clip(body.x + body.vx * DT, -OUT_X, OUT_X))
         body.y = float(np.clip(body.y + body.vy * DT, -OUT_Y, OUT_Y))
 
