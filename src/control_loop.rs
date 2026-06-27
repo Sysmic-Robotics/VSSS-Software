@@ -168,7 +168,7 @@ fn dispatch_choices(
             motion,
         );
         let target = match choice.skill_id {
-            SkillId::GoTo | SkillId::FacePoint => Some(choice.target),
+            SkillId::GoTo | SkillId::FacePoint | SkillId::PushBall => Some(choice.target),
             SkillId::ChaseBall => Some(world.get_ball_state().position),
             SkillId::Spin => None,
         };
