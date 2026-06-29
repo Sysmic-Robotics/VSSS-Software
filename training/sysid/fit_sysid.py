@@ -70,34 +70,42 @@ def fit_decel(t: np.ndarray, speed: np.ndarray) -> float:
 
 
 def analyze_linear() -> dict:
-    files = sorted(DATA.glob("lin_step_v*.csv"))
+    files = sorted(DATA.glob("lin_ramp_a*.csv"))
     if not files:
         return {}
-    v_ss_all, accel_all, decel_all = [], [], []
+    vpeak_all, accel_all, decel_all, tracked_all = [], [], [], []
     for fp in files:
         d = load(fp)
-        spd = np.hypot(d["vx"], d["vy"])
-        is_acc = d["_phase"] == "accel"
+        is_ramp = d["_phase"] == "ramp"
         is_coast = d["_phase"] == "coast"
-        if is_acc.sum() < 3:
+        if is_ramp.sum() < 5:
             continue
-        # estado estacionario = mediana del último 30% de la fase de aceleración
-        acc_t, acc_s = d["t"][is_acc], spd[is_acc]
-        tail = acc_t >= (acc_t.min() + 0.7 * (acc_t.max() - acc_t.min()))
-        v_ss = float(np.median(acc_s[tail])) if tail.any() else float(acc_s.max())
-        v_ss_all.append(v_ss)
-        a = fit_first_order_accel(acc_t - acc_t.min(), acc_s, v_ss)
-        if not math.isnan(a):
-            accel_all.append(a)
+        t = d["t"][is_ramp]
+        cmd = d["cmd_v"][is_ramp]
+        act = np.hypot(d["vx"], d["vy"])[is_ramp]
+        vpeak = float(np.percentile(act, 95))          # vel real sostenida (robusto a picos)
+        vpeak_all.append(vpeak)
+        # máx velocidad COMANDADA que el robot todavía seguía (act >= 60% del comando)
+        tracking = act >= 0.6 * np.maximum(cmd, 1e-6)
+        if tracking.any():
+            tracked_all.append(float(np.max(cmd[tracking])))
+        # aceleración real: pendiente de la subida (entre 5% y 80% del pico)
+        rising = (act > 0.05 * vpeak) & (act < 0.80 * vpeak)
+        if rising.sum() >= 3:
+            slope = float(np.polyfit(t[rising], act[rising], 1)[0])
+            if slope > 0:
+                accel_all.append(slope)
         if is_coast.sum() >= 3:
-            dd = fit_decel(d["t"][is_coast] - d["t"][is_coast].min(), spd[is_coast])
+            tc = d["t"][is_coast]
+            sc = np.hypot(d["vx"], d["vy"])[is_coast]
+            dd = fit_decel(tc - tc.min(), sc)
             if not math.isnan(dd):
                 decel_all.append(dd)
     return {
-        "v_max": max(v_ss_all) if v_ss_all else None,
+        "v_max": max(vpeak_all) if vpeak_all else None,
+        "v_tracked_max": max(tracked_all) if tracked_all else None,
         "lin_accel": float(np.median(accel_all)) if accel_all else None,
         "lin_decel": float(np.median(decel_all)) if decel_all else None,
-        "_v_ss_samples": v_ss_all,
     }
 
 
@@ -157,6 +165,7 @@ def main() -> int:
         "wheel_base_l": 0.05,
         "wheel_rad_s_max": 70.0,
         "v_max": lin.get("v_max"),
+        "v_tracked_max": lin.get("v_tracked_max"),
         "omega_max": ang.get("omega_max"),
         "lin_accel": lin.get("lin_accel"),
         "ang_accel": ang.get("ang_accel"),
@@ -173,7 +182,8 @@ def main() -> int:
     def show(label, key, unit):
         val = cal.get(key)
         print(f"  {label:<22}{'-- ' if val is None else f'{val:8.3f} '}{unit}")
-    show("v_max", "v_max", "m/s")
+    show("v_max (sostenible)", "v_max", "m/s")
+    show("v_tracked_max (cmd)", "v_tracked_max", "m/s")
     show("omega_max", "omega_max", "rad/s")
     show("lin_accel", "lin_accel", "m/s^2")
     show("ang_accel", "ang_accel", "rad/s^2")

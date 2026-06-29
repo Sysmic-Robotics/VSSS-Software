@@ -175,6 +175,38 @@ def run_segment(io: FiraIO, dur: float, v: float, w: float,
     return samples
 
 
+def run_ramp(io: FiraIO, accel: float, v_target: float, hold: float,
+             pos_bound: float, hz: float = 60.0) -> list[dict]:
+    """Rampa la velocidad comandada a `accel` (m/s^2) hasta `v_target`, luego sostiene
+    `hold` s. Corta si el robot se acerca a la pared (|x|>pos_bound) o a los 3 s.
+    Mide la respuesta real → revela la velocidad SOSTENIBLE y si el robot se
+    desestabiliza (a diferencia del step instantáneo, que lo encabrita)."""
+    samples: list[dict] = []
+    t0 = time.perf_counter()
+    dt = 1.0 / hz
+    next_t = t0
+    reached_t = None
+    while True:
+        t = time.perf_counter() - t0
+        v_cmd = min(v_target, accel * t)
+        if v_cmd >= v_target and reached_t is None:
+            reached_t = t
+        if (reached_t is not None and t > reached_t + hold) or t > 3.0:
+            break
+        io.send_cmd(v_cmd, 0.0)
+        st = io.latest_state()
+        if st is not None:
+            if abs(st["x"]) > pos_bound or abs(st["y"]) > 0.55:
+                break  # cerca de la pared: terminar
+            st.update({"t": t, "phase": "ramp", "cmd_v": v_cmd, "cmd_w": 0.0})
+            samples.append(st)
+        next_t += dt
+        sleep = next_t - time.perf_counter()
+        if sleep > 0:
+            time.sleep(sleep)
+    return samples
+
+
 _FIELDS = ["t", "phase", "cmd_v", "cmd_w", "x", "y", "theta",
            "vx", "vy", "w", "ball_x", "ball_y", "ball_vx", "ball_vy"]
 
@@ -229,17 +261,21 @@ def main() -> int:
     if not args.skip_preflight and not preflight(io):
         return 1
 
-    # --- 1) Steps lineales (vel máx, aceleración, fricción) ---
-    # Tope físico v_max ≈ wheel_max * r = 1.4 m/s. Probamos varias fracciones.
-    for v in (0.4, 0.8, 1.2, 1.4):
-        print(f"[sysid] Step lineal v={v} m/s ...")
-        io.teleport(-0.55, 0.0, 0.0)          # arrancar de un extremo, mirar +x
+    # --- 1) Rampas lineales (vel máx sostenible, aceleración, estabilidad, fricción) ---
+    # El step instantáneo DESESTABILIZA al robot (descubierto en la 1a corrida: se
+    # encabrita y se frena). Acá se rampa la velocidad comandada de forma gradual,
+    # como un controlador real, y se mide hasta dónde el robot SIGUE el comando
+    # (velocidad sostenible) antes de saturar o caer.
+    for accel in (1.5, 4.0):
+        print(f"[sysid] Rampa lineal accel={accel} m/s^2 (hacia 1.4 m/s) ...")
+        io.teleport(-0.62, 0.0, 0.0)          # arrancar de un extremo, mirar +x
         time.sleep(0.4)
-        accel = run_segment(io, dur=0.6, v=v, w=0.0, phase="accel")
+        ramp = run_ramp(io, accel=accel, v_target=1.4, hold=0.6, pos_bound=0.62)
         coast = run_segment(io, dur=0.5, v=0.0, w=0.0, phase="coast")
+        t_off = ramp[-1]["t"] if ramp else 0.0
         for s in coast:
-            s["t"] += 0.6                      # continuidad temporal
-        write_csv(args.outdir / f"lin_step_v{v:.2f}.csv", accel + coast)
+            s["t"] += t_off                    # continuidad temporal
+        write_csv(args.outdir / f"lin_ramp_a{accel:.1f}.csv", ramp + coast)
 
     # --- 2) Steps angulares (ω máx, aceleración angular) ---
     for w in (3.0, 6.0, 9.0):
