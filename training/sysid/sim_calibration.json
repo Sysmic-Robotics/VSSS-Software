@@ -1,0 +1,15 @@
+{
+  "source": "firasim system-id",
+  "wheel_radius_r": 0.02,
+  "wheel_base_l": 0.05,
+  "wheel_rad_s_max": 70.0,
+  "v_max": 1.4000022899710887,
+  "v_tracked_max": 1.4,
+  "omega_max": 5.2946034190949485,
+  "lin_accel": 1.1905714918529906,
+  "ang_accel": 105.31053873964464,
+  "lin_decel": 5.066657795304238,
+  "ang_decel": 76.7099784014886,
+  "ball_decel": 0.07117034391596758,
+  "dr_ranges_hint": "para domain randomization: multiplicá cada accel/decel por U(0.8, 1.2) por episodio (rango ±20% alrededor de lo medido)."
+}
