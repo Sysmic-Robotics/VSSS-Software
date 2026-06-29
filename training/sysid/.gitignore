@@ -1,0 +1,5 @@
+# Bindings protobuf generados por gen_protos.py
+fira_proto/
+
+# Datos crudos de la calibración (se regeneran corriendo firasim_sysid.py)
+data/
