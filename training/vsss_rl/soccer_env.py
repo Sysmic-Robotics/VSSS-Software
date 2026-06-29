@@ -1,14 +1,14 @@
 """
 Entorno VSSS unificado y parametrizable — base del currículo 1v0 → 1v1 → 3v3.
 
-Contrato de acción (espejo del SkillChoice congelado del equipo): por cada
-robot controlado, la política emite `[skill_sel, tx, ty]` ∈ [-1, 1]³:
-- `skill_sel` se discretiza por binning en 4 → SkillId {GoTo, FacePoint, ChaseBall, Spin}.
-- `(tx, ty)` se mapea a coordenadas de campo (m): `tx·FIELD_HALF_X`, `ty·FIELD_HALF_Y`.
+Contrato de acción (Intento 3 — control de velocidad): por cada robot controlado,
+la política emite `[v, ω]` ∈ [-1, 1]²:
+- `v` → velocidad lineal hacia adelante: `v · SIM_V_MAX` (m/s).
+- `ω` → velocidad angular: `ω · SIM_OMEGA_MAX` (rad/s).
 
-Para N robots controlados, action = Box(3·N). Esto reproduce el tensor (N, 3)
-del contrato del equipo: cada fila `[skill_id, target_x, target_y]`. El deploy
-(`RlCoach`) lee exactamente esto.
+Para N robots controlados, action = Box(2·N). El robot integra `(v, ω)` con la
+física CALIBRADA contra FIRASim (Fase 0, system-ID: límite de aceleración asimétrico).
+El deploy (`RlCoach`, F2) mapea `(v, ω)` directo a ruedas — sin UVF — idéntico al sim.
 
 Observación: 52 floats (contrato Rust, observation.py), desde el marco del
 equipo controlado (ataca hacia +X).
@@ -68,11 +68,42 @@ OBS_THETA_NOISE_STD = 0.03     # rad (~1.7°): ruido en orientación
 OBS_VEL_NOISE_STD = 0.03       # m/s: ruido en velocidades (derivadas → más ruidosas)
 OBS_DELAY_MIN = 1              # latencia: obs vieja en pasos de decisión (1 ≈ 100 ms a 10 Hz)
 OBS_DELAY_MAX = 2              # hasta ~200 ms (se samplea por episodio)
-# Inercia/settling del executor real (PID/UVF) — Fase 3b: el robot NO aplica la
-# velocidad al instante, la rampa con un límite de aceleración. Randomizado por episodio.
-MAX_LINEAR_ACCEL = 6.0         # m/s² (≈ alcanza 1.2 m/s en ~0.2 s)
-MAX_ANGULAR_ACCEL = 20.0       # rad/s² (≈ alcanza 3 rad/s en ~0.15 s)
-ACCEL_RAND_RANGE = (0.7, 1.3)  # multiplicador del accel por episodio (domain randomization)
+# ── Física CALIBRADA contra FIRASim (Intento 3, Fase 0 system-ID) ────────────
+# Medido con training/sysid/. Hallazgo: el robot NO alcanza la velocidad al
+# instante — rampa con un límite de aceleración, y FRENA más rápido de lo que
+# acelera. Modelar esto es el fix central del gap "torpe" del Intento 2: el sim
+# cinemático permitía saltos de velocidad imposibles en FIRASim → encabritamiento.
+SIM_V_MAX = MAX_LINEAR_SPEED       # m/s (1.2) — tope de v comandable (deployable; headroom de rueda)
+SIM_OMEGA_MAX = MAX_ANGULAR_SPEED  # rad/s (3.0) — tope de ω comandable
+LIN_ACCEL = 1.2                    # m/s²  — aceleración lineal (medida ~1.2)
+LIN_DECEL = 5.0                    # m/s²  — deceleración/freno (medida ~5.1; frena más rápido)
+ANG_ACCEL = 30.0                   # rad/s² — aceleración angular (medida alta → casi instantánea)
+SPIN_OMEGA_THRESHOLD = 2.0         # rad/s — sobre esto el contacto imparte "spin-kick" a la pelota
+ACCEL_RAND_RANGE = (0.8, 1.2)      # multiplicador del accel por episodio (domain randomization)
+
+
+def _load_calibration() -> None:
+    """Override opcional de topes/aceleraciones desde la medición real
+    (training/sysid/sim_calibration.json). Si no existe, usa los defaults de arriba."""
+    import json
+    import pathlib
+    global SIM_V_MAX, SIM_OMEGA_MAX, LIN_ACCEL, LIN_DECEL
+    p = pathlib.Path(__file__).resolve().parents[1] / "sysid" / "sim_calibration.json"
+    try:
+        cal = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if cal.get("v_max"):
+        SIM_V_MAX = min(MAX_LINEAR_SPEED, float(cal["v_max"]))       # cap deployable
+    if cal.get("omega_max"):
+        SIM_OMEGA_MAX = min(MAX_ANGULAR_SPEED, float(cal["omega_max"]))
+    if cal.get("lin_accel"):
+        LIN_ACCEL = float(cal["lin_accel"])
+    if cal.get("lin_decel"):
+        LIN_DECEL = float(cal["lin_decel"])
+
+
+_load_calibration()
 
 OUT_X = 0.74
 OUT_Y = 0.64
@@ -212,7 +243,8 @@ class VsssSoccerEnv(gym.Env):
         self._rng = np.random.default_rng(seed)
 
         n_ctrl = len(self.cfg.controlled_field_ids)
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3 * n_ctrl,), dtype=np.float32)
+        # Intento 3: acción (v, ω) por robot → Box(2·N). El deploy mapea (v,ω)→ruedas.
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2 * n_ctrl,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-2.0, high=2.0, shape=(FLAT_SIZE,), dtype=np.float32)
 
         self._max_ticks = int(self.cfg.max_seconds * 60)
@@ -429,14 +461,14 @@ class VsssSoccerEnv(gym.Env):
         self._ball_vel = np.zeros(2, dtype=np.float32)
 
     # ── Decodificación de acción ─────────────────────────────────────────
-    def _decode_action(self, action: np.ndarray) -> list[tuple[int, int, float, float]]:
+    def _decode_action(self, action: np.ndarray) -> list[tuple[int, float, float]]:
+        """Acción (v, ω) por robot controlado, denormalizada a m/s y rad/s."""
         out = []
         for j, rid in enumerate(self.cfg.controlled_field_ids):
-            a = action[3 * j: 3 * j + 3]
-            skill_id = self._bin_skill(float(a[0]))
-            tx = float(a[1]) * FIELD_HALF_X
-            ty = float(a[2]) * FIELD_HALF_Y
-            out.append((rid, skill_id, tx, ty))
+            a = action[2 * j: 2 * j + 2]
+            v = float(a[0]) * SIM_V_MAX
+            omega = float(a[1]) * SIM_OMEGA_MAX
+            out.append((rid, v, omega))
         return out
 
     @staticmethod
@@ -445,12 +477,10 @@ class VsssSoccerEnv(gym.Env):
         return min(SkillId.count() - 1, max(0, idx))
 
     # ── Aplicación de comandos ───────────────────────────────────────────
-    def _apply_controlled(self, choices: list[tuple[int, int, float, float]]) -> None:
-        bx, by = float(self._ball[0]), float(self._ball[1])
-        for rid, skill_id, tx, ty in choices:
+    def _apply_controlled(self, choices: list[tuple[int, float, float]]) -> None:
+        for rid, v, omega in choices:
             body = self._own[rid]
-            body.spinning = (skill_id == int(SkillId.SPIN))
-            v, omega = dispatch_skill(skill_id, tx, ty, body.x, body.y, body.theta, bx, by)
+            body.spinning = abs(omega) > SPIN_OMEGA_THRESHOLD
             self._integrate(body, v, omega)
 
     def _apply_gk(self, gk_choice) -> None:
@@ -464,14 +494,12 @@ class VsssSoccerEnv(gym.Env):
                                   body.x, body.y, body.theta, bx, by)
         self._integrate(body, v, omega)
 
-    def _apply_opponent(self, opp_choices) -> None:
+    def _apply_opponent(self, opp_cmds) -> None:
         if not self.cfg.opp_active_ids:
             return
-        bx, by = float(self._ball[0]), float(self._ball[1])
-        for rid, (skill_id, tx, ty) in opp_choices.items():
+        for rid, (v, omega) in opp_cmds.items():
             body = self._opp[rid]
-            body.spinning = (skill_id == int(SkillId.SPIN))
-            v, omega = dispatch_skill(skill_id, tx, ty, body.x, body.y, body.theta, bx, by)
+            body.spinning = abs(omega) > SPIN_OMEGA_THRESHOLD
             self._integrate(body, v, omega)
 
     def _confine_goalkeeper(self) -> None:
@@ -487,21 +515,23 @@ class VsssSoccerEnv(gym.Env):
         b.y = float(min(max(b.y, ymin), ymax))
 
     def _integrate(self, body: RobotBody, v: float, omega: float) -> None:
-        # Fase 3b: con DR, modelar la inercia/settling del executor real (PID/UVF)
-        # rampando la velocidad hacia el comando con un límite de aceleración, en
-        # vez de aplicarla al instante (lo que hace el sim cinemático puro). Así la
-        # red aprende targets que tienen en cuenta el momento, como en FIRASim/real.
-        if self.cfg.domain_randomization:
-            max_dv = MAX_LINEAR_ACCEL * self._accel_mult * DT
-            max_dw = MAX_ANGULAR_ACCEL * self._accel_mult * DT
-            body.v_cur += float(np.clip(v - body.v_cur, -max_dv, max_dv))
-            body.omega_cur += float(np.clip(omega - body.omega_cur, -max_dw, max_dw))
-        else:
-            body.v_cur, body.omega_cur = v, omega
-        omega = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, body.omega_cur))
-        body.theta = _wrap_pi(body.theta + omega * DT)
+        # Física CALIBRADA (FIRASim system-ID, Fase 0): el robot NO alcanza la
+        # velocidad al instante — rampa con un límite de aceleración, y FRENA más
+        # rápido de lo que acelera (asimétrico). Esto es lo que el sim cinemático del
+        # Intento 2 NO modelaba → la política comandaba saltos que en FIRASim
+        # encabritaban/trababan al robot ("torpe"). m = multiplicador de DR por episodio.
+        v = float(np.clip(v, -SIM_V_MAX, SIM_V_MAX))
+        omega = float(np.clip(omega, -SIM_OMEGA_MAX, SIM_OMEGA_MAX))
+        m = self._accel_mult
+        # Acelerar (subir |v|) usa LIN_ACCEL; frenar/invertir usa LIN_DECEL (más fuerte).
+        a_lin = LIN_ACCEL if abs(v) >= abs(body.v_cur) else LIN_DECEL
+        max_dv = a_lin * m * DT
+        max_dw = ANG_ACCEL * m * DT
+        body.v_cur += float(np.clip(v - body.v_cur, -max_dv, max_dv))
+        body.omega_cur += float(np.clip(omega - body.omega_cur, -max_dw, max_dw))
+        body.theta = _wrap_pi(body.theta + body.omega_cur * DT)
         ct, st = math.cos(body.theta), math.sin(body.theta)
-        body.vx, body.vy, body.omega = body.v_cur * ct, body.v_cur * st, omega
+        body.vx, body.vy, body.omega = body.v_cur * ct, body.v_cur * st, body.omega_cur
         body.x = float(np.clip(body.x + body.vx * DT, -OUT_X, OUT_X))
         body.y = float(np.clip(body.y + body.vy * DT, -OUT_Y, OUT_Y))
 
@@ -588,18 +618,23 @@ class VsssSoccerEnv(gym.Env):
         ball = (float(self._ball[0]), float(self._ball[1]))
         return self._own_coach.goalkeeper_choice(ball)
 
-    def _opponent_choices(self) -> dict[int, tuple[int, float, float]]:
-        # Usa los oponentes realmente spawneados este episodio (el escenario
-        # mixto puede activar 1-3), no la config fija.
+    def _opponent_choices(self) -> dict[int, tuple[float, float]]:
+        """Comando (v, ω) por oponente activo. Unifica todos los modos en velocidad:
+        rule-based/ballchaser pasan por dispatch_skill→(v,ω); el snapshot self-play
+        emite (v,ω) directo (Intento 3). Se integran igual que la política."""
         active = sorted(self._opp.keys())
         if not active or self.cfg.opponent_mode == "none":
             return {}
+        bx, by = float(self._ball[0]), float(self._ball[1])
+
+        def sk(skill_id: int, tx: float, ty: float, body: RobotBody) -> tuple[float, float]:
+            return dispatch_skill(skill_id, tx, ty, body.x, body.y, body.theta, bx, by)
+
         if self.cfg.opponent_mode == "ballchaser":
-            # Rival agresivo FIJO: todos persiguen la pelota. Baseline diverso para
-            # la evaluación por win-tendency (no se usa para entrenar).
-            return {rid: (int(SkillId.CHASE_BALL), 0.0, 0.0) for rid in active}
-        ball = (float(self._ball[0]), float(self._ball[1]))
-        out: dict[int, tuple[int, float, float]] = {}
+            # Rival agresivo FIJO: todos persiguen la pelota (baseline de evaluación).
+            return {rid: sk(int(SkillId.CHASE_BALL), 0.0, 0.0, self._opp[rid]) for rid in active}
+
+        out: dict[int, tuple[float, float]] = {}
         if self.cfg.opponent_mode == "selfplay" and not self._use_rb_this_ep:
             # Cargar el snapshot perezosamente (una vez por worker/ruta).
             if self._opp_model is None and self._opp_model_path:
@@ -614,24 +649,24 @@ class VsssSoccerEnv(gym.Env):
                 act = np.asarray(act, dtype=np.float32).flatten()
                 field_opp = [r for r in active if r != 2]
                 for j, rid in enumerate(field_opp):
-                    a = act[3 * j: 3 * j + 3]
-                    sid = self._bin_skill(float(a[0]))
-                    # des-espejar el target del marco opp al marco global
-                    tx = -float(a[1]) * FIELD_HALF_X
-                    ty = float(a[2]) * FIELD_HALF_Y
-                    out[rid] = (sid, tx, ty)
-                if 2 in self._opp:
-                    gk = self._opp_coach.goalkeeper_choice(ball)
-                    out[2] = (gk.skill_id, gk.target_x, gk.target_y)
+                    a = act[2 * j: 2 * j + 2]
+                    # des-espejar: v (forward) se conserva, ω invierte el sentido de giro
+                    v = float(a[0]) * SIM_V_MAX
+                    omega = -float(a[1]) * SIM_OMEGA_MAX
+                    out[rid] = (v, omega)
+                if 2 in self._opp:  # arquero del snapshot: rule-based
+                    gk = self._opp_coach.goalkeeper_choice((bx, by))
+                    out[2] = sk(gk.skill_id, gk.target_x, gk.target_y, self._opp[2])
                 return out
+
         # rule-based: cada opp activo toma su rol (0 atacante, 1 soporte, 2 portero)
         opp_positions = [
             (self._opp[r].x, self._opp[r].y) if r in self._opp else (0.0, 0.0) for r in range(3)
         ]
-        choices = self._opp_coach.decide(ball, opp_positions)
+        choices = self._opp_coach.decide((bx, by), opp_positions)
         for rid in active:
             c = choices[rid]
-            out[rid] = (c.skill_id, c.target_x, c.target_y)
+            out[rid] = sk(c.skill_id, c.target_x, c.target_y, self._opp[rid])
         return out
 
     # ── Observación ──────────────────────────────────────────────────────
