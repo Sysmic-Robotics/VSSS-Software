@@ -194,9 +194,28 @@ impl Vision {
             self.source, bind_addr, multicast_ip, port
         );
 
-        let socket = UdpSocket::bind(&bind_addr)
-            .await
-            .map_err(|e| format!("Error haciendo bind a {}: {}", bind_addr, e))?;
+        // Socket con SO_REUSEADDR + SO_REUSEPORT para que VARIAS instancias del
+        // engine puedan compartir el mismo puerto multicast de visión. Necesario
+        // para correr 2 equipos a la vez (RL azul + oponente amarillo = 2 procesos).
+        let socket = {
+            use socket2::{Domain, Protocol, Socket, Type};
+            let addr: std::net::SocketAddr = bind_addr
+                .parse()
+                .map_err(|e| format!("Error parseando {}: {}", bind_addr, e))?;
+            let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+                .map_err(|e| format!("Error creando socket: {}", e))?;
+            sock.set_reuse_address(true)
+                .map_err(|e| format!("Error set_reuse_address: {}", e))?;
+            #[cfg(unix)]
+            sock.set_reuse_port(true)
+                .map_err(|e| format!("Error set_reuse_port: {}", e))?;
+            sock.bind(&addr.into())
+                .map_err(|e| format!("Error haciendo bind a {}: {}", bind_addr, e))?;
+            sock.set_nonblocking(true)
+                .map_err(|e| format!("Error set_nonblocking: {}", e))?;
+            let std_sock: std::net::UdpSocket = sock.into();
+            UdpSocket::from_std(std_sock).map_err(|e| format!("Error from_std: {}", e))?
+        };
 
         eprintln!("[Vision] Socket creado exitosamente");
 
