@@ -2,10 +2,10 @@
 Exporta una política PPO entrenada a ONNX para deploy en el motor Rust (RlCoach).
 
 El modelo ONNX recibe la observación de 52 floats y devuelve la acción
-DETERMINISTA (la media μ de la gaussiana), con forma (batch, 3·N) donde N es el
-número de robots de campo controlados. Cada tripleta es `[skill_sel, tx, ty]`:
-- `skill_sel` → SkillId por binning en 5 (mismo binning que el env).
-- `(tx, ty)`  → target en coords de campo: `tx·0.75`, `ty·0.65`.
+DETERMINISTA (la media μ de la gaussiana), con forma (batch, 2·N) donde N es el
+número de robots de campo controlados. Cada par es `[v, ω]` ∈ [-1,1] (Intento 3):
+- `v` → velocidad lineal hacia el frente (el RlCoach la denorm con V_MAX).
+- `ω` → velocidad angular (denorm con OMEGA_MAX). Sin UVF (SkillId::DirectVel).
 
 Esto es exactamente lo que `RlCoach::decide` debe leer y convertir en
 `Vec<SkillChoice>`.
@@ -73,6 +73,11 @@ def main() -> int:
         output_names=["action"],
         dynamic_axes={"obs": {0: "batch"}, "action": {0: "batch"}},
         opset_version=args.opset,
+        # Exportador LEGACY (TorchScript): produce un .onnx self-contained con los
+        # pesos embebidos, compatible con tract-onnx (igual que el modelo de skills).
+        # El exportador nuevo (dynamo=True) sacaba los pesos a un archivo externo →
+        # .onnx de ~1.8 KB sin pesos, que tract no puede usar.
+        dynamo=False,
     )
     print(f"[onnx] exportado: {args.out}  (obs={FLAT_SIZE} → action={action_dim})")
 
