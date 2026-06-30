@@ -124,6 +124,7 @@ pub fn skill_label(s: Option<SkillId>) -> &'static str {
         Some(SkillId::ChaseBall) => "chaseball",
         Some(SkillId::Spin) => "spin",
         Some(SkillId::PushBall) => "pushball",
+        Some(SkillId::DirectVel) => "directvel",
         None => "",
     }
 }

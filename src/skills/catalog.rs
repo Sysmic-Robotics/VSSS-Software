@@ -48,6 +48,12 @@ pub enum SkillId {
     Spin = 3,
     /// Empuje DIRIGIDO de la pelota hacia `target` (tiro/pase). Usa target completo.
     PushBall = 4,
+    /// Comando de velocidad DIRECTO (Intento 3): `target.x = v` (m/s hacia el frente
+    /// del robot), `target.y = ω` (rad/s). NO usa UVF — la política `(v,ω)` lo emite
+    /// para que el sim de entrenamiento y el runtime ejecuten la MISMA dinámica
+    /// (cierra el gap de executor). Fuera del binning del catálogo (no cuenta en
+    /// `COUNT`): solo se construye explícito desde el `RlCoach`, nunca vía `from_u8`.
+    DirectVel = 5,
 }
 
 impl SkillId {
@@ -194,6 +200,22 @@ impl SkillCatalog {
                 let skill = &mut self.push_ball[robot_id];
                 skill.set_push_target(target);
                 skill.tick(robot, world, motion)
+            }
+            // Intento 3: velocidad directa (sin UVF). target = (v, ω). v es la
+            // velocidad lineal HACIA EL FRENTE del robot; se proyecta a global con
+            // su orientación. Misma semántica que el integrador del sim (v,ω).
+            SkillId::DirectVel => {
+                let v = target.x as f64;
+                let omega = target.y as f64;
+                let theta = robot.orientation;
+                MotionCommand {
+                    id: robot.id,
+                    team: robot.team,
+                    vx: v * theta.cos(),
+                    vy: v * theta.sin(),
+                    omega,
+                    orientation: theta,
+                }
             }
         }
     }

@@ -5,16 +5,16 @@
 //! (motor de inferencia ONNX en Rust puro) en el build por defecto del equipo.
 //! Compilar con: `cargo build --release --features rl`.
 //!
-//! # Contrato de la política (espejo del trainer Python)
+//! # Contrato de la política (espejo del trainer Python — Intento 3, control (v,ω))
 //! - Input: 52 floats = `Observation::to_flat_vec()`.
-//! - Output: `3·N` floats para N robots de campo controlados. Cada tripleta
-//!   `[skill_sel, tx, ty]`:
-//!     - `skill_sel` → `SkillId` por binning en 5 (idéntico al env Python).
-//!     - `(tx, ty)`  → target en coords de campo: `tx·FIELD_HALF_X`, `ty·FIELD_HALF_Y`.
+//! - Output: `2·N` floats para N robots de campo controlados. Cada par `[v, ω]`
+//!   en `[-1, 1]` se denormaliza con los MISMOS topes que el env de entrenamiento
+//!   (`V_MAX`, `OMEGA_MAX`) y se emite como `SkillId::DirectVel` → `MotionCommand`
+//!   directo a ruedas, SIN UVF. Así el sim y el runtime ejecutan la misma dinámica
+//!   (cierra el gap de executor que hacía "torpe" al modelo de skills).
 //! - El portero (robot id 2) lo controla una red de arquero entrenada aparte
-//!   (2º ONNX, `VSSL_RL_GK_MODEL`); si no carga, cae a una regla fija. La
-//!   política de campo NO controla al arquero (arquitectura: 1 red de campo
-//!   compartida + 1 red de arquero).
+//!   (2º ONNX, `VSSL_RL_GK_MODEL`, también `(v,ω)`); si no carga, cae a una regla
+//!   fija. La política de campo NO controla al arquero (1 red de campo + 1 de arquero).
 
 use crate::coach::coach_trait::Coach;
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation};
@@ -24,6 +24,12 @@ use glam::Vec2;
 use tract_onnx::prelude::*;
 
 type OnnxModel = TypedRunnableModel<TypedModel>;
+
+/// Topes de la acción `(v, ω)` — espejo EXACTO de `SIM_V_MAX` / `SIM_OMEGA_MAX`
+/// del env de entrenamiento (`soccer_env.py`). La red emite `[-1, 1]`; acá se
+/// denormaliza a m/s y rad/s. Si cambian en Python, actualizar acá.
+const V_MAX: f32 = 1.2;
+const OMEGA_MAX: f32 = 3.0;
 
 pub struct RlCoach {
     model: OnnxModel,
@@ -85,15 +91,6 @@ impl RlCoach {
             .into_runnable()
     }
 
-    /// Discretiza el valor continuo `skill_sel ∈ [-1, 1]` a un `SkillId`
-    /// (binning en `SkillId::COUNT`=5, idéntico a `VsssSoccerEnv._bin_skill`).
-    fn bin_skill(v: f32) -> SkillId {
-        let v = v.clamp(-1.0, 1.0);
-        let idx = (((v + 1.0) / 2.0) * SkillId::COUNT as f32).floor() as i64;
-        let idx = idx.clamp(0, SkillId::COUNT as i64 - 1) as u8;
-        SkillId::from_u8(idx).unwrap_or(SkillId::ChaseBall)
-    }
-
     /// Portero rule-based (idéntico a RuleBasedCoach::goalkeeper_choice): se
     /// para 12 cm delante del arco propio y sigue la `y` de la pelota clampeada.
     fn goalkeeper_choice(&self, obs: &Observation) -> SkillChoice {
@@ -125,32 +122,26 @@ impl RlCoach {
 impl Coach for RlCoach {
     fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice> {
         let action = Self::run_model(&self.model, obs);
-        let num_field = action.len() / 3;
+        let num_field = action.len() / 2;
         let mut choices = Vec::with_capacity(num_field + 1);
 
         for i in 0..num_field {
-            let skill_id = Self::bin_skill(action[3 * i]);
-            // Clamp del target a [-1,1] ANTES de escalar — igual que el env de
-            // entrenamiento (`np.clip(action,-1,1)`). Sin esto, la media μ de la
-            // gaussiana (sin bound) manda targets fuera del campo y el robot se
-            // vuelve loco. bin_skill ya clampea el skill_sel.
-            let tx = action[3 * i + 1].clamp(-1.0, 1.0);
-            let ty = action[3 * i + 2].clamp(-1.0, 1.0);
-            let target = Vec2::new(tx * FIELD_HALF_X, ty * FIELD_HALF_Y);
-            choices.push(SkillChoice::new(i as i32, skill_id, target));
+            // Intento 3: la política emite (v, ω) en [-1,1]. Clamp + denormalización
+            // con los mismos topes que el env, y se emite como DirectVel (sin UVF).
+            let v = action[2 * i].clamp(-1.0, 1.0) * V_MAX;
+            let omega = action[2 * i + 1].clamp(-1.0, 1.0) * OMEGA_MAX;
+            choices.push(SkillChoice::new(i as i32, SkillId::DirectVel, Vec2::new(v, omega)));
         }
 
         // Arquero (robot id 2), si la política de campo controla <3 robots.
         if num_field < 3 {
             if let Some(gk) = self.gk_model.as_ref() {
-                // Arquero entrenado: misma observación de 52 floats → [skill, tx, ty].
+                // Arquero entrenado: misma observación de 52 floats → (v, ω).
                 let gk_action = Self::run_model(gk, obs);
-                if gk_action.len() >= 3 {
-                    let skill_id = Self::bin_skill(gk_action[0]);
-                    let tx = gk_action[1].clamp(-1.0, 1.0);
-                    let ty = gk_action[2].clamp(-1.0, 1.0);
-                    let target = Vec2::new(tx * FIELD_HALF_X, ty * FIELD_HALF_Y);
-                    choices.push(SkillChoice::new(2, skill_id, target));
+                if gk_action.len() >= 2 {
+                    let v = gk_action[0].clamp(-1.0, 1.0) * V_MAX;
+                    let omega = gk_action[1].clamp(-1.0, 1.0) * OMEGA_MAX;
+                    choices.push(SkillChoice::new(2, SkillId::DirectVel, Vec2::new(v, omega)));
                 } else if self.with_goalkeeper {
                     choices.push(self.goalkeeper_choice(obs)); // fallback si falla la inferencia
                 }
