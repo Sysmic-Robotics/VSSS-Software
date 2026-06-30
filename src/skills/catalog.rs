@@ -105,12 +105,30 @@ impl SkillId {
 /// // ... cada tick:
 /// let cmd = catalog.tick(robot.id, SkillId::GoTo, target_xy, &robot, &world, &motion);
 /// ```
+/// Estado por robot del comando de velocidad directo (Intento 3): mantiene la
+/// velocidad ACTUAL para RAMPAR hacia el target con límite de aceleración, igual
+/// que el `_integrate` del sim. Sin esto el deploy mandaría la velocidad de golpe →
+/// comando de rueda instantáneo que ENCABRITA al robot en FIRASim (medido en system-ID).
+#[derive(Debug, Clone, Copy, Default)]
+struct DirectVelState {
+    v_cur: f64,
+    omega_cur: f64,
+}
+
+// Física calibrada del deploy (espejo de soccer_env.py): acelera ~1.2 m/s²,
+// frena ~5, angular ~30 rad/s². DV_DT = paso del control loop (60 Hz).
+const DV_LIN_ACCEL: f64 = 1.2;
+const DV_LIN_DECEL: f64 = 5.0;
+const DV_ANG_ACCEL: f64 = 30.0;
+const DV_DT: f64 = 1.0 / 60.0;
+
 pub struct SkillCatalog {
     go_to: Vec<GoToSkill>,
     face_point: Vec<FacePointSkill>,
     chase_ball: Vec<ChaseBallSkill>,
     spin: Vec<SpinSkill>,
     push_ball: Vec<PushBallSkill>,
+    direct_vel: Vec<DirectVelState>,
     config: SkillConfig,
 }
 
@@ -133,12 +151,14 @@ impl SkillCatalog {
         let push_ball = (0..num_robots)
             .map(|_| PushBallSkill::new(Vec2::ZERO))
             .collect();
+        let direct_vel = vec![DirectVelState::default(); num_robots];
         Self {
             go_to,
             face_point,
             chase_ball,
             spin,
             push_ball,
+            direct_vel,
             config,
         }
     }
@@ -201,19 +221,31 @@ impl SkillCatalog {
                 skill.set_push_target(target);
                 skill.tick(robot, world, motion)
             }
-            // Intento 3: velocidad directa (sin UVF). target = (v, ω). v es la
-            // velocidad lineal HACIA EL FRENTE del robot; se proyecta a global con
-            // su orientación. Misma semántica que el integrador del sim (v,ω).
+            // Intento 3: velocidad directa (sin UVF). target = (v, ω). Se RAMPA con
+            // límite de aceleración (igual que el _integrate del sim) para no mandar
+            // la velocidad de golpe — un comando de rueda instantáneo encabrita al
+            // robot en FIRASim. v es hacia el frente del robot; se proyecta a global.
             SkillId::DirectVel => {
-                let v = target.x as f64;
-                let omega = target.y as f64;
+                let st = &mut self.direct_vel[robot_id];
+                let v_target = target.x as f64;
+                let omega_target = target.y as f64;
+                // Acelerar (subir |v|) usa LIN_ACCEL; frenar/invertir usa LIN_DECEL.
+                let a_lin = if v_target.abs() >= st.v_cur.abs() {
+                    DV_LIN_ACCEL
+                } else {
+                    DV_LIN_DECEL
+                };
+                let max_dv = a_lin * DV_DT;
+                let max_dw = DV_ANG_ACCEL * DV_DT;
+                st.v_cur += (v_target - st.v_cur).clamp(-max_dv, max_dv);
+                st.omega_cur += (omega_target - st.omega_cur).clamp(-max_dw, max_dw);
                 let theta = robot.orientation;
                 MotionCommand {
                     id: robot.id,
                     team: robot.team,
-                    vx: v * theta.cos(),
-                    vy: v * theta.sin(),
-                    omega,
+                    vx: st.v_cur * theta.cos(),
+                    vy: st.v_cur * theta.sin(),
+                    omega: st.omega_cur,
                     orientation: theta,
                 }
             }
