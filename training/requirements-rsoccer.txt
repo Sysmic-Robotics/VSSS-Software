@@ -1,0 +1,22 @@
+# Venv DEDICADA para entrenar sobre rSoccer (Intento 3 — física VSS realista).
+# Separada de la venv normal porque rSoccer trae libs viejas con conflictos:
+#   - numpy < 2.0     : el gym 0.26.2 de rsoccer usa np.bool8 (removido en numpy 2).
+#   - protobuf < 3.21 : las bindings protobuf de rsoccer son viejas (gen con protoc <3.19).
+#   - gym (viejo) != gymnasium → se adapta con un wrapper propio (rsoccer_env.py).
+#
+# Setup (Linux):
+#   python3 -m venv .venv-rsoccer
+#   . .venv-rsoccer/bin/activate
+#   pip install --upgrade pip
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU
+#   pip install -r requirements-rsoccer.txt
+#
+# Validado en WSL: numpy 1.26.4, protobuf 3.20.3, gym 0.26.2, sb3 2.9.0, shimmy 2.0.1.
+# Campo rSoccer = 1.5x1.3 (mitades 0.75/0.65) y max_v≈1.2 → calza con nuestro contrato.
+
+numpy<2.0
+protobuf<3.21
+rsoccer-gym
+shimmy
+gymnasium
+stable-baselines3>=2.2,<3
