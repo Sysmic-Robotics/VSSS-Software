@@ -28,6 +28,8 @@ OMEGA_MAX = 3.0
 WHEELBASE_L = 0.075
 CONTROLLED = (0, 1)
 GK_ID = 2
+FRAME_SKIP = 4        # 4 * 0.025s = 0.1s -> decide a 10 Hz (igual que el deploy: COACH_DECISION_PERIOD=6 @ 60Hz)
+MAX_DECISIONS = 300   # 300 decisiones * 0.1s = 30s por episodio (como el sim viejo)
 GOAL_R, CONCEDE_R = 10.0, -10.0
 BALL_PROGRESS_W, ROBOT_TO_BALL_W, BALL_VEL_W, TIME_PEN = 3.0, 0.3, 0.1, -0.001
 ATTACK_GOAL = (FIELD_HALF_X, 0.0)   # blue ataca +X
@@ -130,14 +132,25 @@ class GymnasiumAdapter(gymnasium.Env):
         self.env = RSoccerFieldEnv()
         self.observation_space = self.env.observation_space
         self.action_space = self.env.action_space
+        self._dec = 0
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        self._dec = 0
         return np.asarray(self.env.reset(), dtype=np.float32), {}
 
     def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        return np.asarray(obs, dtype=np.float32), float(reward), bool(done), False, info or {}
+        # Frame-skip: aplica la MISMA accion FRAME_SKIP pasos (decide a 10 Hz como el
+        # deploy), acumulando reward (igual que el frame-skip del sim viejo).
+        total_r, done, info, obs = 0.0, False, {}, None
+        for _ in range(FRAME_SKIP):
+            obs, r, done, info = self.env.step(action)
+            total_r += r
+            if done:
+                break
+        self._dec += 1
+        truncated = (not done) and (self._dec >= MAX_DECISIONS)
+        return np.asarray(obs, dtype=np.float32), float(total_r), bool(done), bool(truncated), info or {}
 
     def close(self):
         self.env.close()
