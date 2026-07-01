@@ -1,103 +1,125 @@
-"""Wrapper de rSoccer (física VSS realista rc_robosim) con NUESTRO contrato:
-obs de 52 floats + acción (v, omega) por robot de campo. Subclasea el env VSS de
-rSoccer (override obs/acción/reward) y lo expone como gymnasium.Env para SB3.
+"""Wrapper de rSoccer (fisica VSS realista rc_robosim) con NUESTRO contrato:
+obs 52 floats + accion (v, omega) por robot de campo. Deploy sin cambios (RlCoach).
 
-Intento 3 — pivote a física realista. El modelo entrenado acá usa la MISMA obs y
-acción que el deploy (RlCoach), así se despliega sin cambios.
-
-⚠️ ESTADO: esqueleto VALIDADO (pipeline rSoccer→obs52→(v,ω)→SB3 funciona). Falta
-portar: reward shaping completo, arquero rule-based, oponente rule-based/snapshot
-(hoy son OU-random placeholder), y el currículo. Requiere venv dedicada:
-numpy<2, protobuf<3.21, rsoccer-gym, shimmy, stable-baselines3, torch (CPU).
+Setup: 2 robots de campo (blue 0,1) los controla la politica; blue 2 = arquero
+rule-based; yellow 0,1,2 = oponente rule-based (2 persiguen pelota, 1 arquero).
+Reward portado de soccer_env (gol/concede + progreso + robot-a-pelota + vel-a-arco).
+Requiere venv dedicada (numpy<2, rsoccer-gym, SB3, gymnasium) — ver requirements-rsoccer.txt.
 """
 from __future__ import annotations
+import os
+# rSoccer trae bindings protobuf viejas; el modo pure-python las hace compatibles
+# con cualquier protobuf (ej. el que arrastra tensorboard). Debe setearse ANTES de
+# importar rsoccer_gym. Impacto nulo en VSS-v0 (usa rc_robosim, no protobuf en el loop).
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import math
 import numpy as np
 import gymnasium
 from gymnasium import spaces as gspaces
-
 from rsoccer_gym.Entities import Robot
 from rsoccer_gym.vss.env_vss.vss_gym import VSSEnv
 
-# Contrato de normalizacion (espejo de observation.py / observation.rs)
 FIELD_HALF_X = 0.75
 FIELD_HALF_Y = 0.65
 MAX_VEL_NORM = 1.5
 MAX_OMEGA_NORM = math.pi
-# Topes de accion (espejo de SIM_V_MAX / SIM_OMEGA_MAX del soccer_env)
 V_MAX = 1.2
 OMEGA_MAX = 3.0
-WHEELBASE_L = 0.075  # m (aprox VSS); para (v,omega)->ruedas
-
-CONTROLLED = (0, 1)  # robots de campo que controla la politica (blue 0,1); blue 2 = arquero
+WHEELBASE_L = 0.075
+CONTROLLED = (0, 1)
+GK_ID = 2
+GOAL_R, CONCEDE_R = 10.0, -10.0
+BALL_PROGRESS_W, ROBOT_TO_BALL_W, BALL_VEL_W, TIME_PEN = 3.0, 0.3, 0.1, -0.001
+ATTACK_GOAL = (FIELD_HALF_X, 0.0)   # blue ataca +X
 
 
 class RSoccerFieldEnv(VSSEnv):
-    """Controla los 2 robots de campo (blue 0,1) con accion (v,omega); arquero (blue 2)
-    y rivales (yellow) por ahora OU-random (placeholder hasta portar GK/oponente)."""
-
     def __init__(self):
         super().__init__()
         self._r = self.field.rbt_wheel_radius
-        self._wheel_max = self.max_v / self._r  # rad/s
-        n = len(CONTROLLED)
-        self.action_space = gspaces.Box(low=-1.0, high=1.0, shape=(2 * n,), dtype=np.float32)
-        self.observation_space = gspaces.Box(low=-2.0, high=2.0, shape=(52,), dtype=np.float32)
+        self._wmax = self.max_v / self._r
+        self.action_space = gspaces.Box(-1.0, 1.0, (2 * len(CONTROLLED),), np.float32)
+        self.observation_space = gspaces.Box(-2.0, 2.0, (52,), np.float32)
+        self._prev_bg = None
+        self._prev_rb = None
 
     def _vw_to_wheels(self, v, w):
         vl = (v - w * WHEELBASE_L / 2.0) / self._r
         vr = (v + w * WHEELBASE_L / 2.0) / self._r
-        c = self._wheel_max
-        return float(np.clip(vl, -c, c)), float(np.clip(vr, -c, c))
+        return float(np.clip(vl, -self._wmax, self._wmax)), float(np.clip(vr, -self._wmax, self._wmax))
+
+    def _goto_wheels(self, rb, tx, ty, vfrac=0.8):
+        dx, dy = tx - rb.x, ty - rb.y
+        dist = math.hypot(dx, dy)
+        ang_err = ((math.degrees(math.atan2(dy, dx)) - rb.theta + 180) % 360) - 180
+        v = V_MAX * vfrac * max(0.0, math.cos(math.radians(ang_err)))
+        if dist < 0.05:
+            v = 0.0
+        w = float(np.clip(math.radians(ang_err) * 4.0, -OMEGA_MAX, OMEGA_MAX))
+        return self._vw_to_wheels(v, w)
 
     def _get_commands(self, action):
-        action = np.asarray(action, dtype=np.float32).flatten()
+        a = np.asarray(action, dtype=np.float32).flatten()
+        f = self.frame
         cmds = []
         for idx, rid in enumerate(CONTROLLED):
-            v = float(np.clip(action[2 * idx], -1, 1)) * V_MAX
-            w = float(np.clip(action[2 * idx + 1], -1, 1)) * OMEGA_MAX
+            v = float(np.clip(a[2 * idx], -1, 1)) * V_MAX
+            w = float(np.clip(a[2 * idx + 1], -1, 1)) * OMEGA_MAX
             vl, vr = self._vw_to_wheels(v, w)
             cmds.append(Robot(yellow=False, id=rid, v_wheel0=vl, v_wheel1=vr))
-        for rid in range(self.n_robots_blue):
-            if rid in CONTROLLED:
-                continue
-            a = self.ou_actions[rid].sample()
-            vl, vr = self._actions_to_v_wheels(a)
-            cmds.append(Robot(yellow=False, id=rid, v_wheel0=vl, v_wheel1=vr))
+        gk = f.robots_blue[GK_ID]
+        vl, vr = self._goto_wheels(gk, -FIELD_HALF_X + 0.12, float(np.clip(f.ball.y, -0.2, 0.2)))
+        cmds.append(Robot(yellow=False, id=GK_ID, v_wheel0=vl, v_wheel1=vr))
         for i in range(self.n_robots_yellow):
-            a = self.ou_actions[self.n_robots_blue + i].sample()
-            vl, vr = self._actions_to_v_wheels(a)
+            yb = f.robots_yellow[i]
+            if i == 2:
+                vl, vr = self._goto_wheels(yb, FIELD_HALF_X - 0.12, float(np.clip(f.ball.y, -0.2, 0.2)))
+            else:
+                vl, vr = self._goto_wheels(yb, f.ball.x, f.ball.y)
             cmds.append(Robot(yellow=True, id=i, v_wheel0=vl, v_wheel1=vr))
         return cmds
 
     def _robot_obs(self, rb):
-        return [rb.x / FIELD_HALF_X, rb.y / FIELD_HALF_Y,
-                rb.v_x / MAX_VEL_NORM, rb.v_y / MAX_VEL_NORM,
+        return [rb.x / FIELD_HALF_X, rb.y / FIELD_HALF_Y, rb.v_x / MAX_VEL_NORM, rb.v_y / MAX_VEL_NORM,
                 math.sin(math.radians(rb.theta)), math.cos(math.radians(rb.theta)),
                 math.radians(rb.v_theta) / MAX_OMEGA_NORM, 1.0]
 
     def _frame_to_observations(self):
         f = self.frame
-        obs = [f.ball.x / FIELD_HALF_X, f.ball.y / FIELD_HALF_Y,
-               f.ball.v_x / MAX_VEL_NORM, f.ball.v_y / MAX_VEL_NORM]
+        obs = [f.ball.x / FIELD_HALF_X, f.ball.y / FIELD_HALF_Y, f.ball.v_x / MAX_VEL_NORM, f.ball.v_y / MAX_VEL_NORM]
         for i in range(3):
             obs += self._robot_obs(f.robots_blue[i])
         for i in range(3):
             obs += self._robot_obs(f.robots_yellow[i])
         return np.array(obs, dtype=np.float32)
 
+    def reset(self):
+        self._prev_bg = None
+        self._prev_rb = None
+        return super().reset()
+
     def _calculate_reward_and_done(self):
+        f = self.frame
         half = self.field.length / 2.0
-        bx = self.frame.ball.x
+        bx, by = f.ball.x, f.ball.y
         if bx > half:
-            return 10.0, True       # gol (azul ataca +X)
+            return GOAL_R, True
         if bx < -half:
-            return -10.0, True      # gol en contra
-        # shaping minimo (placeholder): progreso de la pelota hacia +X
-        reward = 0.0
-        if self.last_frame is not None:
-            reward += 3.0 * (self.frame.ball.x - self.last_frame.ball.x)
-        return float(reward), False
+            return CONCEDE_R, True
+        r = TIME_PEN
+        dg = math.hypot(ATTACK_GOAL[0] - bx, ATTACK_GOAL[1] - by)
+        if self._prev_bg is not None:
+            r += BALL_PROGRESS_W * (self._prev_bg - dg)
+        self._prev_bg = dg
+        dmin = min(math.hypot(f.robots_blue[rid].x - bx, f.robots_blue[rid].y - by) for rid in CONTROLLED)
+        if self._prev_rb is not None:
+            r += ROBOT_TO_BALL_W * (self._prev_rb - dmin)
+        self._prev_rb = dmin
+        gx, gy = ATTACK_GOAL[0] - bx, ATTACK_GOAL[1] - by
+        gn = math.hypot(gx, gy)
+        if gn > 1e-6:
+            r += BALL_VEL_W * max(0.0, (f.ball.v_x * gx + f.ball.v_y * gy) / gn)
+        return float(r), False
 
 
 class GymnasiumAdapter(gymnasium.Env):
@@ -111,8 +133,7 @@ class GymnasiumAdapter(gymnasium.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        obs = self.env.reset()
-        return np.asarray(obs, dtype=np.float32), {}
+        return np.asarray(self.env.reset(), dtype=np.float32), {}
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)

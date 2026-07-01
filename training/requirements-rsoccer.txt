@@ -20,3 +20,9 @@ rsoccer-gym
 shimmy
 gymnasium
 stable-baselines3>=2.2,<3
+# Monitoreo del entrenamiento (train_rsoccer.py). tensorboard puede subir protobuf,
+# pero el env-var PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python (seteado en rsoccer_env.py
+# y train_rsoccer.py) mantiene compatibles las bindings viejas de rSoccer.
+tensorboard
+tqdm
+rich
