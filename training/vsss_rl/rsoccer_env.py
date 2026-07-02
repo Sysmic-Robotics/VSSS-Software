@@ -58,9 +58,17 @@ GOAL_R, CONCEDE_R = 10.0, -10.0
 # (4 ticks) el término de remate llegue a ~0.7 como en Brandão.
 BALL_VEL_W = 0.175      # ×4 ticks ≈ 0.7/decisión con pelota a V_MAX hacia el arco
 BALL_PROGRESS_W = 1.0   # gradiente Δdist (~0.1/decisión máx) — secundario
-ROBOT_TO_BALL_W = 0.2   # gradiente de acercamiento del robot más cercano
-DEF_POS_W = 0.025       # nivel: robot de campo entre pelota y arco propio (~0.1/decisión)
+# Cercanía a la pelota como NIVEL (Brandão r_dist = 0.1·cercanía por paso), NO como
+# gradiente: el gradiente se telescopa a ~0 total y no compensa el riesgo de tocar
+# la pelota → el Gate 1a (8M) aprendió a EVITARLA (diag: dmin=0.51 m, 67% de
+# episodios cortados por Free Ball, 8% goles). El nivel paga sostenidamente por
+# estar encima de la pelota. (0.025/tick ≈ 0.1/decisión con contacto.)
+BALL_PROX_W = 0.025
+BALL_PROX_DMAX = 0.75   # a esta distancia el término llega a 0
 TIME_PEN = -0.001
+# DEF_POS eliminado (Gate 1a): era farmeable — pagaba por estar "detrás de la pelota"
+# a CUALQUIER distancia, alimentando la pasividad. La defensa vendrá del concede -10
+# y del self-play (Fase C/D).
 ATTACK_GOAL = (FIELD_HALF_X, 0.0)   # blue ataca +X
 # Árbitro interno (B-R — reglas LARC 2026, como el "virtual referee" de Brandão):
 AREA_X = 0.60           # área de meta: |x| > 0.60 (prof. 0.15 desde 0.75)
@@ -83,7 +91,6 @@ class RSoccerFieldEnv(VSSEnv):
         self.action_space = gspaces.Box(-1.0, 1.0, (2 * len(CONTROLLED),), np.float32)
         self.observation_space = gspaces.Box(-2.0, 2.0, (52,), np.float32)
         self._prev_bg = None
-        self._prev_rb = None
         # Estado de la rampa DirectVel por robot controlado: [v_cur, omega_cur] (A2).
         self._dv = {rid: [0.0, 0.0] for rid in CONTROLLED}
         # Historial de poses RUIDOSAS por entidad, para la diferencia finita a 10 Hz (A3).
@@ -176,7 +183,6 @@ class RSoccerFieldEnv(VSSEnv):
 
     def reset(self):
         self._prev_bg = None
-        self._prev_rb = None
         self._dv = {rid: [0.0, 0.0] for rid in CONTROLLED}
         self._pose_hist = {}
         self._ball_ref = None
@@ -226,18 +232,10 @@ class RSoccerFieldEnv(VSSEnv):
         if self._prev_bg is not None:
             r += BALL_PROGRESS_W * (self._prev_bg - dg)
         self._prev_bg = dg
+        # Cercanía a la pelota (NIVEL, como Brandão): paga sostenidamente por estar
+        # encima de la pelota — el tirón que le faltaba a la política pasiva del 1a.
         dmin = min(math.hypot(f.robots_blue[rid].x - bx, f.robots_blue[rid].y - by) for rid in CONTROLLED)
-        if self._prev_rb is not None:
-            r += ROBOT_TO_BALL_W * (self._prev_rb - dmin)
-        self._prev_rb = dmin
-        # Posicionamiento defensivo (Brandão r_def): con la pelota en campo propio,
-        # premia tener un robot de campo entre la pelota y el arco propio.
-        if bx < 0.0:
-            for rid in CONTROLLED:
-                rb = f.robots_blue[rid]
-                if rb.x < bx and abs(rb.y - by) < 0.20:
-                    r += DEF_POS_W
-                    break
+        r += BALL_PROX_W * max(0.0, 1.0 - dmin / BALL_PROX_DMAX)
         # Comportamiento de juego (§9.2): penaliza robots de campo quietos > 5 s.
         for rid in CONTROLLED:
             rb = f.robots_blue[rid]
