@@ -51,8 +51,28 @@ OBS_SIGMA_Y = 1.679e-3   # m
 OBS_SIGMA_TH = 0.031     # rad (~1.79°)
 FD_DT = FRAME_SKIP * PHYS_DT  # ventana de la diferencia finita = 1 decisión (0.1 s)
 GOAL_R, CONCEDE_R = 10.0, -10.0
-BALL_PROGRESS_W, ROBOT_TO_BALL_W, BALL_VEL_W, TIME_PEN = 3.0, 0.3, 0.1, -0.001
+# Reward B2 (estilo Brandão IEEE Access 2022): el término DOMINANTE es la velocidad
+# de la pelota hacia el arco rival (con signo) = premia el REMATE. El progreso por
+# distancia queda secundario (antes 3.0 dominaba → enseñaba a "pastorear" la pelota:
+# 76% de episodios en timeout). Pesos por tick calibrados para que por decisión
+# (4 ticks) el término de remate llegue a ~0.7 como en Brandão.
+BALL_VEL_W = 0.175      # ×4 ticks ≈ 0.7/decisión con pelota a V_MAX hacia el arco
+BALL_PROGRESS_W = 1.0   # gradiente Δdist (~0.1/decisión máx) — secundario
+ROBOT_TO_BALL_W = 0.2   # gradiente de acercamiento del robot más cercano
+DEF_POS_W = 0.025       # nivel: robot de campo entre pelota y arco propio (~0.1/decisión)
+TIME_PEN = -0.001
 ATTACK_GOAL = (FIELD_HALF_X, 0.0)   # blue ataca +X
+# Árbitro interno (B-R — reglas LARC 2026, como el "virtual referee" de Brandão):
+AREA_X = 0.60           # área de meta: |x| > 0.60 (prof. 0.15 desde 0.75)
+AREA_Y = 0.35           # |y| < 0.35 (ancho 0.70)
+FOUL_DEF_R = -1.0       # defensa ilegal: 2+ propios en área propia CON pelota (→ penal)
+FOUL_ATK_R = -0.2       # ataque ilegal: 2+ propios en área rival CON pelota (→ goal kick)
+STUCK_R = -0.5          # Free Ball: pelota quieta 10 s → el árbitro corta la jugada
+STUCK_TICKS = 400       # 10 s a 40 Hz
+STUCK_DIST = 0.03       # umbral de pelota "quieta" (3 cm)
+IDLE_TICKS = 200        # comportamiento de juego (§9.2): robot quieto > 5 s
+IDLE_DIST = 0.03
+IDLE_PEN = -0.0005      # por tick y robot quieto (≈ −0.02/decisión)
 
 
 class RSoccerFieldEnv(VSSEnv):
@@ -68,6 +88,11 @@ class RSoccerFieldEnv(VSSEnv):
         self._dv = {rid: [0.0, 0.0] for rid in CONTROLLED}
         # Historial de poses RUIDOSAS por entidad, para la diferencia finita a 10 Hz (A3).
         self._pose_hist = {}
+        # Árbitro interno (B-R): timers de pelota estancada y robots quietos.
+        self._ball_ref = None
+        self._ball_still = 0
+        self._idle_ref = {}
+        self._idle = {rid: 0 for rid in CONTROLLED}
 
     def _vw_to_wheels(self, v, w):
         vl = (v - w * WHEELBASE_L / 2.0) / self._r
@@ -154,6 +179,10 @@ class RSoccerFieldEnv(VSSEnv):
         self._prev_rb = None
         self._dv = {rid: [0.0, 0.0] for rid in CONTROLLED}
         self._pose_hist = {}
+        self._ball_ref = None
+        self._ball_still = 0
+        self._idle_ref = {}
+        self._idle = {rid: 0 for rid in CONTROLLED}
         return super().reset()
 
     def _calculate_reward_and_done(self):
@@ -164,8 +193,36 @@ class RSoccerFieldEnv(VSSEnv):
             return GOAL_R, True
         if bx < -half:
             return CONCEDE_R, True
+
+        # ── Árbitro interno (B-R, reglas LARC 2026) ──────────────────────────
+        # Faltas de área (§9.5): la condición incluye la PELOTA en el área (así
+        # operacionaliza Brandão su árbitro virtual). El foul REEMPLAZA el shaping
+        # de ese tick y corta la jugada (como el árbitro real).
+        if abs(by) < AREA_Y:
+            if bx < -AREA_X and sum(1 for i in range(3)
+                    if f.robots_blue[i].x < -AREA_X and abs(f.robots_blue[i].y) < AREA_Y) >= 2:
+                return FOUL_DEF_R, True   # defensa ilegal → penal en contra
+            if bx > AREA_X and sum(1 for i in range(3)
+                    if f.robots_blue[i].x > AREA_X and abs(f.robots_blue[i].y) < AREA_Y) >= 2:
+                return FOUL_ATK_R, True   # ataque ilegal → goal kick rival
+        # Free Ball (§10.4): pelota sin moverse 10 s → el árbitro corta.
+        if self._ball_ref is None or math.hypot(bx - self._ball_ref[0], by - self._ball_ref[1]) > STUCK_DIST:
+            self._ball_ref = (bx, by)
+            self._ball_still = 0
+        else:
+            self._ball_still += 1
+            if self._ball_still >= STUCK_TICKS:
+                return STUCK_R, True
+
+        # ── Shaping B2 ────────────────────────────────────────────────────────
         r = TIME_PEN
-        dg = math.hypot(ATTACK_GOAL[0] - bx, ATTACK_GOAL[1] - by)
+        gx, gy = ATTACK_GOAL[0] - bx, ATTACK_GOAL[1] - by
+        gn = math.hypot(gx, gy)
+        if gn > 1e-6:
+            # DOMINANTE: velocidad de la pelota hacia el arco rival, CON SIGNO
+            # (remate acerca → +; despeje hacia atrás/autogol → −).
+            r += BALL_VEL_W * float(np.clip((f.ball.v_x * gx + f.ball.v_y * gy) / gn / V_MAX, -1.0, 1.0))
+        dg = gn
         if self._prev_bg is not None:
             r += BALL_PROGRESS_W * (self._prev_bg - dg)
         self._prev_bg = dg
@@ -173,10 +230,25 @@ class RSoccerFieldEnv(VSSEnv):
         if self._prev_rb is not None:
             r += ROBOT_TO_BALL_W * (self._prev_rb - dmin)
         self._prev_rb = dmin
-        gx, gy = ATTACK_GOAL[0] - bx, ATTACK_GOAL[1] - by
-        gn = math.hypot(gx, gy)
-        if gn > 1e-6:
-            r += BALL_VEL_W * max(0.0, (f.ball.v_x * gx + f.ball.v_y * gy) / gn)
+        # Posicionamiento defensivo (Brandão r_def): con la pelota en campo propio,
+        # premia tener un robot de campo entre la pelota y el arco propio.
+        if bx < 0.0:
+            for rid in CONTROLLED:
+                rb = f.robots_blue[rid]
+                if rb.x < bx and abs(rb.y - by) < 0.20:
+                    r += DEF_POS_W
+                    break
+        # Comportamiento de juego (§9.2): penaliza robots de campo quietos > 5 s.
+        for rid in CONTROLLED:
+            rb = f.robots_blue[rid]
+            ref = self._idle_ref.get(rid)
+            if ref is None or math.hypot(rb.x - ref[0], rb.y - ref[1]) > IDLE_DIST:
+                self._idle_ref[rid] = (rb.x, rb.y)
+                self._idle[rid] = 0
+            else:
+                self._idle[rid] += 1
+                if self._idle[rid] >= IDLE_TICKS:
+                    r += IDLE_PEN
         return float(r), False
 
 
