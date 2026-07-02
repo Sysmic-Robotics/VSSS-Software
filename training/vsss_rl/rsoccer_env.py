@@ -13,6 +13,7 @@ import os
 # importar rsoccer_gym. Impacto nulo en VSS-v0 (usa rc_robosim, no protobuf en el loop).
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import math
+from collections import deque
 import numpy as np
 import gymnasium
 from gymnasium import spaces as gspaces
@@ -25,11 +26,30 @@ MAX_VEL_NORM = 1.5
 MAX_OMEGA_NORM = math.pi
 V_MAX = 1.2
 OMEGA_MAX = 3.0
-WHEELBASE_L = 0.075
+# WHEELBASE efectivo de rSim, MEDIDO empíricamente (sysid/measure_wheelbase_rsim.py,
+# 2026-07-02): giro puro a 3 velocidades → L≈0.0776 (el nominal 0.075 respondía ~3%
+# arriba). El deploy usa las constantes efectivas de FIRASim (r=0.02, L=0.085) en
+# commands.rs — cada lado con las constantes verdaderas de SU sim ⇒ la misma (v,ω)
+# produce la misma respuesta física en entrenamiento y en deploy (Intento 4, Fase A1).
+WHEELBASE_L = 0.0776
 CONTROLLED = (0, 1)
 GK_ID = 2
 FRAME_SKIP = 4        # 4 * 0.025s = 0.1s -> decide a 10 Hz (igual que el deploy: COACH_DECISION_PERIOD=6 @ 60Hz)
 MAX_DECISIONS = 300   # 300 decisiones * 0.1s = 30s por episodio (como el sim viejo)
+PHYS_DT = 0.025       # tick físico de rSim (40 Hz)
+# Rampa de aceleración — espejo EXACTO de DirectVel en el deploy (skills/catalog.rs):
+# la política nunca ve un cambio de (v,ω) más brusco de lo que el runtime ejecuta (A2).
+DV_LIN_ACCEL = 1.2    # m/s² acelerando
+DV_LIN_DECEL = 5.0    # m/s² frenando
+DV_ANG_ACCEL = 30.0   # rad/s²
+# Ruido de observación MEDIDO (σ del sistema de visión real, Brandão et al. IEEE
+# Access 2022). Se aplica a posiciones/orientación; las VELOCIDADES de la obs se
+# derivan por diferencia finita de las posiciones ruidosas a 10 Hz — imita al EKF
+# del deploy (lag + ruido) en vez de exponer las velocidades perfectas del sim (A3).
+OBS_SIGMA_X = 1.854e-3   # m
+OBS_SIGMA_Y = 1.679e-3   # m
+OBS_SIGMA_TH = 0.031     # rad (~1.79°)
+FD_DT = FRAME_SKIP * PHYS_DT  # ventana de la diferencia finita = 1 decisión (0.1 s)
 GOAL_R, CONCEDE_R = 10.0, -10.0
 BALL_PROGRESS_W, ROBOT_TO_BALL_W, BALL_VEL_W, TIME_PEN = 3.0, 0.3, 0.1, -0.001
 ATTACK_GOAL = (FIELD_HALF_X, 0.0)   # blue ataca +X
@@ -44,6 +64,10 @@ class RSoccerFieldEnv(VSSEnv):
         self.observation_space = gspaces.Box(-2.0, 2.0, (52,), np.float32)
         self._prev_bg = None
         self._prev_rb = None
+        # Estado de la rampa DirectVel por robot controlado: [v_cur, omega_cur] (A2).
+        self._dv = {rid: [0.0, 0.0] for rid in CONTROLLED}
+        # Historial de poses RUIDOSAS por entidad, para la diferencia finita a 10 Hz (A3).
+        self._pose_hist = {}
 
     def _vw_to_wheels(self, v, w):
         vl = (v - w * WHEELBASE_L / 2.0) / self._r
@@ -65,9 +89,15 @@ class RSoccerFieldEnv(VSSEnv):
         f = self.frame
         cmds = []
         for idx, rid in enumerate(CONTROLLED):
-            v = float(np.clip(a[2 * idx], -1, 1)) * V_MAX
-            w = float(np.clip(a[2 * idx + 1], -1, 1)) * OMEGA_MAX
-            vl, vr = self._vw_to_wheels(v, w)
+            v_t = float(np.clip(a[2 * idx], -1, 1)) * V_MAX
+            w_t = float(np.clip(a[2 * idx + 1], -1, 1)) * OMEGA_MAX
+            # Rampa DirectVel (espejo del deploy): integra hacia el target con los
+            # mismos límites de aceleración, a la resolución del tick físico (A2).
+            st = self._dv[rid]
+            a_lin = DV_LIN_ACCEL if abs(v_t) >= abs(st[0]) else DV_LIN_DECEL
+            st[0] += float(np.clip(v_t - st[0], -a_lin * PHYS_DT, a_lin * PHYS_DT))
+            st[1] += float(np.clip(w_t - st[1], -DV_ANG_ACCEL * PHYS_DT, DV_ANG_ACCEL * PHYS_DT))
+            vl, vr = self._vw_to_wheels(st[0], st[1])
             cmds.append(Robot(yellow=False, id=rid, v_wheel0=vl, v_wheel1=vr))
         gk = f.robots_blue[GK_ID]
         vl, vr = self._goto_wheels(gk, -FIELD_HALF_X + 0.12, float(np.clip(f.ball.y, -0.2, 0.2)))
@@ -81,23 +111,49 @@ class RSoccerFieldEnv(VSSEnv):
             cmds.append(Robot(yellow=True, id=i, v_wheel0=vl, v_wheel1=vr))
         return cmds
 
-    def _robot_obs(self, rb):
-        return [rb.x / FIELD_HALF_X, rb.y / FIELD_HALF_Y, rb.v_x / MAX_VEL_NORM, rb.v_y / MAX_VEL_NORM,
-                math.sin(math.radians(rb.theta)), math.cos(math.radians(rb.theta)),
-                math.radians(rb.v_theta) / MAX_OMEGA_NORM, 1.0]
+    def _noisy_pose(self, key, x, y, th):
+        """Aplica ruido de visión a la pose y la guarda en el historial. Devuelve
+        (pose ruidosa actual, pose ruidosa de hace 1 decisión, historial completo?)."""
+        nx = x + np.random.normal(0.0, OBS_SIGMA_X)
+        ny = y + np.random.normal(0.0, OBS_SIGMA_Y)
+        nth = th + np.random.normal(0.0, OBS_SIGMA_TH)
+        hist = self._pose_hist.setdefault(key, deque(maxlen=FRAME_SKIP + 1))
+        full = len(hist) == FRAME_SKIP + 1  # ya hay una pose de hace exactamente 0.1 s
+        old = hist[0] if full else (nx, ny, nth)
+        hist.append((nx, ny, nth))
+        return (nx, ny, nth), old, full
+
+    def _robot_obs(self, key, rb):
+        (x, y, th), (px, py, pth), full = self._noisy_pose(key, rb.x, rb.y, math.radians(rb.theta))
+        if full:
+            vx, vy = (x - px) / FD_DT, (y - py) / FD_DT
+            dth = th - pth
+            while dth > math.pi:
+                dth -= 2 * math.pi
+            while dth < -math.pi:
+                dth += 2 * math.pi
+            om = dth / FD_DT
+        else:
+            vx = vy = om = 0.0  # arranque: como el EKF del deploy (velocidad 0 hasta converger)
+        return [x / FIELD_HALF_X, y / FIELD_HALF_Y, vx / MAX_VEL_NORM, vy / MAX_VEL_NORM,
+                math.sin(th), math.cos(th), om / MAX_OMEGA_NORM, 1.0]
 
     def _frame_to_observations(self):
         f = self.frame
-        obs = [f.ball.x / FIELD_HALF_X, f.ball.y / FIELD_HALF_Y, f.ball.v_x / MAX_VEL_NORM, f.ball.v_y / MAX_VEL_NORM]
+        (bx, by, _), (pbx, pby, _), full = self._noisy_pose("ball", f.ball.x, f.ball.y, 0.0)
+        bvx, bvy = ((bx - pbx) / FD_DT, (by - pby) / FD_DT) if full else (0.0, 0.0)
+        obs = [bx / FIELD_HALF_X, by / FIELD_HALF_Y, bvx / MAX_VEL_NORM, bvy / MAX_VEL_NORM]
         for i in range(3):
-            obs += self._robot_obs(f.robots_blue[i])
+            obs += self._robot_obs(("b", i), f.robots_blue[i])
         for i in range(3):
-            obs += self._robot_obs(f.robots_yellow[i])
+            obs += self._robot_obs(("y", i), f.robots_yellow[i])
         return np.array(obs, dtype=np.float32)
 
     def reset(self):
         self._prev_bg = None
         self._prev_rb = None
+        self._dv = {rid: [0.0, 0.0] for rid in CONTROLLED}
+        self._pose_hist = {}
         return super().reset()
 
     def _calculate_reward_and_done(self):
