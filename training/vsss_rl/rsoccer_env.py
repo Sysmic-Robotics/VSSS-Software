@@ -118,10 +118,10 @@ class RSoccerFieldEnv(VSSEnv):
         ny = y + np.random.normal(0.0, OBS_SIGMA_Y)
         nth = th + np.random.normal(0.0, OBS_SIGMA_TH)
         hist = self._pose_hist.setdefault(key, deque(maxlen=FRAME_SKIP + 1))
-        full = len(hist) == FRAME_SKIP + 1  # ya hay una pose de hace exactamente 0.1 s
-        old = hist[0] if full else (nx, ny, nth)
         hist.append((nx, ny, nth))
-        return (nx, ny, nth), old, full
+        # Tras el append, hist[0] queda EXACTAMENTE FRAME_SKIP ticks (0.1 s) atrás.
+        full = len(hist) == FRAME_SKIP + 1
+        return (nx, ny, nth), hist[0], full
 
     def _robot_obs(self, key, rb):
         (x, y, th), (px, py, pth), full = self._noisy_pose(key, rb.x, rb.y, math.radians(rb.theta))
