@@ -1,7 +1,9 @@
-.venv/
+.venv*/
 __pycache__/
 *.pyc
 checkpoints/
+checkpoints_rsoccer/
+tb_rsoccer/
 logs/
 tb_logs/
 runs/
@@ -9,17 +11,12 @@ runs/
 *.pt
 *.onnx
 
-# Material académico personal del curso INF398 (no va al repo del equipo).
-# Estos archivos son apuntes/presentaciones/informes del integrante del curso
-# y se mantienen solo localmente.
+# Material academico personal del curso INF398 (no va al repo del equipo).
 PRESENTACION.md
 EXPLICACION_RED.md
 RESULTADOS_FASE1.md
 GUIA_REVISION.md
 informe_latex/
 
-# Sobreescribe la regla *.md del .gitignore raíz solo para README.md,
-# que sí es documentación técnica del proyecto.
+# README.md si es documentacion tecnica del proyecto.
 !README.md
-# Guía de setup AWS (documentación técnica, sí se versiona).
-!aws/AWS_SETUP.md
