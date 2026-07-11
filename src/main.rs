@@ -18,7 +18,7 @@ const COACH_DECISION_PERIOD: u32 = 6;
 use glam::Vec2;
 use rustengine::coach::{Coach, RuleBasedCoach, SkillChoice};
 use rustengine::control_loop::{
-    CoachDecider, ControlLoopConfig, GuiChannels, TickDecider, run_control_loop,
+    CoachDecider, ControlLoopConfig, GuiChannels, ManualCommand, TickDecider, run_control_loop,
 };
 use rustengine::radio::RadioTarget;
 use rustengine::vision::VisionSource;
@@ -81,17 +81,37 @@ fn run_with_gui() {
     let (status_tx, status_rx) = mpsc::channel(100);
     let (motion_tx, motion_rx) = mpsc::channel::<Vec<GUI::RobotMotionDebug>>(32);
     let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
+    let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
 
     let source = VisionSource::from_env();
     let ip = source.multicast_ip().to_string();
     let port = source.port();
 
+    // Config de radio para el panel (etiqueta + defaults de base station).
+    let radio_target_label = format!("{:?}", RadioTarget::from_env());
+    let radio_port =
+        std::env::var("VSSL_BASESTATION_DEVICE").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
+    let radio_baud = std::env::var("VSSL_BASESTATION_BAUD").unwrap_or_else(|_| "115200".to_string());
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(Some((status_tx, motion_tx))));
+        rt.block_on(async_main(Some((status_tx, motion_tx, manual_rx))));
     });
 
-    GUI::run_gui(ip, port, config_tx, status_rx, motion_rx).expect("GUI terminó con error");
+    let setup = GUI::GuiSetup {
+        ip,
+        port,
+        config_tx,
+        status_rx,
+        motion_rx,
+        manual_tx: Some(manual_tx),
+        num_robots: NUM_ROBOTS,
+        own_team: OWN_TEAM as u32,
+        radio_target_label,
+        radio_port,
+        radio_baud,
+    };
+    GUI::run_gui(setup).expect("GUI terminó con error");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,12 +126,14 @@ fn run_with_gui() {
 //  Si necesitas cambiar el lazo de control, edita src/control_loop.rs — esta
 //  función solo arma la configuración.
 // ─────────────────────────────────────────────────────────────────────────────
-async fn async_main(
-    gui_channels: Option<(
-        mpsc::Sender<GUI::StatusUpdate>,
-        mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
-    )>,
-) {
+/// Canales GUI→loop / loop→GUI que `run_with_gui` pasa a `async_main`.
+type GuiChannelBundle = (
+    mpsc::Sender<GUI::StatusUpdate>,
+    mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
+    mpsc::Receiver<ManualCommand>,
+);
+
+async fn async_main(gui_channels: Option<GuiChannelBundle>) {
     let vision_source = VisionSource::from_env();
     let radio_target = RadioTarget::from_env();
     eprintln!(
@@ -150,9 +172,10 @@ async fn async_main(
         vision_timeout: None,
     };
 
-    let gui = gui_channels.map(|(status_tx, motion_tx)| GuiChannels {
+    let gui = gui_channels.map(|(status_tx, motion_tx, manual_rx)| GuiChannels {
         status_tx,
         motion_tx,
+        manual_rx: Some(manual_rx),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));

@@ -28,6 +28,8 @@ pub struct FieldCanvas<'a> {
     pub ball: &'a Option<Ball>,
     pub motion: &'a HashMap<(u32, u32), RobotMotionDebug>,
     pub cache: &'a Cache,
+    /// Robot resaltado para control manual, como `(team, id)`. `None` = ninguno.
+    pub selected: Option<(u32, u32)>,
 }
 
 impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
@@ -206,6 +208,17 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     &robot_circle,
                     Stroke::default().with_width(1.0).with_color(Color::BLACK),
                 );
+
+                // Resaltado del robot seleccionado para control manual (halo).
+                if self.selected == Some((robot.team, robot.id)) {
+                    let halo = Path::circle(robot_pos, ROBOT_RADIUS_MM * scale + 6.0);
+                    frame.stroke(
+                        &halo,
+                        Stroke::default()
+                            .with_width(3.0)
+                            .with_color(Color::from_rgb(1.0, 0.5, 0.0)),
+                    );
+                }
 
                 // Línea de orientación
                 let dx = robot.orientation.cos() * ORIENTATION_LINE_MM * scale;

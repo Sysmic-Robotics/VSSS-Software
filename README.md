@@ -40,6 +40,30 @@ cargo clippy                         # lint
 cargo fmt                            # formato
 ```
 
+### GUI de debug: control manual y panel de radio (`VSSL_DEBUG_GUI=1`)
+
+La GUI Iced (tab **Robots**) permite **manejar un robot a mano**, útil para el
+bring-up del robot real (ver `docs/bringup_robot_real.md`):
+
+- **Manual: ON/OFF** activa el control manual del robot/equipo seleccionados.
+- Selector de **Robot** (`-`/`+`) y de **Equipo** (Azul/Amarillo).
+- **Marco de referencia** (toggle Mundo/Robot):
+  - **Robot** (default, arcade drive): **W/S** = adelante/atrás según hacia dónde mira el
+    robot, **A/D** = giro. Usa la orientación de visión del robot seleccionado.
+  - **Mundo**: **W/S** = ±Y de la cancha, **A/D** = ±X, **Q/E** = giro CCW/CW.
+- **Escalas ajustables** en la GUI: velocidad lineal máx (m/s) y angular máx (rad/s).
+- **Rampa de aceleración**: el comando arranca y frena suave (no salta de 0 a máximo),
+  evitando tirones/patinaje. Al soltar las teclas decae a cero por la misma rampa.
+- El comando pasa por la MISMA cinemática inversa y el mismo `RobotTransport` que el coach
+  (no hay ruta paralela): lo que ves en el chart L/R es lo que se envía.
+- El robot seleccionado se resalta con un halo naranjo, y el chart inferior grafica sus
+  velocidades de rueda comandadas **L/R (mm/s)** en el tiempo.
+
+La tab **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
+estado de conexión y PPS. Editar puerto/baud requiere reiniciar el proceso (se aplican por
+`VSSL_BASESTATION_DEVICE` / `VSSL_BASESTATION_BAUD`). En headless nada de esto aplica: la
+config sigue viniendo del entorno y los bytes enviados son idénticos.
+
 **3 binarios:**
 - `rustengine` (default): producción headless o con `VSSL_DEBUG_GUI=1`. Coach decide qué skill correr.
 - `scenario`: banco de pruebas tipo "editar y correr". Una skill a la vez, configurada como constantes en la zona de edición al inicio de `src/bin/scenario.rs`. GUI siempre activa. CSV opcional a `logs/scenario_<skill>_<epoch>.csv` (toggle con la constante `log: Option<PathBuf>`: `Some(scenario_log_path(&scenario))` escribe, `None` desactiva el archivo y deja solo el resumen humano a stderr).

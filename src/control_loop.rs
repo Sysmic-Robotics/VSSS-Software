@@ -16,6 +16,7 @@ use crate::skills::{SkillCatalog, SkillId};
 use crate::vision::{Vision, VisionEvent, VisionSource};
 use crate::world::{RobotState, World};
 use glam::Vec2;
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -121,10 +122,32 @@ impl TickDecider for FixedSkillDecider {
     }
 }
 
+/// Comando de control manual proveniente de la GUI. Lleva velocidades en marco
+/// mundo `(vx, vy, omega)` para un robot concreto; la `orientation` NO viaja aquí
+/// porque el loop la toma del `World` (visión) en cada tick, de modo que la
+/// proyección `v = vx·cosθ + vy·sinθ` use el heading real.
+#[derive(Debug, Clone)]
+pub struct ManualCommand {
+    pub team: i32,
+    pub id: i32,
+    pub vx: f64,
+    pub vy: f64,
+    pub omega: f64,
+}
+
+/// Cuántos ticks (a 60 Hz) se mantiene vigente un comando manual sin refresco.
+/// La GUI reenvía a mayor tasa que esto mientras el modo manual está activo; al
+/// apagarlo deja de enviar y el comando expira, devolviendo el control al decider.
+/// 15 ticks ≈ 250 ms.
+const MANUAL_STALE_TICKS: u32 = 15;
+
 /// Canales opcionales para alimentar el GUI (mismo shape que el código pre-refactor).
 pub struct GuiChannels {
     pub status_tx: mpsc::Sender<GUI::StatusUpdate>,
     pub motion_tx: mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
+    /// Canal opcional de comandos manuales GUI→loop. `None` = sin control manual
+    /// (comportamiento idéntico al headless). Ver `ManualCommand`.
+    pub manual_rx: Option<mpsc::Receiver<ManualCommand>>,
 }
 
 /// Mismo dispatcher que tenía `main.rs` pre-refactor (`dispatch_choices`).
@@ -179,6 +202,40 @@ fn dispatch_choices(
     (commands, targets, applied)
 }
 
+/// Aplica los comandos manuales vigentes sobre los comandos del decider.
+/// Para cada robot con comando manual, reemplaza el comando del decider (mismo
+/// `id`/`team`) o lo inserta si no existía, tomando `orientation` del `World`
+/// (0.0 si el robot no es visible). Mantiene `targets` alineado con `commands`.
+///
+/// Función pura sobre las entradas: no lee canales ni reloj. Testeable sin sockets.
+fn apply_manual_overrides(
+    commands: &mut Vec<MotionCommand>,
+    targets: &mut Vec<Option<Vec2>>,
+    manual_state: &HashMap<(i32, i32), (ManualCommand, u32)>,
+    world: &World,
+) {
+    for ((team, id), (mc, _)) in manual_state {
+        let orientation = world
+            .get_robot_state(*id, *team)
+            .map(|r| r.orientation)
+            .unwrap_or(0.0);
+        let manual_cmd = MotionCommand {
+            id: *id,
+            team: *team,
+            vx: mc.vx,
+            vy: mc.vy,
+            omega: mc.omega,
+            orientation,
+        };
+        if let Some(pos) = commands.iter().position(|c| c.id == *id && c.team == *team) {
+            commands[pos] = manual_cmd;
+        } else {
+            commands.push(manual_cmd);
+            targets.push(None);
+        }
+    }
+}
+
 /// Ejecuta el loop de control con el decisor entregado. Una sola fuente de
 /// verdad: tanto `main` como `skill_test` (modo skill) llaman aquí.
 pub async fn run_control_loop(
@@ -196,10 +253,17 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(true));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (status_tx, motion_tx) = match gui {
-        Some(g) => (Some(g.status_tx), Some(g.motion_tx)),
-        None => (None, None),
+    let (status_tx, motion_tx, mut manual_rx) = match gui {
+        Some(g) => (Some(g.status_tx), Some(g.motion_tx), g.manual_rx),
+        None => (None, None, None),
     };
+
+    // Estado de comandos manuales vigentes por (team, id) con el tick de último
+    // refresco, para expirar comandos rancios (ver `MANUAL_STALE_TICKS`).
+    let mut manual_state: HashMap<(i32, i32), (ManualCommand, u32)> = HashMap::new();
+    // Última señal de conexión del transporte reportada a la GUI (para emitir
+    // solo en transiciones y no inundar el canal de estado).
+    let mut last_transport_ok: Option<bool> = None;
 
     // Vision
     {
@@ -309,16 +373,31 @@ pub async fn run_control_loop(
             break;
         }
 
+        // Drenar el canal manual (no bloqueante) quedándose con el más reciente
+        // por robot; refrescar su marca de tick.
+        if let Some(rx) = manual_rx.as_mut() {
+            while let Ok(mc) = rx.try_recv() {
+                manual_state.insert((mc.team, mc.id), (mc, tick_counter));
+            }
+        }
+        // Expirar comandos manuales sin refresco reciente (modo manual apagado).
+        if !manual_state.is_empty() {
+            manual_state
+                .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
+        }
+
         let (commands, targets, applied_choices) = {
             let world_guard = world.read().await;
             let choices = decider.decide(tick_counter, &world_guard);
-            dispatch_choices(
+            let (mut cmds, mut tgts, applied) = dispatch_choices(
                 &choices,
                 &mut catalog,
                 &world_guard,
                 &motion,
                 config.own_team,
-            )
+            );
+            apply_manual_overrides(&mut cmds, &mut tgts, &manual_state, &world_guard);
+            (cmds, tgts, applied)
         };
         tick_counter = tick_counter.wrapping_add(1);
 
@@ -368,8 +447,18 @@ pub async fn run_control_loop(
         for cmd in &commands {
             radio_guard.add_motion_command(cmd.clone());
         }
-        if let Err(err) = radio_guard.send_commands().await {
+        let send_result = radio_guard.send_commands().await;
+        drop(radio_guard);
+        let ok = send_result.is_ok();
+        if let Err(err) = send_result {
             eprintln!("[control_loop] error enviando: {err}");
+        }
+        // Reportar el estado del transporte a la GUI solo en transiciones.
+        if last_transport_ok != Some(ok) {
+            last_transport_ok = Some(ok);
+            if let Some(ref tx) = status_tx {
+                let _ = tx.try_send(GUI::StatusUpdate::TransportStatus(ok));
+            }
         }
     }
 
@@ -469,6 +558,115 @@ mod tests {
         }
         // Debe haber sido llamado en ticks 0, 6, 12 → 3 veces.
         assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    /// 1.7 — Sin comandos manuales, `apply_manual_overrides` no toca nada.
+    #[test]
+    fn manual_override_empty_is_noop() {
+        let mut cmds = vec![MotionCommand {
+            id: 0,
+            team: 0,
+            vx: 1.0,
+            vy: 0.0,
+            omega: 0.0,
+            orientation: 0.0,
+        }];
+        let mut tgts: Vec<Option<Vec2>> = vec![Some(Vec2::new(0.3, 0.0))];
+        let manual: HashMap<(i32, i32), (ManualCommand, u32)> = HashMap::new();
+        let world = World::new(3, 3);
+
+        let before = cmds.clone();
+        apply_manual_overrides(&mut cmds, &mut tgts, &manual, &world);
+
+        assert_eq!(cmds.len(), before.len());
+        assert_eq!(cmds[0].vx, before[0].vx);
+        assert_eq!(tgts.len(), 1);
+    }
+
+    /// 1.8 — El comando manual reemplaza al del decider para su robot y deja
+    /// intactos los de los otros robots. `orientation` sale del World.
+    #[test]
+    fn manual_override_replaces_target_robot_only() {
+        let mut world = World::new(3, 3);
+        // Robot 1 azul visible con orientación conocida.
+        world.update_robot(1, 0, Vec2::new(0.0, 0.0), 1.5, Vec2::ZERO, 0.0);
+
+        let mut cmds = vec![
+            MotionCommand {
+                id: 0,
+                team: 0,
+                vx: 0.1,
+                vy: 0.0,
+                omega: 0.0,
+                orientation: 0.0,
+            },
+            MotionCommand {
+                id: 1,
+                team: 0,
+                vx: 0.2,
+                vy: 0.0,
+                omega: 0.0,
+                orientation: 0.0,
+            },
+        ];
+        let mut tgts: Vec<Option<Vec2>> = vec![None, None];
+
+        let mut manual: HashMap<(i32, i32), (ManualCommand, u32)> = HashMap::new();
+        manual.insert(
+            (0, 1),
+            (
+                ManualCommand {
+                    team: 0,
+                    id: 1,
+                    vx: 0.9,
+                    vy: 0.0,
+                    omega: 0.0,
+                },
+                0,
+            ),
+        );
+
+        apply_manual_overrides(&mut cmds, &mut tgts, &manual, &world);
+
+        // Robot 0 (no manual) intacto.
+        let r0 = cmds.iter().find(|c| c.id == 0).unwrap();
+        assert_eq!(r0.vx, 0.1);
+        // Robot 1 (manual) reemplazado, orientación tomada del World (1.5).
+        let r1 = cmds.iter().find(|c| c.id == 1).unwrap();
+        assert_eq!(r1.vx, 0.9);
+        assert_eq!(r1.orientation, 1.5);
+    }
+
+    /// El comando manual de un robot NO presente en los comandos del decider se
+    /// inserta, y `targets` queda alineado en largo con `commands`.
+    #[test]
+    fn manual_override_inserts_when_absent() {
+        let mut cmds: Vec<MotionCommand> = Vec::new();
+        let mut tgts: Vec<Option<Vec2>> = Vec::new();
+        let world = World::new(3, 3); // robot no visible → orientation 0.0
+
+        let mut manual: HashMap<(i32, i32), (ManualCommand, u32)> = HashMap::new();
+        manual.insert(
+            (0, 2),
+            (
+                ManualCommand {
+                    team: 0,
+                    id: 2,
+                    vx: 0.5,
+                    vy: 0.3,
+                    omega: -1.0,
+                },
+                0,
+            ),
+        );
+
+        apply_manual_overrides(&mut cmds, &mut tgts, &manual, &world);
+
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(tgts.len(), cmds.len());
+        assert_eq!(cmds[0].id, 2);
+        assert_eq!(cmds[0].vx, 0.5);
+        assert_eq!(cmds[0].orientation, 0.0);
     }
 
     /// Smoke test: `run_control_loop` con `FixedSkillDecider` y `MockTransport`.

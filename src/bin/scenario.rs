@@ -168,7 +168,22 @@ fn run_bench(
         ));
     });
 
-    GUI::run_gui(ip, port, config_tx, status_rx, motion_rx).expect("GUI terminó con error");
+    let setup = GUI::GuiSetup {
+        ip,
+        port,
+        config_tx,
+        status_rx,
+        motion_rx,
+        manual_tx: None, // el bench no usa control manual
+        num_robots: 3,
+        own_team: team.as_team_id() as u32,
+        radio_target_label: format!("{transport:?}"),
+        radio_port: std::env::var("VSSL_BASESTATION_DEVICE")
+            .unwrap_or_else(|_| "/dev/ttyUSB0".to_string()),
+        radio_baud: std::env::var("VSSL_BASESTATION_BAUD")
+            .unwrap_or_else(|_| "115200".to_string()),
+    };
+    GUI::run_gui(setup).expect("GUI terminó con error");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -248,6 +263,7 @@ async fn async_run(
     let gui = Some(GuiChannels {
         status_tx,
         motion_tx,
+        manual_rx: None,
     });
 
     if let Err(err) = run_control_loop(config, decider, Some(on_tick), gui, shutdown).await {

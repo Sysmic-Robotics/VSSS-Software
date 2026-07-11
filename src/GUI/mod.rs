@@ -1,5 +1,7 @@
 mod field;
+mod radio_panel;
 mod vision_status;
+mod wheel_chart;
 
 use glam::Vec2;
 use iced::futures::SinkExt;
@@ -7,15 +9,102 @@ use iced::stream;
 use iced::widget::canvas::Cache;
 use iced::{
     Element, Length, Subscription, Task, Theme,
-    widget::{Canvas, button, column, container, row, text},
+    widget::{Canvas, button, column, container, row, text, text_input},
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use crate::control_loop::ManualCommand;
 use field::FieldCanvas;
+use wheel_chart::WheelChart;
 pub use crate::vision::StatusUpdate;
+
+/// Velocidad lineal máx (m/s) por defecto del control manual (ajustable en la GUI).
+const MANUAL_LIN_MS_DEFAULT: f64 = 0.5;
+/// Velocidad angular máx (rad/s) por defecto del control manual (ajustable en la GUI).
+/// Convención: giro positivo → CCW (omega > 0), alineada con la skill Spin del catálogo.
+const MANUAL_ANG_RADS_DEFAULT: f64 = 3.0;
+/// Aceleración lineal máx de la rampa del control manual (m/s²).
+const MANUAL_LIN_ACCEL: f64 = 2.0;
+/// Aceleración angular máx de la rampa del control manual (rad/s²).
+const MANUAL_ANG_ACCEL: f64 = 12.0;
+/// Paso temporal del `ManualTick` (s). Debe coincidir con el intervalo de la
+/// suscripción `manual_tick` (33 ms).
+const MANUAL_TICK_DT: f64 = 0.033;
+/// Ventana de la telemetría de rueda (cantidad máxima de muestras retenidas).
+const WHEEL_HISTORY_MAX: usize = 300;
+
+/// Marco de referencia del control manual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+    /// W/S = ±Y mundo, A/D = ±X mundo, Q/E = giro.
+    World,
+    /// W/S = adelante/atrás según heading, A/D = giro (arcade drive).
+    Robot,
+}
+
+/// Extrae un carácter en minúscula de una tecla de iced (solo teclas de carácter).
+fn key_to_char(key: &iced::keyboard::Key) -> Option<char> {
+    match key {
+        iced::keyboard::Key::Character(s) => s.chars().next().map(|c| c.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Traduce las teclas presionadas al comando objetivo en **marco mundo**
+/// `(vx, vy, omega)`, según el modo de marco, las escalas y la orientación `theta`
+/// del robot (rad). Función pura y testeable (θ explícito).
+///
+/// - `World`: W/S = ±Y mundo, A/D = ±X mundo, Q/E = giro CCW/CW.
+/// - `Robot`: W/S = adelante/atrás según heading (`vx=v_fwd·cosθ`, `vy=v_fwd·sinθ`),
+///   A/D = giro (arcade drive). Q/E también giran (equivalentes a A/D).
+pub fn manual_world_target(
+    keys: &HashSet<char>,
+    frame: FrameMode,
+    lin: f64,
+    ang: f64,
+    theta: f64,
+) -> (f64, f64, f64) {
+    let axis = |pos: char, neg: char, scale: f64| -> f64 {
+        let mut v = 0.0;
+        if keys.contains(&pos) {
+            v += scale;
+        }
+        if keys.contains(&neg) {
+            v -= scale;
+        }
+        v
+    };
+
+    match frame {
+        FrameMode::World => {
+            let vx = axis('d', 'a', lin);
+            let vy = axis('w', 's', lin);
+            let omega = axis('q', 'e', ang);
+            (vx, vy, omega)
+        }
+        FrameMode::Robot => {
+            let v_fwd = axis('w', 's', lin);
+            // A/D giran (arcade); Q/E también, sumados.
+            let omega = axis('a', 'd', ang) + axis('q', 'e', ang);
+            let (c, s) = (theta.cos(), theta.sin());
+            (v_fwd * c, v_fwd * s, omega)
+        }
+    }
+}
+
+/// Rampa por componente: acerca `current` a `target` sin pasarlo, con paso máximo
+/// `max_step`. Función pura y testeable.
+pub fn slew(current: f64, target: f64, max_step: f64) -> f64 {
+    let delta = target - current;
+    if delta.abs() <= max_step {
+        target
+    } else {
+        current + max_step * delta.signum()
+    }
+}
 
 /// Datos de motion de un robot para debug visual.
 /// Se envía desde el control loop al GUI cada tick.
@@ -44,6 +133,7 @@ const GUI_FIELD_UPDATE_INTERVAL_MS: u64 = 50;
 pub enum TabView {
     Vision,
     Robots,
+    Radio,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +147,21 @@ pub enum Message {
     ToggleTracker(bool),
     Tick,
     TabSelected(TabView),
+    // --- Control manual y paneles ---
+    KeyPressed(char),
+    KeyReleased(char),
+    /// Tick rápido que recomputa y envía el comando manual mientras está activo.
+    ManualTick,
+    ToggleManual(bool),
+    SelectRobot(u32),
+    SelectTeam(u32),
+    RadioPortChanged(String),
+    RadioBaudChanged(String),
+    ToggleFrame,
+    ManualLinChanged(String),
+    ManualAngChanged(String),
+    ManualLinAccelChanged(String),
+    ManualAngAccelChanged(String),
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +197,9 @@ struct FieldSnapshotBuffer {
 impl FieldSnapshotBuffer {
     fn push(&mut self, update: StatusUpdate) -> Option<StatusUpdate> {
         match update {
-            StatusUpdate::Connected(_, _) | StatusUpdate::PacketReceived => Some(update),
+            StatusUpdate::Connected(_, _)
+            | StatusUpdate::PacketReceived
+            | StatusUpdate::TransportStatus(_) => Some(update),
             StatusUpdate::BallDetected(count) => {
                 self.ball_count = Some(count);
                 None
@@ -162,6 +269,30 @@ pub struct VisionGui {
     last_second: u64,
     current_second_count: u64,
     tracker_enabled: bool,
+    // --- Control manual / radio / telemetría ---
+    num_robots: usize,
+    selected_robot: u32,
+    selected_team: u32,
+    manual_enabled: bool,
+    manual_frame: FrameMode,
+    manual_lin_ms: f64,
+    manual_ang_rads: f64,
+    manual_lin_str: String,
+    manual_ang_str: String,
+    manual_lin_accel: f64,
+    manual_ang_accel: f64,
+    manual_lin_accel_str: String,
+    manual_ang_accel_str: String,
+    /// Último comando (vx, vy, omega) enviado — base de la rampa de aceleración.
+    applied_cmd: (f64, f64, f64),
+    keys: HashSet<char>,
+    manual_tx: Option<mpsc::Sender<ManualCommand>>,
+    wheel_history: VecDeque<(f64, i16, i16)>,
+    wheel_chart_cache: Cache,
+    transport_connected: Option<bool>,
+    radio_target_label: String,
+    radio_port: String,
+    radio_baud: String,
 }
 
 #[derive(Debug, Clone)]
@@ -170,18 +301,31 @@ pub enum ConfigUpdate {
     ToggleTracker(bool), // true = habilitado, false = deshabilitado
 }
 
+/// Parámetros de arranque de la GUI. Agrupa los canales y la config inicial para
+/// no explotar la aridad de `run_gui`/`new`.
+pub struct GuiSetup {
+    pub ip: String,
+    pub port: u16,
+    pub config_tx: mpsc::Sender<ConfigUpdate>,
+    pub status_rx: mpsc::Receiver<StatusUpdate>,
+    pub motion_rx: mpsc::Receiver<Vec<RobotMotionDebug>>,
+    /// Canal de comandos manuales GUI→control loop.
+    pub manual_tx: Option<mpsc::Sender<ManualCommand>>,
+    pub num_robots: usize,
+    /// Equipo propio inicial (0 = azul, 1 = amarillo).
+    pub own_team: u32,
+    /// Etiqueta del transporte activo (p. ej. "BaseStation", "FiraSim").
+    pub radio_target_label: String,
+    pub radio_port: String,
+    pub radio_baud: String,
+}
+
 impl VisionGui {
-    fn new(
-        ip: String,
-        port: u16,
-        config_tx: mpsc::Sender<ConfigUpdate>,
-        status_rx: mpsc::Receiver<StatusUpdate>,
-        motion_rx: mpsc::Receiver<Vec<RobotMotionDebug>>,
-    ) -> (Self, Task<Message>) {
+    fn new(setup: GuiSetup) -> (Self, Task<Message>) {
         (
             VisionGui {
-                vision_ip: ip,
-                vision_port: port.to_string(),
+                vision_ip: setup.ip,
+                vision_port: setup.port.to_string(),
                 connected: false,
                 packet_count: 0,
                 packet_frequency: 0.0,
@@ -192,15 +336,37 @@ impl VisionGui {
                 motion_debug: HashMap::new(),
                 field_cache: Cache::default(),
                 chart_cache: Cache::default(),
-                config_tx: Some(config_tx),
-                status_rx: Arc::new(Mutex::new(Some(status_rx))),
-                motion_rx: Arc::new(Mutex::new(Some(motion_rx))),
+                config_tx: Some(setup.config_tx),
+                status_rx: Arc::new(Mutex::new(Some(setup.status_rx))),
+                motion_rx: Arc::new(Mutex::new(Some(setup.motion_rx))),
                 active_tab: TabView::Vision,
                 packet_history: VecDeque::new(),
                 start_time: Instant::now(),
                 last_second: 0,
                 current_second_count: 0,
                 tracker_enabled: true,
+                num_robots: setup.num_robots.max(1),
+                selected_robot: 0,
+                selected_team: setup.own_team,
+                manual_enabled: false,
+                manual_frame: FrameMode::Robot,
+                manual_lin_ms: MANUAL_LIN_MS_DEFAULT,
+                manual_ang_rads: MANUAL_ANG_RADS_DEFAULT,
+                manual_lin_str: format!("{MANUAL_LIN_MS_DEFAULT}"),
+                manual_ang_str: format!("{MANUAL_ANG_RADS_DEFAULT}"),
+                manual_lin_accel: MANUAL_LIN_ACCEL,
+                manual_ang_accel: MANUAL_ANG_ACCEL,
+                manual_lin_accel_str: format!("{MANUAL_LIN_ACCEL}"),
+                manual_ang_accel_str: format!("{MANUAL_ANG_ACCEL}"),
+                applied_cmd: (0.0, 0.0, 0.0),
+                keys: HashSet::new(),
+                manual_tx: setup.manual_tx,
+                wheel_history: VecDeque::new(),
+                wheel_chart_cache: Cache::default(),
+                transport_connected: None,
+                radio_target_label: setup.radio_target_label,
+                radio_port: setup.radio_port,
+                radio_baud: setup.radio_baud,
             },
             Task::none(),
         )
@@ -282,6 +448,9 @@ impl VisionGui {
                         self.ball = Some(Ball { position });
                         self.field_cache.clear();
                     }
+                    StatusUpdate::TransportStatus(ok) => {
+                        self.transport_connected = Some(ok);
+                    }
                 }
             }
             Message::FieldSnapshot(snapshot) => {
@@ -307,7 +476,16 @@ impl VisionGui {
                 }
             }
             Message::MotionUpdate(updates) => {
+                let t = self.start_time.elapsed().as_secs_f64();
                 for m in updates {
+                    // Telemetría de rueda del robot seleccionado.
+                    if m.team == self.selected_team && m.id == self.selected_robot {
+                        self.wheel_history.push_back((t, m.wheel_l_mm_s, m.wheel_r_mm_s));
+                        while self.wheel_history.len() > WHEEL_HISTORY_MAX {
+                            self.wheel_history.pop_front();
+                        }
+                        self.wheel_chart_cache.clear();
+                    }
                     self.motion_debug.insert((m.team, m.id), m);
                 }
                 self.field_cache.clear();
@@ -365,6 +543,129 @@ impl VisionGui {
                 // Enviar comando al módulo Vision
                 if let Some(tx) = &self.config_tx {
                     let _ = tx.try_send(ConfigUpdate::ToggleTracker(enabled));
+                }
+            }
+            Message::KeyPressed(c) => {
+                if self.manual_enabled {
+                    self.keys.insert(c);
+                }
+            }
+            Message::KeyReleased(c) => {
+                self.keys.remove(&c);
+            }
+            Message::ToggleManual(enabled) => {
+                self.manual_enabled = enabled;
+                if !enabled {
+                    self.keys.clear();
+                    // Resetear la rampa para no arrancar con inercia la próxima vez.
+                    self.applied_cmd = (0.0, 0.0, 0.0);
+                }
+            }
+            Message::SelectRobot(id) => {
+                if id != self.selected_robot {
+                    self.selected_robot = id;
+                    // Reiniciar la serie de telemetría para no mezclar robots.
+                    self.wheel_history.clear();
+                    self.wheel_chart_cache.clear();
+                    self.field_cache.clear();
+                }
+            }
+            Message::SelectTeam(team) => {
+                if team != self.selected_team {
+                    self.selected_team = team;
+                    self.wheel_history.clear();
+                    self.wheel_chart_cache.clear();
+                    self.field_cache.clear();
+                }
+            }
+            Message::ManualTick => {
+                // Mientras el modo manual está activo, recomputar el objetivo,
+                // aplicar la rampa y reenviar (incluso cero al soltar teclas) para
+                // mantener el comando vigente en el loop.
+                if self.manual_enabled
+                    && let Some(tx) = &self.manual_tx
+                {
+                    // Orientación del robot seleccionado (para el marco robot).
+                    let theta = self
+                        .robots
+                        .get(&(self.selected_team, self.selected_robot))
+                        .map(|r| r.orientation as f64)
+                        .unwrap_or(0.0);
+                    let (tx_v, ty_v, tw_v) = manual_world_target(
+                        &self.keys,
+                        self.manual_frame,
+                        self.manual_lin_ms,
+                        self.manual_ang_rads,
+                        theta,
+                    );
+                    // Rampa por componente (tasas ajustables desde la GUI).
+                    let lin_step = self.manual_lin_accel * MANUAL_TICK_DT;
+                    let ang_step = self.manual_ang_accel * MANUAL_TICK_DT;
+                    let (cx, cy, co) = self.applied_cmd;
+                    self.applied_cmd = (
+                        slew(cx, tx_v, lin_step),
+                        slew(cy, ty_v, lin_step),
+                        slew(co, tw_v, ang_step),
+                    );
+                    let (vx, vy, omega) = self.applied_cmd;
+                    let _ = tx.try_send(ManualCommand {
+                        team: self.selected_team as i32,
+                        id: self.selected_robot as i32,
+                        vx,
+                        vy,
+                        omega,
+                    });
+                }
+            }
+            Message::ToggleFrame => {
+                self.manual_frame = match self.manual_frame {
+                    FrameMode::World => FrameMode::Robot,
+                    FrameMode::Robot => FrameMode::World,
+                };
+            }
+            Message::ManualLinChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v >= 0.0
+                {
+                    self.manual_lin_ms = v;
+                }
+                self.manual_lin_str = s;
+            }
+            Message::ManualAngChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v >= 0.0
+                {
+                    self.manual_ang_rads = v;
+                }
+                self.manual_ang_str = s;
+            }
+            Message::ManualLinAccelChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v > 0.0
+                {
+                    self.manual_lin_accel = v;
+                }
+                self.manual_lin_accel_str = s;
+            }
+            Message::ManualAngAccelChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v > 0.0
+                {
+                    self.manual_ang_accel = v;
+                }
+                self.manual_ang_accel_str = s;
+            }
+            Message::RadioPortChanged(port) => {
+                self.radio_port = port;
+            }
+            Message::RadioBaudChanged(baud) => {
+                // Validación mínima: aceptar solo dígitos (o vacío mientras se edita).
+                if baud.is_empty() || baud.chars().all(|c| c.is_ascii_digit()) {
+                    self.radio_baud = baud;
                 }
             }
         }
@@ -445,11 +746,127 @@ impl VisionGui {
         let tick_subscription =
             iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::Tick);
 
-        Subscription::batch([status_subscription, motion_subscription, tick_subscription])
+        // Control manual: teclas presionadas/soltadas + tick rápido de reenvío.
+        let key_press = iced::keyboard::on_key_press(|key, _mods| {
+            key_to_char(&key).map(Message::KeyPressed)
+        });
+        let key_release = iced::keyboard::on_key_release(|key, _mods| {
+            key_to_char(&key).map(Message::KeyReleased)
+        });
+        let manual_tick =
+            iced::time::every(std::time::Duration::from_millis(33)).map(|_| Message::ManualTick);
+
+        Subscription::batch([
+            status_subscription,
+            motion_subscription,
+            tick_subscription,
+            key_press,
+            key_release,
+            manual_tick,
+        ])
     }
 
     fn theme(&self) -> Theme {
         Theme::Dark
+    }
+
+    /// Fila de controles de control manual: toggle, selector de robot y de equipo.
+    fn manual_controls_view(&self) -> Element<'_, Message> {
+        let manual_btn = button(
+            text(if self.manual_enabled {
+                "Manual: ON"
+            } else {
+                "Manual: OFF"
+            })
+            .size(13),
+        )
+        .padding([4, 10])
+        .style(if self.manual_enabled {
+            button::primary
+        } else {
+            button::secondary
+        })
+        .on_press(Message::ToggleManual(!self.manual_enabled));
+
+        let max_id = self.num_robots.saturating_sub(1) as u32;
+        let robot_dec = button(text("-").size(14)).padding([4, 10]).on_press(
+            Message::SelectRobot(self.selected_robot.saturating_sub(1)),
+        );
+        let robot_inc = button(text("+").size(14)).padding([4, 10]).on_press(
+            Message::SelectRobot((self.selected_robot + 1).min(max_id)),
+        );
+
+        let team_btn = button(
+            text(if self.selected_team == 0 {
+                "Equipo: Azul"
+            } else {
+                "Equipo: Amarillo"
+            })
+            .size(13),
+        )
+        .padding([4, 10])
+        .on_press(Message::SelectTeam(1 - self.selected_team));
+
+        let frame_btn = button(
+            text(match self.manual_frame {
+                FrameMode::World => "Marco: Mundo",
+                FrameMode::Robot => "Marco: Robot",
+            })
+            .size(13),
+        )
+        .padding([4, 10])
+        .on_press(Message::ToggleFrame);
+
+        let help = match self.manual_frame {
+            FrameMode::World => "(W/S=±Y, A/D=±X, Q/E girar)",
+            FrameMode::Robot => "(W/S adelante/atrás, A/D girar)",
+        };
+
+        let top = row![
+            manual_btn,
+            text("Robot:").size(13),
+            robot_dec,
+            text(format!("{}", self.selected_robot)).size(14),
+            robot_inc,
+            team_btn,
+            frame_btn,
+            text(help).size(11),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let scales = row![
+            text("Lin máx (m/s):").size(12),
+            text_input("0.5", &self.manual_lin_str)
+                .on_input(Message::ManualLinChanged)
+                .size(12)
+                .width(Length::Fixed(70.0)),
+            text("Ang máx (rad/s):").size(12),
+            text_input("3.0", &self.manual_ang_str)
+                .on_input(Message::ManualAngChanged)
+                .size(12)
+                .width(Length::Fixed(70.0)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let accels = row![
+            text("Accel lin (m/s²):").size(12),
+            text_input("2.0", &self.manual_lin_accel_str)
+                .on_input(Message::ManualLinAccelChanged)
+                .size(12)
+                .width(Length::Fixed(70.0)),
+            text("Accel ang (rad/s²):").size(12),
+            text_input("12.0", &self.manual_ang_accel_str)
+                .on_input(Message::ManualAngAccelChanged)
+                .size(12)
+                .width(Length::Fixed(70.0)),
+            text("(↑ para giro más snappy)").size(11),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        column![top, scales, accels].spacing(6).into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -472,7 +889,16 @@ impl VisionGui {
             })
             .on_press(Message::TabSelected(TabView::Robots));
 
-        let tabs = row![vision_button, robots_button]
+        let radio_button = button(text("Radio").size(14))
+            .padding([8, 16])
+            .style(if self.active_tab == TabView::Radio {
+                button::primary
+            } else {
+                button::secondary
+            })
+            .on_press(Message::TabSelected(TabView::Radio));
+
+        let tabs = row![vision_button, robots_button, radio_button]
             .spacing(5)
             .padding([8, 16]);
 
@@ -491,20 +917,47 @@ impl VisionGui {
                 self.tracker_enabled,
             ),
             TabView::Robots => {
+                let selected = if self.manual_enabled {
+                    Some((self.selected_team, self.selected_robot))
+                } else {
+                    None
+                };
                 let field = Canvas::new(FieldCanvas {
                     robots: &self.robots,
                     ball: &self.ball,
                     motion: &self.motion_debug,
                     cache: &self.field_cache,
+                    selected,
                 })
                 .width(Length::Fill)
                 .height(Length::Fill);
 
-                container(field)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
+                let controls = self.manual_controls_view();
+
+                let chart = Canvas::new(WheelChart {
+                    history: &self.wheel_history,
+                    cache: &self.wheel_chart_cache,
+                })
+                .width(Length::Fill)
+                .height(Length::Fixed(160.0));
+
+                column![
+                    container(field).width(Length::Fill).height(Length::Fill),
+                    controls,
+                    chart,
+                ]
+                .spacing(8)
+                .padding(8)
+                .into()
             }
+            TabView::Radio => radio_panel::view(
+                &self.radio_target_label,
+                &self.radio_port,
+                &self.radio_baud,
+                self.selected_team,
+                self.transport_connected,
+                self.packet_frequency,
+            ),
         };
 
         let main_content = column![tabs, content]
@@ -518,17 +971,11 @@ impl VisionGui {
     }
 }
 
-pub fn run_gui(
-    ip: String,
-    port: u16,
-    config_tx: mpsc::Sender<ConfigUpdate>,
-    status_rx: mpsc::Receiver<StatusUpdate>,
-    motion_rx: mpsc::Receiver<Vec<RobotMotionDebug>>,
-) -> iced::Result {
+pub fn run_gui(setup: GuiSetup) -> iced::Result {
     iced::application(VisionGui::title, VisionGui::update, VisionGui::view)
         .subscription(VisionGui::subscription)
         .theme(VisionGui::theme)
-        .run_with(move || VisionGui::new(ip, port, config_tx, status_rx, motion_rx))
+        .run_with(move || VisionGui::new(setup))
 }
 
 #[cfg(test)]
@@ -580,5 +1027,103 @@ mod tests {
     fn field_snapshot_buffer_returns_none_when_empty() {
         let mut buffer = FieldSnapshotBuffer::default();
         assert!(buffer.drain_snapshot().is_none());
+    }
+
+    /// 1.4 — Mapeo marco mundo determinista y escalado.
+    #[test]
+    fn world_frame_mapping_is_deterministic_and_scaled() {
+        let lin = MANUAL_LIN_MS_DEFAULT;
+        let ang = MANUAL_ANG_RADS_DEFAULT;
+
+        // Avance (W): +Y = lin, sin giro.
+        let mut keys = HashSet::new();
+        keys.insert('w');
+        let (vx, vy, omega) = manual_world_target(&keys, FrameMode::World, lin, ang, 0.0);
+        assert_eq!(vx, 0.0);
+        assert_eq!(vy, lin);
+        assert_eq!(omega, 0.0);
+
+        // Escala distinta afecta la magnitud.
+        let (_, vy2, _) = manual_world_target(&keys, FrameMode::World, 1.2, ang, 0.0);
+        assert_eq!(vy2, 1.2);
+
+        // Q → CCW (omega > 0).
+        let mut k = HashSet::new();
+        k.insert('q');
+        assert!(manual_world_target(&k, FrameMode::World, lin, ang, 0.0).2 > 0.0);
+
+        // Teclas opuestas se cancelan; sin teclas = freno.
+        let mut opp = HashSet::new();
+        for c in ['w', 's', 'a', 'd'] {
+            opp.insert(c);
+        }
+        assert_eq!(
+            manual_world_target(&opp, FrameMode::World, lin, ang, 0.0),
+            (0.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            manual_world_target(&HashSet::new(), FrameMode::World, lin, ang, 0.0),
+            (0.0, 0.0, 0.0)
+        );
+    }
+
+    /// 2.3 — Marco robot: avance según heading, A/D giran, sin NaN.
+    #[test]
+    fn robot_frame_converts_forward_by_heading() {
+        let lin = 0.5;
+        let ang = 3.0;
+        let mut w = HashSet::new();
+        w.insert('w');
+
+        // θ = 0 → avanza en +X.
+        let (vx, vy, _) = manual_world_target(&w, FrameMode::Robot, lin, ang, 0.0);
+        assert!((vx - 0.5).abs() < 1e-9);
+        assert!(vy.abs() < 1e-9);
+
+        // θ = π/2 → avanza en +Y.
+        let (vx2, vy2, _) =
+            manual_world_target(&w, FrameMode::Robot, lin, ang, std::f64::consts::FRAC_PI_2);
+        assert!(vx2.abs() < 1e-9);
+        assert!((vy2 - 0.5).abs() < 1e-9);
+
+        // A gira (omega > 0); todo finito.
+        let mut a = HashSet::new();
+        a.insert('a');
+        let (rx, ry, romega) = manual_world_target(&a, FrameMode::Robot, lin, ang, 1.234);
+        assert!(rx.is_finite() && ry.is_finite() && romega.is_finite());
+        assert!(romega > 0.0);
+    }
+
+    /// 3.5 — La rampa no sobrepasa, converge y decae hacia cero.
+    #[test]
+    fn slew_ramps_without_overshoot() {
+        // No sobrepasa el objetivo.
+        assert_eq!(slew(0.0, 1.0, 0.3), 0.3);
+        // Si el paso alcanza, aterriza exacto en el objetivo.
+        assert_eq!(slew(0.9, 1.0, 0.3), 1.0);
+        // Converge en pasos finitos.
+        let mut v = 0.0;
+        for _ in 0..100 {
+            v = slew(v, 1.0, 0.1);
+        }
+        assert!((v - 1.0).abs() < 1e-9);
+        // Decae hacia cero (frenado).
+        assert_eq!(slew(1.0, 0.0, 0.3), 0.7);
+    }
+
+    /// 4.5 — La ventana de telemetría descarta muestras viejas (misma lógica
+    /// que `Message::MotionUpdate`).
+    #[test]
+    fn wheel_history_respects_window() {
+        let mut hist: VecDeque<(f64, i16, i16)> = VecDeque::new();
+        for i in 0..(WHEEL_HISTORY_MAX + 50) {
+            hist.push_back((i as f64, i as i16, -(i as i16)));
+            while hist.len() > WHEEL_HISTORY_MAX {
+                hist.pop_front();
+            }
+        }
+        assert_eq!(hist.len(), WHEEL_HISTORY_MAX);
+        // Las 50 muestras más viejas fueron descartadas.
+        assert!(hist.front().unwrap().0 >= 50.0);
     }
 }

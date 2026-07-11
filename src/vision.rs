@@ -29,6 +29,9 @@ pub enum StatusUpdate {
     RobotsDetected(usize),
     RobotPosition(u32, u32, Vec2, f32), // id, team, position, orientation
     BallPosition(Vec2),
+    /// Estado de conexión del transporte de radio (lo emite el control loop, no
+    /// la visión). `true` = último envío OK, `false` = último envío falló.
+    TransportStatus(bool),
 }
 
 /// Log por cada robot azul enviado a la GUI (SSL). Desactivado por defecto; usar `[FieldAudit]` en main.
