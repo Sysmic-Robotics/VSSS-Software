@@ -12,6 +12,7 @@ use iced::{
     widget::{Canvas, button, column, container, row, text, text_input},
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -36,6 +37,9 @@ const MANUAL_ANG_ACCEL: f64 = 12.0;
 const MANUAL_TICK_DT: f64 = 0.033;
 /// Ventana de la telemetría de rueda (cantidad máxima de muestras retenidas).
 const WHEEL_HISTORY_MAX: usize = 300;
+/// Velocidad angular de Spin por defecto en la GUI (rad/s). Coincide con
+/// `SkillConfig::default().spin_omega`.
+const SPIN_OMEGA_DEFAULT: f64 = 20.0;
 
 /// Marco de referencia del control manual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +109,19 @@ pub fn slew(current: f64, target: f64, max_step: f64) -> f64 {
     } else {
         current + max_step * delta.signum()
     }
+}
+
+/// Para el runner de `Spin`: devuelve un target cuyo `x` lleva el signo de
+/// `(skill_target_x − robot_x)`, de modo que el sentido del giro dependa del lado
+/// del robot donde se clickeó. Empate/`0` → `+1` (siempre gira). `y = 0`.
+/// Función pura y testeable. Unidades: ambos en metros.
+pub fn spin_relative_target(skill_target_x: f32, robot_x_m: f32) -> Vec2 {
+    let sign = if skill_target_x - robot_x_m < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    Vec2::new(sign, 0.0)
 }
 
 /// Botón de selección de skill; resaltado si es la skill activa.
@@ -181,6 +198,9 @@ pub enum Message {
     ManualAngAccelChanged(String),
     SelectSkill(Option<SkillId>),
     FieldClicked(Vec2),
+    SpinOmegaChanged(String),
+    ToggleEstop,
+    EngageEstop,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +331,10 @@ pub struct VisionGui {
     /// Target de la skill activa (metros, marco mundo), fijado con click.
     skill_target: Vec2,
     skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
+    /// Velocidad angular de Spin (rad/s), tuneable en vivo.
+    spin_omega: f64,
+    spin_omega_str: String,
+    estop: Arc<AtomicBool>,
     wheel_history: VecDeque<(f64, i16, i16)>,
     wheel_chart_cache: Cache,
     transport_connected: Option<bool>,
@@ -337,6 +361,8 @@ pub struct GuiSetup {
     pub manual_tx: Option<mpsc::Sender<ManualCommand>>,
     /// Canal de skills de GUI GUI→control loop.
     pub skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
+    /// Flag de parada de emergencia compartido con el control loop.
+    pub estop: Arc<AtomicBool>,
     pub num_robots: usize,
     /// Equipo propio inicial (0 = azul, 1 = amarillo).
     pub own_team: u32,
@@ -390,6 +416,9 @@ impl VisionGui {
                 active_skill: None,
                 skill_target: Vec2::ZERO,
                 skill_tx: setup.skill_tx,
+                spin_omega: SPIN_OMEGA_DEFAULT,
+                spin_omega_str: format!("{SPIN_OMEGA_DEFAULT}"),
+                estop: setup.estop,
                 wheel_history: VecDeque::new(),
                 wheel_chart_cache: Cache::default(),
                 transport_connected: None,
@@ -649,11 +678,24 @@ impl VisionGui {
                 if !self.manual_enabled
                     && let (Some(skill), Some(tx)) = (self.active_skill, &self.skill_tx)
                 {
+                    // Spin: el sentido se elige relativo al robot (signo de
+                    // click.x − robot.x). Las demás skills usan el target tal cual.
+                    let target = if skill == SkillId::Spin {
+                        let robot_x_m = self
+                            .robots
+                            .get(&(self.selected_team, self.selected_robot))
+                            .map(|r| r.position.x / 1000.0)
+                            .unwrap_or(0.0);
+                        spin_relative_target(self.skill_target.x, robot_x_m)
+                    } else {
+                        self.skill_target
+                    };
                     let _ = tx.try_send(GuiSkillCommand {
                         team: self.selected_team as i32,
                         id: self.selected_robot as i32,
                         skill_id: skill,
-                        target: self.skill_target,
+                        target,
+                        spin_omega: self.spin_omega,
                     });
                 }
             }
@@ -709,6 +751,24 @@ impl VisionGui {
                     self.skill_target = world_m;
                     self.field_cache.clear();
                 }
+            }
+            Message::SpinOmegaChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v > 0.0
+                {
+                    self.spin_omega = v;
+                }
+                self.spin_omega_str = s;
+            }
+            Message::ToggleEstop => {
+                // Enclava/libera.
+                let now = self.estop.load(Ordering::Relaxed);
+                self.estop.store(!now, Ordering::Relaxed);
+            }
+            Message::EngageEstop => {
+                // Tecla de pánico: activar (idempotente).
+                self.estop.store(true, Ordering::Relaxed);
             }
             Message::RadioPortChanged(port) => {
                 self.radio_port = port;
@@ -799,6 +859,13 @@ impl VisionGui {
 
         // Control manual: teclas presionadas/soltadas + tick rápido de reenvío.
         let key_press = iced::keyboard::on_key_press(|key, _mods| {
+            // Espacio = parada de emergencia (tecla de pánico).
+            if matches!(
+                key,
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Space)
+            ) {
+                return Some(Message::EngageEstop);
+            }
             key_to_char(&key).map(Message::KeyPressed)
         });
         let key_release = iced::keyboard::on_key_release(|key, _mods| {
@@ -917,6 +984,25 @@ impl VisionGui {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
+        let estop_on = self.estop.load(Ordering::Relaxed);
+        let estop_btn = button(
+            text(if estop_on {
+                "⚠ ESTOP ACTIVO — liberar"
+            } else {
+                "STOP (Espacio)"
+            })
+            .size(15),
+        )
+        .padding([6, 16])
+        .style(if estop_on {
+            button::secondary
+        } else {
+            button::danger
+        })
+        .on_press(Message::ToggleEstop);
+
+        let estop_row = row![estop_btn].spacing(8).align_y(iced::Alignment::Center);
+
         let skills = row![
             text("Skill:").size(12),
             skill_button("Ninguna", None, self.active_skill),
@@ -924,12 +1010,19 @@ impl VisionGui {
             skill_button("FacePoint", Some(SkillId::FacePoint), self.active_skill),
             skill_button("ChaseBall", Some(SkillId::ChaseBall), self.active_skill),
             skill_button("Spin", Some(SkillId::Spin), self.active_skill),
-            text("(click en la cancha = target)").size(11),
+            text("Spin ω (rad/s):").size(12),
+            text_input("20", &self.spin_omega_str)
+                .on_input(Message::SpinOmegaChanged)
+                .size(12)
+                .width(Length::Fixed(60.0)),
+            text("(click = target/lado)").size(11),
         ]
         .spacing(6)
         .align_y(iced::Alignment::Center);
 
-        column![top, scales, accels, skills].spacing(6).into()
+        column![estop_row, top, scales, accels, skills]
+            .spacing(6)
+            .into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1173,6 +1266,19 @@ mod tests {
         assert!((v - 1.0).abs() < 1e-9);
         // Decae hacia cero (frenado).
         assert_eq!(slew(1.0, 0.0, 0.3), 0.7);
+    }
+
+    /// Spin en el runner: el signo del target depende del lado del robot.
+    #[test]
+    fn spin_relative_sign_by_side() {
+        // Click a la derecha del robot (x mayor) → +1 (CCW).
+        assert_eq!(spin_relative_target(0.5, 0.2).x, 1.0);
+        // Click a la izquierda (x menor) → -1 (CW).
+        assert_eq!(spin_relative_target(-0.5, 0.2).x, -1.0);
+        // Empate → +1 determinista (siempre gira).
+        assert_eq!(spin_relative_target(0.2, 0.2).x, 1.0);
+        // y siempre 0 (giro puro).
+        assert_eq!(spin_relative_target(0.5, 0.0).y, 0.0);
     }
 
     /// 4.5 — La ventana de telemetría descarta muestras viejas (misma lógica

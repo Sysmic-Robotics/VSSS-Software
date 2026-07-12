@@ -136,6 +136,15 @@ impl SkillCatalog {
         &self.config
     }
 
+    /// Override en vivo de la velocidad angular de `Spin` para un robot puntual.
+    /// Pensado para el runner de la GUI (tuneo de bring-up); no altera el
+    /// `SkillConfig` por defecto del catálogo. No-op si `robot_id` fuera de rango.
+    pub fn set_spin_omega_for(&mut self, robot_id: usize, omega_max: f64) {
+        if let Some(spin) = self.spin.get_mut(robot_id) {
+            spin.omega_max = omega_max;
+        }
+    }
+
     /// Despacha el skill seleccionado para el robot indicado y devuelve
     /// el `MotionCommand` resultante.
     ///

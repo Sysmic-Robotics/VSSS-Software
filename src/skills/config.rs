@@ -42,7 +42,11 @@ impl Default for SkillConfig {
             control_kp: 3.0,
             control_ki: 0.08,
             control_kd: 0.20,
-            spin_omega: 2.0,
+            // Tiro por giro: magnitud alta para que el cuerpo impulse la pelota
+            // (el diff-drive no tiene pateador). Queda holgada bajo el clamp de
+            // rueda (±1500 mm/s ≈ 42 rad/s en giro puro). CONTRATO RL: si cambia,
+            // subir la versión del catálogo y reentrenar. (era 2.0)
+            spin_omega: 20.0,
         }
     }
 }
@@ -52,11 +56,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_inside_motion_limits() {
-        // El spin no debe pedir más velocidad angular que el límite duro
-        // que motion impone por defecto (3.0 rad/s en MotionConfig).
+    fn spin_omega_within_wheel_clamp() {
+        // Spin no pasa por el clamp angular de Motion (lo ignora), así que el
+        // límite real es el clamp de rueda de la base: en giro puro cada rueda
+        // va a `omega · WHEEL_BASE/2 · 1000` mm/s y no debe superar ±1500.
+        const WHEEL_BASE_M: f64 = 0.07; // igual que radio::base_station::WHEEL_BASE_M
+        const MAX_WHEEL_MM_S: f64 = 1500.0;
         let cfg = SkillConfig::default();
-        assert!(cfg.spin_omega.abs() <= 3.0);
+        let wheel_mm_s = cfg.spin_omega.abs() * WHEEL_BASE_M / 2.0 * 1000.0;
+        assert!(
+            wheel_mm_s <= MAX_WHEEL_MM_S,
+            "spin_omega={} → {} mm/s excede el clamp de rueda",
+            cfg.spin_omega,
+            wheel_mm_s
+        );
     }
 
     #[test]

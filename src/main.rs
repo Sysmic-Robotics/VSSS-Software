@@ -84,6 +84,7 @@ fn run_with_gui() {
     let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
     let (skill_tx, skill_rx) = mpsc::channel::<GuiSkillCommand>(32);
+    let estop = Arc::new(AtomicBool::new(false));
 
     let source = VisionSource::from_env();
     let ip = source.multicast_ip().to_string();
@@ -95,9 +96,12 @@ fn run_with_gui() {
         std::env::var("VSSL_BASESTATION_DEVICE").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
     let radio_baud = std::env::var("VSSL_BASESTATION_BAUD").unwrap_or_else(|_| "115200".to_string());
 
+    let estop_loop = estop.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(Some((status_tx, motion_tx, manual_rx, skill_rx))));
+        rt.block_on(async_main(Some((
+            status_tx, motion_tx, manual_rx, skill_rx, estop_loop,
+        ))));
     });
 
     let setup = GUI::GuiSetup {
@@ -108,6 +112,7 @@ fn run_with_gui() {
         motion_rx,
         manual_tx: Some(manual_tx),
         skill_tx: Some(skill_tx),
+        estop,
         num_robots: NUM_ROBOTS,
         own_team: OWN_TEAM as u32,
         radio_target_label,
@@ -135,6 +140,7 @@ type GuiChannelBundle = (
     mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
     mpsc::Receiver<ManualCommand>,
     mpsc::Receiver<GuiSkillCommand>,
+    Arc<AtomicBool>,
 );
 
 async fn async_main(gui_channels: Option<GuiChannelBundle>) {
@@ -176,12 +182,15 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         vision_timeout: None,
     };
 
-    let gui = gui_channels.map(|(status_tx, motion_tx, manual_rx, skill_rx)| GuiChannels {
-        status_tx,
-        motion_tx,
-        manual_rx: Some(manual_rx),
-        skill_rx: Some(skill_rx),
-    });
+    let gui = gui_channels.map(
+        |(status_tx, motion_tx, manual_rx, skill_rx, estop)| GuiChannels {
+            status_tx,
+            motion_tx,
+            manual_rx: Some(manual_rx),
+            skill_rx: Some(skill_rx),
+            estop: Some(estop),
+        },
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
 

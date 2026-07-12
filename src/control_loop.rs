@@ -143,6 +143,9 @@ pub struct GuiSkillCommand {
     pub id: i32,
     pub skill_id: SkillId,
     pub target: Vec2,
+    /// Override en vivo de la velocidad angular de `Spin` (rad/s). Ignorado por
+    /// las otras skills. Permite tunear el tiro por giro desde la GUI.
+    pub spin_omega: f64,
 }
 
 /// Cuántos ticks (a 60 Hz) se mantiene vigente un comando manual/skill sin refresco.
@@ -159,6 +162,35 @@ pub struct GuiChannels {
     pub manual_rx: Option<mpsc::Receiver<ManualCommand>>,
     /// Canal opcional de skills de GUI GUI→loop. `None` = sin runner de skills.
     pub skill_rx: Option<mpsc::Receiver<GuiSkillCommand>>,
+    /// Flag opcional de parada de emergencia compartido con la GUI. Si está
+    /// activo, el loop comanda cero a todo el equipo propio. `None` = sin parada.
+    pub estop: Option<Arc<AtomicBool>>,
+}
+
+/// Construye comandos de velocidad cero para todos los robots activos del equipo
+/// propio (usado por la parada de emergencia y como base del stop de cierre).
+fn zero_commands_for_active_team(
+    world: &World,
+    own_team: i32,
+) -> (Vec<MotionCommand>, Vec<Option<Vec2>>) {
+    let team_robots = if own_team == 0 {
+        world.get_blue_team_active()
+    } else {
+        world.get_yellow_team_active()
+    };
+    let cmds: Vec<MotionCommand> = team_robots
+        .iter()
+        .map(|r| MotionCommand {
+            id: r.id,
+            team: r.team,
+            vx: 0.0,
+            vy: 0.0,
+            omega: 0.0,
+            orientation: r.orientation,
+        })
+        .collect();
+    let tgts = vec![None; cmds.len()];
+    (cmds, tgts)
 }
 
 /// Mismo dispatcher que tenía `main.rs` pre-refactor (`dispatch_choices`).
@@ -292,9 +324,15 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(true));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (status_tx, motion_tx, mut manual_rx, mut skill_rx) = match gui {
-        Some(g) => (Some(g.status_tx), Some(g.motion_tx), g.manual_rx, g.skill_rx),
-        None => (None, None, None, None),
+    let (status_tx, motion_tx, mut manual_rx, mut skill_rx, estop) = match gui {
+        Some(g) => (
+            Some(g.status_tx),
+            Some(g.motion_tx),
+            g.manual_rx,
+            g.skill_rx,
+            g.estop,
+        ),
+        None => (None, None, None, None, None),
     };
 
     // Estado de comandos manuales vigentes por (team, id) con el tick de último
@@ -438,19 +476,40 @@ pub async fn run_control_loop(
                 .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
         }
 
+        // Parada de emergencia: prevalece sobre coach/manual/skills.
+        let estop_engaged = estop
+            .as_ref()
+            .map(|e| e.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if estop_engaged {
+            manual_state.clear();
+            skill_state.clear();
+        }
+
         let (commands, targets, applied_choices) = {
             let world_guard = world.read().await;
-            let mut choices = decider.decide(tick_counter, &world_guard);
-            apply_gui_skill_overrides(&mut choices, &skill_state, config.own_team);
-            let (mut cmds, mut tgts, applied) = dispatch_choices(
-                &choices,
-                &mut catalog,
-                &world_guard,
-                &motion,
-                config.own_team,
-            );
-            apply_manual_overrides(&mut cmds, &mut tgts, &manual_state, &world_guard);
-            (cmds, tgts, applied)
+            if estop_engaged {
+                let (z_cmds, z_tgts) = zero_commands_for_active_team(&world_guard, config.own_team);
+                (z_cmds, z_tgts, Vec::new())
+            } else {
+                // Override en vivo de la velocidad de Spin desde la GUI (por robot).
+                for ((team, id), (cmd, _)) in &skill_state {
+                    if *team == config.own_team && cmd.skill_id == SkillId::Spin {
+                        catalog.set_spin_omega_for(*id as usize, cmd.spin_omega);
+                    }
+                }
+                let mut choices = decider.decide(tick_counter, &world_guard);
+                apply_gui_skill_overrides(&mut choices, &skill_state, config.own_team);
+                let (mut cmds, mut tgts, applied) = dispatch_choices(
+                    &choices,
+                    &mut catalog,
+                    &world_guard,
+                    &motion,
+                    config.own_team,
+                );
+                apply_manual_overrides(&mut cmds, &mut tgts, &manual_state, &world_guard);
+                (cmds, tgts, applied)
+            }
         };
         tick_counter = tick_counter.wrapping_add(1);
 
@@ -756,6 +815,7 @@ mod tests {
                     id: 1,
                     skill_id: SkillId::Spin,
                     target: Vec2::new(0.5, 0.0),
+                    spin_omega: 20.0,
                 },
                 0,
             ),
@@ -768,6 +828,7 @@ mod tests {
                     id: 2,
                     skill_id: SkillId::ChaseBall,
                     target: Vec2::ZERO,
+                    spin_omega: 20.0,
                 },
                 0,
             ),
@@ -780,6 +841,7 @@ mod tests {
                     id: 0,
                     skill_id: SkillId::FacePoint,
                     target: Vec2::ZERO,
+                    spin_omega: 20.0,
                 },
                 0,
             ),
@@ -796,6 +858,24 @@ mod tests {
         // Robot 2 insertado (ChaseBall).
         let c2 = choices.iter().find(|c| c.robot_id == 2).unwrap();
         assert_eq!(c2.skill_id, SkillId::ChaseBall);
+    }
+
+    /// 1.4 — La parada produce comando cero por cada robot activo del equipo propio.
+    #[test]
+    fn estop_zeroes_active_team() {
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
+        world.update_robot(2, 0, Vec2::new(0.1, 0.1), 1.0, Vec2::ZERO, 0.0);
+        // Robot del otro equipo no debe aparecer.
+        world.update_robot(1, 1, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
+
+        let (cmds, tgts) = zero_commands_for_active_team(&world, 0);
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(tgts.len(), 2);
+        for c in &cmds {
+            assert_eq!((c.vx, c.vy, c.omega), (0.0, 0.0, 0.0));
+            assert_eq!(c.team, 0);
+        }
     }
 
     /// Smoke test: `run_control_loop` con `FixedSkillDecider` y `MockTransport`.

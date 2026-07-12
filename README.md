@@ -59,6 +59,11 @@ bring-up del robot real (ver `docs/bringup_robot_real.md`):
 - El robot seleccionado se resalta con un halo naranjo, y el chart inferior grafica sus
   velocidades de rueda comandadas **L/R (mm/s)** en el tiempo.
 
+**Parada de emergencia:** el botón rojo **STOP** (o la tecla **Espacio**) enclava una
+parada que comanda velocidad cero a todos los robots del equipo propio y prevalece sobre
+coach, control manual y skills. Se libera con el mismo botón. El watchdog del firmware
+(200 ms) queda como red final.
+
 **Runner de skills (validador visual):** en la fila de control eliges una de las 4 skills
 (`GoTo`, `FacePoint`, `ChaseBall`, `Spin`) o **Ninguna**, y haces **click en la cancha**
 para fijar el target (marcador verde). La skill se inyecta como `SkillChoice` al mismo
