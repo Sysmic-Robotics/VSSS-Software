@@ -19,8 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use crate::control_loop::{GuiSkillCommand, ManualCommand};
+use crate::control_loop::{GuiSkillCommand, HeadingPid, ManualCommand};
 use crate::skills::SkillId;
+use serde::{Deserialize, Serialize};
 use field::FieldCanvas;
 use wheel_chart::WheelChart;
 pub use crate::vision::StatusUpdate;
@@ -42,6 +43,23 @@ const WHEEL_HISTORY_MAX: usize = 300;
 /// Velocidad angular de Spin por defecto en la GUI (rad/s). Coincide con
 /// `SkillConfig::default().spin_omega`.
 const SPIN_OMEGA_DEFAULT: f64 = 20.0;
+/// Ganancias PID de heading por defecto (coinciden con `SkillConfig::default`).
+const PID_KP_DEFAULT: f64 = 3.0;
+const PID_KI_DEFAULT: f64 = 0.08;
+const PID_KD_DEFAULT: f64 = 0.20;
+
+/// Conjunto de parámetros de tuning, serializable a JSON para presets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuningPreset {
+    pub lin_ms: f64,
+    pub ang_rads: f64,
+    pub lin_accel: f64,
+    pub ang_accel: f64,
+    pub spin_omega: f64,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
 
 /// Marco de referencia del control manual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,15 +188,17 @@ const GUI_FIELD_UPDATE_INTERVAL_MS: u64 = 50;
 pub enum Section {
     Control,
     Skills,
+    Tuning,
     Radio,
     Vision,
     Telemetry,
 }
 
 impl Section {
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::Control,
         Section::Skills,
+        Section::Tuning,
         Section::Radio,
         Section::Vision,
         Section::Telemetry,
@@ -187,6 +207,7 @@ impl Section {
         match self {
             Section::Control => "Control",
             Section::Skills => "Skills",
+            Section::Tuning => "Tuning",
             Section::Radio => "Radio",
             Section::Vision => "Visión",
             Section::Telemetry => "Telemetría",
@@ -223,6 +244,12 @@ pub enum Message {
     SelectSkill(Option<SkillId>),
     FieldClicked(Vec2),
     SpinOmegaChanged(String),
+    PidKpChanged(String),
+    PidKiChanged(String),
+    PidKdChanged(String),
+    PresetNameChanged(String),
+    SavePreset,
+    LoadPreset,
     ToggleEstop,
     EngageEstop,
 }
@@ -358,6 +385,18 @@ pub struct VisionGui {
     /// Velocidad angular de Spin (rad/s), tuneable en vivo.
     spin_omega: f64,
     spin_omega_str: String,
+    /// PID de heading tuneable en vivo.
+    pid_kp: f64,
+    pid_ki: f64,
+    pid_kd: f64,
+    pid_kp_str: String,
+    pid_ki_str: String,
+    pid_kd_str: String,
+    pid_tx: Option<mpsc::Sender<HeadingPid>>,
+    /// Nombre de archivo para presets de tuning.
+    preset_name: String,
+    /// Mensaje breve de estado de guardar/cargar preset.
+    preset_status: String,
     estop: Arc<AtomicBool>,
     wheel_history: VecDeque<(f64, i16, i16)>,
     wheel_chart_cache: Cache,
@@ -385,6 +424,8 @@ pub struct GuiSetup {
     pub manual_tx: Option<mpsc::Sender<ManualCommand>>,
     /// Canal de skills de GUI GUI→control loop.
     pub skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
+    /// Canal de tuneo del PID de heading GUI→control loop.
+    pub pid_tx: Option<mpsc::Sender<HeadingPid>>,
     /// Flag de parada de emergencia compartido con el control loop.
     pub estop: Arc<AtomicBool>,
     pub num_robots: usize,
@@ -443,6 +484,15 @@ impl VisionGui {
                 skill_tx: setup.skill_tx,
                 spin_omega: SPIN_OMEGA_DEFAULT,
                 spin_omega_str: format!("{SPIN_OMEGA_DEFAULT}"),
+                pid_kp: PID_KP_DEFAULT,
+                pid_ki: PID_KI_DEFAULT,
+                pid_kd: PID_KD_DEFAULT,
+                pid_kp_str: format!("{PID_KP_DEFAULT}"),
+                pid_ki_str: format!("{PID_KI_DEFAULT}"),
+                pid_kd_str: format!("{PID_KD_DEFAULT}"),
+                pid_tx: setup.pid_tx,
+                preset_name: "tuning.json".to_string(),
+                preset_status: String::new(),
                 estop: setup.estop,
                 wheel_history: VecDeque::new(),
                 wheel_chart_cache: Cache::default(),
@@ -788,6 +838,54 @@ impl VisionGui {
                 }
                 self.spin_omega_str = s;
             }
+            Message::PidKpChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v >= 0.0
+                {
+                    self.pid_kp = v;
+                    self.send_pid();
+                }
+                self.pid_kp_str = s;
+            }
+            Message::PidKiChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v >= 0.0
+                {
+                    self.pid_ki = v;
+                    self.send_pid();
+                }
+                self.pid_ki_str = s;
+            }
+            Message::PidKdChanged(s) => {
+                if let Ok(v) = s.parse::<f64>()
+                    && v.is_finite()
+                    && v >= 0.0
+                {
+                    self.pid_kd = v;
+                    self.send_pid();
+                }
+                self.pid_kd_str = s;
+            }
+            Message::PresetNameChanged(s) => {
+                self.preset_name = s;
+            }
+            Message::SavePreset => {
+                self.preset_status = match self.save_preset() {
+                    Ok(()) => format!("guardado: {}", self.preset_name),
+                    Err(e) => format!("error al guardar: {e}"),
+                };
+            }
+            Message::LoadPreset => {
+                self.preset_status = match self.load_preset() {
+                    Ok(()) => {
+                        self.send_pid();
+                        format!("cargado: {}", self.preset_name)
+                    }
+                    Err(e) => format!("error al cargar: {e}"),
+                };
+            }
             Message::ToggleEstop => {
                 // Enclava/libera.
                 let now = self.estop.load(Ordering::Relaxed);
@@ -915,8 +1013,58 @@ impl VisionGui {
         Theme::Dark
     }
 
-    /// Contenido de la sección **Control**: manual, robot, equipo, marco, escalas, rampa.
-    /// Apilado en vertical para caber en el sidebar.
+    /// Envía las ganancias PID actuales al loop (si hay canal).
+    fn send_pid(&self) {
+        if let Some(tx) = &self.pid_tx {
+            let _ = tx.try_send(HeadingPid {
+                kp: self.pid_kp,
+                ki: self.pid_ki,
+                kd: self.pid_kd,
+            });
+        }
+    }
+
+    /// Serializa el tuning actual al archivo `preset_name` (JSON).
+    fn save_preset(&self) -> Result<(), String> {
+        let preset = TuningPreset {
+            lin_ms: self.manual_lin_ms,
+            ang_rads: self.manual_ang_rads,
+            lin_accel: self.manual_lin_accel,
+            ang_accel: self.manual_ang_accel,
+            spin_omega: self.spin_omega,
+            kp: self.pid_kp,
+            ki: self.pid_ki,
+            kd: self.pid_kd,
+        };
+        let json = serde_json::to_string_pretty(&preset).map_err(|e| e.to_string())?;
+        std::fs::write(&self.preset_name, json).map_err(|e| e.to_string())
+    }
+
+    /// Carga el tuning desde `preset_name` y actualiza el estado (no envía PID; el
+    /// caller decide reenviar). Errores de archivo/JSON se devuelven como `Err`.
+    fn load_preset(&mut self) -> Result<(), String> {
+        let data = std::fs::read_to_string(&self.preset_name).map_err(|e| e.to_string())?;
+        let p: TuningPreset = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        self.manual_lin_ms = p.lin_ms;
+        self.manual_lin_str = format!("{}", p.lin_ms);
+        self.manual_ang_rads = p.ang_rads;
+        self.manual_ang_str = format!("{}", p.ang_rads);
+        self.manual_lin_accel = p.lin_accel;
+        self.manual_lin_accel_str = format!("{}", p.lin_accel);
+        self.manual_ang_accel = p.ang_accel;
+        self.manual_ang_accel_str = format!("{}", p.ang_accel);
+        self.spin_omega = p.spin_omega;
+        self.spin_omega_str = format!("{}", p.spin_omega);
+        self.pid_kp = p.kp;
+        self.pid_kp_str = format!("{}", p.kp);
+        self.pid_ki = p.ki;
+        self.pid_ki_str = format!("{}", p.ki);
+        self.pid_kd = p.kd;
+        self.pid_kd_str = format!("{}", p.kd);
+        Ok(())
+    }
+
+    /// Contenido de la sección **Control**: manual, robot, equipo, marco.
     fn control_section(&self) -> Element<'_, Message> {
         let manual_btn = button(
             text(if self.manual_enabled {
@@ -968,34 +1116,6 @@ impl VisionGui {
             FrameMode::Robot => "W/S adelante/atrás · A/D girar",
         };
 
-        let scales = row![
-            text("Vel L/A:").size(12),
-            text_input("0.5", &self.manual_lin_str)
-                .on_input(Message::ManualLinChanged)
-                .size(12)
-                .width(Length::Fixed(60.0)),
-            text_input("3.0", &self.manual_ang_str)
-                .on_input(Message::ManualAngChanged)
-                .size(12)
-                .width(Length::Fixed(60.0)),
-        ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center);
-
-        let accels = row![
-            text("Acc L/A:").size(12),
-            text_input("2.0", &self.manual_lin_accel_str)
-                .on_input(Message::ManualLinAccelChanged)
-                .size(12)
-                .width(Length::Fixed(60.0)),
-            text_input("12.0", &self.manual_ang_accel_str)
-                .on_input(Message::ManualAngAccelChanged)
-                .size(12)
-                .width(Length::Fixed(60.0)),
-        ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center);
-
         column![
             row![manual_btn, frame_btn]
                 .spacing(6)
@@ -1010,10 +1130,58 @@ impl VisionGui {
             .spacing(6)
             .align_y(iced::Alignment::Center),
             text(help).size(10),
-            scales,
-            accels,
         ]
         .spacing(6)
+        .into()
+    }
+
+    /// Contenido de la sección **Tuning**: escalas, rampa, Spin ω, PID y presets.
+    fn tuning_section(&self) -> Element<'_, Message> {
+        let num = |label: &'static str, value: &str, msg: fn(String) -> Message| {
+            row![
+                text(label).size(12).width(Length::Fixed(84.0)),
+                text_input("", value)
+                    .on_input(msg)
+                    .size(12)
+                    .width(Length::Fixed(64.0)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+        };
+
+        let save_btn = button(text("Guardar").size(12))
+            .padding([4, 8])
+            .on_press(Message::SavePreset);
+        let load_btn = button(text("Cargar").size(12))
+            .padding([4, 8])
+            .on_press(Message::LoadPreset);
+
+        column![
+            text("Manual").size(12),
+            num("Vel lin", &self.manual_lin_str, Message::ManualLinChanged),
+            num("Vel ang", &self.manual_ang_str, Message::ManualAngChanged),
+            num("Acc lin", &self.manual_lin_accel_str, Message::ManualLinAccelChanged),
+            num("Acc ang", &self.manual_ang_accel_str, Message::ManualAngAccelChanged),
+            text("Spin").size(12),
+            num("Spin ω", &self.spin_omega_str, Message::SpinOmegaChanged),
+            text("PID heading (GoTo/FacePoint/ChaseBall)").size(12),
+            num("kp", &self.pid_kp_str, Message::PidKpChanged),
+            num("ki", &self.pid_ki_str, Message::PidKiChanged),
+            num("kd", &self.pid_kd_str, Message::PidKdChanged),
+            text("Preset").size(12),
+            row![
+                text_input("tuning.json", &self.preset_name)
+                    .on_input(Message::PresetNameChanged)
+                    .size(12)
+                    .width(Length::Fixed(150.0)),
+                save_btn,
+                load_btn,
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text(&self.preset_status).size(10),
+        ]
+        .spacing(4)
         .into()
     }
 
@@ -1031,16 +1199,8 @@ impl VisionGui {
                 skill_button("Spin", Some(SkillId::Spin), self.active_skill),
             ]
             .spacing(4),
-            row![
-                text("Spin ω (rad/s):").size(12),
-                text_input("20", &self.spin_omega_str)
-                    .on_input(Message::SpinOmegaChanged)
-                    .size(12)
-                    .width(Length::Fixed(60.0)),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
             text("click en la cancha = target / lado de giro").size(10),
+            text("(Spin ω y PID en la sección Tuning)").size(10),
         ]
         .spacing(6)
         .into()
@@ -1081,6 +1241,7 @@ impl VisionGui {
             let content: Element<'_, Message> = match sec {
                 Section::Control => self.control_section(),
                 Section::Skills => self.skills_section(),
+                Section::Tuning => self.tuning_section(),
                 Section::Radio => radio_panel::view(
                     &self.radio_target_label,
                     &self.radio_port,
@@ -1388,6 +1549,27 @@ mod tests {
         assert_eq!(spin_relative_target(0.2, 0.2).x, 1.0);
         // y siempre 0 (giro puro).
         assert_eq!(spin_relative_target(0.5, 0.0).y, 0.0);
+    }
+
+    /// Round-trip del preset de tuning (serialize → deserialize preserva valores).
+    #[test]
+    fn tuning_preset_round_trip() {
+        let p = TuningPreset {
+            lin_ms: 0.6,
+            ang_rads: 4.0,
+            lin_accel: 2.5,
+            ang_accel: 15.0,
+            spin_omega: 25.0,
+            kp: 3.5,
+            ki: 0.1,
+            kd: 0.25,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let q: TuningPreset = serde_json::from_str(&json).unwrap();
+        assert_eq!(q.lin_ms, 0.6);
+        assert_eq!(q.spin_omega, 25.0);
+        assert_eq!(q.kp, 3.5);
+        assert_eq!(q.kd, 0.25);
     }
 
     /// 4.5 — La ventana de telemetría descarta muestras viejas (misma lógica

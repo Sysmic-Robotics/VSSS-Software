@@ -136,6 +136,28 @@ impl SkillCatalog {
         &self.config
     }
 
+    /// Override en vivo de las ganancias del PID de heading (kp/ki/kd) en todas
+    /// las skills que lo usan (`GoTo`, `FacePoint`, `ChaseBall`), para todos los
+    /// robots. Pensado para tuneo desde la GUI; no altera los defaults del
+    /// catálogo ni el `SkillId`/orden congelado.
+    pub fn set_heading_pid(&mut self, kp: f64, ki: f64, kd: f64) {
+        for s in &mut self.go_to {
+            s.kp = kp;
+            s.ki = ki;
+            s.kd = kd;
+        }
+        for s in &mut self.face_point {
+            s.kp = kp;
+            s.ki = ki;
+            s.kd = kd;
+        }
+        for s in &mut self.chase_ball {
+            s.kp = kp;
+            s.ki = ki;
+            s.kd = kd;
+        }
+    }
+
     /// Override en vivo de la velocidad angular de `Spin` para un robot puntual.
     /// Pensado para el runner de la GUI (tuneo de bring-up); no altera el
     /// `SkillConfig` por defecto del catálogo. No-op si `robot_id` fuera de rango.
@@ -303,6 +325,17 @@ mod tests {
         // Pequeñas diferencias por estado interno del PID son OK; el target
         // mismo no debería mover la decisión más que ese ruido residual.
         assert!(diff < 0.5, "ChaseBall no debe depender del target: diff={diff}");
+    }
+
+    #[test]
+    fn set_heading_pid_updates_all_skills() {
+        let mut catalog = SkillCatalog::new(2);
+        catalog.set_heading_pid(9.0, 1.0, 0.5);
+        for i in 0..2 {
+            assert_eq!(catalog.go_to[i].kp, 9.0);
+            assert_eq!(catalog.face_point[i].ki, 1.0);
+            assert_eq!(catalog.chase_ball[i].kd, 0.5);
+        }
     }
 
     #[test]

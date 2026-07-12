@@ -18,8 +18,8 @@ const COACH_DECISION_PERIOD: u32 = 6;
 use glam::Vec2;
 use rustengine::coach::{Coach, RuleBasedCoach, SkillChoice};
 use rustengine::control_loop::{
-    CoachDecider, ControlLoopConfig, GuiChannels, GuiSkillCommand, ManualCommand, TickDecider,
-    run_control_loop,
+    CoachDecider, ControlLoopConfig, GuiChannels, GuiSkillCommand, HeadingPid, ManualCommand,
+    TickDecider, run_control_loop,
 };
 use rustengine::radio::RadioTarget;
 use rustengine::vision::VisionSource;
@@ -84,6 +84,7 @@ fn run_with_gui() {
     let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
     let (skill_tx, skill_rx) = mpsc::channel::<GuiSkillCommand>(32);
+    let (pid_tx, pid_rx) = mpsc::channel::<HeadingPid>(16);
     let estop = Arc::new(AtomicBool::new(false));
 
     let source = VisionSource::from_env();
@@ -100,7 +101,7 @@ fn run_with_gui() {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(Some((
-            status_tx, motion_tx, manual_rx, skill_rx, estop_loop,
+            status_tx, motion_tx, manual_rx, skill_rx, estop_loop, pid_rx,
         ))));
     });
 
@@ -112,6 +113,7 @@ fn run_with_gui() {
         motion_rx,
         manual_tx: Some(manual_tx),
         skill_tx: Some(skill_tx),
+        pid_tx: Some(pid_tx),
         estop,
         num_robots: NUM_ROBOTS,
         own_team: OWN_TEAM as u32,
@@ -141,6 +143,7 @@ type GuiChannelBundle = (
     mpsc::Receiver<ManualCommand>,
     mpsc::Receiver<GuiSkillCommand>,
     Arc<AtomicBool>,
+    mpsc::Receiver<HeadingPid>,
 );
 
 async fn async_main(gui_channels: Option<GuiChannelBundle>) {
@@ -183,12 +186,13 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
     };
 
     let gui = gui_channels.map(
-        |(status_tx, motion_tx, manual_rx, skill_rx, estop)| GuiChannels {
+        |(status_tx, motion_tx, manual_rx, skill_rx, estop, pid_rx)| GuiChannels {
             status_tx,
             motion_tx,
             manual_rx: Some(manual_rx),
             skill_rx: Some(skill_rx),
             estop: Some(estop),
+            pid_rx: Some(pid_rx),
         },
     );
 

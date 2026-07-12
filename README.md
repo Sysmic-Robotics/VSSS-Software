@@ -76,6 +76,10 @@ para fijar el target (marcador verde). La skill se inyecta como `SkillChoice` al
 Precedencia: control manual (velocidad cruda) > skill de GUI > coach. Con "Ninguna" el robot
 vuelve al coach.
 
+La sección **Tuning** ajusta en vivo (sin recompilar): escalas de velocidad, rampa, **Spin ω**
+y el **PID de heading** (`kp/ki/kd`, que gobierna el giro de GoTo/FacePoint/ChaseBall — afecta
+también al coach). Además guarda/carga **presets** de todo el tuning en un archivo JSON.
+
 La sección **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
 estado de conexión y PPS. Editar puerto/baud requiere reiniciar el proceso (se aplican por
 `VSSL_BASESTATION_DEVICE` / `VSSL_BASESTATION_BAUD`). En headless nada de esto aplica: la

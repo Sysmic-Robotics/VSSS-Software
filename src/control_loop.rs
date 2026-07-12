@@ -148,6 +148,14 @@ pub struct GuiSkillCommand {
     pub spin_omega: f64,
 }
 
+/// Ganancias del PID de heading enviadas desde la GUI para tuneo en vivo.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadingPid {
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
 /// Cuántos ticks (a 60 Hz) se mantiene vigente un comando manual/skill sin refresco.
 /// La GUI reenvía a mayor tasa que esto mientras está activo; al apagarlo deja de
 /// enviar y el comando expira, devolviendo el control al decider. 15 ticks ≈ 250 ms.
@@ -165,6 +173,8 @@ pub struct GuiChannels {
     /// Flag opcional de parada de emergencia compartido con la GUI. Si está
     /// activo, el loop comanda cero a todo el equipo propio. `None` = sin parada.
     pub estop: Option<Arc<AtomicBool>>,
+    /// Canal opcional de tuneo del PID de heading GUI→loop. `None` = sin tuneo.
+    pub pid_rx: Option<mpsc::Receiver<HeadingPid>>,
 }
 
 /// Construye comandos de velocidad cero para todos los robots activos del equipo
@@ -324,15 +334,16 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(true));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (status_tx, motion_tx, mut manual_rx, mut skill_rx, estop) = match gui {
+    let (status_tx, motion_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx) = match gui {
         Some(g) => (
             Some(g.status_tx),
             Some(g.motion_tx),
             g.manual_rx,
             g.skill_rx,
             g.estop,
+            g.pid_rx,
         ),
-        None => (None, None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
 
     // Estado de comandos manuales vigentes por (team, id) con el tick de último
@@ -463,6 +474,13 @@ pub async fn run_control_loop(
         if !manual_state.is_empty() {
             manual_state
                 .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
+        }
+
+        // Tuneo de PID de heading desde la GUI (aplica al catálogo en runtime).
+        if let Some(rx) = pid_rx.as_mut() {
+            while let Ok(p) = rx.try_recv() {
+                catalog.set_heading_pid(p.kp, p.ki, p.kd);
+            }
         }
 
         // Drenar y expirar skills de GUI (misma mecánica que el manual).
