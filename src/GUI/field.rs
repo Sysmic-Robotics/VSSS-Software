@@ -1,7 +1,7 @@
 use iced::mouse;
 use iced::widget::canvas::{self, Cache, Geometry, Path, Stroke};
 use iced::{Color, Point, Rectangle, Size, Theme};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use super::{Ball, Message, Robot, RobotMotionDebug};
 
@@ -32,7 +32,14 @@ pub struct FieldCanvas<'a> {
     pub selected: Option<(u32, u32)>,
     /// Target de la skill de GUI activa (metros, marco mundo). `None` = ninguno.
     pub skill_target: Option<glam::Vec2>,
+    /// Traza de posiciones recientes del robot seleccionado (mm, marco cancha).
+    pub trace: &'a VecDeque<glam::Vec2>,
+    /// Si se dibuja la traza.
+    pub show_trace: bool,
 }
+
+/// mm por cada m/s para el vector de velocidad **medida** (visión).
+const MEASURED_VELOCITY_SCALE_MM: f32 = 300.0;
 
 /// Centro y escala del dibujo del campo para unas `bounds` dadas. Compartido por
 /// `draw` y por la conversión de click, para que no puedan divergir.
@@ -207,6 +214,26 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                 frame.fill(&ball_circle, Color::from_rgb(1.0, 0.0, 0.0));
             }
 
+            // Traza del robot seleccionado (celeste, debajo de los robots).
+            if self.show_trace && self.trace.len() >= 2 {
+                let path = Path::new(|b| {
+                    for (i, p) in self.trace.iter().enumerate() {
+                        let pt = Point::new(center.x + p.x * scale, center.y - p.y * scale);
+                        if i == 0 {
+                            b.move_to(pt);
+                        } else {
+                            b.line_to(pt);
+                        }
+                    }
+                });
+                frame.stroke(
+                    &path,
+                    Stroke::default()
+                        .with_width(1.5)
+                        .with_color(Color::from_rgb(0.5, 0.9, 1.0)),
+                );
+            }
+
             // Draw robots (proporción real ~75mm diámetro, como en FIRASim)
             for robot in self.robots.values() {
                 let color = if robot.team == 0 {
@@ -247,6 +274,34 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     &orientation_line,
                     Stroke::default().with_width(2.0).with_color(Color::BLACK),
                 );
+
+                // Vector de velocidad MEDIDA (visión), naranja — distinto de la
+                // flecha blanca de velocidad comandada.
+                let mspeed = (robot.velocity.x * robot.velocity.x
+                    + robot.velocity.y * robot.velocity.y)
+                    .sqrt();
+                if mspeed > 0.02 {
+                    let mx = robot.velocity.x * MEASURED_VELOCITY_SCALE_MM * scale;
+                    let my = -robot.velocity.y * MEASURED_VELOCITY_SCALE_MM * scale;
+                    frame.stroke(
+                        &Path::line(robot_pos, Point::new(robot_pos.x + mx, robot_pos.y + my)),
+                        Stroke::default()
+                            .with_width(2.0)
+                            .with_color(Color::from_rgb(1.0, 0.6, 0.0)),
+                    );
+                }
+
+                // Número de robot, arriba del cuerpo.
+                frame.fill_text(canvas::Text {
+                    content: format!("{}", robot.id),
+                    position: Point::new(
+                        robot_pos.x - 4.0,
+                        robot_pos.y - ROBOT_RADIUS_MM * scale - 14.0,
+                    ),
+                    color: Color::WHITE,
+                    size: 13.0.into(),
+                    ..Default::default()
+                });
 
                 // Vector de velocidad comandada (flecha blanca) + punto target (círculo cyan)
                 if let Some(m) = self.motion.get(&(robot.team, robot.id)) {

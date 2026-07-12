@@ -27,7 +27,7 @@ pub enum StatusUpdate {
     PacketReceived,
     BallDetected(usize),
     RobotsDetected(usize),
-    RobotPosition(u32, u32, Vec2, f32), // id, team, position, orientation
+    RobotPosition(u32, u32, Vec2, f32, Vec2, f32), // id, team, position, orientation, velocity, angular_velocity
     BallPosition(Vec2),
     /// Estado de conexión del transporte de radio (lo emite el control loop, no
     /// la visión). `true` = último envío OK, `false` = último envío falló.
@@ -472,7 +472,14 @@ impl Vision {
 
         Self::send_status_best_effort(
             status_tx,
-            StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32),
+            StatusUpdate::RobotPosition(
+                id,
+                team as u32,
+                Vec2::new(xf_mm, yf_mm),
+                thetaf as f32,
+                Vec2::new(vx as f32, vy as f32),
+                omega as f32,
+            ),
         );
 
         let event = VisionEvent::Robot(RobotData {
@@ -600,7 +607,14 @@ impl Vision {
         // Send position to UI (in millimeters, with origin at center)
         Self::send_status_best_effort(
             status_tx,
-            StatusUpdate::RobotPosition(id, team as u32, Vec2::new(xf_mm, yf_mm), thetaf as f32),
+            StatusUpdate::RobotPosition(
+                id,
+                team as u32,
+                Vec2::new(xf_mm, yf_mm),
+                thetaf as f32,
+                Vec2::new(vx as f32, vy as f32),
+                omega as f32,
+            ),
         );
         if VISION_LOG_EVERY_BLUE_ROBOT_TO_GUI && id < 3 && team == 0 {
             eprintln!(

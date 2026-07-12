@@ -40,6 +40,10 @@ const MANUAL_ANG_ACCEL: f64 = 12.0;
 const MANUAL_TICK_DT: f64 = 0.033;
 /// Ventana de la telemetría de rueda (cantidad máxima de muestras retenidas).
 const WHEEL_HISTORY_MAX: usize = 300;
+/// Cantidad máxima de puntos de traza del robot seleccionado.
+const TRACE_MAX: usize = 150;
+/// Umbral (s) para considerar un robot "activo" según su último dato de visión.
+const ACTIVE_THRESHOLD_S: f64 = 0.5;
 /// Velocidad angular de Spin por defecto en la GUI (rad/s). Coincide con
 /// `SkillConfig::default().spin_omega`.
 const SPIN_OMEGA_DEFAULT: f64 = 20.0;
@@ -177,8 +181,6 @@ pub struct RobotMotionDebug {
     pub wheel_r_mm_s: i16,
 }
 
-/// `true` imprime cada actualización de robot en stderr (muy ruidoso). Dejar en `false` para auditar con `[FieldAudit]` en `main`.
-const GUI_LOG_EVERY_ROBOT_UPDATE: bool = false;
 /// Ritmo de refresco del campo en GUI. La visión/control siguen a tasa completa;
 /// solo la pintura del mapa se limita para evitar trabajo visual redundante.
 const GUI_FIELD_UPDATE_INTERVAL_MS: u64 = 50;
@@ -188,6 +190,7 @@ const GUI_FIELD_UPDATE_INTERVAL_MS: u64 = 50;
 pub enum Section {
     Control,
     Skills,
+    Inspector,
     Tuning,
     Radio,
     Vision,
@@ -195,9 +198,10 @@ pub enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 7] = [
         Section::Control,
         Section::Skills,
+        Section::Inspector,
         Section::Tuning,
         Section::Radio,
         Section::Vision,
@@ -207,6 +211,7 @@ impl Section {
         match self {
             Section::Control => "Control",
             Section::Skills => "Skills",
+            Section::Inspector => "Inspector",
             Section::Tuning => "Tuning",
             Section::Radio => "Radio",
             Section::Vision => "Visión",
@@ -252,15 +257,19 @@ pub enum Message {
     LoadPreset,
     ToggleEstop,
     EngageEstop,
+    ToggleTrace(bool),
 }
 
 #[derive(Debug, Clone)]
 pub struct Robot {
-    #[allow(dead_code)] // ID may be used for labeling robots in the future
     pub id: u32,
     pub team: u32,
     pub position: Vec2,
     pub orientation: f32,
+    /// Velocidad lineal medida por visión (m/s, marco mundo).
+    pub velocity: Vec2,
+    /// Velocidad angular medida por visión (rad/s).
+    pub angular_velocity: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -302,7 +311,7 @@ impl FieldSnapshotBuffer {
                 self.ball = Some(Ball { position });
                 None
             }
-            StatusUpdate::RobotPosition(id, team, position, orientation) => {
+            StatusUpdate::RobotPosition(id, team, position, orientation, velocity, angular_velocity) => {
                 self.robots.insert(
                     (team, id),
                     Robot {
@@ -310,6 +319,8 @@ impl FieldSnapshotBuffer {
                         team,
                         position,
                         orientation,
+                        velocity,
+                        angular_velocity,
                     },
                 );
                 None
@@ -348,6 +359,12 @@ pub struct VisionGui {
     robots: HashMap<(u32, u32), Robot>,
     ball: Option<Ball>,
     motion_debug: HashMap<(u32, u32), RobotMotionDebug>,
+    /// Instante del último dato de visión por robot (para antigüedad/actividad).
+    last_seen: HashMap<(u32, u32), Instant>,
+    /// Traza de posiciones recientes del robot seleccionado (mm, marco cancha).
+    trace: VecDeque<Vec2>,
+    /// Si se dibuja la traza del robot seleccionado.
+    trace_enabled: bool,
     field_cache: Cache,
     chart_cache: Cache,
     config_tx: Option<mpsc::Sender<ConfigUpdate>>,
@@ -451,6 +468,9 @@ impl VisionGui {
                 robots: HashMap::new(),
                 ball: None,
                 motion_debug: HashMap::new(),
+                last_seen: HashMap::new(),
+                trace: VecDeque::new(),
+                trace_enabled: true,
                 field_cache: Cache::default(),
                 chart_cache: Cache::default(),
                 config_tx: Some(setup.config_tx),
@@ -556,13 +576,14 @@ impl VisionGui {
                     StatusUpdate::RobotsDetected(count) => {
                         self.last_robot_count = count;
                     }
-                    StatusUpdate::RobotPosition(id, team, position, orientation) => {
-                        if GUI_LOG_EVERY_ROBOT_UPDATE {
-                            eprintln!(
-                                "[GUI] Recibida posición de robot: ID={}, team={}, pos=({:.2}, {:.2}) mm, orientación={:.2} rad",
-                                id, team, position.x, position.y, orientation
-                            );
-                        }
+                    StatusUpdate::RobotPosition(
+                        id,
+                        team,
+                        position,
+                        orientation,
+                        velocity,
+                        angular_velocity,
+                    ) => {
                         self.robots.insert(
                             (team, id),
                             Robot {
@@ -570,12 +591,12 @@ impl VisionGui {
                                 team,
                                 position,
                                 orientation,
+                                velocity,
+                                angular_velocity,
                             },
                         );
+                        self.note_robot_seen(team, id, position);
                         self.field_cache.clear();
-                        if GUI_LOG_EVERY_ROBOT_UPDATE {
-                            eprintln!("[GUI] Total robots en mapa: {}", self.robots.len());
-                        }
                     }
                     StatusUpdate::BallPosition(position) => {
                         self.ball = Some(Ball { position });
@@ -600,7 +621,9 @@ impl VisionGui {
                     field_changed = true;
                 }
                 for robot in snapshot.robots {
-                    self.robots.insert((robot.team, robot.id), robot);
+                    let (t, i, p) = (robot.team, robot.id, robot.position);
+                    self.robots.insert((t, i), robot);
+                    self.note_robot_seen(t, i, p);
                     field_changed = true;
                 }
 
@@ -702,6 +725,7 @@ impl VisionGui {
                     // Reiniciar la serie de telemetría para no mezclar robots.
                     self.wheel_history.clear();
                     self.wheel_chart_cache.clear();
+                    self.trace.clear();
                     self.field_cache.clear();
                 }
             }
@@ -710,6 +734,7 @@ impl VisionGui {
                     self.selected_team = team;
                     self.wheel_history.clear();
                     self.wheel_chart_cache.clear();
+                    self.trace.clear();
                     self.field_cache.clear();
                 }
             }
@@ -895,6 +920,13 @@ impl VisionGui {
                 // Tecla de pánico: activar (idempotente).
                 self.estop.store(true, Ordering::Relaxed);
             }
+            Message::ToggleTrace(on) => {
+                self.trace_enabled = on;
+                if !on {
+                    self.trace.clear();
+                }
+                self.field_cache.clear();
+            }
             Message::RadioPortChanged(port) => {
                 self.radio_port = port;
             }
@@ -1011,6 +1043,18 @@ impl VisionGui {
 
     fn theme(&self) -> Theme {
         Theme::Dark
+    }
+
+    /// Registra que se recibió dato de visión de un robot: actualiza `last_seen`
+    /// y, si es el seleccionado, agrega su posición a la traza.
+    fn note_robot_seen(&mut self, team: u32, id: u32, position: Vec2) {
+        self.last_seen.insert((team, id), Instant::now());
+        if team == self.selected_team && id == self.selected_robot {
+            self.trace.push_back(position);
+            while self.trace.len() > TRACE_MAX {
+                self.trace.pop_front();
+            }
+        }
     }
 
     /// Envía las ganancias PID actuales al loop (si hay canal).
@@ -1206,6 +1250,66 @@ impl VisionGui {
         .into()
     }
 
+    /// Contenido de la sección **Inspector**: datos de visión del robot seleccionado.
+    fn inspector_section(&self) -> Element<'_, Message> {
+        let trace_btn = button(
+            text(if self.trace_enabled {
+                "Traza: ON"
+            } else {
+                "Traza: OFF"
+            })
+            .size(12),
+        )
+        .padding([4, 10])
+        .style(if self.trace_enabled {
+            button::primary
+        } else {
+            button::secondary
+        })
+        .on_press(Message::ToggleTrace(!self.trace_enabled));
+
+        let key = (self.selected_team, self.selected_robot);
+        let data: Element<'_, Message> = match self.robots.get(&key) {
+            Some(r) => {
+                let speed = (r.velocity.x * r.velocity.x + r.velocity.y * r.velocity.y).sqrt();
+                let age = self
+                    .last_seen
+                    .get(&key)
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(f64::INFINITY);
+                let active = age <= ACTIVE_THRESHOLD_S;
+                column![
+                    text(format!(
+                        "pos: ({:.2}, {:.2}) m",
+                        r.position.x / 1000.0,
+                        r.position.y / 1000.0
+                    ))
+                    .size(12),
+                    text(format!("θ: {:.3} rad", r.orientation)).size(12),
+                    text(format!("rapidez: {speed:.2} m/s")).size(12),
+                    text(format!("ω: {:.2} rad/s", r.angular_velocity)).size(12),
+                    text(format!(
+                        "estado: {}",
+                        if active { "activo" } else { "inactivo" }
+                    ))
+                    .size(12)
+                    .style(move |_t: &Theme| text::Style {
+                        color: Some(if active {
+                            Color::from_rgb(0.0, 0.8, 0.0)
+                        } else {
+                            Color::from_rgb(0.8, 0.5, 0.0)
+                        }),
+                    }),
+                    text(format!("antigüedad: {age:.2} s")).size(12),
+                ]
+                .spacing(4)
+                .into()
+            }
+            None => text("sin datos del robot seleccionado").size(12).into(),
+        };
+        column![trace_btn, data].spacing(6).into()
+    }
+
     /// Envuelve un contenido con su encabezado colapsable de sección.
     fn section_view<'a>(
         &'a self,
@@ -1241,6 +1345,7 @@ impl VisionGui {
             let content: Element<'_, Message> = match sec {
                 Section::Control => self.control_section(),
                 Section::Skills => self.skills_section(),
+                Section::Inspector => self.inspector_section(),
                 Section::Tuning => self.tuning_section(),
                 Section::Radio => radio_panel::view(
                     &self.radio_target_label,
@@ -1378,6 +1483,8 @@ impl VisionGui {
             cache: &self.field_cache,
             selected,
             skill_target: self.active_skill.map(|_| self.skill_target),
+            trace: &self.trace,
+            show_trace: self.trace_enabled,
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -1427,12 +1534,26 @@ mod tests {
         );
         assert!(
             buffer
-                .push(StatusUpdate::RobotPosition(0, 0, Vec2::new(1.0, 2.0), 0.1))
+                .push(StatusUpdate::RobotPosition(
+                    0,
+                    0,
+                    Vec2::new(1.0, 2.0),
+                    0.1,
+                    Vec2::ZERO,
+                    0.0
+                ))
                 .is_none()
         );
         assert!(
             buffer
-                .push(StatusUpdate::RobotPosition(0, 0, Vec2::new(3.0, 4.0), 0.2))
+                .push(StatusUpdate::RobotPosition(
+                    0,
+                    0,
+                    Vec2::new(3.0, 4.0),
+                    0.2,
+                    Vec2::ZERO,
+                    0.0
+                ))
                 .is_none()
         );
 

@@ -43,7 +43,8 @@ cargo fmt                            # formato
 ### GUI de debug (`VSSL_DEBUG_GUI=1`)
 
 Layout: **barra superior** (botón STOP + estado de conexión), **sidebar izquierdo con
-secciones colapsables** (Control, Skills, Radio, Visión, Telemetría), **cancha central**, y
+secciones colapsables** (Control, Skills, Inspector, Tuning, Radio, Visión, Telemetría),
+**cancha central**, y
 **barra de estado** inferior (robot/equipo, θ, PPS, ESTOP). Cada sección se expande/colapsa
 con su encabezado.
 
@@ -75,6 +76,11 @@ para fijar el target (marcador verde). La skill se inyecta como `SkillChoice` al
 `SkillCatalog::tick` que el coach — reemplaza la decisión del coach solo para ese robot.
 Precedencia: control manual (velocidad cruda) > skill de GUI > coach. Con "Ninguna" el robot
 vuelve al coach.
+
+La sección **Inspector** muestra los datos de visión del robot seleccionado: posición, θ,
+rapidez (m/s), ω (rad/s), estado activo/inactivo y antigüedad del último dato. En la cancha,
+overlays de diagnóstico: **vector de velocidad medida** (naranja, distinto de la flecha blanca
+de velocidad comandada), **número de robot** y **traza** del recorrido reciente del seleccionado (activable/desactivable en Inspector).
 
 La sección **Tuning** ajusta en vivo (sin recompilar): escalas de velocidad, rampa, **Spin ω**
 y el **PID de heading** (`kp/ki/kd`, que gobierna el giro de GoTo/FacePoint/ChaseBall — afecta
