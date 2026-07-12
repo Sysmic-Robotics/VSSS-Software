@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use crate::control_loop::ManualCommand;
+use crate::control_loop::{GuiSkillCommand, ManualCommand};
+use crate::skills::SkillId;
 use field::FieldCanvas;
 use wheel_chart::WheelChart;
 pub use crate::vision::StatusUpdate;
@@ -106,6 +107,22 @@ pub fn slew(current: f64, target: f64, max_step: f64) -> f64 {
     }
 }
 
+/// Botón de selección de skill; resaltado si es la skill activa.
+fn skill_button<'a>(
+    label: &'a str,
+    sk: Option<SkillId>,
+    active: Option<SkillId>,
+) -> iced::widget::Button<'a, Message> {
+    button(text(label).size(12))
+        .padding([4, 8])
+        .style(if active == sk {
+            button::primary
+        } else {
+            button::secondary
+        })
+        .on_press(Message::SelectSkill(sk))
+}
+
 /// Datos de motion de un robot para debug visual.
 /// Se envía desde el control loop al GUI cada tick.
 #[derive(Debug, Clone)]
@@ -162,6 +179,8 @@ pub enum Message {
     ManualAngChanged(String),
     ManualLinAccelChanged(String),
     ManualAngAccelChanged(String),
+    SelectSkill(Option<SkillId>),
+    FieldClicked(Vec2),
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +306,11 @@ pub struct VisionGui {
     applied_cmd: (f64, f64, f64),
     keys: HashSet<char>,
     manual_tx: Option<mpsc::Sender<ManualCommand>>,
+    /// Skill de GUI activa sobre el robot seleccionado. `None` = coach.
+    active_skill: Option<SkillId>,
+    /// Target de la skill activa (metros, marco mundo), fijado con click.
+    skill_target: Vec2,
+    skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
     wheel_history: VecDeque<(f64, i16, i16)>,
     wheel_chart_cache: Cache,
     transport_connected: Option<bool>,
@@ -311,6 +335,8 @@ pub struct GuiSetup {
     pub motion_rx: mpsc::Receiver<Vec<RobotMotionDebug>>,
     /// Canal de comandos manuales GUI→control loop.
     pub manual_tx: Option<mpsc::Sender<ManualCommand>>,
+    /// Canal de skills de GUI GUI→control loop.
+    pub skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
     pub num_robots: usize,
     /// Equipo propio inicial (0 = azul, 1 = amarillo).
     pub own_team: u32,
@@ -361,6 +387,9 @@ impl VisionGui {
                 applied_cmd: (0.0, 0.0, 0.0),
                 keys: HashSet::new(),
                 manual_tx: setup.manual_tx,
+                active_skill: None,
+                skill_target: Vec2::ZERO,
+                skill_tx: setup.skill_tx,
                 wheel_history: VecDeque::new(),
                 wheel_chart_cache: Cache::default(),
                 transport_connected: None,
@@ -616,6 +645,17 @@ impl VisionGui {
                         omega,
                     });
                 }
+                // Skill de GUI: streamear mientras haya una activa y el manual esté off.
+                if !self.manual_enabled
+                    && let (Some(skill), Some(tx)) = (self.active_skill, &self.skill_tx)
+                {
+                    let _ = tx.try_send(GuiSkillCommand {
+                        team: self.selected_team as i32,
+                        id: self.selected_robot as i32,
+                        skill_id: skill,
+                        target: self.skill_target,
+                    });
+                }
             }
             Message::ToggleFrame => {
                 self.manual_frame = match self.manual_frame {
@@ -658,6 +698,17 @@ impl VisionGui {
                     self.manual_ang_accel = v;
                 }
                 self.manual_ang_accel_str = s;
+            }
+            Message::SelectSkill(skill) => {
+                self.active_skill = skill;
+                self.field_cache.clear();
+            }
+            Message::FieldClicked(world_m) => {
+                // El click fija el target de la skill activa (si hay).
+                if self.active_skill.is_some() {
+                    self.skill_target = world_m;
+                    self.field_cache.clear();
+                }
             }
             Message::RadioPortChanged(port) => {
                 self.radio_port = port;
@@ -866,7 +917,19 @@ impl VisionGui {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        column![top, scales, accels].spacing(6).into()
+        let skills = row![
+            text("Skill:").size(12),
+            skill_button("Ninguna", None, self.active_skill),
+            skill_button("GoTo", Some(SkillId::GoTo), self.active_skill),
+            skill_button("FacePoint", Some(SkillId::FacePoint), self.active_skill),
+            skill_button("ChaseBall", Some(SkillId::ChaseBall), self.active_skill),
+            skill_button("Spin", Some(SkillId::Spin), self.active_skill),
+            text("(click en la cancha = target)").size(11),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        column![top, scales, accels, skills].spacing(6).into()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -928,6 +991,7 @@ impl VisionGui {
                     motion: &self.motion_debug,
                     cache: &self.field_cache,
                     selected,
+                    skill_target: self.active_skill.map(|_| self.skill_target),
                 })
                 .width(Length::Fill)
                 .height(Length::Fill);

@@ -135,10 +135,19 @@ pub struct ManualCommand {
     pub omega: f64,
 }
 
-/// Cuántos ticks (a 60 Hz) se mantiene vigente un comando manual sin refresco.
-/// La GUI reenvía a mayor tasa que esto mientras el modo manual está activo; al
-/// apagarlo deja de enviar y el comando expira, devolviendo el control al decider.
-/// 15 ticks ≈ 250 ms.
+/// Skill elegida desde la GUI para un robot puntual. Se inyecta como `SkillChoice`
+/// antes del dispatch, corriendo por el mismo `SkillCatalog::tick` que el coach.
+#[derive(Debug, Clone)]
+pub struct GuiSkillCommand {
+    pub team: i32,
+    pub id: i32,
+    pub skill_id: SkillId,
+    pub target: Vec2,
+}
+
+/// Cuántos ticks (a 60 Hz) se mantiene vigente un comando manual/skill sin refresco.
+/// La GUI reenvía a mayor tasa que esto mientras está activo; al apagarlo deja de
+/// enviar y el comando expira, devolviendo el control al decider. 15 ticks ≈ 250 ms.
 const MANUAL_STALE_TICKS: u32 = 15;
 
 /// Canales opcionales para alimentar el GUI (mismo shape que el código pre-refactor).
@@ -148,6 +157,8 @@ pub struct GuiChannels {
     /// Canal opcional de comandos manuales GUI→loop. `None` = sin control manual
     /// (comportamiento idéntico al headless). Ver `ManualCommand`.
     pub manual_rx: Option<mpsc::Receiver<ManualCommand>>,
+    /// Canal opcional de skills de GUI GUI→loop. `None` = sin runner de skills.
+    pub skill_rx: Option<mpsc::Receiver<GuiSkillCommand>>,
 }
 
 /// Mismo dispatcher que tenía `main.rs` pre-refactor (`dispatch_choices`).
@@ -202,6 +213,34 @@ fn dispatch_choices(
     (commands, targets, applied)
 }
 
+/// Aplica las skills de GUI vigentes sobre las `SkillChoice` del decider, antes
+/// del dispatch. Para cada skill de GUI cuyo `team == own_team`, reemplaza la
+/// choice del robot (mismo `robot_id`) o la inserta si no existía. Los demás
+/// robots conservan la choice del coach.
+///
+/// Función pura: no lee canales ni reloj. Testeable sin sockets.
+fn apply_gui_skill_overrides(
+    choices: &mut Vec<SkillChoice>,
+    skill_state: &std::collections::HashMap<(i32, i32), (GuiSkillCommand, u32)>,
+    own_team: i32,
+) {
+    for ((team, id), (cmd, _)) in skill_state {
+        if *team != own_team {
+            continue;
+        }
+        let choice = SkillChoice {
+            robot_id: *id,
+            skill_id: cmd.skill_id,
+            target: cmd.target,
+        };
+        if let Some(pos) = choices.iter().position(|c| c.robot_id == *id) {
+            choices[pos] = choice;
+        } else {
+            choices.push(choice);
+        }
+    }
+}
+
 /// Aplica los comandos manuales vigentes sobre los comandos del decider.
 /// Para cada robot con comando manual, reemplaza el comando del decider (mismo
 /// `id`/`team`) o lo inserta si no existía, tomando `orientation` del `World`
@@ -253,14 +292,16 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(true));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (status_tx, motion_tx, mut manual_rx) = match gui {
-        Some(g) => (Some(g.status_tx), Some(g.motion_tx), g.manual_rx),
-        None => (None, None, None),
+    let (status_tx, motion_tx, mut manual_rx, mut skill_rx) = match gui {
+        Some(g) => (Some(g.status_tx), Some(g.motion_tx), g.manual_rx, g.skill_rx),
+        None => (None, None, None, None),
     };
 
     // Estado de comandos manuales vigentes por (team, id) con el tick de último
     // refresco, para expirar comandos rancios (ver `MANUAL_STALE_TICKS`).
     let mut manual_state: HashMap<(i32, i32), (ManualCommand, u32)> = HashMap::new();
+    // Estado de skills de GUI vigentes por (team, id), misma mecánica de expiry.
+    let mut skill_state: HashMap<(i32, i32), (GuiSkillCommand, u32)> = HashMap::new();
     // Última señal de conexión del transporte reportada a la GUI (para emitir
     // solo en transiciones y no inundar el canal de estado).
     let mut last_transport_ok: Option<bool> = None;
@@ -386,9 +427,21 @@ pub async fn run_control_loop(
                 .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
         }
 
+        // Drenar y expirar skills de GUI (misma mecánica que el manual).
+        if let Some(rx) = skill_rx.as_mut() {
+            while let Ok(sc) = rx.try_recv() {
+                skill_state.insert((sc.team, sc.id), (sc, tick_counter));
+            }
+        }
+        if !skill_state.is_empty() {
+            skill_state
+                .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
+        }
+
         let (commands, targets, applied_choices) = {
             let world_guard = world.read().await;
-            let choices = decider.decide(tick_counter, &world_guard);
+            let mut choices = decider.decide(tick_counter, &world_guard);
+            apply_gui_skill_overrides(&mut choices, &skill_state, config.own_team);
             let (mut cmds, mut tgts, applied) = dispatch_choices(
                 &choices,
                 &mut catalog,
@@ -667,6 +720,82 @@ mod tests {
         assert_eq!(cmds[0].id, 2);
         assert_eq!(cmds[0].vx, 0.5);
         assert_eq!(cmds[0].orientation, 0.0);
+    }
+
+    /// 1.7 — `apply_gui_skill_overrides`: noop sin skills; reemplaza solo su robot
+    /// e inserta si ausente; respeta `own_team`.
+    #[test]
+    fn gui_skill_override_replaces_and_inserts() {
+        use std::collections::HashMap;
+        let mut choices = vec![
+            SkillChoice {
+                robot_id: 0,
+                skill_id: SkillId::GoTo,
+                target: Vec2::ZERO,
+            },
+            SkillChoice {
+                robot_id: 1,
+                skill_id: SkillId::GoTo,
+                target: Vec2::ZERO,
+            },
+        ];
+
+        // Sin skills → noop.
+        let empty: HashMap<(i32, i32), (GuiSkillCommand, u32)> = HashMap::new();
+        let before = choices.clone();
+        apply_gui_skill_overrides(&mut choices, &empty, 0);
+        assert_eq!(choices.len(), before.len());
+
+        // Reemplaza robot 1 (own_team=0) y agrega robot 2; ignora otro equipo.
+        let mut state: HashMap<(i32, i32), (GuiSkillCommand, u32)> = HashMap::new();
+        state.insert(
+            (0, 1),
+            (
+                GuiSkillCommand {
+                    team: 0,
+                    id: 1,
+                    skill_id: SkillId::Spin,
+                    target: Vec2::new(0.5, 0.0),
+                },
+                0,
+            ),
+        );
+        state.insert(
+            (0, 2),
+            (
+                GuiSkillCommand {
+                    team: 0,
+                    id: 2,
+                    skill_id: SkillId::ChaseBall,
+                    target: Vec2::ZERO,
+                },
+                0,
+            ),
+        );
+        state.insert(
+            (1, 0),
+            (
+                GuiSkillCommand {
+                    team: 1,
+                    id: 0,
+                    skill_id: SkillId::FacePoint,
+                    target: Vec2::ZERO,
+                },
+                0,
+            ),
+        );
+
+        apply_gui_skill_overrides(&mut choices, &state, 0);
+
+        // Robot 0 intacto (GoTo del "coach"), no lo tocó el equipo contrario.
+        let c0 = choices.iter().find(|c| c.robot_id == 0).unwrap();
+        assert_eq!(c0.skill_id, SkillId::GoTo);
+        // Robot 1 reemplazado por Spin.
+        let c1 = choices.iter().find(|c| c.robot_id == 1).unwrap();
+        assert_eq!(c1.skill_id, SkillId::Spin);
+        // Robot 2 insertado (ChaseBall).
+        let c2 = choices.iter().find(|c| c.robot_id == 2).unwrap();
+        assert_eq!(c2.skill_id, SkillId::ChaseBall);
     }
 
     /// Smoke test: `run_control_loop` con `FixedSkillDecider` y `MockTransport`.

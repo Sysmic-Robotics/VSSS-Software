@@ -59,6 +59,13 @@ bring-up del robot real (ver `docs/bringup_robot_real.md`):
 - El robot seleccionado se resalta con un halo naranjo, y el chart inferior grafica sus
   velocidades de rueda comandadas **L/R (mm/s)** en el tiempo.
 
+**Runner de skills (validador visual):** en la fila de control eliges una de las 4 skills
+(`GoTo`, `FacePoint`, `ChaseBall`, `Spin`) o **Ninguna**, y haces **click en la cancha**
+para fijar el target (marcador verde). La skill se inyecta como `SkillChoice` al mismo
+`SkillCatalog::tick` que el coach — reemplaza la decisión del coach solo para ese robot.
+Precedencia: control manual (velocidad cruda) > skill de GUI > coach. Con "Ninguna" el robot
+vuelve al coach.
+
 La tab **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
 estado de conexión y PPS. Editar puerto/baud requiere reiniciar el proceso (se aplican por
 `VSSL_BASESTATION_DEVICE` / `VSSL_BASESTATION_BAUD`). En headless nada de esto aplica: la

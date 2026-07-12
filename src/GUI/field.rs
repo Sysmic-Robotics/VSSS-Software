@@ -30,6 +30,27 @@ pub struct FieldCanvas<'a> {
     pub cache: &'a Cache,
     /// Robot resaltado para control manual, como `(team, id)`. `None` = ninguno.
     pub selected: Option<(u32, u32)>,
+    /// Target de la skill de GUI activa (metros, marco mundo). `None` = ninguno.
+    pub skill_target: Option<glam::Vec2>,
+}
+
+/// Centro y escala del dibujo del campo para unas `bounds` dadas. Compartido por
+/// `draw` y por la conversión de click, para que no puedan divergir.
+pub fn field_center_scale(bounds: Rectangle) -> (Point, f32) {
+    let center = Point::new(bounds.width / 2.0, bounds.height / 2.0);
+    let scale_x = bounds.width / (FIELD_LENGTH + FIELD_MARGIN * 2.0);
+    let scale_y = bounds.height / (FIELD_WIDTH + FIELD_MARGIN * 2.0);
+    (center, scale_x.min(scale_y) * 0.9)
+}
+
+/// Convierte un punto de pantalla (relativo a `bounds`) a coordenadas de mundo en
+/// **metros**, inversa consistente con el `·1000` del marcador de target del dibujo.
+pub fn screen_to_world_m(bounds: Rectangle, p: Point) -> glam::Vec2 {
+    let (center, scale) = field_center_scale(bounds);
+    glam::Vec2::new(
+        (p.x - center.x) / (scale * 1000.0),
+        (center.y - p.y) / (scale * 1000.0),
+    )
 }
 
 impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
@@ -44,10 +65,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let geometry = self.cache.draw(renderer, bounds.size(), |frame| {
-            let center = frame.center();
-            let scale_x = bounds.width / (FIELD_LENGTH + FIELD_MARGIN * 2.0);
-            let scale_y = bounds.height / (FIELD_WIDTH + FIELD_MARGIN * 2.0);
-            let scale = scale_x.min(scale_y) * 0.9;
+            let (center, scale) = field_center_scale(bounds);
 
             // Draw margin (green area outside field boundaries)
             let margin_rect = Path::rectangle(
@@ -299,8 +317,81 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     }
                 }
             }
+
+            // Marcador del target de la skill de GUI activa (verde).
+            if let Some(t) = self.skill_target {
+                let p = Point::new(center.x + t.x * 1000.0 * scale, center.y - t.y * 1000.0 * scale);
+                let ring = Path::circle(p, 10.0);
+                frame.stroke(
+                    &ring,
+                    Stroke::default()
+                        .with_width(2.5)
+                        .with_color(Color::from_rgb(0.1, 1.0, 0.3)),
+                );
+                for (dx, dy) in [(-7.0_f32, 0.0), (7.0, 0.0), (0.0, -7.0_f32), (0.0, 7.0)] {
+                    frame.stroke(
+                        &Path::line(p, Point::new(p.x + dx, p.y + dy)),
+                        Stroke::default()
+                            .with_width(2.0)
+                            .with_color(Color::from_rgb(0.1, 1.0, 0.3)),
+                    );
+                }
+            }
         });
 
         vec![geometry]
+    }
+
+    fn update(
+        &self,
+        _state: &mut Self::State,
+        event: canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> (canvas::event::Status, Option<Message>) {
+        if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
+            && let Some(p) = cursor.position_in(bounds)
+        {
+            let world = screen_to_world_m(bounds, p);
+            return (
+                canvas::event::Status::Captured,
+                Some(Message::FieldClicked(world)),
+            );
+        }
+        (canvas::event::Status::Ignored, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds() -> Rectangle {
+        Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 1000.0,
+            height: 800.0,
+        }
+    }
+
+    /// 2.4 — El centro de la pantalla mapea al origen del mundo (0,0).
+    #[test]
+    fn screen_center_is_world_origin() {
+        let b = bounds();
+        let (center, _scale) = field_center_scale(b);
+        let w = screen_to_world_m(b, center);
+        assert!(w.x.abs() < 1e-6 && w.y.abs() < 1e-6);
+    }
+
+    /// 2.4 — Un punto conocido mapea a los metros esperados (con flip de Y).
+    #[test]
+    fn known_point_maps_to_meters() {
+        let b = bounds();
+        let (center, scale) = field_center_scale(b);
+        let p = Point::new(center.x + 100.0, center.y - 50.0);
+        let w = screen_to_world_m(b, p);
+        assert!((w.x - 100.0 / (scale * 1000.0)).abs() < 1e-6);
+        assert!((w.y - 50.0 / (scale * 1000.0)).abs() < 1e-6);
     }
 }

@@ -175,6 +175,7 @@ fn run_bench(
         status_rx,
         motion_rx,
         manual_tx: None, // el bench no usa control manual
+        skill_tx: None,
         num_robots: 3,
         own_team: team.as_team_id() as u32,
         radio_target_label: format!("{transport:?}"),
@@ -264,6 +265,7 @@ async fn async_run(
         status_tx,
         motion_tx,
         manual_rx: None,
+        skill_rx: None,
     });
 
     if let Err(err) = run_control_loop(config, decider, Some(on_tick), gui, shutdown).await {

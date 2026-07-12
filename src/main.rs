@@ -18,7 +18,8 @@ const COACH_DECISION_PERIOD: u32 = 6;
 use glam::Vec2;
 use rustengine::coach::{Coach, RuleBasedCoach, SkillChoice};
 use rustengine::control_loop::{
-    CoachDecider, ControlLoopConfig, GuiChannels, ManualCommand, TickDecider, run_control_loop,
+    CoachDecider, ControlLoopConfig, GuiChannels, GuiSkillCommand, ManualCommand, TickDecider,
+    run_control_loop,
 };
 use rustengine::radio::RadioTarget;
 use rustengine::vision::VisionSource;
@@ -82,6 +83,7 @@ fn run_with_gui() {
     let (motion_tx, motion_rx) = mpsc::channel::<Vec<GUI::RobotMotionDebug>>(32);
     let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
+    let (skill_tx, skill_rx) = mpsc::channel::<GuiSkillCommand>(32);
 
     let source = VisionSource::from_env();
     let ip = source.multicast_ip().to_string();
@@ -95,7 +97,7 @@ fn run_with_gui() {
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(Some((status_tx, motion_tx, manual_rx))));
+        rt.block_on(async_main(Some((status_tx, motion_tx, manual_rx, skill_rx))));
     });
 
     let setup = GUI::GuiSetup {
@@ -105,6 +107,7 @@ fn run_with_gui() {
         status_rx,
         motion_rx,
         manual_tx: Some(manual_tx),
+        skill_tx: Some(skill_tx),
         num_robots: NUM_ROBOTS,
         own_team: OWN_TEAM as u32,
         radio_target_label,
@@ -131,6 +134,7 @@ type GuiChannelBundle = (
     mpsc::Sender<GUI::StatusUpdate>,
     mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
     mpsc::Receiver<ManualCommand>,
+    mpsc::Receiver<GuiSkillCommand>,
 );
 
 async fn async_main(gui_channels: Option<GuiChannelBundle>) {
@@ -172,10 +176,11 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         vision_timeout: None,
     };
 
-    let gui = gui_channels.map(|(status_tx, motion_tx, manual_rx)| GuiChannels {
+    let gui = gui_channels.map(|(status_tx, motion_tx, manual_rx, skill_rx)| GuiChannels {
         status_tx,
         motion_tx,
         manual_rx: Some(manual_rx),
+        skill_rx: Some(skill_rx),
     });
 
     let shutdown = Arc::new(AtomicBool::new(false));
