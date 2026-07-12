@@ -175,6 +175,8 @@ pub struct GuiChannels {
     pub estop: Option<Arc<AtomicBool>>,
     /// Canal opcional de tuneo del PID de heading GUI→loop. `None` = sin tuneo.
     pub pid_rx: Option<mpsc::Receiver<HeadingPid>>,
+    /// Canal opcional de teleport (sim) GUI→loop. `None` = sin teleport.
+    pub teleport_rx: Option<mpsc::Receiver<Vec<crate::radio::TeleportItem>>>,
 }
 
 /// Construye comandos de velocidad cero para todos los robots activos del equipo
@@ -334,17 +336,19 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(true));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (status_tx, motion_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx) = match gui {
-        Some(g) => (
-            Some(g.status_tx),
-            Some(g.motion_tx),
-            g.manual_rx,
-            g.skill_rx,
-            g.estop,
-            g.pid_rx,
-        ),
-        None => (None, None, None, None, None, None),
-    };
+    let (status_tx, motion_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx) =
+        match gui {
+            Some(g) => (
+                Some(g.status_tx),
+                Some(g.motion_tx),
+                g.manual_rx,
+                g.skill_rx,
+                g.estop,
+                g.pid_rx,
+                g.teleport_rx,
+            ),
+            None => (None, None, None, None, None, None, None),
+        };
 
     // Estado de comandos manuales vigentes por (team, id) con el tick de último
     // refresco, para expirar comandos rancios (ver `MANUAL_STALE_TICKS`).
@@ -480,6 +484,20 @@ pub async fn run_control_loop(
         if let Some(rx) = pid_rx.as_mut() {
             while let Ok(p) = rx.try_recv() {
                 catalog.set_heading_pid(p.kp, p.ki, p.kd);
+            }
+        }
+
+        // Teleport (sim) solicitado desde la GUI.
+        if let Some(rx) = teleport_rx.as_mut() {
+            let mut reqs: Vec<crate::radio::TeleportItem> = Vec::new();
+            while let Ok(items) = rx.try_recv() {
+                reqs.extend(items);
+            }
+            if !reqs.is_empty() {
+                let mut radio_guard = radio.lock().await;
+                if let Err(e) = radio_guard.teleport(&reqs).await {
+                    eprintln!("[control_loop] teleport error: {e}");
+                }
             }
         }
 

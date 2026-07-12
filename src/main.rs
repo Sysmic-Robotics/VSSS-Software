@@ -85,6 +85,8 @@ fn run_with_gui() {
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
     let (skill_tx, skill_rx) = mpsc::channel::<GuiSkillCommand>(32);
     let (pid_tx, pid_rx) = mpsc::channel::<HeadingPid>(16);
+    let (teleport_tx, teleport_rx) =
+        mpsc::channel::<Vec<rustengine::radio::TeleportItem>>(16);
     let estop = Arc::new(AtomicBool::new(false));
 
     let source = VisionSource::from_env();
@@ -101,7 +103,7 @@ fn run_with_gui() {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(Some((
-            status_tx, motion_tx, manual_rx, skill_rx, estop_loop, pid_rx,
+            status_tx, motion_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx,
         ))));
     });
 
@@ -114,6 +116,7 @@ fn run_with_gui() {
         manual_tx: Some(manual_tx),
         skill_tx: Some(skill_tx),
         pid_tx: Some(pid_tx),
+        teleport_tx: Some(teleport_tx),
         estop,
         num_robots: NUM_ROBOTS,
         own_team: OWN_TEAM as u32,
@@ -144,6 +147,7 @@ type GuiChannelBundle = (
     mpsc::Receiver<GuiSkillCommand>,
     Arc<AtomicBool>,
     mpsc::Receiver<HeadingPid>,
+    mpsc::Receiver<Vec<rustengine::radio::TeleportItem>>,
 );
 
 async fn async_main(gui_channels: Option<GuiChannelBundle>) {
@@ -186,13 +190,14 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
     };
 
     let gui = gui_channels.map(
-        |(status_tx, motion_tx, manual_rx, skill_rx, estop, pid_rx)| GuiChannels {
+        |(status_tx, motion_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)| GuiChannels {
             status_tx,
             motion_tx,
             manual_rx: Some(manual_rx),
             skill_rx: Some(skill_rx),
             estop: Some(estop),
             pid_rx: Some(pid_rx),
+            teleport_rx: Some(teleport_rx),
         },
     );
 

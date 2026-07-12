@@ -177,6 +177,7 @@ fn run_bench(
         manual_tx: None, // el bench no usa control manual
         skill_tx: None,
         pid_tx: None,
+        teleport_tx: None,
         estop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         num_robots: 3,
         own_team: team.as_team_id() as u32,
@@ -270,6 +271,7 @@ async fn async_run(
         skill_rx: None,
         estop: None,
         pid_rx: None,
+        teleport_rx: None,
     });
 
     if let Err(err) = run_control_loop(config, decider, Some(on_tick), gui, shutdown).await {

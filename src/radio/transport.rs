@@ -3,11 +3,33 @@ use async_trait::async_trait;
 
 pub type TransportError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Solicitud de reposicionamiento (teleport) en simulador. Coordenadas en metros,
+/// marco mundo; `theta` en radianes. Sin efecto en base station (robots reales).
+#[derive(Debug, Clone, Copy)]
+pub enum TeleportItem {
+    Robot {
+        team: u32,
+        id: u32,
+        x: f64,
+        y: f64,
+        theta: f64,
+    },
+    Ball {
+        x: f64,
+        y: f64,
+    },
+}
+
 #[async_trait]
 pub trait RobotTransport: Send + Sync {
     async fn send_commands(&mut self, commands: &[RobotCommand]) -> Result<(), TransportError>;
 
     async fn create_robots(&mut self, _robot_ids: &[(u32, u32)]) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    /// Reposiciona robots/pelota en el simulador. Default no-op (base station real).
+    async fn teleport(&mut self, _items: &[TeleportItem]) -> Result<(), TransportError> {
         Ok(())
     }
 }
@@ -32,6 +54,10 @@ impl RobotTransport for FiraSimTransport {
 
     async fn create_robots(&mut self, robot_ids: &[(u32, u32)]) -> Result<(), TransportError> {
         self.client.create_robots(robot_ids).await
+    }
+
+    async fn teleport(&mut self, items: &[TeleportItem]) -> Result<(), TransportError> {
+        self.client.teleport(items).await
     }
 }
 
@@ -58,5 +84,9 @@ impl RobotTransport for GrSimTransport {
             self.client.send_commands(&yellow).await?;
         }
         Ok(())
+    }
+
+    async fn teleport(&mut self, items: &[TeleportItem]) -> Result<(), TransportError> {
+        self.client.teleport(items).await
     }
 }

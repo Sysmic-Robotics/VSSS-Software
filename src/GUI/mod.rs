@@ -20,6 +20,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::control_loop::{GuiSkillCommand, HeadingPid, ManualCommand};
+use crate::radio::TeleportItem;
 use crate::skills::SkillId;
 use serde::{Deserialize, Serialize};
 use field::FieldCanvas;
@@ -192,17 +193,19 @@ pub enum Section {
     Skills,
     Inspector,
     Tuning,
+    Teleport,
     Radio,
     Vision,
     Telemetry,
 }
 
 impl Section {
-    const ALL: [Section; 7] = [
+    const ALL: [Section; 8] = [
         Section::Control,
         Section::Skills,
         Section::Inspector,
         Section::Tuning,
+        Section::Teleport,
         Section::Radio,
         Section::Vision,
         Section::Telemetry,
@@ -213,6 +216,7 @@ impl Section {
             Section::Skills => "Skills",
             Section::Inspector => "Inspector",
             Section::Tuning => "Tuning",
+            Section::Teleport => "Teleport (sim)",
             Section::Radio => "Radio",
             Section::Vision => "Visión",
             Section::Telemetry => "Telemetría",
@@ -258,6 +262,13 @@ pub enum Message {
     ToggleEstop,
     EngageEstop,
     ToggleTrace(bool),
+    TpRobotXChanged(String),
+    TpRobotYChanged(String),
+    TpRobotThetaChanged(String),
+    TpBallXChanged(String),
+    TpBallYChanged(String),
+    TeleportRobot,
+    TeleportBall,
 }
 
 #[derive(Debug, Clone)]
@@ -410,6 +421,13 @@ pub struct VisionGui {
     pid_ki_str: String,
     pid_kd_str: String,
     pid_tx: Option<mpsc::Sender<HeadingPid>>,
+    teleport_tx: Option<mpsc::Sender<Vec<TeleportItem>>>,
+    /// Campos de teleport (metros / rad) como texto.
+    tp_robot_x: String,
+    tp_robot_y: String,
+    tp_robot_theta: String,
+    tp_ball_x: String,
+    tp_ball_y: String,
     /// Nombre de archivo para presets de tuning.
     preset_name: String,
     /// Mensaje breve de estado de guardar/cargar preset.
@@ -443,6 +461,8 @@ pub struct GuiSetup {
     pub skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
     /// Canal de tuneo del PID de heading GUI→control loop.
     pub pid_tx: Option<mpsc::Sender<HeadingPid>>,
+    /// Canal de teleport (sim) GUI→control loop.
+    pub teleport_tx: Option<mpsc::Sender<Vec<TeleportItem>>>,
     /// Flag de parada de emergencia compartido con el control loop.
     pub estop: Arc<AtomicBool>,
     pub num_robots: usize,
@@ -511,6 +531,12 @@ impl VisionGui {
                 pid_ki_str: format!("{PID_KI_DEFAULT}"),
                 pid_kd_str: format!("{PID_KD_DEFAULT}"),
                 pid_tx: setup.pid_tx,
+                teleport_tx: setup.teleport_tx,
+                tp_robot_x: "0.0".to_string(),
+                tp_robot_y: "0.0".to_string(),
+                tp_robot_theta: "0.0".to_string(),
+                tp_ball_x: "0.0".to_string(),
+                tp_ball_y: "0.0".to_string(),
                 preset_name: "tuning.json".to_string(),
                 preset_status: String::new(),
                 estop: setup.estop,
@@ -927,6 +953,35 @@ impl VisionGui {
                 }
                 self.field_cache.clear();
             }
+            Message::TpRobotXChanged(s) => self.tp_robot_x = s,
+            Message::TpRobotYChanged(s) => self.tp_robot_y = s,
+            Message::TpRobotThetaChanged(s) => self.tp_robot_theta = s,
+            Message::TpBallXChanged(s) => self.tp_ball_x = s,
+            Message::TpBallYChanged(s) => self.tp_ball_y = s,
+            Message::TeleportRobot => {
+                if let (Ok(x), Ok(y), Ok(theta)) = (
+                    self.tp_robot_x.parse::<f64>(),
+                    self.tp_robot_y.parse::<f64>(),
+                    self.tp_robot_theta.parse::<f64>(),
+                ) && let Some(tx) = &self.teleport_tx
+                {
+                    let _ = tx.try_send(vec![TeleportItem::Robot {
+                        team: self.selected_team,
+                        id: self.selected_robot,
+                        x,
+                        y,
+                        theta,
+                    }]);
+                }
+            }
+            Message::TeleportBall => {
+                if let (Ok(x), Ok(y)) =
+                    (self.tp_ball_x.parse::<f64>(), self.tp_ball_y.parse::<f64>())
+                    && let Some(tx) = &self.teleport_tx
+                {
+                    let _ = tx.try_send(vec![TeleportItem::Ball { x, y }]);
+                }
+            }
             Message::RadioPortChanged(port) => {
                 self.radio_port = port;
             }
@@ -1250,6 +1305,42 @@ impl VisionGui {
         .into()
     }
 
+    /// Contenido de la sección **Teleport** (solo sim): reposicionar robot y pelota.
+    fn teleport_section(&self) -> Element<'_, Message> {
+        let field = |value: &str, msg: fn(String) -> Message| {
+            text_input("", value)
+                .on_input(msg)
+                .size(12)
+                .width(Length::Fixed(56.0))
+        };
+        column![
+            text(format!("Robot {} (x, y, θ)", self.selected_robot)).size(12),
+            row![
+                field(&self.tp_robot_x, Message::TpRobotXChanged),
+                field(&self.tp_robot_y, Message::TpRobotYChanged),
+                field(&self.tp_robot_theta, Message::TpRobotThetaChanged),
+                button(text("Teleport").size(12))
+                    .padding([4, 8])
+                    .on_press(Message::TeleportRobot),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text("Pelota (x, y)").size(12),
+            row![
+                field(&self.tp_ball_x, Message::TpBallXChanged),
+                field(&self.tp_ball_y, Message::TpBallYChanged),
+                button(text("Teleport").size(12))
+                    .padding([4, 8])
+                    .on_press(Message::TeleportBall),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text("metros, marco mundo · solo FIRASim/grSim").size(10),
+        ]
+        .spacing(6)
+        .into()
+    }
+
     /// Contenido de la sección **Inspector**: datos de visión del robot seleccionado.
     fn inspector_section(&self) -> Element<'_, Message> {
         let trace_btn = button(
@@ -1347,6 +1438,7 @@ impl VisionGui {
                 Section::Skills => self.skills_section(),
                 Section::Inspector => self.inspector_section(),
                 Section::Tuning => self.tuning_section(),
+                Section::Teleport => self.teleport_section(),
                 Section::Radio => radio_panel::view(
                     &self.radio_target_label,
                     &self.radio_port,

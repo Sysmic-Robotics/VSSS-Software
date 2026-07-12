@@ -43,7 +43,7 @@ cargo fmt                            # formato
 ### GUI de debug (`VSSL_DEBUG_GUI=1`)
 
 Layout: **barra superior** (botón STOP + estado de conexión), **sidebar izquierdo con
-secciones colapsables** (Control, Skills, Inspector, Tuning, Radio, Visión, Telemetría),
+secciones colapsables** (Control, Skills, Inspector, Tuning, Teleport, Radio, Visión, Telemetría),
 **cancha central**, y
 **barra de estado** inferior (robot/equipo, θ, PPS, ESTOP). Cada sección se expande/colapsa
 con su encabezado.
@@ -85,6 +85,10 @@ de velocidad comandada), **número de robot** y **traza** del recorrido reciente
 La sección **Tuning** ajusta en vivo (sin recompilar): escalas de velocidad, rampa, **Spin ω**
 y el **PID de heading** (`kp/ki/kd`, que gobierna el giro de GoTo/FacePoint/ChaseBall — afecta
 también al coach). Además guarda/carga **presets** de todo el tuning en un archivo JSON.
+
+La sección **Teleport (sim)** reposiciona el robot seleccionado a `(x, y, θ)` y la pelota a
+`(x, y)` en el simulador (FIRASim/grSim) — útil para armar situaciones reproducibles de test.
+En base station (robots reales) es no-op.
 
 La sección **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
 estado de conexión y PPS. Editar puerto/baud requiere reiniciar el proceso (se aplican por

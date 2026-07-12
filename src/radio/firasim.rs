@@ -1,6 +1,7 @@
 use crate::motion::RobotCommand;
 use crate::protos::ssl_gc_common::{RobotId, Team};
 use crate::protos::ssl_simulation_control::{SimulatorCommand, SimulatorControl, TeleportRobot};
+use crate::radio::transport::TeleportItem;
 use crate::protos::ssl_simulation_synchronous::{SimulationSyncRequest, SimulationSyncResponse};
 use crate::radio::commands::{serialize_to_fira_actuator, serialize_to_firasim};
 use protobuf::Message;
@@ -149,6 +150,53 @@ impl FIRASimClient {
     }
 
     /// Envía un comando individual
+    /// Reposiciona robots/pelota en FIRASim vía `Packet.replace` (protocolo FIRA),
+    /// al mismo puerto de comandos. (FIRASim usa replacement FIRA, no SSL.)
+    pub async fn teleport(
+        &self,
+        items: &[TeleportItem],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::protos::fira_common::Robot as FiraRobot;
+        use crate::protos::fira_packet::Packet;
+        use crate::protos::fira_replacement::{BallReplacement, Replacement, RobotReplacement};
+
+        let mut replacement = Replacement::new();
+        for item in items {
+            match *item {
+                TeleportItem::Robot {
+                    team,
+                    id,
+                    x,
+                    y,
+                    theta,
+                } => {
+                    let mut pos = FiraRobot::new();
+                    pos.robot_id = id;
+                    pos.x = x;
+                    pos.y = y;
+                    pos.orientation = theta;
+                    let mut rr = RobotReplacement::new();
+                    rr.position = protobuf::MessageField::some(pos);
+                    rr.yellowteam = team == 1;
+                    rr.turnon = true;
+                    replacement.robots.push(rr);
+                }
+                TeleportItem::Ball { x, y } => {
+                    let mut b = BallReplacement::new();
+                    b.x = x;
+                    b.y = y;
+                    replacement.ball = protobuf::MessageField::some(b);
+                }
+            }
+        }
+        let mut pkt = Packet::new();
+        pkt.replace = protobuf::MessageField::some(replacement);
+        let mut buffer = Vec::new();
+        pkt.write_to_vec(&mut buffer)?;
+        self.socket.send_to(&buffer, &self.address).await?;
+        Ok(())
+    }
+
     pub async fn send_command(
         &self,
         cmd: &RobotCommand,

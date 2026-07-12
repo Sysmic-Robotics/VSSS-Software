@@ -7,7 +7,9 @@ mod transport;
 pub use base_station::{BaseStationTransport, TeamColor};
 pub use firasim::FIRASimClient;
 pub use grsim::GrSimClient;
-pub use transport::{FiraSimTransport, GrSimTransport, RobotTransport, TransportError};
+pub use transport::{
+    FiraSimTransport, GrSimTransport, RobotTransport, TeleportItem, TransportError,
+};
 
 use crate::motion::RobotCommand;
 use std::collections::HashMap;
@@ -116,6 +118,11 @@ impl Radio {
 
     pub async fn create_robots(&mut self, robot_ids: &[(u32, u32)]) -> Result<(), TransportError> {
         self.transport.create_robots(robot_ids).await
+    }
+
+    /// Reposiciona robots/pelota en el simulador (no-op en base station).
+    pub async fn teleport(&mut self, items: &[TeleportItem]) -> Result<(), TransportError> {
+        self.transport.teleport(items).await
     }
 
     pub async fn send_commands(&mut self) -> Result<(), TransportError> {
