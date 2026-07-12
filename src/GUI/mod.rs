@@ -8,8 +8,10 @@ use iced::futures::SinkExt;
 use iced::stream;
 use iced::widget::canvas::Cache;
 use iced::{
-    Element, Length, Subscription, Task, Theme,
-    widget::{Canvas, button, column, container, row, text, text_input},
+    Color, Element, Length, Subscription, Task, Theme,
+    widget::{
+        Canvas, button, column, container, horizontal_space, row, scrollable, text, text_input,
+    },
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,11 +165,33 @@ const GUI_LOG_EVERY_ROBOT_UPDATE: bool = false;
 /// solo la pintura del mapa se limita para evitar trabajo visual redundante.
 const GUI_FIELD_UPDATE_INTERVAL_MS: u64 = 50;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TabView {
-    Vision,
-    Robots,
+/// Secciones colapsables del sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Section {
+    Control,
+    Skills,
     Radio,
+    Vision,
+    Telemetry,
+}
+
+impl Section {
+    const ALL: [Section; 5] = [
+        Section::Control,
+        Section::Skills,
+        Section::Radio,
+        Section::Vision,
+        Section::Telemetry,
+    ];
+    fn title(self) -> &'static str {
+        match self {
+            Section::Control => "Control",
+            Section::Skills => "Skills",
+            Section::Radio => "Radio",
+            Section::Vision => "Visión",
+            Section::Telemetry => "Telemetría",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,7 +204,7 @@ pub enum Message {
     Connect,
     ToggleTracker(bool),
     Tick,
-    TabSelected(TabView),
+    ToggleSection(Section),
     // --- Control manual y paneles ---
     KeyPressed(char),
     KeyReleased(char),
@@ -302,7 +326,7 @@ pub struct VisionGui {
     config_tx: Option<mpsc::Sender<ConfigUpdate>>,
     status_rx: Arc<Mutex<Option<mpsc::Receiver<StatusUpdate>>>>,
     motion_rx: Arc<Mutex<Option<mpsc::Receiver<Vec<RobotMotionDebug>>>>>,
-    active_tab: TabView,
+    expanded: HashSet<Section>,
     packet_history: VecDeque<(f64, u64)>,
     start_time: Instant,
     last_second: u64,
@@ -391,7 +415,8 @@ impl VisionGui {
                 config_tx: Some(setup.config_tx),
                 status_rx: Arc::new(Mutex::new(Some(setup.status_rx))),
                 motion_rx: Arc::new(Mutex::new(Some(setup.motion_rx))),
-                active_tab: TabView::Vision,
+                // Por defecto Control y Skills abiertas (lo más usado en bring-up).
+                expanded: HashSet::from([Section::Control, Section::Skills]),
                 packet_history: VecDeque::new(),
                 start_time: Instant::now(),
                 last_second: 0,
@@ -593,8 +618,10 @@ impl VisionGui {
                     self.chart_cache.clear();
                 }
             }
-            Message::TabSelected(tab) => {
-                self.active_tab = tab;
+            Message::ToggleSection(sec) => {
+                if !self.expanded.remove(&sec) {
+                    self.expanded.insert(sec);
+                }
             }
             Message::ToggleTracker(enabled) => {
                 self.tracker_enabled = enabled;
@@ -888,8 +915,9 @@ impl VisionGui {
         Theme::Dark
     }
 
-    /// Fila de controles de control manual: toggle, selector de robot y de equipo.
-    fn manual_controls_view(&self) -> Element<'_, Message> {
+    /// Contenido de la sección **Control**: manual, robot, equipo, marco, escalas, rampa.
+    /// Apilado en vertical para caber en el sidebar.
+    fn control_section(&self) -> Element<'_, Message> {
         let manual_btn = button(
             text(if self.manual_enabled {
                 "Manual: ON"
@@ -936,58 +964,165 @@ impl VisionGui {
         .on_press(Message::ToggleFrame);
 
         let help = match self.manual_frame {
-            FrameMode::World => "(W/S=±Y, A/D=±X, Q/E girar)",
-            FrameMode::Robot => "(W/S adelante/atrás, A/D girar)",
+            FrameMode::World => "W/S=±Y · A/D=±X · Q/E girar",
+            FrameMode::Robot => "W/S adelante/atrás · A/D girar",
         };
 
-        let top = row![
-            manual_btn,
-            text("Robot:").size(13),
-            robot_dec,
-            text(format!("{}", self.selected_robot)).size(14),
-            robot_inc,
-            team_btn,
-            frame_btn,
-            text(help).size(11),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
-
         let scales = row![
-            text("Lin máx (m/s):").size(12),
+            text("Vel L/A:").size(12),
             text_input("0.5", &self.manual_lin_str)
                 .on_input(Message::ManualLinChanged)
                 .size(12)
-                .width(Length::Fixed(70.0)),
-            text("Ang máx (rad/s):").size(12),
+                .width(Length::Fixed(60.0)),
             text_input("3.0", &self.manual_ang_str)
                 .on_input(Message::ManualAngChanged)
                 .size(12)
-                .width(Length::Fixed(70.0)),
+                .width(Length::Fixed(60.0)),
         ]
-        .spacing(8)
+        .spacing(6)
         .align_y(iced::Alignment::Center);
 
         let accels = row![
-            text("Accel lin (m/s²):").size(12),
+            text("Acc L/A:").size(12),
             text_input("2.0", &self.manual_lin_accel_str)
                 .on_input(Message::ManualLinAccelChanged)
                 .size(12)
-                .width(Length::Fixed(70.0)),
-            text("Accel ang (rad/s²):").size(12),
+                .width(Length::Fixed(60.0)),
             text_input("12.0", &self.manual_ang_accel_str)
                 .on_input(Message::ManualAngAccelChanged)
                 .size(12)
-                .width(Length::Fixed(70.0)),
-            text("(↑ para giro más snappy)").size(11),
+                .width(Length::Fixed(60.0)),
         ]
-        .spacing(8)
+        .spacing(6)
         .align_y(iced::Alignment::Center);
 
+        column![
+            row![manual_btn, frame_btn]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            row![
+                text("Robot:").size(13),
+                robot_dec,
+                text(format!("{}", self.selected_robot)).size(14),
+                robot_inc,
+                team_btn,
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text(help).size(10),
+            scales,
+            accels,
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    /// Contenido de la sección **Skills**: selector de skill + Spin ω.
+    fn skills_section(&self) -> Element<'_, Message> {
+        column![
+            row![
+                skill_button("Ninguna", None, self.active_skill),
+                skill_button("GoTo", Some(SkillId::GoTo), self.active_skill),
+                skill_button("FacePoint", Some(SkillId::FacePoint), self.active_skill),
+            ]
+            .spacing(4),
+            row![
+                skill_button("ChaseBall", Some(SkillId::ChaseBall), self.active_skill),
+                skill_button("Spin", Some(SkillId::Spin), self.active_skill),
+            ]
+            .spacing(4),
+            row![
+                text("Spin ω (rad/s):").size(12),
+                text_input("20", &self.spin_omega_str)
+                    .on_input(Message::SpinOmegaChanged)
+                    .size(12)
+                    .width(Length::Fixed(60.0)),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text("click en la cancha = target / lado de giro").size(10),
+        ]
+        .spacing(6)
+        .into()
+    }
+
+    /// Envuelve un contenido con su encabezado colapsable de sección.
+    fn section_view<'a>(
+        &'a self,
+        sec: Section,
+        content: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let open = self.expanded.contains(&sec);
+        let header = button(
+            row![
+                text(if open { "▼" } else { "▶" }).size(13),
+                text(sec.title()).size(14),
+            ]
+            .spacing(6),
+        )
+        .width(Length::Fill)
+        .padding([6, 8])
+        .style(button::secondary)
+        .on_press(Message::ToggleSection(sec));
+
+        if open {
+            column![header, container(content).padding([4, 8])]
+                .spacing(2)
+                .into()
+        } else {
+            header.into()
+        }
+    }
+
+    /// Sidebar: columna scrollable de secciones colapsables.
+    fn sidebar_view(&self) -> Element<'_, Message> {
+        let mut col = column![].spacing(6).padding(6);
+        for sec in Section::ALL {
+            let content: Element<'_, Message> = match sec {
+                Section::Control => self.control_section(),
+                Section::Skills => self.skills_section(),
+                Section::Radio => radio_panel::view(
+                    &self.radio_target_label,
+                    &self.radio_port,
+                    &self.radio_baud,
+                    self.selected_team,
+                    self.transport_connected,
+                    self.packet_frequency,
+                ),
+                Section::Vision => vision_status::view(
+                    self.connected,
+                    &self.vision_ip,
+                    &self.vision_port,
+                    self.packet_count,
+                    self.packet_frequency,
+                    self.last_ball_count,
+                    self.last_robot_count,
+                    &self.packet_history,
+                    &self.chart_cache,
+                    self.tracker_enabled,
+                ),
+                Section::Telemetry => Canvas::new(WheelChart {
+                    history: &self.wheel_history,
+                    cache: &self.wheel_chart_cache,
+                })
+                .width(Length::Fill)
+                .height(Length::Fixed(160.0))
+                .into(),
+            };
+            col = col.push(self.section_view(sec, content));
+        }
+        scrollable(col)
+            .width(Length::Fixed(360.0))
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Barra superior: STOP + título + estado de conexión.
+    fn top_bar_view(&self) -> Element<'_, Message> {
         let estop_on = self.estop.load(Ordering::Relaxed);
         let estop_btn = button(
             text(if estop_on {
-                "⚠ ESTOP ACTIVO — liberar"
+                "⚠ ESTOP — liberar"
             } else {
                 "STOP (Espacio)"
             })
@@ -1001,127 +1136,101 @@ impl VisionGui {
         })
         .on_press(Message::ToggleEstop);
 
-        let estop_row = row![estop_btn].spacing(8).align_y(iced::Alignment::Center);
+        let (conn_txt, conn_col) = match self.transport_connected {
+            Some(true) => ("radio ✓", Color::from_rgb(0.0, 0.8, 0.0)),
+            Some(false) => ("radio ✗", Color::from_rgb(0.8, 0.0, 0.0)),
+            None => ("radio —", Color::from_rgb(0.6, 0.6, 0.6)),
+        };
+        let vis_col = if self.connected {
+            Color::from_rgb(0.0, 0.8, 0.0)
+        } else {
+            Color::from_rgb(0.8, 0.0, 0.0)
+        };
 
-        let skills = row![
-            text("Skill:").size(12),
-            skill_button("Ninguna", None, self.active_skill),
-            skill_button("GoTo", Some(SkillId::GoTo), self.active_skill),
-            skill_button("FacePoint", Some(SkillId::FacePoint), self.active_skill),
-            skill_button("ChaseBall", Some(SkillId::ChaseBall), self.active_skill),
-            skill_button("Spin", Some(SkillId::Spin), self.active_skill),
-            text("Spin ω (rad/s):").size(12),
-            text_input("20", &self.spin_omega_str)
-                .on_input(Message::SpinOmegaChanged)
+        row![
+            estop_btn,
+            text("VSSS — Debug").size(16),
+            horizontal_space(),
+            text("visión")
                 .size(12)
-                .width(Length::Fixed(60.0)),
-            text("(click = target/lado)").size(11),
+                .style(move |_t: &Theme| text::Style { color: Some(vis_col) }),
+            text(conn_txt)
+                .size(12)
+                .style(move |_t: &Theme| text::Style {
+                    color: Some(conn_col)
+                }),
         ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center);
+        .spacing(12)
+        .padding([6, 10])
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
 
-        column![estop_row, top, scales, accels, skills]
-            .spacing(6)
-            .into()
+    /// Barra de estado inferior.
+    fn status_bar_view(&self) -> Element<'_, Message> {
+        let theta = self
+            .robots
+            .get(&(self.selected_team, self.selected_robot))
+            .map(|r| r.orientation)
+            .unwrap_or(0.0);
+        let estop_on = self.estop.load(Ordering::Relaxed);
+        row![
+            text(format!(
+                "robot {} · {}",
+                self.selected_robot,
+                if self.selected_team == 0 {
+                    "azul"
+                } else {
+                    "amarillo"
+                }
+            ))
+            .size(12),
+            text(format!("θ {theta:.2}")).size(12),
+            text(format!("PPS {:.0}", self.packet_frequency)).size(12),
+            horizontal_space(),
+            text(if estop_on { "ESTOP: ON" } else { "ESTOP: off" })
+                .size(12)
+                .style(move |_t: &Theme| text::Style {
+                    color: Some(if estop_on {
+                        Color::from_rgb(0.9, 0.2, 0.2)
+                    } else {
+                        Color::from_rgb(0.6, 0.6, 0.6)
+                    }),
+                }),
+        ]
+        .spacing(14)
+        .padding([4, 10])
+        .align_y(iced::Alignment::Center)
+        .into()
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // Tab buttons
-        let vision_button = button(text("Vision").size(14))
-            .padding([8, 16])
-            .style(if self.active_tab == TabView::Vision {
-                button::primary
-            } else {
-                button::secondary
-            })
-            .on_press(Message::TabSelected(TabView::Vision));
-
-        let robots_button = button(text("Robots").size(14))
-            .padding([8, 16])
-            .style(if self.active_tab == TabView::Robots {
-                button::primary
-            } else {
-                button::secondary
-            })
-            .on_press(Message::TabSelected(TabView::Robots));
-
-        let radio_button = button(text("Radio").size(14))
-            .padding([8, 16])
-            .style(if self.active_tab == TabView::Radio {
-                button::primary
-            } else {
-                button::secondary
-            })
-            .on_press(Message::TabSelected(TabView::Radio));
-
-        let tabs = row![vision_button, robots_button, radio_button]
-            .spacing(5)
-            .padding([8, 16]);
-
-        // Content based on active tab
-        let content = match self.active_tab {
-            TabView::Vision => vision_status::view(
-                self.connected,
-                &self.vision_ip,
-                &self.vision_port,
-                self.packet_count,
-                self.packet_frequency,
-                self.last_ball_count,
-                self.last_robot_count,
-                &self.packet_history,
-                &self.chart_cache,
-                self.tracker_enabled,
-            ),
-            TabView::Robots => {
-                let selected = if self.manual_enabled {
-                    Some((self.selected_team, self.selected_robot))
-                } else {
-                    None
-                };
-                let field = Canvas::new(FieldCanvas {
-                    robots: &self.robots,
-                    ball: &self.ball,
-                    motion: &self.motion_debug,
-                    cache: &self.field_cache,
-                    selected,
-                    skill_target: self.active_skill.map(|_| self.skill_target),
-                })
-                .width(Length::Fill)
-                .height(Length::Fill);
-
-                let controls = self.manual_controls_view();
-
-                let chart = Canvas::new(WheelChart {
-                    history: &self.wheel_history,
-                    cache: &self.wheel_chart_cache,
-                })
-                .width(Length::Fill)
-                .height(Length::Fixed(160.0));
-
-                column![
-                    container(field).width(Length::Fill).height(Length::Fill),
-                    controls,
-                    chart,
-                ]
-                .spacing(8)
-                .padding(8)
-                .into()
-            }
-            TabView::Radio => radio_panel::view(
-                &self.radio_target_label,
-                &self.radio_port,
-                &self.radio_baud,
-                self.selected_team,
-                self.transport_connected,
-                self.packet_frequency,
-            ),
+        let selected = if self.manual_enabled {
+            Some((self.selected_team, self.selected_robot))
+        } else {
+            None
         };
+        let field = Canvas::new(FieldCanvas {
+            robots: &self.robots,
+            ball: &self.ball,
+            motion: &self.motion_debug,
+            cache: &self.field_cache,
+            selected,
+            skill_target: self.active_skill.map(|_| self.skill_target),
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
 
-        let main_content = column![tabs, content]
-            .width(Length::Fill)
-            .height(Length::Fill);
+        let center = row![
+            self.sidebar_view(),
+            container(field)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(4),
+        ]
+        .height(Length::Fill);
 
-        container(main_content)
+        column![self.top_bar_view(), center, self.status_bar_view()]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

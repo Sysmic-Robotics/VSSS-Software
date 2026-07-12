@@ -40,10 +40,15 @@ cargo clippy                         # lint
 cargo fmt                            # formato
 ```
 
-### GUI de debug: control manual y panel de radio (`VSSL_DEBUG_GUI=1`)
+### GUI de debug (`VSSL_DEBUG_GUI=1`)
 
-La GUI Iced (tab **Robots**) permite **manejar un robot a mano**, útil para el
-bring-up del robot real (ver `docs/bringup_robot_real.md`):
+Layout: **barra superior** (botón STOP + estado de conexión), **sidebar izquierdo con
+secciones colapsables** (Control, Skills, Radio, Visión, Telemetría), **cancha central**, y
+**barra de estado** inferior (robot/equipo, θ, PPS, ESTOP). Cada sección se expande/colapsa
+con su encabezado.
+
+La sección **Control** permite **manejar un robot a mano**, útil para el bring-up del robot
+real (ver `docs/bringup_robot_real.md`):
 
 - **Manual: ON/OFF** activa el control manual del robot/equipo seleccionados.
 - Selector de **Robot** (`-`/`+`) y de **Equipo** (Azul/Amarillo).
@@ -71,7 +76,7 @@ para fijar el target (marcador verde). La skill se inyecta como `SkillChoice` al
 Precedencia: control manual (velocidad cruda) > skill de GUI > coach. Con "Ninguna" el robot
 vuelve al coach.
 
-La tab **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
+La sección **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
 estado de conexión y PPS. Editar puerto/baud requiere reiniciar el proceso (se aplican por
 `VSSL_BASESTATION_DEVICE` / `VSSL_BASESTATION_BAUD`). En headless nada de esto aplica: la
 config sigue viniendo del entorno y los bytes enviados son idénticos.
