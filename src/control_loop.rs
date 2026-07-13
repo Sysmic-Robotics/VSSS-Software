@@ -10,7 +10,7 @@
 
 use crate::GUI;
 use crate::coach::{Coach, Observation, SkillChoice};
-use crate::motion::{Motion, MotionCommand};
+use crate::motion::{BorderRecovery, Motion, MotionCommand};
 use crate::radio::{RadioTarget, TransportError};
 use crate::skills::{SkillCatalog, SkillId};
 use crate::vision::{Vision, VisionEvent, VisionSource};
@@ -352,6 +352,9 @@ pub async fn run_control_loop(
 
     // Estado de comandos manuales vigentes por (team, id) con el tick de último
     // refresco, para expirar comandos rancios (ver `MANUAL_STALE_TICKS`).
+    // Capa de recuperación de borde/atasco (wrapper sobre la salida de las skills).
+    // Conmutable por VSSL_BORDER_RECOVERY (default on).
+    let mut recovery = BorderRecovery::from_env();
     let mut manual_state: HashMap<(i32, i32), (ManualCommand, u32)> = HashMap::new();
     // Estado de skills de GUI vigentes por (team, id), misma mecánica de expiry.
     let mut skill_state: HashMap<(i32, i32), (GuiSkillCommand, u32)> = HashMap::new();
@@ -544,6 +547,11 @@ pub async fn run_control_loop(
                     config.own_team,
                 );
                 apply_manual_overrides(&mut cmds, &mut tgts, &manual_state, &world_guard);
+                // Recuperación de borde/atasco: reflejo de bajo nivel sobre los comandos
+                // autónomos del equipo propio (salta manual; el estop ya cortó arriba).
+                let manual_keys: std::collections::HashSet<(i32, i32)> =
+                    manual_state.keys().copied().collect();
+                recovery.guard_commands(&mut cmds, &world_guard, &manual_keys, config.own_team);
                 (cmds, tgts, applied)
             }
         };

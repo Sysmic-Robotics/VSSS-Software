@@ -2,12 +2,14 @@ mod benchmark;
 mod commands;
 mod environment;
 mod pid;
+mod recovery;
 mod uvf;
 
 pub use benchmark::{MotionBenchmarkScenario, MotionKpi, summarize_commands};
 pub use commands::{KickerCommand, MotionCommand, RobotCommand};
 pub use environment::Environment;
 pub use pid::PIDController;
+pub use recovery::BorderRecovery;
 pub use uvf::UniVectorField;
 
 use crate::world::{RobotState, World};
@@ -140,14 +142,24 @@ impl Motion {
         // Wall avoidance: obstáculos virtuales en los límites del campo lógico.
         // Cuando el robot se acerca a una pared, el UVF lo deflecta tangencialmente
         // igual que con robots. Sin esto, los robots se quedan pegados a las paredes.
+        //
+        // Excepción de target (misma regla que robots/pelota): si el destino está de
+        // ese lado y cerca/más allá de la pared lógica (p. ej. una pelota pegada al
+        // borde físico, más allá de ±0.70), NO se agrega esa pared. Si no, la pared
+        // virtual quedaría entre el robot y el target y el UVF deflectaría para siempre
+        // sin cruzar (el robot se "congela" deslizando por el borde).
         let rp = robot_state.position;
         let wall_threshold = self.config.uvf_influence_radius * 1.5;
         const WALL_X: f32 = 0.70;
         const WALL_Y: f32 = 0.60;
-        if (WALL_X - rp.x.abs()) < wall_threshold {
+        let target_beyond_x_wall = target.x.signum() == rp.x.signum()
+            && target.x.abs() > WALL_X - near_target_threshold;
+        let target_beyond_y_wall = target.y.signum() == rp.y.signum()
+            && target.y.abs() > WALL_Y - near_target_threshold;
+        if (WALL_X - rp.x.abs()) < wall_threshold && !target_beyond_x_wall {
             obstacles.push(Vec2::new(rp.x.signum() * WALL_X, rp.y));
         }
-        if (WALL_Y - rp.y.abs()) < wall_threshold {
+        if (WALL_Y - rp.y.abs()) < wall_threshold && !target_beyond_y_wall {
             obstacles.push(Vec2::new(rp.x, rp.y.signum() * WALL_Y));
         }
 
@@ -482,9 +494,54 @@ mod tests {
         );
     }
 
+    /// Regresión del bug de la pelota de borde: con el target (pelota) pegado al borde
+    /// físico (~0.72, más allá del campo lógico ±0.70), la pared virtual NO debe agregarse
+    /// del lado del target — si no, el UVF deflectaría tangencial y el robot deslizaría por
+    /// el borde sin cruzar. Con el fix, apunta directo al target.
+    #[test]
+    fn move_to_reaches_target_beyond_wall() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.72, 0.0), Vec2::ZERO); // pelota pegada al borde
+
+        let mut robot = RobotState::new(0, 0);
+        robot.position = Vec2::new(0.66, 0.0); // acercándose al borde +x
+        let target = Vec2::new(0.72, 0.0); // = la pelota
+
+        let cmd = motion.move_to(&robot, target, &world);
+        let angle = (cmd.vy).atan2(cmd.vx);
+        assert!(cmd.vx > 0.0, "debe avanzar hacia el target (+x), vx={:.3}", cmd.vx);
+        assert!(
+            angle.abs() < 0.3,
+            "no debe deslizar por el borde (heading ~0), angle={:.3}",
+            angle
+        );
+    }
+
+    /// La pared virtual sigue activa cuando el target NO está de ese lado: un robot
+    /// pegado a la pared +x con destino al lado opuesto debe deflectar (no ir recto),
+    /// evitando quedarse pegado al borde.
+    #[test]
+    fn move_to_keeps_wall_when_target_elsewhere() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+
+        let mut robot = RobotState::new(0, 0);
+        robot.position = Vec2::new(0.69, 0.0); // pegado a la pared +x
+        let target = Vec2::new(-0.5, 0.0); // target del lado opuesto (no tras la pared +x)
+
+        let cmd = motion.move_to(&robot, target, &world);
+        // La pared +x sigue como obstáculo → deflexión tangencial (vy != 0).
+        assert!(
+            cmd.vy.abs() > 0.05,
+            "la pared debe seguir deflectando, vy={:.3}",
+            cmd.vy
+        );
+    }
+
     /// Verifica que move_to con UVF produce un vector no-cero cuando hay obstáculos cercanos.
     /// El UVF no tiene un estado "stuck" — siempre calcula una dirección de deflexión tangencial.
-    /// La recuperación de obstáculos persistentes la maneja StuckDetector en las tácticas.
+    /// La recuperación de atascos la maneja la capa `motion::BorderRecovery` (wrapper del loop).
     #[test]
     fn test_move_to_stuck_recovery() {
         let motion = Motion::new();
