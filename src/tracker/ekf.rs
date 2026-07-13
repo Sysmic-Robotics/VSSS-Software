@@ -5,6 +5,24 @@ type StateVector = SVector<f64, 7>;
 type CovarianceMatrix = SMatrix<f64, 7, 7>;
 type MeasurementVector = SVector<f64, 3>; // [x, y, θ]
 
+/// Varianza de medición de posición (m²). std ≈ 1 cm — realista para visión VSSS.
+/// (Antes 1e-6 ⇒ std ≈ 1 mm, sobre-confiado; hacía seguir cualquier glitch.)
+const R_POS: f64 = 1e-4;
+/// Varianza de medición de orientación (rad²). std ≈ 2.9°.
+const R_THETA: f64 = 2.5e-3;
+/// Umbral de gating de innovación: distancia de Mahalanobis (χ² con 3 g.l., p≈0.999).
+/// Mediciones cuyo residuo normalizado lo supere se descartan (outliers por
+/// solape/intercambio de detección) para no disparar velocidad/ω.
+const GATING_CHI2_3DOF: f64 = 16.27;
+
+/// Velocidad lineal máxima físicamente plausible de un robot VSSS (m/s).
+const MAX_LIN_SPEED: f64 = 4.0;
+/// Velocidad angular máxima físicamente plausible (rad/s). Por encima del máx de
+/// tuning (~40) con margen; también acota ω del estado (defensa ante glitches).
+const MAX_OMEGA: f64 = 45.0;
+/// Margen sobre el máximo físico para el gate de innovación (tolerancia).
+const GATE_MARGIN: f64 = 2.0;
+
 /// Extended Kalman Filter para tracking de robots y balón
 ///
 /// Estado: [x, y, sin(θ), cos(θ), vx, vy, ω]
@@ -15,6 +33,9 @@ pub struct ExtendedKalmanFilter {
     P_: CovarianceMatrix,   // Matriz de covarianza
     Q_: CovarianceMatrix,   // Ruido de proceso
     R_: SMatrix<f64, 3, 3>, // Ruido de medición
+    /// Si el filtro ya recibió su primera medición. Reemplaza la heurística de
+    /// posición≈(0,0), que reiniciaba el filtro en el centro de la cancha.
+    initialized: bool,
 }
 
 impl ExtendedKalmanFilter {
@@ -23,13 +44,14 @@ impl ExtendedKalmanFilter {
         // Inicializar estado en cero
         let x_ = StateVector::zeros();
 
-        // Covarianza inicial P (diagonal)
+        // Covarianza inicial P (diagonal). Pos/θ arrancan con la incertidumbre de la
+        // medición (se inicializa con ella); velocidad/ω arrancan inciertas.
         #[allow(non_snake_case)]
         let mut P_ = CovarianceMatrix::zeros();
-        P_[(0, 0)] = 1e-7; // x
-        P_[(1, 1)] = 1e-7; // y
-        P_[(2, 2)] = 1e-7; // sin(theta)
-        P_[(3, 3)] = 1e-7; // cos(theta)
+        P_[(0, 0)] = R_POS; // x
+        P_[(1, 1)] = R_POS; // y
+        P_[(2, 2)] = 1e-4; // sin(theta)
+        P_[(3, 3)] = 1e-4; // cos(theta)
         P_[(4, 4)] = 1.0; // vx
         P_[(5, 5)] = 1.0; // vy
         P_[(6, 6)] = 1.0; // omega
@@ -45,29 +67,39 @@ impl ExtendedKalmanFilter {
         Q_[(5, 5)] = 1e-4; // vy
         Q_[(6, 6)] = 1e-2; // omega
 
-        // Ruido de medición R (diagonal)
+        // Ruido de medición R (diagonal), calibrado a magnitudes realistas.
         #[allow(non_snake_case)]
         let mut R_ = SMatrix::<f64, 3, 3>::zeros();
-        R_[(0, 0)] = 1e-6; // x
-        R_[(1, 1)] = 1e-6; // y
-        R_[(2, 2)] = 1e-6; // theta
+        R_[(0, 0)] = R_POS; // x
+        R_[(1, 1)] = R_POS; // y
+        R_[(2, 2)] = R_THETA; // theta
 
-        Self { x_, P_, Q_, R_ }
+        Self {
+            x_,
+            P_,
+            Q_,
+            R_,
+            initialized: false,
+        }
     }
 
     /// Predice el estado siguiente usando el modelo de transición
     pub fn predict(&mut self, dt: f64) {
+        // El Jacobiano se linealiza en el estado PREVIO (punto de linealización de f),
+        // por eso se calcula antes de sobrescribir x_.
+        #[allow(non_snake_case)]
+        let F = self.jacobian_f(&self.x_, dt);
+
         // Predicción del estado: x = f(x, dt)
         self.x_ = self.f(&self.x_, dt);
 
         // Predicción de la covarianza: P = F * P * F^T + Q
-        #[allow(non_snake_case)]
-        let F = self.jacobian_f(&self.x_, dt);
         self.P_ = F * self.P_ * F.transpose() + self.Q_;
     }
 
-    /// Actualiza el estado con una nueva medición
-    pub fn update(&mut self, measurement: &MeasurementVector) {
+    /// Actualiza el estado con una nueva medición. `dt` se usa para el gate físico
+    /// de innovación (cuánto puede haberse movido/rotado el robot en ese lapso).
+    pub fn update(&mut self, measurement: &MeasurementVector, dt: f64) {
         // Normalizar el ángulo de la medición
         let mut z = *measurement;
         z[2] = Self::normalize_angle(z[2]);
@@ -79,6 +111,15 @@ impl ExtendedKalmanFilter {
         let mut y = z - h;
         y[2] = Self::normalize_angle(y[2]);
 
+        // Gate físico: un robot no puede moverse/rotar más de lo físicamente posible
+        // en `dt`. Un salto mayor = detección espuria (solape/intercambio) → descartar.
+        let max_dpos = MAX_LIN_SPEED * dt * GATE_MARGIN;
+        let max_dtheta = MAX_OMEGA * dt * GATE_MARGIN;
+        let dpos = (y[0] * y[0] + y[1] * y[1]).sqrt();
+        if dpos > max_dpos || y[2].abs() > max_dtheta {
+            return;
+        }
+
         // Jacobiano de observación
         #[allow(non_snake_case)]
         let H = self.jacobian_h(&self.x_);
@@ -87,9 +128,25 @@ impl ExtendedKalmanFilter {
         #[allow(non_snake_case)]
         let S = H * self.P_ * H.transpose() + self.R_;
 
+        // Si S no es invertible, omitir la corrección (conservar la predicción) en
+        // vez de usar un sustituto inválido.
+        #[allow(non_snake_case)]
+        let S_inv = match S.try_inverse() {
+            Some(inv) => inv,
+            None => return,
+        };
+
+        // Gating de innovación (distancia de Mahalanobis). Un residuo demasiado
+        // grande = medición outlier (solape/intercambio de detección): se descarta
+        // para no propagar velocidad/ω irreales.
+        let mahalanobis = (y.transpose() * S_inv * y)[(0, 0)];
+        if mahalanobis > GATING_CHI2_3DOF {
+            return;
+        }
+
         // Ganancia de Kalman: K = P * H^T * S^(-1)
         #[allow(non_snake_case)]
-        let K = self.P_ * H.transpose() * S.try_inverse().unwrap_or(S);
+        let K = self.P_ * H.transpose() * S_inv;
 
         // Actualización del estado: x = x + K * y
         self.x_ += K * y;
@@ -102,6 +159,9 @@ impl ExtendedKalmanFilter {
             self.x_[2] /= norm;
             self.x_[3] /= norm;
         }
+
+        // Acotar ω a su máximo físico (defensa ante cualquier glitch que sobreviva).
+        self.x_[6] = self.x_[6].clamp(-MAX_OMEGA, MAX_OMEGA);
 
         // Actualización de la covarianza: P = (I - K * H) * P
         #[allow(non_snake_case)]
@@ -120,10 +180,9 @@ impl ExtendedKalmanFilter {
         // Normalizar ángulo de entrada
         let theta_norm = Self::normalize_angle(theta);
 
-        // Si es la primera medición, inicializar el estado directamente
-        let is_first_measurement = self.x_[0].abs() < 1e-10 && self.x_[1].abs() < 1e-10;
-
-        if is_first_measurement {
+        // La inicialización se marca explícitamente (no se infiere de la posición, que
+        // rompía en el centro de la cancha / balón en el origen).
+        if !self.initialized {
             // Inicializar estado con la primera medición
             self.x_[0] = x;
             self.x_[1] = y;
@@ -135,13 +194,14 @@ impl ExtendedKalmanFilter {
             self.x_[4] = 0.0;
             self.x_[5] = 0.0;
             self.x_[6] = 0.0;
+            self.initialized = true;
         } else {
             // Predicción
             self.predict(dt);
 
             // Actualización con medición
             let z = MeasurementVector::new(x, y, theta_norm);
-            self.update(&z);
+            self.update(&z, dt);
         }
 
         // Extraer resultados
@@ -339,11 +399,87 @@ mod tests {
         ekf.x_[3] = 1.0;
 
         let measurement = MeasurementVector::new(1.1, 2.1, 0.1);
-        ekf.update(&measurement);
+        ekf.update(&measurement, 0.1);
 
         // El estado debería haberse actualizado hacia la medición
         assert!((ekf.x_[0] - 1.0).abs() < 1.0); // Debería estar entre 1.0 y 1.1
         assert!((ekf.x_[1] - 2.0).abs() < 1.0); // Debería estar entre 2.0 y 2.1
+    }
+
+    /// Un salto espurio de orientación (~π por solape/intercambio de detección) se
+    /// descarta por el gating y NO dispara ω a valores irreales; el filtro se recupera.
+    #[test]
+    fn outlier_theta_does_not_blow_up_omega() {
+        let mut ekf = ExtendedKalmanFilter::new();
+        let dt = 0.016;
+        // Robot quieto mirando a θ=0 durante varios frames → el filtro converge.
+        for _ in 0..30 {
+            ekf.filter_pose(1.0, 1.0, 0.0, dt);
+        }
+        // Frame outlier: θ salta a π (misma posición).
+        let (_, _, theta_out, _, _, omega_out) =
+            ekf.filter_pose(1.0, 1.0, std::f64::consts::PI, dt);
+        // El outlier se descartó: θ sigue cerca de 0 y ω no se disparó.
+        assert!(theta_out.abs() < 0.5, "θ saltó al outlier: {theta_out}");
+        assert!(omega_out.abs() < 5.0, "ω se disparó: {omega_out}");
+        // Con mediciones consistentes de nuevo, sigue estable.
+        let (.., omega_after) = ekf.filter_pose(1.0, 1.0, 0.0, dt);
+        assert!(omega_after.abs() < 5.0);
+    }
+
+    /// Un robot que pasa por el centro (0,0) NO reinicia su filtro (las velocidades
+    /// estimadas se conservan, no se fuerzan a cero).
+    #[test]
+    fn passing_through_origin_does_not_reinitialize() {
+        let mut ekf = ExtendedKalmanFilter::new();
+        let dt = 0.016;
+        // Trayectoria a velocidad constante que cruza el origen exacto.
+        let step = (-0.02, -0.01);
+        let mut x = 0.20;
+        let mut y = 0.10;
+        for _ in 0..15 {
+            ekf.filter_pose(x, y, 0.0, dt);
+            x += step.0;
+            y += step.1;
+        }
+        // Pasa exactamente por (0,0)...
+        let (_, _, _, vx0, vy0, _) = ekf.filter_pose(0.0, 0.0, 0.0, dt);
+        // ...y si el filtro NO se reinició, las velocidades siguen reflejando el
+        // movimiento (serían 0 si se hubiese reinicializado).
+        assert!(vx0 < -0.1, "vx se reinició en el origen: {vx0}");
+        assert!(vy0 < -0.05, "vy se reinició en el origen: {vy0}");
+    }
+
+    /// Mediciones normales pasan el gating y el filtro converge a la pose medida.
+    #[test]
+    fn normal_measurements_converge() {
+        let mut ekf = ExtendedKalmanFilter::new();
+        let dt = 0.016;
+        let mut last = (0.0, 0.0, 0.0);
+        for _ in 0..40 {
+            let (x, y, theta, ..) = ekf.filter_pose(0.5, -0.3, 0.7, dt);
+            last = (x, y, theta);
+        }
+        assert!((last.0 - 0.5).abs() < 0.05);
+        assert!((last.1 - (-0.3)).abs() < 0.05);
+        assert!((last.2 - 0.7).abs() < 0.05);
+    }
+
+    /// El filtro nunca produce NaN/valores no finitos ante secuencias largas
+    /// (incluye mediciones repetidas que podrían acercar S a singular).
+    #[test]
+    fn stays_finite_over_long_run() {
+        let mut ekf = ExtendedKalmanFilter::new();
+        let dt = 0.016;
+        for i in 0..200 {
+            let x = 0.3 + (i as f64 * 0.001);
+            let (xf, yf, tf, vx, vy, w) = ekf.filter_pose(x, 0.2, 0.1, dt);
+            assert!(
+                xf.is_finite() && yf.is_finite() && tf.is_finite()
+                    && vx.is_finite() && vy.is_finite() && w.is_finite(),
+                "valor no finito en iter {i}"
+            );
+        }
     }
 
     #[test]
