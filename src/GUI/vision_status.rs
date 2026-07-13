@@ -1,11 +1,12 @@
 use iced::widget::canvas::{Cache, Geometry, Path, Stroke};
 use iced::{
-    Border, Color, Element, Length, Point, Rectangle, Theme, font,
+    Element, Length, Point, Rectangle, Theme, font,
     widget::{Canvas, button, canvas, column, container, row, text, text_input},
 };
 use std::collections::VecDeque;
 
 use super::Message;
+use super::theme;
 
 struct PacketChart<'a> {
     history: &'a VecDeque<(f64, u64)>,
@@ -30,14 +31,14 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
 
             // Draw background
             let background = Path::rectangle(Point::ORIGIN, bounds.size());
-            frame.fill(&background, Color::from_rgb(0.1, 0.1, 0.1));
+            frame.fill(&background, theme::BG_ELEVATED);
 
             // Draw border
             frame.stroke(
                 &background,
                 Stroke::default()
                     .with_width(2.0)
-                    .with_color(Color::from_rgb(0.3, 0.3, 0.3)),
+                    .with_color(theme::BORDER),
             );
 
             if self.history.is_empty() {
@@ -45,7 +46,7 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
                 frame.fill_text(iced::widget::canvas::Text {
                     content: "Waiting for packets...".to_string(),
                     position: Point::new(width / 2.0 - 80.0, height / 2.0),
-                    color: Color::from_rgb(0.5, 0.5, 0.5),
+                    color: theme::TEXT_DIM,
                     size: 16.0.into(),
                     ..Default::default()
                 });
@@ -72,7 +73,7 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
                     &line,
                     Stroke::default()
                         .with_width(1.0)
-                        .with_color(Color::from_rgba(0.5, 0.5, 0.5, 0.3)),
+                        .with_color(theme::GRID),
                 );
             }
 
@@ -90,12 +91,12 @@ impl<'a> canvas::Program<Message> for PacketChart<'a> {
                         Point::new(x, y),
                         iced::Size::new(bar_width, bar_height as f32),
                     );
-                    frame.fill(&bar, Color::from_rgb(0.0, 0.8, 1.0));
+                    frame.fill(&bar, theme::DATA_BARS);
                 }
             }
 
             // Draw axes labels
-            let text_color = Color::from_rgb(0.8, 0.8, 0.8);
+            let text_color = theme::AXIS_TEXT;
 
             // Y-axis label (packets per second)
             frame.fill_text(iced::widget::canvas::Text {
@@ -150,11 +151,7 @@ pub fn view<'a>(
     chart_cache: &'a Cache,
     tracker_enabled: bool,
 ) -> Element<'a, Message> {
-    let status_color = if connected {
-        Color::from_rgb(0.0, 0.8, 0.0)
-    } else {
-        Color::from_rgb(0.8, 0.0, 0.0)
-    };
+    let status_color = if connected { theme::OK } else { theme::ERR };
 
     let status_text = if connected {
         "CONNECTED"
@@ -245,11 +242,7 @@ pub fn view<'a>(
                 .size(12)
                 .style(move |_theme: &Theme| {
                     text::Style {
-                        color: Some(if tracker_enabled {
-                            Color::from_rgb(0.0, 0.8, 0.0)
-                        } else {
-                            Color::from_rgb(0.8, 0.0, 0.0)
-                        }),
+                        color: Some(if tracker_enabled { theme::OK } else { theme::ERR }),
                     }
                 }),
             ]
@@ -260,15 +253,7 @@ pub fn view<'a>(
         .padding(12),
     )
     .padding(8)
-    .style(|_theme: &Theme| container::Style {
-        border: Border {
-            color: Color::from_rgb(0.3, 0.3, 0.3),
-            width: 2.0,
-            radius: 8.0.into(),
-        },
-        background: Some(Color::from_rgba(0.1, 0.1, 0.1, 0.5).into()),
-        ..Default::default()
-    });
+    .style(theme::card);
 
     let chart = Canvas::new(PacketChart {
         history: packet_history,

@@ -1,9 +1,10 @@
 use iced::{
-    Border, Color, Element, Length, Theme, font,
+    Element, Length, Theme, font,
     widget::{button, column, container, row, text, text_input},
 };
 
 use super::Message;
+use super::theme;
 
 /// Panel de radio/transporte: muestra el transporte activo, puerto/baud, equipo
 /// propio, estado de conexión y PPS de visión. La edición de puerto/baud queda
@@ -18,9 +19,9 @@ pub fn view<'a>(
     packet_frequency: f64,
 ) -> Element<'a, Message> {
     let (conn_text, conn_color) = match transport_connected {
-        Some(true) => ("CONECTADO", Color::from_rgb(0.0, 0.8, 0.0)),
-        Some(false) => ("ERROR / DESCONECTADO", Color::from_rgb(0.8, 0.0, 0.0)),
-        None => ("SIN DATOS", Color::from_rgb(0.6, 0.6, 0.6)),
+        Some(true) => ("CONECTADO", theme::OK),
+        Some(false) => ("ERROR / DESCONECTADO", theme::ERR),
+        None => ("SIN DATOS", theme::NEUTRAL),
     };
 
     let is_base_station = target_label.eq_ignore_ascii_case("basestation")
@@ -102,21 +103,10 @@ pub fn view<'a>(
                 .font(font::Font::MONOSPACE)
                 .size(11)
                 .style(|_t: &Theme| text::Style {
-                    color: Some(Color::from_rgb(0.7, 0.7, 0.3)),
+                    color: Some(theme::WARN),
                 }),
         );
     }
 
-    container(body)
-        .padding(8)
-        .style(|_theme: &Theme| container::Style {
-            border: Border {
-                color: Color::from_rgb(0.3, 0.3, 0.3),
-                width: 2.0,
-                radius: 8.0.into(),
-            },
-            background: Some(Color::from_rgba(0.1, 0.1, 0.1, 0.5).into()),
-            ..Default::default()
-        })
-        .into()
+    container(body).padding(8).style(theme::card).into()
 }

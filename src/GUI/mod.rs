@@ -1,5 +1,7 @@
 mod field;
+mod motion_chart;
 mod radio_panel;
+mod theme;
 mod vision_status;
 mod wheel_chart;
 
@@ -8,9 +10,10 @@ use iced::futures::SinkExt;
 use iced::stream;
 use iced::widget::canvas::Cache;
 use iced::{
-    Color, Element, Length, Subscription, Task, Theme,
+    Element, Length, Subscription, Task, Theme,
     widget::{
-        Canvas, button, column, container, horizontal_space, row, scrollable, text, text_input,
+        Canvas, button, column, container, horizontal_space, row, scrollable, slider, text,
+        text_input,
     },
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -24,6 +27,7 @@ use crate::radio::TeleportItem;
 use crate::skills::SkillId;
 use serde::{Deserialize, Serialize};
 use field::FieldCanvas;
+use motion_chart::LineChart;
 use wheel_chart::WheelChart;
 pub use crate::vision::StatusUpdate;
 
@@ -39,8 +43,13 @@ const MANUAL_ANG_ACCEL: f64 = 12.0;
 /// Paso temporal del `ManualTick` (s). Debe coincidir con el intervalo de la
 /// suscripción `manual_tick` (33 ms).
 const MANUAL_TICK_DT: f64 = 0.033;
-/// Ventana de la telemetría de rueda (cantidad máxima de muestras retenidas).
-const WHEEL_HISTORY_MAX: usize = 300;
+/// Retención máxima de muestras de telemetría (rueda/motion/error). ~30 s @ 60 Hz,
+/// suficiente para cubrir la ventana de tiempo máxima seleccionable.
+const WHEEL_HISTORY_MAX: usize = 1800;
+/// Presets de ventana de tiempo de la telemetría (segundos mostrados).
+const TELEMETRY_WINDOWS_S: [f64; 3] = [5.0, 15.0, 30.0];
+/// Ventana de tiempo por defecto (s).
+const TELEMETRY_WINDOW_DEFAULT_S: f64 = 5.0;
 /// Cantidad máxima de puntos de traza del robot seleccionado.
 const TRACE_MAX: usize = 150;
 /// Umbral (s) para considerar un robot "activo" según su último dato de visión.
@@ -149,6 +158,26 @@ pub fn spin_relative_target(skill_target_x: f32, robot_x_m: f32) -> Vec2 {
     Vec2::new(sign, 0.0)
 }
 
+/// Agrega una muestra a una serie de telemetría, descartando las más viejas al
+/// superar la ventana de retención máxima.
+fn push_capped<T>(q: &mut VecDeque<T>, item: T) {
+    q.push_back(item);
+    while q.len() > WHEEL_HISTORY_MAX {
+        q.pop_front();
+    }
+}
+
+/// Envuelve un ángulo (rad) al rango `[-π, π]`.
+fn wrap_angle(a: f32) -> f32 {
+    let mut a = a % (2.0 * std::f32::consts::PI);
+    if a > std::f32::consts::PI {
+        a -= 2.0 * std::f32::consts::PI;
+    } else if a < -std::f32::consts::PI {
+        a += 2.0 * std::f32::consts::PI;
+    }
+    a
+}
+
 /// Botón de selección de skill; resaltado si es la skill activa.
 fn skill_button<'a>(
     label: &'a str,
@@ -174,6 +203,9 @@ pub struct RobotMotionDebug {
     /// Velocidad en frame mundial (m/s)
     pub vx: f32,
     pub vy: f32,
+    /// Velocidad angular COMANDADA (rad/s), copiada de `MotionCommand.omega`.
+    /// Solo informativa (comparar contra la ω medida por visión).
+    pub omega: f32,
     /// Destino del skill activo (metros, frame mundial). None si no aplica.
     pub target: Option<Vec2>,
     /// Velocidades de rueda que LLEGAN al robot (mm/s), ya clampadas a ±1500.
@@ -269,6 +301,8 @@ pub enum Message {
     TpBallYChanged(String),
     TeleportRobot,
     TeleportBall,
+    ToggleTelemetryFreeze(bool),
+    SetTelemetryWindow(f64),
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +469,19 @@ pub struct VisionGui {
     estop: Arc<AtomicBool>,
     wheel_history: VecDeque<(f64, i16, i16)>,
     wheel_chart_cache: Cache,
+    /// Serie `(t, v_comandada, v_medida)` en m/s del robot seleccionado.
+    vel_history: VecDeque<(f64, f32, f32)>,
+    vel_chart_cache: Cache,
+    /// Serie `(t, ω_comandada, ω_medida)` en rad/s del robot seleccionado.
+    omega_history: VecDeque<(f64, f32, f32)>,
+    omega_chart_cache: Cache,
+    /// Serie `(t, error_heading_rad, distancia_m)` respecto al target de la skill.
+    skill_err_history: VecDeque<(f64, f32, f32)>,
+    skill_err_chart_cache: Cache,
+    /// Freeze de la telemetría: si está activo, no se agregan muestras a las series.
+    telemetry_frozen: bool,
+    /// Ventana de tiempo mostrada en la telemetría (s).
+    telemetry_window_s: f64,
     transport_connected: Option<bool>,
     radio_target_label: String,
     radio_port: String,
@@ -542,6 +589,14 @@ impl VisionGui {
                 estop: setup.estop,
                 wheel_history: VecDeque::new(),
                 wheel_chart_cache: Cache::default(),
+                vel_history: VecDeque::new(),
+                vel_chart_cache: Cache::default(),
+                omega_history: VecDeque::new(),
+                omega_chart_cache: Cache::default(),
+                skill_err_history: VecDeque::new(),
+                skill_err_chart_cache: Cache::default(),
+                telemetry_frozen: false,
+                telemetry_window_s: TELEMETRY_WINDOW_DEFAULT_S,
                 transport_connected: None,
                 radio_target_label: setup.radio_target_label,
                 radio_port: setup.radio_port,
@@ -660,13 +715,42 @@ impl VisionGui {
             Message::MotionUpdate(updates) => {
                 let t = self.start_time.elapsed().as_secs_f64();
                 for m in updates {
-                    // Telemetría de rueda del robot seleccionado.
-                    if m.team == self.selected_team && m.id == self.selected_robot {
-                        self.wheel_history.push_back((t, m.wheel_l_mm_s, m.wheel_r_mm_s));
-                        while self.wheel_history.len() > WHEEL_HISTORY_MAX {
-                            self.wheel_history.pop_front();
+                    // Telemetría del robot seleccionado (si no está congelada).
+                    if m.team == self.selected_team
+                        && m.id == self.selected_robot
+                        && !self.telemetry_frozen
+                    {
+                        // Rueda comandada (mm/s).
+                        push_capped(
+                            &mut self.wheel_history,
+                            (t, m.wheel_l_mm_s, m.wheel_r_mm_s),
+                        );
+
+                        // Comandado vs medido: velocidad lineal (m/s) y ω (rad/s).
+                        let cmd_v = (m.vx * m.vx + m.vy * m.vy).sqrt();
+                        let cmd_w = m.omega;
+                        let robot = self.robots.get(&(m.team, m.id));
+                        let meas_v = robot
+                            .map(|r| (r.velocity.x * r.velocity.x + r.velocity.y * r.velocity.y).sqrt())
+                            .unwrap_or(0.0);
+                        let meas_w = robot.map(|r| r.angular_velocity).unwrap_or(0.0);
+                        push_capped(&mut self.vel_history, (t, cmd_v, meas_v));
+                        push_capped(&mut self.omega_history, (t, cmd_w, meas_w));
+
+                        // Error de heading y distancia al target de la skill activa.
+                        if let (Some(target), Some(r)) = (m.target, robot) {
+                            let pos_m = Vec2::new(r.position.x / 1000.0, r.position.y / 1000.0);
+                            let to_target = target - pos_m;
+                            let dist = to_target.length();
+                            let heading_err =
+                                wrap_angle(to_target.y.atan2(to_target.x) - r.orientation);
+                            push_capped(&mut self.skill_err_history, (t, heading_err, dist));
                         }
+
                         self.wheel_chart_cache.clear();
+                        self.vel_chart_cache.clear();
+                        self.omega_chart_cache.clear();
+                        self.skill_err_chart_cache.clear();
                     }
                     self.motion_debug.insert((m.team, m.id), m);
                 }
@@ -748,9 +832,8 @@ impl VisionGui {
             Message::SelectRobot(id) => {
                 if id != self.selected_robot {
                     self.selected_robot = id;
-                    // Reiniciar la serie de telemetría para no mezclar robots.
-                    self.wheel_history.clear();
-                    self.wheel_chart_cache.clear();
+                    // Reiniciar las series de telemetría para no mezclar robots.
+                    self.clear_telemetry();
                     self.trace.clear();
                     self.field_cache.clear();
                 }
@@ -758,8 +841,7 @@ impl VisionGui {
             Message::SelectTeam(team) => {
                 if team != self.selected_team {
                     self.selected_team = team;
-                    self.wheel_history.clear();
-                    self.wheel_chart_cache.clear();
+                    self.clear_telemetry();
                     self.trace.clear();
                     self.field_cache.clear();
                 }
@@ -991,8 +1073,30 @@ impl VisionGui {
                     self.radio_baud = baud;
                 }
             }
+            Message::ToggleTelemetryFreeze(on) => {
+                self.telemetry_frozen = on;
+            }
+            Message::SetTelemetryWindow(s) => {
+                self.telemetry_window_s = s;
+                self.wheel_chart_cache.clear();
+                self.vel_chart_cache.clear();
+                self.omega_chart_cache.clear();
+                self.skill_err_chart_cache.clear();
+            }
         }
         Task::none()
+    }
+
+    /// Reinicia todas las series de telemetría y sus caches (al cambiar de robot/equipo).
+    fn clear_telemetry(&mut self) {
+        self.wheel_history.clear();
+        self.vel_history.clear();
+        self.omega_history.clear();
+        self.skill_err_history.clear();
+        self.wheel_chart_cache.clear();
+        self.vel_chart_cache.clear();
+        self.omega_chart_cache.clear();
+        self.skill_err_chart_cache.clear();
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1097,7 +1201,7 @@ impl VisionGui {
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        theme::theme()
     }
 
     /// Registra que se recibió dato de visión de un robot: actualiza `last_seen`
@@ -1236,38 +1340,54 @@ impl VisionGui {
 
     /// Contenido de la sección **Tuning**: escalas, rampa, Spin ω, PID y presets.
     fn tuning_section(&self) -> Element<'_, Message> {
-        let num = |label: &'static str, value: &str, msg: fn(String) -> Message| {
-            row![
-                text(label).size(12).width(Length::Fixed(84.0)),
-                text_input("", value)
-                    .on_input(msg)
-                    .size(12)
-                    .width(Length::Fixed(64.0)),
+        // Fila de parámetro: etiqueta + valor en vivo + slider + entrada de texto fina.
+        // El slider siempre produce un valor dentro de rango; el text_input conserva la
+        // ruta de validación existente (entradas inválidas no rompen la GUI).
+        let param = |label: &'static str,
+                     value: f64,
+                     sval: &str,
+                     min: f64,
+                     max: f64,
+                     step: f64,
+                     msg: fn(String) -> Message| {
+            column![
+                row![
+                    text(label).size(theme::FS_SM).width(Length::Fixed(70.0)),
+                    text(format!("{value:.2}"))
+                        .size(theme::FS_SM)
+                        .width(Length::Fixed(46.0)),
+                    text_input("", sval)
+                        .on_input(msg)
+                        .size(theme::FS_SM)
+                        .width(Length::Fixed(64.0)),
+                ]
+                .spacing(theme::SP_SM)
+                .align_y(iced::Alignment::Center),
+                slider(min..=max, value, move |v| msg(format!("{v:.3}"))).step(step),
             ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center)
+            .spacing(theme::SP_XS)
         };
 
-        let save_btn = button(text("Guardar").size(12))
+        let save_btn = button(text("Guardar").size(theme::FS_SM))
             .padding([4, 8])
             .on_press(Message::SavePreset);
-        let load_btn = button(text("Cargar").size(12))
+        let load_btn = button(text("Cargar").size(theme::FS_SM))
             .padding([4, 8])
             .on_press(Message::LoadPreset);
 
         column![
-            text("Manual").size(12),
-            num("Vel lin", &self.manual_lin_str, Message::ManualLinChanged),
-            num("Vel ang", &self.manual_ang_str, Message::ManualAngChanged),
-            num("Acc lin", &self.manual_lin_accel_str, Message::ManualLinAccelChanged),
-            num("Acc ang", &self.manual_ang_accel_str, Message::ManualAngAccelChanged),
-            text("Spin").size(12),
-            num("Spin ω", &self.spin_omega_str, Message::SpinOmegaChanged),
-            text("PID heading (GoTo/FacePoint/ChaseBall)").size(12),
-            num("kp", &self.pid_kp_str, Message::PidKpChanged),
-            num("ki", &self.pid_ki_str, Message::PidKiChanged),
-            num("kd", &self.pid_kd_str, Message::PidKdChanged),
-            text("Preset").size(12),
+            text("Manual").size(theme::FS_SM),
+            param("Vel lin", self.manual_lin_ms, &self.manual_lin_str, 0.0, 1.5, 0.05, Message::ManualLinChanged),
+            param("Vel ang", self.manual_ang_rads, &self.manual_ang_str, 0.0, 12.0, 0.25, Message::ManualAngChanged),
+            param("Acc lin", self.manual_lin_accel, &self.manual_lin_accel_str, 0.0, 6.0, 0.1, Message::ManualLinAccelChanged),
+            param("Acc ang", self.manual_ang_accel, &self.manual_ang_accel_str, 0.0, 30.0, 0.5, Message::ManualAngAccelChanged),
+            text("Spin").size(theme::FS_SM),
+            param("Spin ω", self.spin_omega, &self.spin_omega_str, 0.0, 40.0, 0.5, Message::SpinOmegaChanged),
+            text("PID heading (GoTo/FacePoint/ChaseBall)").size(theme::FS_SM),
+            param("kp", self.pid_kp, &self.pid_kp_str, 0.0, 10.0, 0.1, Message::PidKpChanged),
+            param("ki", self.pid_ki, &self.pid_ki_str, 0.0, 1.0, 0.01, Message::PidKiChanged),
+            param("kd", self.pid_kd, &self.pid_kd_str, 0.0, 2.0, 0.05, Message::PidKdChanged),
+            text("Preset").size(theme::FS_SM),
             row![
                 text_input("tuning.json", &self.preset_name)
                     .on_input(Message::PresetNameChanged)
@@ -1385,11 +1505,7 @@ impl VisionGui {
                     ))
                     .size(12)
                     .style(move |_t: &Theme| text::Style {
-                        color: Some(if active {
-                            Color::from_rgb(0.0, 0.8, 0.0)
-                        } else {
-                            Color::from_rgb(0.8, 0.5, 0.0)
-                        }),
+                        color: Some(if active { theme::OK } else { theme::WARN }),
                     }),
                     text(format!("antigüedad: {age:.2} s")).size(12),
                 ]
@@ -1401,6 +1517,134 @@ impl VisionGui {
         column![trace_btn, data].spacing(6).into()
     }
 
+    /// Contenido de la sección **Telemetría**: lectura instantánea, controles
+    /// (freeze + ventana) y los gráficos temporales del robot seleccionado.
+    fn telemetry_section(&self) -> Element<'_, Message> {
+        let key = (self.selected_team, self.selected_robot);
+        let robot = self.robots.get(&key);
+        let motion = self.motion_debug.get(&key);
+
+        // Lectura instantánea de valores actuales (o guiones si no hay datos).
+        let readout = {
+            let (pos, v, w) = match robot {
+                Some(r) => (
+                    format!("({:.2}, {:.2}) m", r.position.x / 1000.0, r.position.y / 1000.0),
+                    format!(
+                        "{:.2} m/s",
+                        (r.velocity.x * r.velocity.x + r.velocity.y * r.velocity.y).sqrt()
+                    ),
+                    format!("{:.2} rad/s", r.angular_velocity),
+                ),
+                None => ("—".to_string(), "—".to_string(), "—".to_string()),
+            };
+            let lr = match motion {
+                Some(m) => format!("L:{} R:{}", m.wheel_l_mm_s, m.wheel_r_mm_s),
+                None => "L:— R:—".to_string(),
+            };
+            column![
+                text(format!("pos {pos}")).size(theme::FS_XS),
+                text(format!("v {v}   ω {w}")).size(theme::FS_XS),
+                text(format!("rueda {lr}")).size(theme::FS_XS),
+            ]
+            .spacing(theme::SP_XS)
+        };
+
+        // Controles: freeze + presets de ventana de tiempo.
+        let freeze_btn = button(
+            text(if self.telemetry_frozen {
+                "Freeze: ON"
+            } else {
+                "Freeze: OFF"
+            })
+            .size(theme::FS_SM),
+        )
+        .padding([4, 8])
+        .style(if self.telemetry_frozen {
+            button::primary
+        } else {
+            button::secondary
+        })
+        .on_press(Message::ToggleTelemetryFreeze(!self.telemetry_frozen));
+
+        let mut window_row = row![freeze_btn, text("ventana:").size(theme::FS_XS)]
+            .spacing(theme::SP_SM)
+            .align_y(iced::Alignment::Center);
+        for w in TELEMETRY_WINDOWS_S {
+            let active = (self.telemetry_window_s - w).abs() < 1e-6;
+            window_row = window_row.push(
+                button(text(format!("{w:.0}s")).size(theme::FS_SM))
+                    .padding([4, 8])
+                    .style(if active {
+                        button::primary
+                    } else {
+                        button::secondary
+                    })
+                    .on_press(Message::SetTelemetryWindow(w)),
+            );
+        }
+
+        let wheel_chart = Canvas::new(WheelChart {
+            history: &self.wheel_history,
+            window_s: self.telemetry_window_s,
+            cache: &self.wheel_chart_cache,
+        })
+        .width(Length::Fill)
+        .height(Length::Fixed(120.0));
+
+        let vel_chart = Canvas::new(LineChart {
+            history: &self.vel_history,
+            window_s: self.telemetry_window_s,
+            title: "v: comandada vs medida (m/s)",
+            label_a: "cmd",
+            color_a: theme::ACCENT,
+            label_b: "med",
+            color_b: theme::DATA_R,
+            symmetric: false,
+            cache: &self.vel_chart_cache,
+        })
+        .width(Length::Fill)
+        .height(Length::Fixed(110.0));
+
+        let omega_chart = Canvas::new(LineChart {
+            history: &self.omega_history,
+            window_s: self.telemetry_window_s,
+            title: "ω: comandada vs medida (rad/s)",
+            label_a: "cmd",
+            color_a: theme::ACCENT,
+            label_b: "med",
+            color_b: theme::DATA_R,
+            symmetric: true,
+            cache: &self.omega_chart_cache,
+        })
+        .width(Length::Fill)
+        .height(Length::Fixed(110.0));
+
+        let skill_chart = Canvas::new(LineChart {
+            history: &self.skill_err_history,
+            window_s: self.telemetry_window_s,
+            title: "skill: error θ (rad) y distancia (m)",
+            label_a: "errθ",
+            color_a: theme::DATA_L,
+            label_b: "dist",
+            color_b: theme::WARN,
+            symmetric: true,
+            cache: &self.skill_err_chart_cache,
+        })
+        .width(Length::Fill)
+        .height(Length::Fixed(110.0));
+
+        column![
+            readout,
+            window_row,
+            wheel_chart,
+            vel_chart,
+            omega_chart,
+            skill_chart,
+        ]
+        .spacing(theme::SP_SM)
+        .into()
+    }
+
     /// Envuelve un contenido con su encabezado colapsable de sección.
     fn section_view<'a>(
         &'a self,
@@ -1410,10 +1654,10 @@ impl VisionGui {
         let open = self.expanded.contains(&sec);
         let header = button(
             row![
-                text(if open { "▼" } else { "▶" }).size(13),
-                text(sec.title()).size(14),
+                text(if open { "▼" } else { "▶" }).size(theme::FS_MD),
+                text(sec.title()).size(theme::FS_LG),
             ]
-            .spacing(6),
+            .spacing(theme::SP_SM),
         )
         .width(Length::Fill)
         .padding([6, 8])
@@ -1459,13 +1703,7 @@ impl VisionGui {
                     &self.chart_cache,
                     self.tracker_enabled,
                 ),
-                Section::Telemetry => Canvas::new(WheelChart {
-                    history: &self.wheel_history,
-                    cache: &self.wheel_chart_cache,
-                })
-                .width(Length::Fill)
-                .height(Length::Fixed(160.0))
-                .into(),
+                Section::Telemetry => self.telemetry_section(),
             };
             col = col.push(self.section_view(sec, content));
         }
@@ -1495,19 +1733,19 @@ impl VisionGui {
         .on_press(Message::ToggleEstop);
 
         let (conn_txt, conn_col) = match self.transport_connected {
-            Some(true) => ("radio ✓", Color::from_rgb(0.0, 0.8, 0.0)),
-            Some(false) => ("radio ✗", Color::from_rgb(0.8, 0.0, 0.0)),
-            None => ("radio —", Color::from_rgb(0.6, 0.6, 0.6)),
+            Some(true) => ("radio ✓", theme::OK),
+            Some(false) => ("radio ✗", theme::ERR),
+            None => ("radio —", theme::NEUTRAL),
         };
         let vis_col = if self.connected {
-            Color::from_rgb(0.0, 0.8, 0.0)
+            theme::OK
         } else {
-            Color::from_rgb(0.8, 0.0, 0.0)
+            theme::ERR
         };
 
         row![
             estop_btn,
-            text("VSSS — Debug").size(16),
+            text("VSSS — Debug").size(theme::FS_XL),
             horizontal_space(),
             text("visión")
                 .size(12)
@@ -1518,8 +1756,8 @@ impl VisionGui {
                     color: Some(conn_col)
                 }),
         ]
-        .spacing(12)
-        .padding([6, 10])
+        .spacing(theme::SP_LG)
+        .padding([theme::SP_SM, theme::SP_MD])
         .align_y(iced::Alignment::Center)
         .into()
     }
@@ -1546,14 +1784,15 @@ impl VisionGui {
             text(format!("θ {theta:.2}")).size(12),
             text(format!("PPS {:.0}", self.packet_frequency)).size(12),
             horizontal_space(),
+            text("Espacio = STOP")
+                .size(theme::FS_XS)
+                .style(|_t: &Theme| text::Style {
+                    color: Some(theme::TEXT_DIM),
+                }),
             text(if estop_on { "ESTOP: ON" } else { "ESTOP: off" })
                 .size(12)
                 .style(move |_t: &Theme| text::Style {
-                    color: Some(if estop_on {
-                        Color::from_rgb(0.9, 0.2, 0.2)
-                    } else {
-                        Color::from_rgb(0.6, 0.6, 0.6)
-                    }),
+                    color: Some(if estop_on { theme::ERR } else { theme::NEUTRAL }),
                 }),
         ]
         .spacing(14)

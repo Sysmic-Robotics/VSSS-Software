@@ -1,8 +1,9 @@
 use iced::mouse;
 use iced::widget::canvas::{self, Cache, Geometry, Path, Stroke};
-use iced::{Color, Point, Rectangle, Size, Theme};
+use iced::{Point, Rectangle, Size, Theme};
 use std::collections::{HashMap, VecDeque};
 
+use super::theme;
 use super::{Ball, Message, Robot, RobotMotionDebug};
 
 // Dimensiones del campo VSS (Very Small Size League) — alineadas con FIRASim
@@ -16,7 +17,8 @@ const GOAL_WIDTH: f32 = 400.0; // mm - ancho del arco
 const GOAL_DEPTH: f32 = 50.0; // mm - profundidad del arco
 const CENTER_CIRCLE_RADIUS: f32 = 200.0; // mm
 // Tamaños visuales proporcionales a FIRASim (robots ~75mm diámetro, pelota ~43mm)
-const ROBOT_RADIUS_MM: f32 = 38.0; // mm - radio para dibujo (~76mm diámetro)
+const ROBOT_RADIUS_MM: f32 = 38.0; // mm - radio de referencia para overlays (halo/texto)
+const ROBOT_HALF_MM: f32 = 37.5; // mm - medio lado del cuerpo cuadrado (~75mm, cubo VSSS real)
 const BALL_RADIUS_MM: f32 = 22.0; // mm - radio para dibujo (~44mm diámetro)
 const ORIENTATION_LINE_MM: f32 = 55.0; // mm - longitud de la línea de orientación
 
@@ -85,7 +87,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     (FIELD_WIDTH + FIELD_MARGIN * 2.0) * scale,
                 ),
             );
-            frame.fill(&margin_rect, Color::from_rgb(0.0, 0.5, 0.0));
+            frame.fill(&margin_rect, theme::FIELD_MARGIN);
 
             // Draw field background (white boundary)
             let field_rect = Path::rectangle(
@@ -95,10 +97,10 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                 ),
                 Size::new(FIELD_LENGTH * scale, FIELD_WIDTH * scale),
             );
-            frame.fill(&field_rect, Color::from_rgb(0.0, 0.5, 0.0));
+            frame.fill(&field_rect, theme::FIELD_GREEN);
             frame.stroke(
                 &field_rect,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
 
             // Draw center line
@@ -108,14 +110,14 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
             );
             frame.stroke(
                 &center_line,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
 
             // Draw center circle
             let center_circle = Path::circle(center, CENTER_CIRCLE_RADIUS * scale);
             frame.stroke(
                 &center_circle,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
 
             // Zonas de arquero (goalkeeper areas) — rectángulos delante de cada arco, estilo FIRASim
@@ -129,7 +131,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
             );
             frame.stroke(
                 &left_goalkeeper_rect,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
 
             // Derecha (lado X positivo)
@@ -142,7 +144,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
             );
             frame.stroke(
                 &right_goalkeeper_rect,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
 
             // Draw goals with depth
@@ -154,10 +156,10 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                 ),
                 Size::new(GOAL_DEPTH * scale, GOAL_WIDTH * scale),
             );
-            frame.fill(&left_goal_back, Color::from_rgb(0.3, 0.3, 0.3));
+            frame.fill(&left_goal_back, theme::GOAL_FILL);
             frame.stroke(
                 &left_goal_back,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
             // Left goal opening line
             let left_goal_line = Path::line(
@@ -172,7 +174,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
             );
             frame.stroke(
                 &left_goal_line,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
 
             // Right goal (positive X side)
@@ -183,10 +185,10 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                 ),
                 Size::new(GOAL_DEPTH * scale, GOAL_WIDTH * scale),
             );
-            frame.fill(&right_goal_back, Color::from_rgb(0.3, 0.3, 0.3));
+            frame.fill(&right_goal_back, theme::GOAL_FILL);
             frame.stroke(
                 &right_goal_back,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
             // Right goal opening line
             let right_goal_line = Path::line(
@@ -201,7 +203,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
             );
             frame.stroke(
                 &right_goal_line,
-                Stroke::default().with_width(2.0).with_color(Color::WHITE),
+                Stroke::default().with_width(2.0).with_color(theme::FIELD_LINE),
             );
 
             // Draw ball (proporción real ~43mm diámetro)
@@ -211,7 +213,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     center.y - ball.position.y * scale,
                 );
                 let ball_circle = Path::circle(ball_pos, BALL_RADIUS_MM * scale);
-                frame.fill(&ball_circle, Color::from_rgb(1.0, 0.0, 0.0));
+                frame.fill(&ball_circle, theme::BALL);
             }
 
             // Traza del robot seleccionado (celeste, debajo de los robots).
@@ -230,16 +232,16 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     &path,
                     Stroke::default()
                         .with_width(1.5)
-                        .with_color(Color::from_rgb(0.5, 0.9, 1.0)),
+                        .with_color(theme::TRACE),
                 );
             }
 
             // Draw robots (proporción real ~75mm diámetro, como en FIRASim)
             for robot in self.robots.values() {
                 let color = if robot.team == 0 {
-                    Color::from_rgb(0.0, 0.0, 1.0)
+                    theme::TEAM_BLUE
                 } else {
-                    Color::from_rgb(1.0, 1.0, 0.0)
+                    theme::TEAM_YELLOW
                 };
 
                 let robot_pos = Point::new(
@@ -247,11 +249,39 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     center.y - robot.position.y * scale,
                 );
 
-                let robot_circle = Path::circle(robot_pos, ROBOT_RADIUS_MM * scale);
-                frame.fill(&robot_circle, color);
+                // Cuerpo cuadrado orientado (footprint real ~75mm, cubo VSSS). Vectores
+                // unitarios en pantalla: "adelante" (heading) y "lado" (perpendicular).
+                // La Y de pantalla está invertida (por eso -sin en la componente y).
+                let (sin_t, cos_t) = robot.orientation.sin_cos();
+                let fwd = Point::new(cos_t, -sin_t); // dirección de avance
+                let side = Point::new(sin_t, cos_t); // perpendicular (unitario)
+                let h = ROBOT_HALF_MM * scale;
+                let corner = |a: f32, b: f32| {
+                    Point::new(
+                        robot_pos.x + a * fwd.x * h + b * side.x * h,
+                        robot_pos.y + a * fwd.y * h + b * side.y * h,
+                    )
+                };
+                let c_fl = corner(1.0, 1.0); // frente-izq
+                let c_fr = corner(1.0, -1.0); // frente-der
+                let c_br = corner(-1.0, -1.0); // atrás-der
+                let c_bl = corner(-1.0, 1.0); // atrás-izq
+                let body = Path::new(|b| {
+                    b.move_to(c_fl);
+                    b.line_to(c_fr);
+                    b.line_to(c_br);
+                    b.line_to(c_bl);
+                    b.close();
+                });
+                frame.fill(&body, color);
                 frame.stroke(
-                    &robot_circle,
-                    Stroke::default().with_width(1.0).with_color(Color::BLACK),
+                    &body,
+                    Stroke::default().with_width(1.0).with_color(theme::ROBOT_OUTLINE),
+                );
+                // Indicador de frente: resalta la cara delantera (c_fl→c_fr) en claro.
+                frame.stroke(
+                    &Path::line(c_fl, c_fr),
+                    Stroke::default().with_width(3.0).with_color(theme::ROBOT_LABEL),
                 );
 
                 // Resaltado del robot seleccionado para control manual (halo).
@@ -261,7 +291,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                         &halo,
                         Stroke::default()
                             .with_width(3.0)
-                            .with_color(Color::from_rgb(1.0, 0.5, 0.0)),
+                            .with_color(theme::SELECT_HALO),
                     );
                 }
 
@@ -272,7 +302,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     Path::line(robot_pos, Point::new(robot_pos.x + dx, robot_pos.y + dy));
                 frame.stroke(
                     &orientation_line,
-                    Stroke::default().with_width(2.0).with_color(Color::BLACK),
+                    Stroke::default().with_width(2.0).with_color(theme::ROBOT_OUTLINE),
                 );
 
                 // Vector de velocidad MEDIDA (visión), naranja — distinto de la
@@ -287,7 +317,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                         &Path::line(robot_pos, Point::new(robot_pos.x + mx, robot_pos.y + my)),
                         Stroke::default()
                             .with_width(2.0)
-                            .with_color(Color::from_rgb(1.0, 0.6, 0.0)),
+                            .with_color(theme::MEASURED_VEL),
                     );
                 }
 
@@ -298,7 +328,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                         robot_pos.x - 4.0,
                         robot_pos.y - ROBOT_RADIUS_MM * scale - 14.0,
                     ),
-                    color: Color::WHITE,
+                    color: theme::ROBOT_LABEL,
                     size: 13.0.into(),
                     ..Default::default()
                 });
@@ -315,7 +345,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                         let shaft = Path::line(robot_pos, tip);
                         frame.stroke(
                             &shaft,
-                            Stroke::default().with_width(2.5).with_color(Color::WHITE),
+                            Stroke::default().with_width(2.5).with_color(theme::CMD_ARROW),
                         );
 
                         // Cabeza de flecha (dos líneas cortas)
@@ -326,7 +356,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                             let hy = tip.y + head_len * (angle + side).sin();
                             frame.stroke(
                                 &Path::line(tip, Point::new(hx, hy)),
-                                Stroke::default().with_width(2.5).with_color(Color::WHITE),
+                                Stroke::default().with_width(2.5).with_color(theme::CMD_ARROW),
                             );
                         }
                     }
@@ -339,7 +369,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                             robot_pos.x - ROBOT_RADIUS_MM * scale,
                             robot_pos.y + ROBOT_RADIUS_MM * scale + 2.0,
                         ),
-                        color: Color::WHITE,
+                        color: theme::ROBOT_LABEL,
                         size: 12.0.into(),
                         ..Default::default()
                     });
@@ -355,7 +385,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                             &target_circle,
                             Stroke::default()
                                 .with_width(2.0)
-                                .with_color(Color::from_rgb(0.0, 1.0, 1.0)),
+                                .with_color(theme::TARGET),
                         );
                         // Cruz en el centro del target
                         for (dx, dy) in [(-5.0_f32, 0.0), (5.0, 0.0), (0.0, -5.0_f32), (0.0, 5.0)] {
@@ -366,7 +396,7 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                                 ),
                                 Stroke::default()
                                     .with_width(1.5)
-                                    .with_color(Color::from_rgb(0.0, 1.0, 1.0)),
+                                    .with_color(theme::TARGET),
                             );
                         }
                     }
@@ -381,14 +411,14 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                     &ring,
                     Stroke::default()
                         .with_width(2.5)
-                        .with_color(Color::from_rgb(0.1, 1.0, 0.3)),
+                        .with_color(theme::SKILL_TARGET),
                 );
                 for (dx, dy) in [(-7.0_f32, 0.0), (7.0, 0.0), (0.0, -7.0_f32), (0.0, 7.0)] {
                     frame.stroke(
                         &Path::line(p, Point::new(p.x + dx, p.y + dy)),
                         Stroke::default()
                             .with_width(2.0)
-                            .with_color(Color::from_rgb(0.1, 1.0, 0.3)),
+                            .with_color(theme::SKILL_TARGET),
                     );
                 }
             }

@@ -582,6 +582,7 @@ pub async fn run_control_loop(
                         id: cmd.id as u32,
                         vx: cmd.vx as f32,
                         vy: cmd.vy as f32,
+                        omega: cmd.omega as f32,
                         target: *target,
                         wheel_l_mm_s,
                         wheel_r_mm_s,
