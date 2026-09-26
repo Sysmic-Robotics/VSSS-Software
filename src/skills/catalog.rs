@@ -24,8 +24,8 @@
 
 use crate::motion::{Motion, MotionCommand};
 use crate::skills::{
-    ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, FacePointSkill, GoToSkill,
-    InterceptSkill, ShootPushSkill, Skill, SkillConfig, SkillStatus, SpinSkill,
+    ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, DefendGoalLineSkill, FacePointSkill,
+    GoToSkill, InterceptSkill, ShootPushSkill, Skill, SkillConfig, SkillStatus, SpinSkill,
 };
 use crate::world::{RobotState, World};
 use glam::Vec2;
@@ -55,12 +55,15 @@ pub enum SkillId {
     Intercept = 6,
     /// Cubrir la línea pelota→arco propio; `target` = centro del arco propio.
     BlockLine = 7,
+    /// Arquero: línea de gol con predicción de trayectoria de la pelota;
+    /// `target` = centro del arco propio.
+    GoalKeep = 8,
 }
 
 impl SkillId {
     /// Cantidad de skills en el catálogo. Este es el tamaño del action space
     /// discreto que la policy debe respetar.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     /// Construye una `SkillId` a partir del entero que emite la policy.
     /// Retorna `None` si el id está fuera del rango del catálogo.
@@ -74,6 +77,7 @@ impl SkillId {
             5 => Some(Self::ShootPush),
             6 => Some(Self::Intercept),
             7 => Some(Self::BlockLine),
+            8 => Some(Self::GoalKeep),
             _ => None,
         }
     }
@@ -93,6 +97,7 @@ impl SkillId {
                 | SkillId::ApproachAligned
                 | SkillId::ShootPush
                 | SkillId::BlockLine
+                | SkillId::GoalKeep
         )
     }
 
@@ -125,7 +130,17 @@ pub struct SkillCatalog {
     shoot: Vec<ShootPushSkill>,
     intercept: Vec<InterceptSkill>,
     block: Vec<BlockLineSkill>,
+    goal_keep: Vec<DefendGoalLineSkill>,
     config: SkillConfig,
+}
+
+/// Reconstruye el arquero si el arco propio cambió de lado (el `target` de
+/// `GoalKeep` es el centro del arco propio; solo importa su signo en x).
+fn ensure_goal_side(skill: &mut DefendGoalLineSkill, own_goal: Vec2) {
+    let same_side = (skill.defend_x < 0.0) == (own_goal.x < 0.0);
+    if !same_side {
+        *skill = DefendGoalLineSkill::new(own_goal);
+    }
 }
 
 impl SkillCatalog {
@@ -154,6 +169,9 @@ impl SkillCatalog {
         let block = (0..num_robots)
             .map(|_| BlockLineSkill::new(Vec2::new(-0.75, 0.0)))
             .collect();
+        let goal_keep = (0..num_robots)
+            .map(|_| DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0)))
+            .collect();
         Self {
             go_to,
             face_point,
@@ -163,6 +181,7 @@ impl SkillCatalog {
             shoot,
             intercept,
             block,
+            goal_keep,
             config,
         }
     }
@@ -197,6 +216,11 @@ impl SkillCatalog {
             SkillId::BlockLine => {
                 let s = &mut self.block[robot_id];
                 s.set_own_goal(target);
+                s.status(robot, world)
+            }
+            SkillId::GoalKeep => {
+                let s = &mut self.goal_keep[robot_id];
+                ensure_goal_side(s, target);
                 s.status(robot, world)
             }
         }
@@ -302,6 +326,11 @@ impl SkillCatalog {
                 skill.set_own_goal(target);
                 skill.tick(robot, world, motion)
             }
+            SkillId::GoalKeep => {
+                let skill = &mut self.goal_keep[robot_id];
+                ensure_goal_side(skill, target);
+                skill.tick(robot, world, motion)
+            }
         }
     }
 }
@@ -341,8 +370,24 @@ mod tests {
             SkillId::ShootPush,
             SkillId::Intercept,
             SkillId::BlockLine,
+            SkillId::GoalKeep,
         ];
         assert_eq!(known.len(), SkillId::COUNT);
+    }
+
+    #[test]
+    fn goal_keep_follows_goal_side_from_target() {
+        let mut catalog = SkillCatalog::new(3);
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.0, 0.1), Vec2::ZERO);
+        let motion = Motion::new();
+        let robot = make_robot(2, 0.6, 0.0, 0.0);
+        // Arco propio a la derecha (equipo amarillo): el target de movimiento
+        // debe quedar del lado +x.
+        let _ = catalog.tick(2, SkillId::GoalKeep, Vec2::new(0.75, 0.0), &robot, &world, &motion);
+        assert!(catalog.goal_keep[2].defend_x > 0.0);
+        let _ = catalog.tick(2, SkillId::GoalKeep, Vec2::new(-0.75, 0.0), &robot, &world, &motion);
+        assert!(catalog.goal_keep[2].defend_x < 0.0);
     }
 
     #[test]

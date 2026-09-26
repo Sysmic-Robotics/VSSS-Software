@@ -137,6 +137,7 @@ pub fn skill_label(s: Option<SkillId>) -> &'static str {
         Some(SkillId::ShootPush) => "shoot",
         Some(SkillId::Intercept) => "intercept",
         Some(SkillId::BlockLine) => "blockline",
+        Some(SkillId::GoalKeep) => "goalkeep",
         None => "",
     }
 }
@@ -207,6 +208,7 @@ impl SkillLogCtx {
                 | SkillId::ShootPush
                 | SkillId::Intercept
                 | SkillId::BlockLine
+                | SkillId::GoalKeep
         );
 
         // Pelota (siempre en modo skill: la necesitan las mediciones de contacto)

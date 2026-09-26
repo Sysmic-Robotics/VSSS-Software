@@ -78,9 +78,10 @@ FLAGS COMUNES (opcionales):
 
 FLAGS MODO skill:
     --vision <sim|real>
-    --skill <goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline>
+    --skill <goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep>
     --target x,y         obligatorio para goto, facepoint, spin, approach,
-                         shoot (punto al que apuntar) y blockline (arco propio)
+                         shoot (punto al que apuntar), blockline y goalkeep
+                         (ambos: centro del arco propio, p.ej. -0.75,0)
                          (spin solo usa el signo de x: + = CCW, − = CW)
                          opcional para chaseball; ignorado por intercept
 
@@ -241,9 +242,10 @@ impl Args {
                         "shoot" => SkillId::ShootPush,
                         "intercept" => SkillId::Intercept,
                         "blockline" => SkillId::BlockLine,
+                        "goalkeep" => SkillId::GoalKeep,
                         other => {
                             return Err(format!(
-                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline)"
+                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep)"
                             ));
                         }
                     });
@@ -322,6 +324,7 @@ impl Args {
                         | SkillId::ApproachAligned
                         | SkillId::ShootPush
                         | SkillId::BlockLine
+                        | SkillId::GoalKeep
                 ) && target.is_none()
                 {
                     return Err(format!(

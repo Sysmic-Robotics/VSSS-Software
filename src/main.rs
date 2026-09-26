@@ -16,7 +16,7 @@ const COACH_DECISION_PERIOD: u32 = 6;
 // ========================
 
 use glam::Vec2;
-use rustengine::coach::{Coach, RuleBasedCoach, SkillChoice};
+use rustengine::coach::{Coach, HeuristicCoach, RuleBasedCoach, SkillChoice};
 use rustengine::control_loop::{
     CoachDecider, ControlLoopConfig, GuiChannels, GuiSkillCommand, HeadingPid, ManualCommand,
     TickDecider, run_control_loop,
@@ -45,20 +45,20 @@ fn goals_for_team(own_team: i32) -> (Vec2, Vec2) {
 }
 
 /// Construye el coach inicial. Soporta selección por env var:
-/// - `VSSL_COACH=rule_based` (default): baseline clásico.
+/// - `VSSL_COACH=heuristic` (default): equipo heurístico STP (roles dinámicos
+///   + tácticas sobre el catálogo completo, robot de dos caras).
+/// - `VSSL_COACH=rule_based`: baseline clásico de roles fijos (regresión).
 /// - `VSSL_COACH=none`: no emite decisiones (útil para test de visión/radio).
-///
-/// El día que llegue Fase 7, este factory va a aceptar también `VSSL_COACH=rl`
-/// para cargar un modelo ONNX.
 fn make_coach(own_team: i32) -> Option<Box<dyn Coach>> {
-    let kind = std::env::var("VSSL_COACH").unwrap_or_else(|_| "rule_based".to_string());
+    let kind = std::env::var("VSSL_COACH").unwrap_or_else(|_| "heuristic".to_string());
     let (attack_goal, own_goal) = goals_for_team(own_team);
     match kind.as_str() {
+        "heuristic" => Some(Box::new(HeuristicCoach::new(attack_goal, own_goal))),
         "rule_based" => Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal))),
         "none" => None,
         other => {
-            eprintln!("[main] VSSL_COACH='{other}' inválido, usando 'rule_based'");
-            Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal)))
+            eprintln!("[main] VSSL_COACH='{other}' inválido, usando 'heuristic'");
+            Some(Box::new(HeuristicCoach::new(attack_goal, own_goal)))
         }
     }
 }
@@ -164,7 +164,7 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
     eprintln!(
         "[main] coach: {}",
         if coach.is_some() {
-            std::env::var("VSSL_COACH").unwrap_or_else(|_| "rule_based".to_string())
+            std::env::var("VSSL_COACH").unwrap_or_else(|_| "heuristic".to_string())
         } else {
             "none".to_string()
         }

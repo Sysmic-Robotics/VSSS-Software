@@ -5,7 +5,8 @@ pub mod tactical;
 pub use catalog::{SkillCatalog, SkillId};
 pub use config::SkillConfig;
 pub use tactical::{
-    ApproachAlignedSkill, BlockLineSkill, Face, InterceptSkill, ShootPushSkill, SkillStatus,
+    ApproachAlignedSkill, BlockLineSkill, Face, InterceptSkill, SHOOT_PUSH_BEHIND_TOL,
+    SHOOT_PUSH_LOSE_RADIUS, ShootPushSkill, SkillStatus, shoot_push_feasible,
 };
 
 use crate::motion::{Motion, MotionCommand};

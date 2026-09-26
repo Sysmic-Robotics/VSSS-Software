@@ -88,6 +88,30 @@ fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
 
+/// Criterio geométrico de factibilidad de `ShootPush`, compartido con la capa
+/// táctica (el coach decide con la MISMA regla que la skill ejecuta):
+/// el robot está detrás de la pelota respecto de `target` (proyección sobre la
+/// línea de empuje ≤ `behind_tol`) y a menos de `lose_radius` de ella.
+pub fn shoot_push_feasible(
+    robot_pos: Vec2,
+    ball: Vec2,
+    target: Vec2,
+    behind_tol: f32,
+    lose_radius: f32,
+) -> bool {
+    let dir = (target - ball).normalize_or_zero();
+    if dir.length_squared() < f32::EPSILON {
+        return false;
+    }
+    let along = (robot_pos - ball).dot(dir);
+    along <= behind_tol && (ball - robot_pos).length() <= lose_radius
+}
+
+/// Valores por defecto de `ShootPushSkill` que la táctica necesita para evaluar
+/// factibilidad sin instanciar la skill.
+pub const SHOOT_PUSH_BEHIND_TOL: f32 = 0.03;
+pub const SHOOT_PUSH_LOSE_RADIUS: f32 = 0.30;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  ApproachAligned
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,8 +283,8 @@ impl ShootPushSkill {
         Self {
             target,
             push_overshoot: 0.25,
-            lose_radius: 0.30,
-            behind_tol: 0.03,
+            lose_radius: SHOOT_PUSH_LOSE_RADIUS,
+            behind_tol: SHOOT_PUSH_BEHIND_TOL,
             release_ball_speed: 0.6,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
@@ -280,11 +304,13 @@ impl ShootPushSkill {
     /// Factible = detrás de la pelota (proyección sobre la línea ≤ tolerancia) y
     /// dentro del radio de trabajo.
     pub fn is_feasible(&self, robot: &RobotState, ball: Vec2) -> bool {
-        let Some(dir) = self.push_dir(ball) else {
-            return false;
-        };
-        let along = (robot.position - ball).dot(dir);
-        along <= self.behind_tol && (ball - robot.position).length() <= self.lose_radius
+        shoot_push_feasible(
+            robot.position,
+            ball,
+            self.target,
+            self.behind_tol,
+            self.lose_radius,
+        )
     }
 
     fn ball_speed_to_target(&self, world: &World) -> f32 {
