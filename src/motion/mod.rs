@@ -67,10 +67,25 @@ impl Default for MotionConfig {
 }
 
 impl MotionConfig {
-    /// Defaults + overrides por variables de entorno (sin recompilar):
-    /// - `VSSL_BIDIRECTIONAL=1|true|on` → modo simétrico de dos caras.
+    /// Config desde los parámetros calibrables (`config/team_params.json`).
+    pub fn from_params(p: &crate::params::MotionParams) -> Self {
+        Self {
+            max_linear_speed: p.max_linear_speed,
+            min_linear_speed: p.min_linear_speed,
+            max_angular_speed: p.max_angular_speed,
+            arrival_threshold: p.arrival_threshold,
+            brake_distance: p.brake_distance,
+            coupling_floor: p.coupling_floor,
+            uvf_influence_radius: p.uvf_influence_radius,
+            uvf_k_rep: p.uvf_k_rep,
+            bidirectional: p.bidirectional,
+        }
+    }
+
+    /// Parámetros del JSON vigente + overrides por variables de entorno:
+    /// - `VSSL_BIDIRECTIONAL=1|true|on` (o `0|false|off`) → modo de dos caras.
     pub fn from_env() -> Self {
-        let mut cfg = Self::default();
+        let mut cfg = Self::from_params(&crate::params::params().motion);
         if let Ok(v) = std::env::var("VSSL_BIDIRECTIONAL") {
             cfg.bidirectional = matches!(v.trim(), "1" | "true" | "on");
         }

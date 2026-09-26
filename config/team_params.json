@@ -1,0 +1,52 @@
+{
+  "coach": {
+    "keeper_id": 2,
+    "v_ref": 1.0,
+    "omega_ref": 3.0,
+    "role_switch_gain": 0.75,
+    "role_min_hold": 5,
+    "skill_min_hold": 3,
+    "intercept_min_ball_speed": 0.3,
+    "gk_clear_max_ball_speed": 0.15,
+    "opp_keeper_radius": 0.3,
+    "wall_band_y": 0.52,
+    "wall_band_x": 0.62
+  },
+  "skills": {
+    "approach_staging_offset": 0.14,
+    "approach_pos_tol": 0.05,
+    "approach_angle_tol": 0.15,
+    "approach_pre_align_radius": 0.25,
+    "shoot_push_overshoot": 0.25,
+    "shoot_lose_radius": 0.3,
+    "shoot_behind_tol": 0.03,
+    "shoot_release_ball_speed": 0.6,
+    "intercept_horizon": 1.5,
+    "intercept_min_ball_speed": 0.08,
+    "intercept_ball_decay_per_s": 0.3,
+    "intercept_reaction_delay": 0.1,
+    "intercept_reach_radius": 0.09,
+    "block_distance": 0.3,
+    "block_max_abs_x": 0.58
+  },
+  "motion": {
+    "max_linear_speed": 1.2,
+    "min_linear_speed": 0.06,
+    "max_angular_speed": 3.0,
+    "arrival_threshold": 0.06,
+    "brake_distance": 0.5,
+    "coupling_floor": 0.22,
+    "uvf_influence_radius": 0.2,
+    "uvf_k_rep": 1.5,
+    "bidirectional": false
+  },
+  "robot": {
+    "wheel_base_m": 0.07,
+    "max_wheel_mm_s": 1500
+  },
+  "sim": {
+    "wheel_base_m": 0.085,
+    "wheel_radius_m": 0.02,
+    "max_wheel_rad_s": 60.0
+  }
+}

@@ -394,18 +394,10 @@ pub fn serialize_to_firasim(
     }
 }
 
-/// Constantes del robot VSS para conversión v,omega → wheel_left/wheel_right (rad/s).
-/// MEDIDAS EMPÍRICAMENTE contra FIRASim (`training/sysid/measure_wheelbase.py`): se
-/// comandaron ruedas conocidas y se midió la respuesta por visión.
-///   - recto  (wl=wr=w):  v_ss/w        → r = 0.02000 m (exacto, 2 velocidades)
-///   - giro   (-w,+w):    2·w·r/ω_ss    → L = 0.08499 m (constante en 3 velocidades)
-/// El valor anterior (L=0.05, "típico VSS") hacía girar al robot al 59% de la ω
-/// comandada (ω_real = ω_cmd·L_conv/L_true): los robots "no doblaban".
-const WHEEL_BASE_L: f64 = 0.085; // m, efectivo medido en FIRASim
-const WHEEL_RADIUS_R: f64 = 0.02; // m, efectivo medido en FIRASim
-/// Tope por rueda = 1.2 m/s lineales por rueda (60·0.02), coherente con
-/// MAX_LINEAR_SPEED=1.2 y con la envolvente del simulador de entrenamiento.
-const WHEEL_RAD_S_MAX: f64 = 60.0;
+// Geometría del robot de FIRASim para la conversión (v, ω) → rad/s por rueda:
+// `params().sim` (`config/team_params.json`). Valores medidos empíricamente
+// contra FIRASim (`measure_wheelbase.py`): r = 0.02000 m, L = 0.08499 m. El valor
+// viejo L = 0.05 hacía girar al robot al 59 % de la ω comandada.
 /// Límites de entrada esperados para comandos cinemáticos.
 const MOTION_VEL_MAX: f64 = 2.0; // m/s
 const MOTION_OMEGA_MAX: f64 = 10.0; // rad/s
@@ -456,14 +448,15 @@ pub fn serialize_to_fira_actuator(
         // v = velocidad lineal en la dirección del robot (m/s)
         let v = vx * theta.cos() + vy * theta.sin();
         // omega_left/right en rad/s (drive diferencial: L = wheel base, r = wheel radius)
-        let inv_r = 1.0 / WHEEL_RADIUS_R;
-        let half_l_over_r = WHEEL_BASE_L / (2.0 * WHEEL_RADIUS_R);
+        let sim = &crate::params::params().sim;
+        let inv_r = 1.0 / sim.wheel_radius_m;
+        let half_l_over_r = sim.wheel_base_m / (2.0 * sim.wheel_radius_m);
         let mut wheel_left = v * inv_r - omega * half_l_over_r;
         let mut wheel_right = v * inv_r + omega * half_l_over_r;
         let unclamped_left = wheel_left;
         let unclamped_right = wheel_right;
-        wheel_left = wheel_left.clamp(-WHEEL_RAD_S_MAX, WHEEL_RAD_S_MAX);
-        wheel_right = wheel_right.clamp(-WHEEL_RAD_S_MAX, WHEEL_RAD_S_MAX);
+        wheel_left = wheel_left.clamp(-sim.max_wheel_rad_s, sim.max_wheel_rad_s);
+        wheel_right = wheel_right.clamp(-sim.max_wheel_rad_s, sim.max_wheel_rad_s);
         if (unclamped_left - wheel_left).abs() > f64::EPSILON
             || (unclamped_right - wheel_right).abs() > f64::EPSILON
         {

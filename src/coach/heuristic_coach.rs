@@ -26,7 +26,8 @@ use crate::coach::coach_trait::Coach;
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation, RobotObs};
 use crate::coach::skill_choice::SkillChoice;
 use crate::motion::MotionConfig;
-use crate::skills::{SHOOT_PUSH_BEHIND_TOL, SHOOT_PUSH_LOSE_RADIUS, SkillId, shoot_push_feasible};
+use crate::params::{CoachParams, params};
+use crate::skills::{SkillId, shoot_push_feasible_now};
 use glam::Vec2;
 use std::f32::consts::{FRAC_PI_2, PI};
 
@@ -41,26 +42,8 @@ pub const GOAL_HALF_Y: f32 = 0.20;
 const FIELD_ROBOT_MAX_ABS_X: f32 = 0.55;
 const FIELD_ROBOT_MAX_ABS_Y: f32 = 0.55;
 
-// ── Parámetros de decisión ───────────────────────────────────────────────────
-/// Velocidad lineal y angular de referencia para el costo de llegada.
-const V_REF: f32 = 1.0;
-const OMEGA_REF: f32 = 3.0;
-/// El striker cambia solo si el otro llega en menos de este factor del tiempo.
-const ROLE_SWITCH_GAIN: f32 = 0.75;
-/// Decisiones mínimas entre cambios de rol (a 10 Hz: 5 = 0.5 s).
-const ROLE_MIN_HOLD: u32 = 5;
-/// Decisiones mínimas manteniendo una skill (a 10 Hz: 3 = 0.3 s).
-const SKILL_MIN_HOLD: u32 = 3;
-/// Pelota "en juego rápido" hacia el robot → Intercept.
-const INTERCEPT_MIN_BALL_SPEED: f32 = 0.30;
-/// Pelota quieta dentro del área propia → el arquero despeja.
-const GK_CLEAR_MAX_BALL_SPEED: f32 = 0.15;
-/// Rival a menos de esto del centro del arco rival cuenta como arquero rival.
-const OPP_KEEPER_RADIUS: f32 = 0.30;
-/// |y| de la pelota desde el que se considera "pegada a la banda".
-const WALL_BAND_Y: f32 = 0.52;
-/// |x| de la pelota desde el que se considera "en el fondo" (fuera de la boca del arco).
-const WALL_BAND_X: f32 = 0.62;
+// Umbrales de decisión: `CoachParams` en `src/params.rs` / `config/team_params.json`
+// (histéresis de rol, compromiso por skill, velocidades de referencia, bandas).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -91,6 +74,8 @@ pub struct HeuristicCoach {
     /// Costo de giro plegado a ±90° (robot de dos caras). Se toma de
     /// `MotionConfig::from_env()` para decidir igual que como se ejecuta.
     pub bidirectional: bool,
+    /// Umbrales calibrables (ver `config/team_params.json`).
+    pub p: CoachParams,
     striker_id: Option<i32>,
     decisions_since_role_switch: u32,
     committed: [Option<Committed>; 3],
@@ -98,20 +83,37 @@ pub struct HeuristicCoach {
 }
 
 impl HeuristicCoach {
+    /// Coach de producción: parámetros del JSON vigente y modo de dos caras según
+    /// `MotionConfig::from_env()` (decide igual que como se ejecuta).
     pub fn new(attack_goal: Vec2, own_goal: Vec2) -> Self {
-        Self::with_options(attack_goal, own_goal, 2, MotionConfig::from_env().bidirectional)
+        Self::from_params(
+            attack_goal,
+            own_goal,
+            params().coach.clone(),
+            MotionConfig::from_env().bidirectional,
+        )
     }
 
+    /// Defaults de código con arquero y modo explícitos (tests, herramientas).
     pub fn with_options(attack_goal: Vec2, own_goal: Vec2, keeper_id: i32, bidirectional: bool) -> Self {
+        let p = CoachParams {
+            keeper_id,
+            ..CoachParams::default()
+        };
+        Self::from_params(attack_goal, own_goal, p, bidirectional)
+    }
+
+    pub fn from_params(attack_goal: Vec2, own_goal: Vec2, p: CoachParams, bidirectional: bool) -> Self {
         Self {
             attack_goal,
             own_goal,
-            keeper_id,
+            keeper_id: p.keeper_id,
             bidirectional,
             striker_id: None,
-            decisions_since_role_switch: ROLE_MIN_HOLD,
+            decisions_since_role_switch: p.role_min_hold,
             committed: [None; 3],
             decision_count: 0,
+            p,
         }
     }
 
@@ -194,9 +196,9 @@ impl HeuristicCoach {
             if self.bidirectional && err > FRAC_PI_2 {
                 err = PI - err;
             }
-            turn = err / OMEGA_REF;
+            turn = err / self.p.omega_ref;
         }
-        dist / V_REF + turn
+        dist / self.p.v_ref + turn
     }
 
     /// Punto del arco rival al que apuntar: centro, o el palo lejano si hay un
@@ -205,7 +207,7 @@ impl HeuristicCoach {
         let keeper = opp
             .iter()
             .filter(|o| o.active)
-            .filter(|o| (o.pos - self.attack_goal).length() <= OPP_KEEPER_RADIUS)
+            .filter(|o| (o.pos - self.attack_goal).length() <= self.p.opp_keeper_radius)
             .min_by(|a, b| {
                 (a.pos - self.attack_goal)
                     .length()
@@ -228,13 +230,13 @@ impl HeuristicCoach {
     }
 
     /// Pelota pegada a una banda lateral.
-    fn ball_on_side_wall(ball: Vec2) -> bool {
-        ball.y.abs() > WALL_BAND_Y
+    fn ball_on_side_wall(&self, ball: Vec2) -> bool {
+        ball.y.abs() > self.p.wall_band_y
     }
 
     /// Pelota en el fondo (línea de gol fuera de la boca del arco) o en la esquina.
-    fn ball_on_end_wall(ball: Vec2) -> bool {
-        ball.x.abs() > WALL_BAND_X && ball.y.abs() > GOAL_HALF_Y
+    fn ball_on_end_wall(&self, ball: Vec2) -> bool {
+        ball.x.abs() > self.p.wall_band_x && ball.y.abs() > GOAL_HALF_Y
     }
 
     /// Objetivo de empuje del striker según dónde está la pelota. Apuntar al
@@ -244,7 +246,7 @@ impl HeuristicCoach {
         let s = self.attack_sign();
         let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
         let attacking_end = ball.x * s > 0.0;
-        if Self::ball_on_end_wall(ball) {
+        if self.ball_on_end_wall(ball) {
             return if attacking_end {
                 // Fondo/esquina rival: sacarla al frente del arco (segunda pelota).
                 Vec2::new(s * (GOAL_AREA_X - 0.12), -side * 0.10)
@@ -253,7 +255,7 @@ impl HeuristicCoach {
                 Vec2::new(s * 0.20, side * 0.50)
             };
         }
-        if Self::ball_on_side_wall(ball) {
+        if self.ball_on_side_wall(ball) {
             // Banda: conducir a lo largo de la banda con un ángulo suave hacia
             // adentro, para que la pelota se despegue de la pared camino al arco.
             return Vec2::new(ball.x + s * 0.35, side * 0.42);
@@ -269,9 +271,10 @@ impl HeuristicCoach {
     /// Aplica el compromiso mínimo: si el robot venía con `prev` y todavía es
     /// aceptable (`still_ok`), la mantiene hasta `SKILL_MIN_HOLD` decisiones.
     fn commit(&mut self, robot_id: i32, wanted: SkillId, still_ok: impl Fn(SkillId) -> bool) -> SkillId {
+        let min_hold = self.p.skill_min_hold;
         let slot = &mut self.committed[robot_id as usize];
         let chosen = match slot {
-            Some(c) if c.skill != wanted && c.held < SKILL_MIN_HOLD && still_ok(c.skill) => c.skill,
+            Some(c) if c.skill != wanted && c.held < min_hold && still_ok(c.skill) => c.skill,
             _ => wanted,
         };
         match slot {
@@ -286,9 +289,10 @@ impl HeuristicCoach {
     fn striker_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
         let target = self.striker_target(ball, opp);
 
-        let shoot_ok = shoot_push_feasible(r.pos, ball, target, SHOOT_PUSH_BEHIND_TOL, SHOOT_PUSH_LOSE_RADIUS);
+        let shoot_ok = shoot_push_feasible_now(r.pos, ball, target);
         let ball_speed = ball_vel.length();
-        let ball_coming = ball_speed >= INTERCEPT_MIN_BALL_SPEED
+        let intercept_min_speed = self.p.intercept_min_ball_speed;
+        let ball_coming = ball_speed >= intercept_min_speed
             && (r.pos - ball).normalize_or_zero().dot(ball_vel.normalize_or_zero()) > 0.3;
 
         let wanted = if shoot_ok {
@@ -300,7 +304,7 @@ impl HeuristicCoach {
         };
         let skill = self.commit(r.id, wanted, |prev| match prev {
             SkillId::ShootPush => shoot_ok,
-            SkillId::Intercept => ball_speed >= INTERCEPT_MIN_BALL_SPEED * 0.5,
+            SkillId::Intercept => ball_speed >= intercept_min_speed * 0.5,
             _ => true,
         });
         SkillChoice::new(r.id, skill, target)
@@ -316,7 +320,7 @@ impl HeuristicCoach {
         // el support espera ahí la "segunda pelota", del lado contrario, fuera del
         // área rival (no amontonarse contra la pared con el striker).
         let s = self.attack_sign();
-        if Self::ball_on_end_wall(ball) && ball.x * s > 0.0 {
+        if self.ball_on_end_wall(ball) && ball.x * s > 0.0 {
             let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
             let pos = Vec2::new(s * (GOAL_AREA_X - 0.18), -side * 0.22);
             let skill = self.commit(r.id, SkillId::GoTo, |_| true);
@@ -341,10 +345,11 @@ impl HeuristicCoach {
     }
 
     fn keeper_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2) -> SkillChoice {
-        let ball_parked_in_area = self.in_own_area(ball) && ball_vel.length() <= GK_CLEAR_MAX_BALL_SPEED;
+        let ball_parked_in_area =
+            self.in_own_area(ball) && ball_vel.length() <= self.p.gk_clear_max_ball_speed;
         if ball_parked_in_area {
             let target = self.clear_target(ball);
-            let shoot_ok = shoot_push_feasible(r.pos, ball, target, SHOOT_PUSH_BEHIND_TOL, SHOOT_PUSH_LOSE_RADIUS);
+            let shoot_ok = shoot_push_feasible_now(r.pos, ball, target);
             let wanted = if shoot_ok { SkillId::ShootPush } else { SkillId::ApproachAligned };
             let skill = self.commit(r.id, wanted, |prev| prev != SkillId::ShootPush || shoot_ok);
             return SkillChoice::new(r.id, skill, target);
@@ -393,8 +398,8 @@ impl HeuristicCoach {
                 self.decisions_since_role_switch = 0;
             }
             Some((cur, cur_t)) if cur.id != best.id => {
-                let clearly_better = best_t < cur_t * ROLE_SWITCH_GAIN;
-                if clearly_better && self.decisions_since_role_switch >= ROLE_MIN_HOLD {
+                let clearly_better = best_t < cur_t * self.p.role_switch_gain;
+                if clearly_better && self.decisions_since_role_switch >= self.p.role_min_hold {
                     self.striker_id = Some(best.id);
                     self.decisions_since_role_switch = 0;
                 }
@@ -604,7 +609,7 @@ mod tests {
             Vec2::ZERO,
             [Vec2::new(-0.60, 0.0), Vec2::new(0.10, 0.0), Vec2::new(-0.63, 0.0)],
         );
-        for _ in 0..ROLE_MIN_HOLD + 1 {
+        for _ in 0..CoachParams::default().role_min_hold + 1 {
             c.decide(&o);
         }
         assert_eq!(c.role_of(1), Some(Role::Striker));
@@ -632,7 +637,7 @@ mod tests {
         // aunque ShootPush ya sea factible otra vez (evita el ping-pong).
         assert_eq!(choice_of(&c.decide(&behind), 1).skill_id, SkillId::ApproachAligned);
         let mut last = SkillId::ApproachAligned;
-        for _ in 0..SKILL_MIN_HOLD {
+        for _ in 0..CoachParams::default().skill_min_hold {
             last = choice_of(&c.decide(&behind), 1).skill_id;
         }
         assert_eq!(last, SkillId::ShootPush);
@@ -712,6 +717,34 @@ mod tests {
         let t = c.striker_target(Vec2::new(-0.68, -0.58), &[]);
         assert!(t.x > -0.68, "despeje hacia adelante: {t:?}");
         assert!(t.y < 0.0, "por la misma banda: {t:?}");
+    }
+
+    #[test]
+    fn params_drive_keeper_and_hysteresis() {
+        let p = CoachParams {
+            keeper_id: 0,
+            role_min_hold: 0,
+            role_switch_gain: 1.0,
+            ..CoachParams::default()
+        };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        let o = obs(
+            Vec2::new(0.2, 0.0),
+            Vec2::ZERO,
+            [Vec2::new(-0.63, 0.0), Vec2::new(0.0, 0.0), Vec2::new(-0.5, 0.3)],
+        );
+        let ch = c.decide(&o);
+        assert_eq!(c.role_of(0), Some(Role::Keeper));
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::GoalKeep);
+        assert_eq!(c.role_of(1), Some(Role::Striker));
+        // Sin histéresis (hold 0, gain 1.0): el rol cambia apenas otro está más cerca.
+        let o = obs(
+            Vec2::new(0.2, 0.0),
+            Vec2::ZERO,
+            [Vec2::new(-0.63, 0.0), Vec2::new(-0.5, 0.0), Vec2::new(0.1, 0.0)],
+        );
+        c.decide(&o);
+        assert_eq!(c.role_of(2), Some(Role::Striker));
     }
 
     #[test]

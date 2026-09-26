@@ -1,0 +1,345 @@
+//! Parámetros de calibración y táctica FUERA del código (`config/team_params.json`).
+//!
+//! Todo lo que se ajusta con mediciones o con partidos de prueba (wheelbase real,
+//! velocidades, distancias de las skills, umbrales del coach) vive aquí, para que
+//! calibrar sea editar un archivo y no recompilar.
+//!
+//! Carga (`TeamParams::load`):
+//! 1. `VSSL_PARAMS=<ruta>` si está definida (error si el archivo no existe o no parsea);
+//! 2. si no, `config/team_params.json` relativo al directorio de trabajo, si existe;
+//! 3. si no, los defaults de código (los mismos valores que trae el JSON del repo).
+//!
+//! El JSON puede ser PARCIAL: cualquier campo ausente toma su default. Un campo con
+//! nombre desconocido es error (`deny_unknown_fields`), para que un typo en una
+//! calibración no pase en silencio.
+//!
+//! Acceso global: `params()` (se fija una vez al arranque con `load_and_install`;
+//! si nadie lo instaló, p. ej. en tests, devuelve los defaults).
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Umbrales del coach heurístico (`HeuristicCoach`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CoachParams {
+    /// Robot que juega de arquero (id 0..2). Cambia solo si queda inactivo.
+    pub keeper_id: i32,
+    /// Velocidad lineal de referencia para estimar tiempo de llegada (m/s).
+    pub v_ref: f32,
+    /// Velocidad angular de referencia para el costo de giro (rad/s).
+    pub omega_ref: f32,
+    /// El striker cambia solo si el otro llega en menos de este factor del tiempo.
+    pub role_switch_gain: f32,
+    /// Decisiones mínimas entre cambios de rol (a 10 Hz: 5 = 0.5 s).
+    pub role_min_hold: u32,
+    /// Decisiones mínimas manteniendo una skill (a 10 Hz: 3 = 0.3 s).
+    pub skill_min_hold: u32,
+    /// Pelota más rápida que esto y viniendo hacia el robot → `Intercept` (m/s).
+    pub intercept_min_ball_speed: f32,
+    /// Pelota más lenta que esto dentro del área propia → el arquero despeja (m/s).
+    pub gk_clear_max_ball_speed: f32,
+    /// Rival a menos de esto del centro del arco rival cuenta como arquero (m).
+    pub opp_keeper_radius: f32,
+    /// |y| de la pelota desde el que se considera "pegada a la banda" (m).
+    pub wall_band_y: f32,
+    /// |x| de la pelota desde el que se considera "en el fondo" (m).
+    pub wall_band_x: f32,
+}
+
+impl Default for CoachParams {
+    fn default() -> Self {
+        Self {
+            keeper_id: 2,
+            v_ref: 1.0,
+            omega_ref: 3.0,
+            role_switch_gain: 0.75,
+            role_min_hold: 5,
+            skill_min_hold: 3,
+            intercept_min_ball_speed: 0.30,
+            gk_clear_max_ball_speed: 0.15,
+            opp_keeper_radius: 0.30,
+            wall_band_y: 0.52,
+            wall_band_x: 0.62,
+        }
+    }
+}
+
+/// Distancias y tolerancias de las skills tácticas (`skills/tactical.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SkillParams {
+    /// ApproachAligned: distancia del staging detrás de la pelota (m).
+    pub approach_staging_offset: f32,
+    /// ApproachAligned: tolerancia posicional para "en staging" (m).
+    pub approach_pos_tol: f32,
+    /// ApproachAligned: tolerancia angular de alineación (rad).
+    pub approach_angle_tol: f64,
+    /// ApproachAligned: radio desde el que ya mira a la pelota (m).
+    pub approach_pre_align_radius: f32,
+    /// ShootPush: cuánto más allá de la pelota apunta el movimiento (m).
+    pub shoot_push_overshoot: f32,
+    /// ShootPush: distancia robot–pelota desde la que deja de ser factible (m).
+    pub shoot_lose_radius: f32,
+    /// ShootPush: margen para "detrás de la pelota" sobre la línea de empuje (m).
+    pub shoot_behind_tol: f32,
+    /// ShootPush: velocidad de la pelota hacia el objetivo que cuenta como soltada (m/s).
+    pub shoot_release_ball_speed: f32,
+    /// Intercept: horizonte de predicción (s).
+    pub intercept_horizon: f32,
+    /// Intercept: bajo esta velocidad la pelota se considera quieta (m/s).
+    pub intercept_min_ball_speed: f32,
+    /// Intercept: constante de frenado exponencial de la pelota (1/s). MEDIR (M3).
+    pub intercept_ball_decay_per_s: f32,
+    /// Intercept: retardo de reacción sumado al tiempo de viaje (s).
+    pub intercept_reaction_delay: f32,
+    /// Intercept: distancia robot–pelota que cuenta como alcanzada (m).
+    pub intercept_reach_radius: f32,
+    /// BlockLine: distancia del punto de bloqueo al arco propio (m).
+    pub block_distance: f32,
+    /// BlockLine: |x| máximo del bloqueo (no entrar al área propia).
+    pub block_max_abs_x: f32,
+}
+
+impl Default for SkillParams {
+    fn default() -> Self {
+        Self {
+            approach_staging_offset: 0.14,
+            approach_pos_tol: 0.05,
+            approach_angle_tol: 0.15,
+            approach_pre_align_radius: 0.25,
+            shoot_push_overshoot: 0.25,
+            shoot_lose_radius: 0.30,
+            shoot_behind_tol: 0.03,
+            shoot_release_ball_speed: 0.6,
+            intercept_horizon: 1.5,
+            intercept_min_ball_speed: 0.08,
+            intercept_ball_decay_per_s: 0.3,
+            intercept_reaction_delay: 0.10,
+            intercept_reach_radius: 0.09,
+            block_distance: 0.30,
+            block_max_abs_x: 0.58,
+        }
+    }
+}
+
+/// Navegación (`MotionConfig`). Las velocidades máximas se calibran con M2/M4.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MotionParams {
+    pub max_linear_speed: f64,
+    pub min_linear_speed: f64,
+    pub max_angular_speed: f64,
+    pub arrival_threshold: f32,
+    pub brake_distance: f32,
+    pub coupling_floor: f32,
+    pub uvf_influence_radius: f32,
+    pub uvf_k_rep: f32,
+    /// Robot de dos caras (heading módulo 180°). `VSSL_BIDIRECTIONAL` lo sobreescribe.
+    pub bidirectional: bool,
+}
+
+impl Default for MotionParams {
+    fn default() -> Self {
+        Self {
+            max_linear_speed: 1.2,
+            min_linear_speed: 0.06,
+            max_angular_speed: 3.0,
+            arrival_threshold: 0.06,
+            brake_distance: 0.50,
+            coupling_floor: 0.22,
+            uvf_influence_radius: 0.20,
+            uvf_k_rep: 1.5,
+            bidirectional: false,
+        }
+    }
+}
+
+/// Robot REAL (frame a la base station). Calibrar con M2.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RobotParams {
+    /// Separación entre ruedas (m). Hoy: valor medido a mano el 2026-06-13.
+    pub wheel_base_m: f64,
+    /// Tope por rueda que aplica la base (mm/s).
+    pub max_wheel_mm_s: i32,
+}
+
+impl Default for RobotParams {
+    fn default() -> Self {
+        Self {
+            wheel_base_m: 0.07,
+            max_wheel_mm_s: 1500,
+        }
+    }
+}
+
+/// Robot de FIRASim (conversión (v, ω) → rad/s por rueda). Medido con
+/// `measure_wheelbase.py`: r = 0.02000 m, L = 0.08499 m (constante en 3 velocidades).
+/// Con el valor viejo L = 0.05 el robot giraba al 59 % de lo comandado.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SimRobotParams {
+    pub wheel_base_m: f64,
+    pub wheel_radius_m: f64,
+    /// Tope por rueda (rad/s): 60 · 0.02 = 1.2 m/s por rueda.
+    pub max_wheel_rad_s: f64,
+}
+
+impl Default for SimRobotParams {
+    fn default() -> Self {
+        Self {
+            wheel_base_m: 0.085,
+            wheel_radius_m: 0.02,
+            max_wheel_rad_s: 60.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TeamParams {
+    pub coach: CoachParams,
+    pub skills: SkillParams,
+    pub motion: MotionParams,
+    pub robot: RobotParams,
+    pub sim: SimRobotParams,
+}
+
+static PARAMS: OnceLock<TeamParams> = OnceLock::new();
+
+/// Parámetros vigentes del proceso. Defaults si nadie llamó a `load_and_install`.
+pub fn params() -> &'static TeamParams {
+    PARAMS.get_or_init(TeamParams::default)
+}
+
+impl TeamParams {
+    pub const DEFAULT_PATH: &'static str = "config/team_params.json";
+    pub const ENV_VAR: &'static str = "VSSL_PARAMS";
+
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        serde_json::from_str(text).map_err(|e| e.to_string())
+    }
+
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{}: {e}", path.as_ref().display()))?;
+        // Editores de Windows (Bloc de notas, PowerShell) suelen guardar con BOM;
+        // serde_json no lo acepta y el error resultante es críptico.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        Self::from_json(text).map_err(|e| format!("{}: {e}", path.as_ref().display()))
+    }
+
+    pub fn to_json_pretty(&self) -> String {
+        serde_json::to_string_pretty(self).expect("TeamParams serializable")
+    }
+
+    /// Ruta a cargar: `VSSL_PARAMS` si está definida; si no, el archivo por defecto
+    /// solo si existe.
+    pub fn resolve_path() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var(Self::ENV_VAR)
+            && !p.trim().is_empty()
+        {
+            return Some(PathBuf::from(p.trim()));
+        }
+        let default = PathBuf::from(Self::DEFAULT_PATH);
+        default.exists().then_some(default)
+    }
+
+    /// Carga según `resolve_path`. Devuelve los parámetros y una descripción de la
+    /// fuente para el log. Un archivo indicado pero inválido es error duro (no se
+    /// juega con parámetros a medias sin saberlo).
+    pub fn load() -> Result<(Self, String), String> {
+        match Self::resolve_path() {
+            Some(path) => {
+                let p = Self::from_file(&path)?;
+                Ok((p, format!("archivo {}", path.display())))
+            }
+            None => Ok((Self::default(), "defaults de código (sin JSON)".to_string())),
+        }
+    }
+
+    /// Carga e instala como parámetros globales del proceso. Si ya había unos
+    /// instalados, no los reemplaza (devuelve error descriptivo).
+    pub fn load_and_install() -> Result<String, String> {
+        let (p, source) = Self::load()?;
+        PARAMS
+            .set(p)
+            .map_err(|_| "los parámetros ya estaban instalados".to_string())?;
+        Ok(source)
+    }
+
+    /// Para los binarios: carga e instala, imprime la fuente y, si el archivo
+    /// indicado es inválido, termina el proceso (no se juega con parámetros a
+    /// medias sin saberlo).
+    pub fn install_or_exit(tag: &str) {
+        match Self::load_and_install() {
+            Ok(src) => eprintln!("[{tag}] parámetros: {src}"),
+            Err(e) => {
+                eprintln!("[{tag}] ✗ parámetros inválidos: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_json_gives_defaults() {
+        let p = TeamParams::from_json("{}").unwrap();
+        assert_eq!(p, TeamParams::default());
+    }
+
+    #[test]
+    fn partial_json_overrides_only_given_fields() {
+        let p = TeamParams::from_json(
+            r#"{ "coach": { "keeper_id": 0 }, "robot": { "wheel_base_m": 0.0812 } }"#,
+        )
+        .unwrap();
+        assert_eq!(p.coach.keeper_id, 0);
+        assert_eq!(p.coach.role_min_hold, CoachParams::default().role_min_hold);
+        assert!((p.robot.wheel_base_m - 0.0812).abs() < 1e-9);
+        assert_eq!(p.sim, SimRobotParams::default());
+    }
+
+    #[test]
+    fn unknown_field_is_an_error() {
+        let err = TeamParams::from_json(r#"{ "robot": { "wheelbase_m": 0.07 } }"#).unwrap_err();
+        assert!(err.contains("wheelbase_m"), "{err}");
+    }
+
+    #[test]
+    fn default_json_round_trips() {
+        let text = TeamParams::default().to_json_pretty();
+        let back = TeamParams::from_json(&text).unwrap();
+        assert_eq!(back, TeamParams::default());
+    }
+
+    #[test]
+    fn file_with_utf8_bom_is_accepted_and_unknown_field_is_named() {
+        let dir = std::env::temp_dir();
+        let ok_path = dir.join(format!("vsss_params_bom_{}.json", std::process::id()));
+        std::fs::write(&ok_path, "\u{feff}{ \"coach\": { \"keeper_id\": 1 } }").unwrap();
+        let p = TeamParams::from_file(&ok_path).unwrap();
+        let _ = std::fs::remove_file(&ok_path);
+        assert_eq!(p.coach.keeper_id, 1);
+
+        let bad_path = dir.join(format!("vsss_params_bad_{}.json", std::process::id()));
+        std::fs::write(&bad_path, "\u{feff}{ \"robot\": { \"wheelbase_m\": 0.07 } }").unwrap();
+        let err = TeamParams::from_file(&bad_path).unwrap_err();
+        let _ = std::fs::remove_file(&bad_path);
+        assert!(err.contains("wheelbase_m"), "{err}");
+    }
+
+    #[test]
+    fn repo_config_file_parses() {
+        // El archivo del repo debe ser siempre cargable (sin campos desconocidos).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH);
+        let p = TeamParams::from_file(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert!(p.robot.wheel_base_m > 0.0);
+    }
+}

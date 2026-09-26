@@ -78,16 +78,19 @@ pub fn command_to_wheel_mm_s(motion: &crate::motion::MotionCommand) -> (i16, i16
         return (0, 0);
     }
 
+    // Geometría del robot real desde `config/team_params.json` (calibrable con M2);
+    // las constantes de arriba son solo los defaults documentados.
+    let robot = &crate::params::params().robot;
     let cos_t = motion.orientation.cos();
     let sin_t = motion.orientation.sin();
     let v = motion.vx * cos_t + motion.vy * sin_t;
-    let half_wheel_term = motion.omega * WHEEL_BASE_M / 2.0;
+    let half_wheel_term = motion.omega * robot.wheel_base_m / 2.0;
 
     let v_left_mm_s = ((v - half_wheel_term) * 1000.0).round() as i32;
     let v_right_mm_s = ((v + half_wheel_term) * 1000.0).round() as i32;
 
-    let left = v_left_mm_s.clamp(-MAX_WHEEL_MM_S, MAX_WHEEL_MM_S) as i16;
-    let right = v_right_mm_s.clamp(-MAX_WHEEL_MM_S, MAX_WHEEL_MM_S) as i16;
+    let left = v_left_mm_s.clamp(-robot.max_wheel_mm_s, robot.max_wheel_mm_s) as i16;
+    let right = v_right_mm_s.clamp(-robot.max_wheel_mm_s, robot.max_wheel_mm_s) as i16;
     (left, right)
 }
 

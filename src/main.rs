@@ -73,6 +73,8 @@ use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::mpsc;
 
 fn main() {
+    // Parámetros calibrables (config/team_params.json o VSSL_PARAMS) antes de todo.
+    rustengine::params::TeamParams::install_or_exit("main");
     if std::env::var("VSSL_DEBUG_GUI").unwrap_or_default() == "1" {
         run_with_gui();
     } else {

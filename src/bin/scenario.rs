@@ -102,6 +102,7 @@ fn scenario_log_path(scenario: &Scenario) -> PathBuf {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() {
+    rustengine::params::TeamParams::install_or_exit("scenario");
     // ╔══════════════════════════════════════════════════════════════════════╗
     // ║  ZONA DE EDICIÓN — descomenta UNA línea para elegir la skill         ║
     // ╚══════════════════════════════════════════════════════════════════════╝

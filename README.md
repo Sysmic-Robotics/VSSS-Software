@@ -234,6 +234,34 @@ src/
 
 ---
 
+## Parámetros calibrables (`config/team_params.json`)
+
+Todo lo que se ajusta con mediciones o partidos de prueba vive en `config/team_params.json`
+(`src/params.rs`), no en el código: umbrales del coach (`coach`), distancias de las skills
+tácticas (`skills`), navegación (`motion`), geometría del robot real (`robot`: wheelbase, tope de
+rueda) y del robot de FIRASim (`sim`). Los tres binarios lo cargan al arrancar y lo anuncian en el
+log (`[main] parámetros: archivo config/team_params.json`).
+
+- `VSSL_PARAMS=<ruta>` usa otro archivo (útil para comparar dos calibraciones en el mismo partido).
+- El JSON puede ser parcial: lo que falta toma el default. Un campo con nombre desconocido es
+  error y el proceso no arranca (evita que un typo en una calibración pase en silencio).
+- Cambiar un parámetro NO requiere recompilar: editar el JSON y volver a lanzar.
+
+## Métricas de partido (`tools/match_metrics.py`)
+
+Con `VSSL_MATCH_LOG=logs/partido.csv` el engine escribe el registro del partido; el script lo
+convierte en números (solo biblioteca estándar de Python):
+
+```bash
+python tools/match_metrics.py logs/partido_azul.csv            # tabla
+python tools/match_metrics.py logs/a.csv logs/b.csv            # comparar corridas
+python tools/match_metrics.py logs/partido_azul.csv --json     # para scripts
+```
+
+Reporta goles a favor/en contra, posesión, toques por robot, distancia media a la pelota, tiempo
+de pelota en pared/esquina, cambios de striker por minuto, uso de cada skill y el porcentaje de
+ticks en que un robot recibe comando de avance pero no se mueve (atascado).
+
 ## Parámetros clave (`src/main.rs`)
 
 | Constante | Valor | Descripción |

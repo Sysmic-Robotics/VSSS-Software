@@ -18,6 +18,7 @@
 
 use super::{clamp_to_logical_field, is_inside_logical_field, stop_cmd, Skill};
 use crate::motion::{Motion, MotionCommand};
+use crate::params::params;
 use crate::world::{RobotState, World};
 use glam::Vec2;
 
@@ -95,10 +96,12 @@ pub fn shoot_push_feasible(
     along <= behind_tol && (ball - robot_pos).length() <= lose_radius
 }
 
-/// Valores por defecto de `ShootPushSkill` que la táctica necesita para evaluar
-/// factibilidad sin instanciar la skill.
-pub const SHOOT_PUSH_BEHIND_TOL: f32 = 0.03;
-pub const SHOOT_PUSH_LOSE_RADIUS: f32 = 0.30;
+/// `shoot_push_feasible` con las tolerancias vigentes de `config/team_params.json`
+/// (las mismas que usa `ShootPushSkill::new`). Es lo que consulta el coach.
+pub fn shoot_push_feasible_now(robot_pos: Vec2, ball: Vec2, target: Vec2) -> bool {
+    let p = &params().skills;
+    shoot_push_feasible(robot_pos, ball, target, p.shoot_behind_tol, p.shoot_lose_radius)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ApproachAligned
@@ -124,12 +127,13 @@ pub struct ApproachAlignedSkill {
 
 impl ApproachAlignedSkill {
     pub fn new(aim_point: Vec2) -> Self {
+        let p = &params().skills;
         Self {
             aim_point,
-            staging_offset: 0.14,
-            pos_tol: 0.05,
-            angle_tol: 0.15,
-            pre_align_radius: 0.25,
+            staging_offset: p.approach_staging_offset,
+            pos_tol: p.approach_pos_tol,
+            angle_tol: p.approach_angle_tol,
+            pre_align_radius: p.approach_pre_align_radius,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
@@ -264,12 +268,13 @@ pub struct ShootPushSkill {
 
 impl ShootPushSkill {
     pub fn new(target: Vec2) -> Self {
+        let p = &params().skills;
         Self {
             target,
-            push_overshoot: 0.25,
-            lose_radius: SHOOT_PUSH_LOSE_RADIUS,
-            behind_tol: SHOOT_PUSH_BEHIND_TOL,
-            release_ball_speed: 0.6,
+            push_overshoot: p.shoot_push_overshoot,
+            lose_radius: p.shoot_lose_radius,
+            behind_tol: p.shoot_behind_tol,
+            release_ball_speed: p.shoot_release_ball_speed,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
@@ -388,12 +393,13 @@ pub struct InterceptSkill {
 
 impl InterceptSkill {
     pub fn new() -> Self {
+        let p = &params().skills;
         Self {
-            horizon: 1.5,
-            min_ball_speed: 0.08,
-            ball_decay_per_s: 0.3,
-            reaction_delay: 0.10,
-            reach_radius: 0.09,
+            horizon: p.intercept_horizon,
+            min_ball_speed: p.intercept_min_ball_speed,
+            ball_decay_per_s: p.intercept_ball_decay_per_s,
+            reaction_delay: p.intercept_reaction_delay,
+            reach_radius: p.intercept_reach_radius,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
@@ -485,10 +491,11 @@ pub struct BlockLineSkill {
 
 impl BlockLineSkill {
     pub fn new(own_goal: Vec2) -> Self {
+        let p = &params().skills;
         Self {
             own_goal,
-            distance: 0.30,
-            max_abs_x: 0.58,
+            distance: p.block_distance,
+            max_abs_x: p.block_max_abs_x,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
             kd: CONTROL_KD,

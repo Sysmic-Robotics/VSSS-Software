@@ -10,6 +10,7 @@ pub mod GUI;
 pub mod coach;
 pub mod control_loop;
 pub mod motion;
+pub mod params;
 pub mod protos;
 pub mod radio;
 pub mod skill_log;

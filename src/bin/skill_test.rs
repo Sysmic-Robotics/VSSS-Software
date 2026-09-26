@@ -552,6 +552,7 @@ fn main() {
             std::process::exit(2);
         }
     };
+    rustengine::params::TeamParams::install_or_exit("skill_test");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
