@@ -46,6 +46,17 @@ pub struct CoachParams {
     pub wall_band_y: f32,
     /// |x| de la pelota desde el que se considera "en el fondo" (m).
     pub wall_band_x: f32,
+    /// Frecuencia de decisión del coach (Hz); convierte conteos en segundos.
+    pub decision_hz: f32,
+    /// Distancia robot–pelota desde la que el striker puede optar por `SpinKick` (m).
+    pub spin_engage_radius: f32,
+    /// Rival a menos de esto de la pelota cuenta como "encima de la pelota" (m).
+    pub spin_when_opponent_within: f32,
+    /// Segundos con la pelota dentro del área propia tras los que el arquero
+    /// despeja sí o sí (el reglamento castiga retenerla más de 10 s).
+    pub gk_force_clear_s: f32,
+    /// Distancia del punto de marca al rival marcado, hacia nuestro arco (m).
+    pub mark_distance: f32,
 }
 
 impl Default for CoachParams {
@@ -62,6 +73,11 @@ impl Default for CoachParams {
             opp_keeper_radius: 0.30,
             wall_band_y: 0.52,
             wall_band_x: 0.62,
+            decision_hz: 10.0,
+            spin_engage_radius: 0.25,
+            spin_when_opponent_within: 0.10,
+            gk_force_clear_s: 6.0,
+            mark_distance: 0.15,
         }
     }
 }
@@ -100,6 +116,24 @@ pub struct SkillParams {
     pub block_distance: f32,
     /// BlockLine: |x| máximo del bloqueo (no entrar al área propia).
     pub block_max_abs_x: f32,
+    /// Clear: staging corto detrás de la pelota (m).
+    pub clear_staging_offset: f32,
+    /// Clear: margen "detrás de la pelota" (más amplio que ShootPush) (m).
+    pub clear_behind_tol: f32,
+    /// Clear: radio de trabajo del empuje (m).
+    pub clear_lose_radius: f32,
+    /// Clear: velocidad de la pelota hacia el objetivo que cuenta como despejada (m/s).
+    pub clear_release_ball_speed: f32,
+    /// SpinKick: distancia centro del robot–pelota en el contacto (m). MEDIR (M3).
+    pub spin_contact_radius: f32,
+    /// SpinKick: velocidad angular del giro (rad/s).
+    pub spin_omega: f64,
+    /// SpinKick: tolerancia para "en el punto de contacto" (m).
+    pub spin_pos_tol: f32,
+    /// SpinKick: velocidad de la pelota hacia el objetivo que cuenta como lanzada (m/s).
+    pub spin_release_ball_speed: f32,
+    /// SpinKick: tiempo máximo girando antes de darse por terminada (s).
+    pub spin_max_time_s: f32,
 }
 
 impl Default for SkillParams {
@@ -120,6 +154,15 @@ impl Default for SkillParams {
             intercept_reach_radius: 0.09,
             block_distance: 0.30,
             block_max_abs_x: 0.58,
+            clear_staging_offset: 0.10,
+            clear_behind_tol: 0.06,
+            clear_lose_radius: 0.35,
+            clear_release_ball_speed: 0.5,
+            spin_contact_radius: 0.065,
+            spin_omega: 20.0,
+            spin_pos_tol: 0.03,
+            spin_release_ball_speed: 0.4,
+            spin_max_time_s: 1.0,
         }
     }
 }

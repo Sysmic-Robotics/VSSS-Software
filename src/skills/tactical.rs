@@ -548,6 +548,349 @@ impl Skill for BlockLineSkill {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Clear
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Despeje: aproximación + empuje en UNA skill con tolerancias amplias. Para
+/// sacar la pelota de la zona propia no hace falta precisión: se pone detrás
+/// por el camino corto y empuja hacia `target` (punto de despeje que elige la
+/// táctica). Termina cuando la pelota sale disparada.
+pub struct ClearSkill {
+    pub target: Vec2,
+    pub staging_offset: f32,
+    pub behind_tol: f32,
+    pub lose_radius: f32,
+    pub push_overshoot: f32,
+    pub release_ball_speed: f32,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl ClearSkill {
+    pub fn new(target: Vec2) -> Self {
+        let p = &params().skills;
+        Self {
+            target,
+            staging_offset: p.clear_staging_offset,
+            behind_tol: p.clear_behind_tol,
+            lose_radius: p.clear_lose_radius,
+            push_overshoot: p.shoot_push_overshoot,
+            release_ball_speed: p.clear_release_ball_speed,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
+        }
+    }
+
+    pub fn set_target(&mut self, p: Vec2) {
+        self.target = p;
+    }
+
+    fn dir(&self, ball: Vec2) -> Option<Vec2> {
+        let d = (self.target - ball).normalize_or_zero();
+        (d.length_squared() > f32::EPSILON).then_some(d)
+    }
+
+    /// `true` cuando ya está detrás de la pelota y empuja (fase 2).
+    pub fn is_pushing(&self, robot: &RobotState, ball: Vec2) -> bool {
+        shoot_push_feasible(robot.position, ball, self.target, self.behind_tol, self.lose_radius)
+    }
+
+    fn staging(&self, ball: Vec2, dir: Vec2) -> Vec2 {
+        let mut offset = self.staging_offset;
+        let mut staging = ball - dir * offset;
+        while !is_inside_logical_field(staging) && offset > 0.05 {
+            offset -= 0.02;
+            staging = ball - dir * offset;
+        }
+        clamp_to_logical_field(staging)
+    }
+}
+
+impl Skill for ClearSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        let Some(dir) = self.dir(ball) else {
+            return stop_cmd(robot);
+        };
+        if self.is_pushing(robot, ball) {
+            let push_point = ball + dir * self.push_overshoot;
+            let mut cmd = motion.move_direct(robot, push_point);
+            let desired = (dir.y as f64).atan2(dir.x as f64);
+            cmd.omega = motion
+                .face_to_angle(robot, desired, self.kp, self.ki, self.kd)
+                .omega;
+            return cmd;
+        }
+        let staging = self.staging(ball, dir);
+        motion.move_and_face(robot, staging, ball, world, self.kp, self.ki, self.kd)
+    }
+
+    fn is_done(&self, robot: &RobotState, world: &World) -> bool {
+        let b = world.get_ball_state();
+        match self.dir(b.position) {
+            Some(dir) => {
+                b.velocity.dot(dir) >= self.release_ball_speed
+                    && (b.position - robot.position).length() > 0.12
+            }
+            None => false,
+        }
+    }
+
+    fn current_target(&self, world: &World) -> Option<Vec2> {
+        let ball = world.get_ball_state().position;
+        self.dir(ball).map(|d| ball + d * self.push_overshoot)
+    }
+
+    fn status(&self, robot: &RobotState, world: &World) -> SkillStatus {
+        let b = world.get_ball_state();
+        let Some(dir) = self.dir(b.position) else {
+            return SkillStatus {
+                feasible: false,
+                ..Default::default()
+            };
+        };
+        let progress = if self.is_pushing(robot, b.position) {
+            0.5 + 0.5 * clamp01(b.velocity.dot(dir) / self.release_ball_speed)
+        } else {
+            0.5 * clamp01(1.0 - (b.position - robot.position).length() / 0.6)
+        };
+        let raw = Motion::normalize_angle((dir.y as f64).atan2(dir.x as f64) - robot.orientation);
+        let face = if raw.abs() <= std::f64::consts::FRAC_PI_2 {
+            Face::Front
+        } else {
+            Face::Back
+        };
+        SkillStatus {
+            progress,
+            done: self.is_done(robot, world),
+            feasible: true,
+            face,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SpinKick
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Patada por giro (clásica de VSSS): se pone en contacto lateral con la pelota y
+/// gira a velocidad máxima; la pelota sale tangencialmente hacia `target`. Sirve
+/// para sacarla de la pared o de encima de un rival, donde no hay espacio para
+/// ponerse detrás. La cara no importa: cualquier lado del cuerpo cuadrado
+/// lanza igual. El sentido de giro (CCW/CW) se elige por el centro de contacto
+/// más cercano y se mantiene hasta soltar la pelota.
+pub struct SpinKickSkill {
+    pub target: Vec2,
+    /// Distancia centro del robot–pelota en el contacto (m).
+    pub contact_radius: f32,
+    /// Velocidad angular del giro (rad/s).
+    pub omega: f64,
+    pub pos_tol: f32,
+    pub release_ball_speed: f32,
+    pub max_spin_ticks: u32,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+    spin_sign: f32,
+    spinning: bool,
+    spin_ticks: u32,
+}
+
+impl SpinKickSkill {
+    pub fn new(target: Vec2) -> Self {
+        let p = &params().skills;
+        Self {
+            target,
+            contact_radius: p.spin_contact_radius,
+            omega: p.spin_omega,
+            pos_tol: p.spin_pos_tol,
+            release_ball_speed: p.spin_release_ball_speed,
+            max_spin_ticks: (p.spin_max_time_s * 60.0).ceil() as u32,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
+            spin_sign: 0.0,
+            spinning: false,
+            spin_ticks: 0,
+        }
+    }
+
+    pub fn set_target(&mut self, p: Vec2) {
+        self.target = p;
+    }
+
+    pub fn reset(&mut self) {
+        self.spin_sign = 0.0;
+        self.spinning = false;
+        self.spin_ticks = 0;
+    }
+
+    pub fn is_spinning(&self) -> bool {
+        self.spinning
+    }
+
+    fn dir(&self, ball: Vec2) -> Option<Vec2> {
+        let d = (self.target - ball).normalize_or_zero();
+        (d.length_squared() > f32::EPSILON).then_some(d)
+    }
+
+    /// Centros de giro que lanzan la pelota en `dir`: `(ccw, cw)`. Con giro CCW la
+    /// velocidad tangencial en la pelota es ω·perp(pelota − centro), así que el
+    /// centro va del lado `(dir.y, −dir.x)` de la pelota; con CW, del opuesto.
+    pub fn contact_centers(&self, ball: Vec2, dir: Vec2) -> (Vec2, Vec2) {
+        let ccw = ball - Vec2::new(dir.y, -dir.x) * self.contact_radius;
+        let cw = ball - Vec2::new(-dir.y, dir.x) * self.contact_radius;
+        (ccw, cw)
+    }
+
+    fn choose_center(&self, robot_pos: Vec2, ball: Vec2, dir: Vec2) -> (Vec2, f32) {
+        let (ccw, cw) = self.contact_centers(ball, dir);
+        if self.spin_sign > 0.0 {
+            return (ccw, 1.0);
+        }
+        if self.spin_sign < 0.0 {
+            return (cw, -1.0);
+        }
+        if (ccw - robot_pos).length() <= (cw - robot_pos).length() {
+            (ccw, 1.0)
+        } else {
+            (cw, -1.0)
+        }
+    }
+}
+
+impl Skill for SpinKickSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        let Some(dir) = self.dir(ball) else {
+            return stop_cmd(robot);
+        };
+        // La pelota ya se fue: cerrar el episodio de giro.
+        if self.spinning && (ball - robot.position).length() > self.contact_radius * 2.0 + 0.05 {
+            self.reset();
+        }
+        let (center, sign) = self.choose_center(robot.position, ball, dir);
+        let dist = (center - robot.position).length();
+        if !self.spinning && dist > self.pos_tol {
+            // Cerca: directo al punto de contacto (la pelota NO es obstáculo).
+            if dist < 0.15 {
+                let mut cmd = motion.move_direct(robot, center);
+                cmd.omega = 0.0;
+                return cmd;
+            }
+            return motion.move_and_face(robot, center, ball, world, self.kp, self.ki, self.kd);
+        }
+        self.spinning = true;
+        self.spin_sign = sign;
+        self.spin_ticks += 1;
+        MotionCommand {
+            id: robot.id,
+            team: robot.team,
+            vx: 0.0,
+            vy: 0.0,
+            omega: self.omega * sign as f64,
+            orientation: robot.orientation,
+        }
+    }
+
+    fn is_done(&self, _robot: &RobotState, world: &World) -> bool {
+        let b = world.get_ball_state();
+        let Some(dir) = self.dir(b.position) else {
+            return false;
+        };
+        b.velocity.dot(dir) >= self.release_ball_speed || self.spin_ticks >= self.max_spin_ticks
+    }
+
+    fn current_target(&self, world: &World) -> Option<Vec2> {
+        Some(world.get_ball_state().position)
+    }
+
+    fn status(&self, robot: &RobotState, world: &World) -> SkillStatus {
+        let b = world.get_ball_state();
+        let dist_ball = (b.position - robot.position).length();
+        let Some(dir) = self.dir(b.position) else {
+            return SkillStatus {
+                feasible: false,
+                ..Default::default()
+            };
+        };
+        let progress = if self.spinning {
+            0.5 + 0.5 * clamp01(b.velocity.dot(dir) / self.release_ball_speed)
+        } else {
+            0.5 * clamp01(1.0 - dist_ball / 0.5)
+        };
+        SkillStatus {
+            progress,
+            done: self.is_done(robot, world),
+            feasible: b.velocity.length() < 0.5 && dist_ball < 0.6,
+            face: Face::Front,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Mark
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Posicionamiento mirando a la pelota: va a `point` (lo calcula la táctica:
+/// marca entre un rival y nuestro arco, punto de apoyo para la segunda pelota,
+/// etc.) y queda orientado a la pelota con la cara más cercana, listo para
+/// interceptar. Nunca termina por sí sola.
+pub struct MarkSkill {
+    pub point: Vec2,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+}
+
+impl MarkSkill {
+    pub fn new(point: Vec2) -> Self {
+        Self {
+            point,
+            kp: CONTROL_KP,
+            ki: CONTROL_KI,
+            kd: CONTROL_KD,
+        }
+    }
+
+    pub fn set_point(&mut self, p: Vec2) {
+        self.point = p;
+    }
+}
+
+impl Skill for MarkSkill {
+    fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        let ball = world.get_ball_state().position;
+        let point = clamp_to_logical_field(self.point);
+        motion.move_and_face(robot, point, ball, world, self.kp, self.ki, self.kd)
+    }
+
+    fn current_target(&self, _world: &World) -> Option<Vec2> {
+        Some(clamp_to_logical_field(self.point))
+    }
+
+    fn status(&self, robot: &RobotState, world: &World) -> SkillStatus {
+        let ball = world.get_ball_state().position;
+        let dist = (clamp_to_logical_field(self.point) - robot.position).length();
+        let to_ball = ball - robot.position;
+        let raw = Motion::normalize_angle((to_ball.y as f64).atan2(to_ball.x as f64) - robot.orientation);
+        let face = if raw.abs() <= std::f64::consts::FRAC_PI_2 {
+            Face::Front
+        } else {
+            Face::Back
+        };
+        SkillStatus {
+            progress: clamp01(1.0 - dist / 0.6),
+            done: false,
+            feasible: true,
+            face,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +1031,103 @@ mod tests {
     }
 
     #[test]
+    fn clear_approaches_then_pushes_and_finishes_when_ball_leaves() {
+        let motion = bidir_motion();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(-0.5, 0.0), Vec2::ZERO);
+        let mut skill = ClearSkill::new(Vec2::new(0.2, 0.45)); // despeje adelante/banda
+        // Delante de la pelota (lado del despeje): no empuja, va al staging detrás.
+        let front = robot_at(-0.35, 0.1, 0.0);
+        assert!(!skill.is_pushing(&front, Vec2::new(-0.5, 0.0)));
+        let cmd = skill.tick(&front, &world, &motion);
+        assert!(cmd.vx.abs() + cmd.vy.abs() > 0.1);
+        // Detrás (lado del arco propio): empuja hacia el objetivo.
+        let behind = robot_at(-0.58, -0.04, 0.0);
+        assert!(skill.is_pushing(&behind, Vec2::new(-0.5, 0.0)));
+        let cmd = skill.tick(&behind, &world, &motion);
+        assert!(cmd.vx > 0.2, "empuje hacia +x: {cmd:?}");
+        // Pelota lanzada hacia el objetivo → done.
+        world.update_ball(Vec2::new(-0.3, 0.12), Vec2::new(0.6, 0.4));
+        assert!(skill.is_done(&behind, &world));
+    }
+
+    #[test]
+    fn spin_kick_contact_centers_throw_ball_along_direction() {
+        let skill = SpinKickSkill::new(Vec2::new(0.75, 0.0));
+        let ball = Vec2::new(0.0, 0.0);
+        for dir in [Vec2::X, Vec2::Y, Vec2::new(-0.6, 0.8)] {
+            let (ccw, cw) = skill.contact_centers(ball, dir);
+            // v = ω · perp(pelota − centro) con perp(v) = (−v.y, v.x).
+            let r = ball - ccw;
+            let v_ccw = Vec2::new(-r.y, r.x);
+            assert!(v_ccw.normalize().dot(dir) > 0.999, "CCW dir={dir:?} v={v_ccw:?}");
+            let r = ball - cw;
+            let v_cw = -Vec2::new(-r.y, r.x);
+            assert!(v_cw.normalize().dot(dir) > 0.999, "CW dir={dir:?} v={v_cw:?}");
+            assert!(((ccw - ball).length() - skill.contact_radius).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn spin_kick_moves_to_contact_then_spins_and_times_out() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.0, 0.0), Vec2::ZERO);
+        let mut skill = SpinKickSkill::new(Vec2::new(0.75, 0.0));
+        // Lejos: se mueve, no gira a tope.
+        let far = robot_at(-0.4, 0.2, 0.0);
+        let cmd = skill.tick(&far, &world, &motion);
+        assert!(cmd.vx.abs() + cmd.vy.abs() > 0.1);
+        assert!(cmd.omega.abs() < skill.omega);
+        assert!(!skill.is_spinning());
+        // En el centro de contacto CCW (lado −y de la pelota para lanzar a +x): gira CCW.
+        let (ccw, _) = skill.contact_centers(Vec2::ZERO, Vec2::X);
+        let at = robot_at(ccw.x, ccw.y, 0.0);
+        let cmd = skill.tick(&at, &world, &motion);
+        assert!(skill.is_spinning());
+        assert_eq!(cmd.vx, 0.0);
+        assert!((cmd.omega - skill.omega).abs() < 1e-9, "omega={}", cmd.omega);
+        // Sigue girando el mismo sentido aunque el otro centro quede más cerca.
+        let (_, cw) = skill.contact_centers(Vec2::ZERO, Vec2::X);
+        let near_cw = robot_at(cw.x, cw.y, 0.0);
+        let cmd = skill.tick(&near_cw, &world, &motion);
+        assert!(cmd.omega > 0.0);
+        // Sin soltar la pelota, termina por tiempo.
+        for _ in 0..skill.max_spin_ticks {
+            skill.tick(&at, &world, &motion);
+        }
+        assert!(skill.is_done(&at, &world));
+        // Pelota lanzada hacia el objetivo también termina.
+        let mut skill2 = SpinKickSkill::new(Vec2::new(0.75, 0.0));
+        world.update_ball(Vec2::new(0.1, 0.0), Vec2::new(0.8, 0.0));
+        assert!(skill2.is_done(&at, &world));
+        let _ = skill2.tick(&at, &world, &motion);
+    }
+
+    #[test]
+    fn mark_holds_point_and_faces_ball() {
+        let motion = bidir_motion();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.3, 0.3), Vec2::ZERO);
+        let mut skill = MarkSkill::new(Vec2::new(-0.3, 0.0));
+        // Lejos del punto: se mueve hacia él.
+        let far = robot_at(0.2, -0.3, 0.0);
+        let cmd = skill.tick(&far, &world, &motion);
+        assert!(cmd.vx < 0.0, "hacia −x: {cmd:?}");
+        // En el punto, de espaldas a la pelota (180° ± 45°): no se mueve, y con dos
+        // caras no necesita girar. Motion nuevo: el PID de heading guarda estado por
+        // robot y el tick anterior (lejos) dejaría términos I/D distintos de cero.
+        let motion = bidir_motion();
+        let deg_to_ball = (0.3f32 / 0.6).atan().to_degrees(); // dirección punto→pelota
+        let at = robot_at(-0.3, 0.0, 180.0 + deg_to_ball);
+        let cmd = skill.tick(&at, &world, &motion);
+        assert_eq!(cmd.vx, 0.0);
+        assert!(cmd.omega.abs() < 1e-3, "alineado por la espalda: {}", cmd.omega);
+        assert_eq!(skill.status(&at, &world).face, Face::Back);
+        assert!(!skill.is_done(&at, &world));
+    }
+
+    #[test]
     fn all_tactical_skills_stay_finite_under_degenerate_states() {
         let motion = bidir_motion();
         let mut world = World::new(3, 3);
@@ -697,12 +1137,18 @@ mod tests {
         let mut s = ShootPushSkill::new(robot.position);
         let mut i = InterceptSkill::new();
         let mut b = BlockLineSkill::new(robot.position);
+        let mut c = ClearSkill::new(robot.position);
+        let mut k = SpinKickSkill::new(robot.position);
+        let mut m = MarkSkill::new(robot.position);
         for _ in 0..50 {
             for cmd in [
                 a.tick(&robot, &world, &motion),
                 s.tick(&robot, &world, &motion),
                 i.tick(&robot, &world, &motion),
                 b.tick(&robot, &world, &motion),
+                c.tick(&robot, &world, &motion),
+                k.tick(&robot, &world, &motion),
+                m.tick(&robot, &world, &motion),
             ] {
                 assert!(cmd.vx.is_finite() && cmd.vy.is_finite() && cmd.omega.is_finite());
             }

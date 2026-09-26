@@ -24,8 +24,9 @@
 
 use crate::motion::{Motion, MotionCommand};
 use crate::skills::{
-    ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, DefendGoalLineSkill, FacePointSkill,
-    GoToSkill, InterceptSkill, ShootPushSkill, Skill, SkillConfig, SkillStatus, SpinSkill,
+    ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, ClearSkill, DefendGoalLineSkill,
+    FacePointSkill, GoToSkill, InterceptSkill, MarkSkill, ShootPushSkill, Skill, SkillConfig,
+    SkillStatus, SpinKickSkill, SpinSkill,
 };
 use crate::world::{RobotState, World};
 use glam::Vec2;
@@ -58,12 +59,18 @@ pub enum SkillId {
     /// Arquero: línea de gol con predicción de trayectoria de la pelota;
     /// `target` = centro del arco propio.
     GoalKeep = 8,
+    /// Despeje: aproximación corta + empuje con tolerancias amplias hacia `target`.
+    Clear = 9,
+    /// Patada por giro: contacto lateral + spin; lanza la pelota hacia `target`.
+    SpinKick = 10,
+    /// Posicionamiento mirando a la pelota; `target` = punto (lo calcula la táctica).
+    Mark = 11,
 }
 
 impl SkillId {
     /// Cantidad de skills en el catálogo. Este es el tamaño del action space
     /// discreto que la policy debe respetar.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 12;
 
     /// Construye una `SkillId` a partir del entero que emite la policy.
     /// Retorna `None` si el id está fuera del rango del catálogo.
@@ -78,6 +85,9 @@ impl SkillId {
             6 => Some(Self::Intercept),
             7 => Some(Self::BlockLine),
             8 => Some(Self::GoalKeep),
+            9 => Some(Self::Clear),
+            10 => Some(Self::SpinKick),
+            11 => Some(Self::Mark),
             _ => None,
         }
     }
@@ -98,6 +108,9 @@ impl SkillId {
                 | SkillId::ShootPush
                 | SkillId::BlockLine
                 | SkillId::GoalKeep
+                | SkillId::Clear
+                | SkillId::SpinKick
+                | SkillId::Mark
         )
     }
 
@@ -131,6 +144,9 @@ pub struct SkillCatalog {
     intercept: Vec<InterceptSkill>,
     block: Vec<BlockLineSkill>,
     goal_keep: Vec<DefendGoalLineSkill>,
+    clear: Vec<ClearSkill>,
+    spin_kick: Vec<SpinKickSkill>,
+    mark: Vec<MarkSkill>,
     config: SkillConfig,
 }
 
@@ -172,6 +188,11 @@ impl SkillCatalog {
         let goal_keep = (0..num_robots)
             .map(|_| DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0)))
             .collect();
+        let clear = (0..num_robots).map(|_| ClearSkill::new(Vec2::ZERO)).collect();
+        let spin_kick = (0..num_robots)
+            .map(|_| SpinKickSkill::new(Vec2::ZERO))
+            .collect();
+        let mark = (0..num_robots).map(|_| MarkSkill::new(Vec2::ZERO)).collect();
         Self {
             go_to,
             face_point,
@@ -182,6 +203,9 @@ impl SkillCatalog {
             intercept,
             block,
             goal_keep,
+            clear,
+            spin_kick,
+            mark,
             config,
         }
     }
@@ -221,6 +245,21 @@ impl SkillCatalog {
             SkillId::GoalKeep => {
                 let s = &mut self.goal_keep[robot_id];
                 ensure_goal_side(s, target);
+                s.status(robot, world)
+            }
+            SkillId::Clear => {
+                let s = &mut self.clear[robot_id];
+                s.set_target(target);
+                s.status(robot, world)
+            }
+            SkillId::SpinKick => {
+                let s = &mut self.spin_kick[robot_id];
+                s.set_target(target);
+                s.status(robot, world)
+            }
+            SkillId::Mark => {
+                let s = &mut self.mark[robot_id];
+                s.set_point(target);
                 s.status(robot, world)
             }
         }
@@ -331,6 +370,21 @@ impl SkillCatalog {
                 ensure_goal_side(skill, target);
                 skill.tick(robot, world, motion)
             }
+            SkillId::Clear => {
+                let skill = &mut self.clear[robot_id];
+                skill.set_target(target);
+                skill.tick(robot, world, motion)
+            }
+            SkillId::SpinKick => {
+                let skill = &mut self.spin_kick[robot_id];
+                skill.set_target(target);
+                skill.tick(robot, world, motion)
+            }
+            SkillId::Mark => {
+                let skill = &mut self.mark[robot_id];
+                skill.set_point(target);
+                skill.tick(robot, world, motion)
+            }
         }
     }
 }
@@ -371,8 +425,33 @@ mod tests {
             SkillId::Intercept,
             SkillId::BlockLine,
             SkillId::GoalKeep,
+            SkillId::Clear,
+            SkillId::SpinKick,
+            SkillId::Mark,
         ];
         assert_eq!(known.len(), SkillId::COUNT);
+        for (i, id) in known.iter().enumerate() {
+            assert_eq!(SkillId::from_u8(i as u8), Some(*id));
+        }
+    }
+
+    #[test]
+    fn catalog_dispatches_batch2_skills() {
+        let mut catalog = SkillCatalog::new(3);
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(-0.5, 0.0), Vec2::ZERO);
+        let motion = Motion::new();
+        let robot = make_robot(1, -0.3, 0.2, 0.0);
+        for (id, target) in [
+            (SkillId::Clear, Vec2::new(0.2, 0.45)),
+            (SkillId::SpinKick, Vec2::new(0.75, 0.0)),
+            (SkillId::Mark, Vec2::new(-0.2, 0.1)),
+        ] {
+            let cmd = catalog.tick(1, id, target, &robot, &world, &motion);
+            assert!(cmd.vx.is_finite() && cmd.vy.is_finite() && cmd.omega.is_finite());
+            let st = catalog.status(1, id, target, &robot, &world);
+            assert!((0.0..=1.0).contains(&st.progress));
+        }
     }
 
     #[test]

@@ -290,7 +290,10 @@ fn dispatch_choices(
             | SkillId::ApproachAligned
             | SkillId::ShootPush
             | SkillId::BlockLine
-            | SkillId::GoalKeep => Some(choice.target),
+            | SkillId::GoalKeep
+            | SkillId::Clear
+            | SkillId::SpinKick
+            | SkillId::Mark => Some(choice.target),
             SkillId::ChaseBall | SkillId::Intercept => Some(world.get_ball_state().position),
             SkillId::Spin => None,
         };

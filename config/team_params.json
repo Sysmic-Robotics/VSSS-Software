@@ -10,7 +10,12 @@
     "gk_clear_max_ball_speed": 0.15,
     "opp_keeper_radius": 0.3,
     "wall_band_y": 0.52,
-    "wall_band_x": 0.62
+    "wall_band_x": 0.62,
+    "decision_hz": 10.0,
+    "spin_engage_radius": 0.25,
+    "spin_when_opponent_within": 0.1,
+    "gk_force_clear_s": 6.0,
+    "mark_distance": 0.15
   },
   "skills": {
     "approach_staging_offset": 0.14,
@@ -27,7 +32,16 @@
     "intercept_reaction_delay": 0.1,
     "intercept_reach_radius": 0.09,
     "block_distance": 0.3,
-    "block_max_abs_x": 0.58
+    "block_max_abs_x": 0.58,
+    "clear_staging_offset": 0.1,
+    "clear_behind_tol": 0.06,
+    "clear_lose_radius": 0.35,
+    "clear_release_ball_speed": 0.5,
+    "spin_contact_radius": 0.065,
+    "spin_omega": 20.0,
+    "spin_pos_tol": 0.03,
+    "spin_release_ball_speed": 0.4,
+    "spin_max_time_s": 1.0
   },
   "motion": {
     "max_linear_speed": 1.2,

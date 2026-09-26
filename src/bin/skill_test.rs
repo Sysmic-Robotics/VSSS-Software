@@ -78,10 +78,12 @@ FLAGS COMUNES (opcionales):
 
 FLAGS MODO skill:
     --vision <sim|real>
-    --skill <goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep>
+    --skill <goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|
+             goalkeep|clear|spinkick|mark>
     --target x,y         obligatorio para goto, facepoint, spin, approach,
-                         shoot (punto al que apuntar), blockline y goalkeep
-                         (ambos: centro del arco propio, p.ej. -0.75,0)
+                         shoot/clear/spinkick (punto al que lanzar la pelota),
+                         blockline y goalkeep (centro del arco propio, p.ej.
+                         -0.75,0) y mark (punto donde pararse mirando la pelota)
                          (spin solo usa el signo de x: + = CCW, − = CW)
                          opcional para chaseball; ignorado por intercept
 
@@ -243,9 +245,12 @@ impl Args {
                         "intercept" => SkillId::Intercept,
                         "blockline" => SkillId::BlockLine,
                         "goalkeep" => SkillId::GoalKeep,
+                        "clear" => SkillId::Clear,
+                        "spinkick" => SkillId::SpinKick,
+                        "mark" => SkillId::Mark,
                         other => {
                             return Err(format!(
-                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep)"
+                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep|clear|spinkick|mark)"
                             ));
                         }
                     });
@@ -325,6 +330,9 @@ impl Args {
                         | SkillId::ShootPush
                         | SkillId::BlockLine
                         | SkillId::GoalKeep
+                        | SkillId::Clear
+                        | SkillId::SpinKick
+                        | SkillId::Mark
                 ) && target.is_none()
                 {
                     return Err(format!(
