@@ -41,6 +41,13 @@ pub struct MotionConfig {
     pub uvf_influence_radius: f32,
     /// Ganancia repulsiva del UVF — más alto = deflexión más brusca
     pub uvf_k_rep: f32,
+    /// Robot simétrico con dos caras de contacto (frente y espalda): la orientación
+    /// se trata módulo 180°. El PID de heading apunta a la cara más cercana a la
+    /// dirección deseada (nunca gira más de 90°) y el coupling velocidad-heading no
+    /// castiga avanzar "de espaldas". La conversión a ruedas ya soporta v<0 (proyecta
+    /// el comando global sobre el heading), así que no hace falta tocar el radio.
+    /// Activar con `VSSL_BIDIRECTIONAL=1` (ver `MotionConfig::from_env`).
+    pub bidirectional: bool,
 }
 
 impl Default for MotionConfig {
@@ -54,7 +61,20 @@ impl Default for MotionConfig {
             coupling_floor: 0.22,
             uvf_influence_radius: 0.20,
             uvf_k_rep: 1.5,
+            bidirectional: false,
         }
+    }
+}
+
+impl MotionConfig {
+    /// Defaults + overrides por variables de entorno (sin recompilar):
+    /// - `VSSL_BIDIRECTIONAL=1|true|on` → modo simétrico de dos caras.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(v) = std::env::var("VSSL_BIDIRECTIONAL") {
+            cfg.bidirectional = matches!(v.trim(), "1" | "true" | "on");
+        }
+        cfg
     }
 }
 
@@ -97,6 +117,21 @@ impl Motion {
             normalized += two_pi;
         }
         normalized
+    }
+
+    /// Pliega un error de heading (ya normalizado a [-π, π]) al rango [-π/2, π/2]:
+    /// para un robot de dos caras, apuntar con la espalda es tan bueno como con el
+    /// frente, así que nunca conviene girar más de 90°.
+    pub fn fold_bidirectional(error: f64) -> f64 {
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        let pi = std::f64::consts::PI;
+        if error > half_pi {
+            error - pi
+        } else if error < -half_pi {
+            error + pi
+        } else {
+            error
+        }
     }
 
     /// Movimiento hacia un objetivo usando Univector Field.
@@ -168,7 +203,12 @@ impl Motion {
         // Coupling velocidad-steering: penaliza ir de lado, pero no anula del todo el avance
         // (si no, con `move_and_face` + UVF≠mirada al balón, cos→0 y el robot solo rota).
         let heading_error = UniVectorField::heading_error(theta_uvf, robot_state.orientation);
-        let cos_align = (heading_error.cos() as f32).max(0.0);
+        // Bidireccional: ir de espaldas alinea tan bien como de frente (|cos|).
+        let cos_align = if self.config.bidirectional {
+            (heading_error.cos() as f32).abs()
+        } else {
+            (heading_error.cos() as f32).max(0.0)
+        };
         let coupling = self.config.coupling_floor + (1.0 - self.config.coupling_floor) * cos_align;
 
         let normalized = (dist_to_goal / self.config.brake_distance).clamp(0.0, 1.0);
@@ -332,7 +372,10 @@ impl Motion {
         ki: f64,
         kd: f64,
     ) -> MotionCommand {
-        let error = Self::normalize_angle(target_angle - robot_state.orientation);
+        let mut error = Self::normalize_angle(target_angle - robot_state.orientation);
+        if self.config.bidirectional {
+            error = Self::fold_bidirectional(error);
+        }
         let key = (robot_state.team, robot_state.id);
         let omega = {
             let mut pid_theta_map = self
@@ -412,6 +455,56 @@ mod tests {
             (normalized_neg_pi - (-pi)).abs() < 1e-10 || (normalized_neg_pi - pi).abs() < 1e-10
         );
         assert!((Motion::normalize_angle(2.0 * pi) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fold_bidirectional_never_exceeds_quarter_turn() {
+        let pi = std::f64::consts::PI;
+        assert!((Motion::fold_bidirectional(pi) - 0.0).abs() < 1e-9);
+        assert!((Motion::fold_bidirectional(-pi) - 0.0).abs() < 1e-9);
+        assert!((Motion::fold_bidirectional(2.0) - (2.0 - pi)).abs() < 1e-9);
+        assert!((Motion::fold_bidirectional(-2.0) - (-2.0 + pi)).abs() < 1e-9);
+        assert!((Motion::fold_bidirectional(0.7) - 0.7).abs() < 1e-9);
+        for e in [-3.1, -2.0, -1.0, 0.0, 1.0, 2.0, 3.1] {
+            assert!(Motion::fold_bidirectional(e).abs() <= std::f64::consts::FRAC_PI_2 + 1e-9);
+        }
+    }
+
+    #[test]
+    fn bidirectional_face_uses_back_when_target_is_behind() {
+        let mut cfg = MotionConfig::default();
+        cfg.bidirectional = true;
+        let motion = Motion::with_config(cfg);
+        let mut robot = RobotState::new(0, 0);
+        robot.orientation = std::f64::consts::PI; // mira a -x
+        // Target exactamente detrás (+x): con dos caras ya está alineado → omega ≈ 0.
+        let cmd = motion.face_to(&robot, Vec2::new(1.0, 0.0), 3.0, 0.0, 0.0);
+        assert!(cmd.omega.abs() < 1e-6, "omega={} debería ser ~0", cmd.omega);
+
+        // Sin bidireccional, el mismo caso pide media vuelta completa.
+        let motion_fwd = Motion::new();
+        let cmd_fwd = motion_fwd.face_to(&robot, Vec2::new(1.0, 0.0), 3.0, 0.0, 0.0);
+        assert!(cmd_fwd.omega.abs() > 1.0);
+    }
+
+    #[test]
+    fn bidirectional_move_to_keeps_speed_when_driving_backwards() {
+        let mut cfg = MotionConfig::default();
+        cfg.bidirectional = true;
+        let motion = Motion::with_config(cfg);
+        let world = World::new(3, 3);
+        let mut robot = RobotState::new(0, 0);
+        robot.position = Vec2::new(-0.4, 0.0);
+        robot.orientation = std::f64::consts::PI; // de espaldas al target (+x)
+        let target = Vec2::new(0.4, 0.0);
+
+        let cmd = motion.move_to(&robot, target, &world);
+        let speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
+        // Con coupling |cos| la velocidad global es plena aunque vaya de espaldas.
+        assert!(speed > 1.0, "speed={speed}");
+        // La proyección sobre el heading (lo que va a las ruedas) es negativa: retrocede.
+        let v_local = cmd.vx * robot.orientation.cos() + cmd.vy * robot.orientation.sin();
+        assert!(v_local < -0.9, "v_local={v_local}");
     }
 
     #[test]

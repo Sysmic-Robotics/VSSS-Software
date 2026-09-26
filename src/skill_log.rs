@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-pub const CSV_HEADER: &str = "t_ms,tick,mode,transport,vision,robot,team,skill,pose_x,pose_y,pose_theta,target_x,target_y,cmd_vx,cmd_vy,cmd_omega,wheel_L_mm_s,wheel_R_mm_s,frame_str,err_dist,err_heading\n";
+pub const CSV_HEADER: &str = "t_ms,tick,mode,transport,vision,robot,team,skill,pose_x,pose_y,pose_theta,target_x,target_y,cmd_vx,cmd_vy,cmd_omega,wheel_L_mm_s,wheel_R_mm_s,frame_str,err_dist,err_heading,ball_x,ball_y,ball_vx,ball_vy\n";
 
 pub struct CsvLogger {
     file: File,
@@ -35,7 +35,7 @@ impl CsvLogger {
     pub fn write_row(&mut self, row: &CsvRow<'_>) -> std::io::Result<()> {
         writeln!(
             self.file,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             row.t_ms,
             row.tick,
             row.mode,
@@ -57,6 +57,10 @@ impl CsvLogger {
             row.frame_str,
             opt(row.err_dist),
             opt(row.err_heading),
+            opt(row.ball_x),
+            opt(row.ball_y),
+            opt(row.ball_vx),
+            opt(row.ball_vy),
         )
     }
 }
@@ -88,6 +92,12 @@ pub struct CsvRow<'a> {
     pub frame_str: String,
     pub err_dist: Option<f32>,
     pub err_heading: Option<f64>,
+    /// Pelota (posición y velocidad filtradas por el tracker, o crudas si está
+    /// apagado). Vacías en modo wheels. Necesarias para medir contacto por cara.
+    pub ball_x: Option<f32>,
+    pub ball_y: Option<f32>,
+    pub ball_vx: Option<f32>,
+    pub ball_vy: Option<f32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +133,10 @@ pub fn skill_label(s: Option<SkillId>) -> &'static str {
         Some(SkillId::FacePoint) => "facepoint",
         Some(SkillId::ChaseBall) => "chaseball",
         Some(SkillId::Spin) => "spin",
+        Some(SkillId::ApproachAligned) => "approach",
+        Some(SkillId::ShootPush) => "shoot",
+        Some(SkillId::Intercept) => "intercept",
+        Some(SkillId::BlockLine) => "blockline",
         None => "",
     }
 }
@@ -186,7 +200,22 @@ impl SkillLogCtx {
         // Errores: solo si skill usa target espacial y robot está visible
         let skill_uses_target = matches!(
             self.skill,
-            SkillId::GoTo | SkillId::FacePoint | SkillId::Spin
+            SkillId::GoTo
+                | SkillId::FacePoint
+                | SkillId::Spin
+                | SkillId::ApproachAligned
+                | SkillId::ShootPush
+                | SkillId::Intercept
+                | SkillId::BlockLine
+        );
+
+        // Pelota (siempre en modo skill: la necesitan las mediciones de contacto)
+        let ball = rec.world.get_ball_state();
+        let (ball_x, ball_y, ball_vx, ball_vy) = (
+            Some(ball.position.x),
+            Some(ball.position.y),
+            Some(ball.velocity.x),
+            Some(ball.velocity.y),
         );
         let (err_dist, err_heading) = if skill_uses_target {
             match (robot_state.as_ref(), target_xy) {
@@ -232,6 +261,10 @@ impl SkillLogCtx {
             frame_str,
             err_dist,
             err_heading,
+            ball_x,
+            ball_y,
+            ball_vx,
+            ball_vy,
         }
     }
 }
@@ -312,9 +345,10 @@ mod tests {
     }
 
     #[test]
-    fn csv_header_has_21_columns() {
+    fn csv_header_has_25_columns() {
         let cols = CSV_HEADER.trim_end().split(',').count();
-        assert_eq!(cols, 21);
+        assert_eq!(cols, 25);
+        assert!(CSV_HEADER.trim_end().ends_with("ball_x,ball_y,ball_vx,ball_vy"));
     }
 
     #[test]
@@ -447,6 +481,10 @@ mod tests {
             frame_str: String::new(),
             err_dist: Some(0.18),
             err_heading: Some(0.05),
+            ball_x: Some(0.5),
+            ball_y: Some(0.0),
+            ball_vx: Some(0.0),
+            ball_vy: Some(0.0),
         };
         let s = format_human_summary(&row);
         assert!(s.contains("tick=90"));

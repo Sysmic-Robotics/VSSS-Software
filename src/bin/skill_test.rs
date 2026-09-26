@@ -78,10 +78,18 @@ FLAGS COMUNES (opcionales):
 
 FLAGS MODO skill:
     --vision <sim|real>
-    --skill <goto|facepoint|chaseball|spin>
-    --target x,y         obligatorio para goto, facepoint, spin
+    --skill <goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline>
+    --target x,y         obligatorio para goto, facepoint, spin, approach,
+                         shoot (punto al que apuntar) y blockline (arco propio)
                          (spin solo usa el signo de x: + = CCW, − = CW)
-                         opcional para chaseball
+                         opcional para chaseball; ignorado por intercept
+
+VARIABLES DE ENTORNO:
+    VSSL_BIDIRECTIONAL=1   motion de dos caras: el heading se controla mod 180°
+                           (usa la cara frontal o trasera, la que requiera
+                           menos giro). Por defecto apagado (solo frente).
+    VSSL_TRACKER=off       arranca con el EKF apagado → el CSV registra poses
+                           CRUDAS de visión (para medir ruido de cámara).
 
 FLAGS MODO wheels (solo --transport base-station):
     --left L             mm/s rueda izquierda. Se clampa a ±1500.
@@ -108,6 +116,11 @@ EJEMPLOS:
     cargo run --bin skill_test -- --transport base-station --vision real \
         --mode skill --skill spin --target 1,0 --robot 0 --team blue --dur 3 \
         --log /tmp/spin.csv
+
+    # Sim, empuje de dos caras hacia el arco rival:
+    VSSL_BIDIRECTIONAL=1 cargo run --bin skill_test -- --transport firasim \
+        --vision sim --mode skill --skill shoot --target 0.75,0 \
+        --robot 0 --team blue --dur 6 --log /tmp/shoot.csv
 "#;
 
 impl Args {
@@ -224,9 +237,13 @@ impl Args {
                         "facepoint" => SkillId::FacePoint,
                         "chaseball" => SkillId::ChaseBall,
                         "spin" => SkillId::Spin,
+                        "approach" => SkillId::ApproachAligned,
+                        "shoot" => SkillId::ShootPush,
+                        "intercept" => SkillId::Intercept,
+                        "blockline" => SkillId::BlockLine,
                         other => {
                             return Err(format!(
-                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin)"
+                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline)"
                             ));
                         }
                     });
@@ -297,8 +314,15 @@ impl Args {
                 if left.is_some() || right.is_some() {
                     return Err("modo skill NO acepta --left ni --right".to_string());
                 }
-                if matches!(skill_id, SkillId::GoTo | SkillId::FacePoint | SkillId::Spin)
-                    && target.is_none()
+                if matches!(
+                    skill_id,
+                    SkillId::GoTo
+                        | SkillId::FacePoint
+                        | SkillId::Spin
+                        | SkillId::ApproachAligned
+                        | SkillId::ShootPush
+                        | SkillId::BlockLine
+                ) && target.is_none()
                 {
                     return Err(format!(
                         "modo skill --skill {:?} requiere --target x,y",
@@ -406,6 +430,10 @@ async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), S
                 frame_str: frame_stripped.clone(),
                 err_dist: None,
                 err_heading: None,
+                ball_x: None,
+                ball_y: None,
+                ball_vx: None,
+                ball_vy: None,
             });
         }
 

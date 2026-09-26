@@ -1,15 +1,19 @@
 pub mod catalog;
 pub mod config;
+pub mod tactical;
 
 pub use catalog::{SkillCatalog, SkillId};
 pub use config::SkillConfig;
+pub use tactical::{
+    ApproachAlignedSkill, BlockLineSkill, Face, InterceptSkill, ShootPushSkill, SkillStatus,
+};
 
 use crate::motion::{Motion, MotionCommand};
 use crate::world::{RobotState, World};
 use glam::Vec2;
 
-const LOGICAL_FIELD_HALF_X: f32 = 0.70;
-const LOGICAL_FIELD_HALF_Y: f32 = 0.60;
+pub(crate) const LOGICAL_FIELD_HALF_X: f32 = 0.70;
+pub(crate) const LOGICAL_FIELD_HALF_Y: f32 = 0.60;
 
 const CONTROL_KP: f64 = 3.0;
 const CONTROL_KI: f64 = 0.08;
@@ -43,9 +47,21 @@ pub trait Skill: Send + Sync {
     fn current_target(&self, _world: &World) -> Option<Vec2> {
         None
     }
+
+    /// Estado observable de la skill para la capa táctica (STP): progreso [0,1],
+    /// terminación intrínseca, factibilidad en el estado actual y cara de contacto
+    /// elegida. Default conservador: sin progreso, siempre factible, cara frontal.
+    fn status(&self, robot: &RobotState, world: &World) -> SkillStatus {
+        SkillStatus {
+            progress: 0.0,
+            done: self.is_done(robot, world),
+            feasible: true,
+            face: Face::Front,
+        }
+    }
 }
 
-fn stop_cmd(robot: &RobotState) -> MotionCommand {
+pub(crate) fn stop_cmd(robot: &RobotState) -> MotionCommand {
     MotionCommand {
         id: robot.id,
         team: robot.team,
@@ -56,14 +72,14 @@ fn stop_cmd(robot: &RobotState) -> MotionCommand {
     }
 }
 
-fn clamp_to_logical_field(pos: Vec2) -> Vec2 {
+pub(crate) fn clamp_to_logical_field(pos: Vec2) -> Vec2 {
     Vec2::new(
         pos.x.clamp(-LOGICAL_FIELD_HALF_X, LOGICAL_FIELD_HALF_X),
         pos.y.clamp(-LOGICAL_FIELD_HALF_Y, LOGICAL_FIELD_HALF_Y),
     )
 }
 
-fn is_inside_logical_field(pos: Vec2) -> bool {
+pub(crate) fn is_inside_logical_field(pos: Vec2) -> bool {
     pos.x.abs() <= LOGICAL_FIELD_HALF_X && pos.y.abs() <= LOGICAL_FIELD_HALF_Y
 }
 

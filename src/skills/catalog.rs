@@ -23,7 +23,10 @@
 //! herramientas de debugging y experimentación manual desde `scenario.rs`.
 
 use crate::motion::{Motion, MotionCommand};
-use crate::skills::{ChaseBallSkill, FacePointSkill, GoToSkill, Skill, SkillConfig, SpinSkill};
+use crate::skills::{
+    ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, FacePointSkill, GoToSkill,
+    InterceptSkill, ShootPushSkill, Skill, SkillConfig, SkillStatus, SpinSkill,
+};
 use crate::world::{RobotState, World};
 use glam::Vec2;
 
@@ -43,12 +46,21 @@ pub enum SkillId {
     ChaseBall = 2,
     /// Rotar en el lugar. Usa el signo de `target.x` para definir sentido.
     Spin = 3,
+    /// Llegar detrás de la pelota sobre la línea pelota→`target`, alineado
+    /// (con la cara que requiera menos giro). Paso previo de `ShootPush`.
+    ApproachAligned = 4,
+    /// Conducir/empujar la pelota alineado hacia `target`; termina al soltarla.
+    ShootPush = 5,
+    /// Ir al punto de intercepción predicho de la pelota. `target` ignorado.
+    Intercept = 6,
+    /// Cubrir la línea pelota→arco propio; `target` = centro del arco propio.
+    BlockLine = 7,
 }
 
 impl SkillId {
     /// Cantidad de skills en el catálogo. Este es el tamaño del action space
     /// discreto que la policy debe respetar.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 8;
 
     /// Construye una `SkillId` a partir del entero que emite la policy.
     /// Retorna `None` si el id está fuera del rango del catálogo.
@@ -58,6 +70,10 @@ impl SkillId {
             1 => Some(Self::FacePoint),
             2 => Some(Self::ChaseBall),
             3 => Some(Self::Spin),
+            4 => Some(Self::ApproachAligned),
+            5 => Some(Self::ShootPush),
+            6 => Some(Self::Intercept),
+            7 => Some(Self::BlockLine),
             _ => None,
         }
     }
@@ -70,7 +86,14 @@ impl SkillId {
     /// Útil para logging y para el wrapper Python: skills que ignoran target
     /// no necesitan que la policy emita un punto significativo.
     pub fn uses_target(self) -> bool {
-        matches!(self, SkillId::GoTo | SkillId::FacePoint)
+        matches!(
+            self,
+            SkillId::GoTo
+                | SkillId::FacePoint
+                | SkillId::ApproachAligned
+                | SkillId::ShootPush
+                | SkillId::BlockLine
+        )
     }
 
     /// Indica si la skill usa el signo de `target.x` como parámetro discreto
@@ -98,6 +121,10 @@ pub struct SkillCatalog {
     face_point: Vec<FacePointSkill>,
     chase_ball: Vec<ChaseBallSkill>,
     spin: Vec<SpinSkill>,
+    approach: Vec<ApproachAlignedSkill>,
+    shoot: Vec<ShootPushSkill>,
+    intercept: Vec<InterceptSkill>,
+    block: Vec<BlockLineSkill>,
     config: SkillConfig,
 }
 
@@ -117,12 +144,61 @@ impl SkillCatalog {
         let spin = (0..num_robots)
             .map(|_| SpinSkill::with_config(&config))
             .collect();
+        let approach = (0..num_robots)
+            .map(|_| ApproachAlignedSkill::new(Vec2::ZERO))
+            .collect();
+        let shoot = (0..num_robots)
+            .map(|_| ShootPushSkill::new(Vec2::ZERO))
+            .collect();
+        let intercept = (0..num_robots).map(|_| InterceptSkill::new()).collect();
+        let block = (0..num_robots)
+            .map(|_| BlockLineSkill::new(Vec2::new(-0.75, 0.0)))
+            .collect();
         Self {
             go_to,
             face_point,
             chase_ball,
             spin,
+            approach,
+            shoot,
+            intercept,
+            block,
             config,
+        }
+    }
+
+    /// Estado observable (`SkillStatus`) de la skill `skill_id` para `robot_id`,
+    /// con el mismo `target` que se le pasaría a `tick`. No muta estado de control.
+    pub fn status(
+        &mut self,
+        robot_id: usize,
+        skill_id: SkillId,
+        target: Vec2,
+        robot: &RobotState,
+        world: &World,
+    ) -> SkillStatus {
+        assert!(robot_id < self.num_robots(), "robot_id fuera de rango");
+        match skill_id {
+            SkillId::GoTo => self.go_to[robot_id].status(robot, world),
+            SkillId::FacePoint => self.face_point[robot_id].status(robot, world),
+            SkillId::ChaseBall => self.chase_ball[robot_id].status(robot, world),
+            SkillId::Spin => self.spin[robot_id].status(robot, world),
+            SkillId::ApproachAligned => {
+                let s = &mut self.approach[robot_id];
+                s.set_aim_point(target);
+                s.status(robot, world)
+            }
+            SkillId::ShootPush => {
+                let s = &mut self.shoot[robot_id];
+                s.set_target(target);
+                s.status(robot, world)
+            }
+            SkillId::Intercept => self.intercept[robot_id].status(robot, world),
+            SkillId::BlockLine => {
+                let s = &mut self.block[robot_id];
+                s.set_own_goal(target);
+                s.status(robot, world)
+            }
         }
     }
 
@@ -210,6 +286,22 @@ impl SkillCatalog {
                 skill.set_direction_from(target);
                 skill.tick(robot, world, motion)
             }
+            SkillId::ApproachAligned => {
+                let skill = &mut self.approach[robot_id];
+                skill.set_aim_point(target);
+                skill.tick(robot, world, motion)
+            }
+            SkillId::ShootPush => {
+                let skill = &mut self.shoot[robot_id];
+                skill.set_target(target);
+                skill.tick(robot, world, motion)
+            }
+            SkillId::Intercept => self.intercept[robot_id].tick(robot, world, motion),
+            SkillId::BlockLine => {
+                let skill = &mut self.block[robot_id];
+                skill.set_own_goal(target);
+                skill.tick(robot, world, motion)
+            }
         }
     }
 }
@@ -245,8 +337,36 @@ mod tests {
             SkillId::FacePoint,
             SkillId::ChaseBall,
             SkillId::Spin,
+            SkillId::ApproachAligned,
+            SkillId::ShootPush,
+            SkillId::Intercept,
+            SkillId::BlockLine,
         ];
         assert_eq!(known.len(), SkillId::COUNT);
+    }
+
+    #[test]
+    fn catalog_dispatches_tactical_skills() {
+        let mut catalog = SkillCatalog::new(3);
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.2, 0.0), Vec2::new(0.5, 0.0));
+        let motion = Motion::new();
+        let robot = make_robot(0, -0.4, 0.1, 0.0);
+        let goal = Vec2::new(0.75, 0.0);
+
+        for (id, target) in [
+            (SkillId::ApproachAligned, goal),
+            (SkillId::ShootPush, goal),
+            (SkillId::Intercept, Vec2::ZERO),
+            (SkillId::BlockLine, Vec2::new(-0.75, 0.0)),
+        ] {
+            let cmd = catalog.tick(0, id, target, &robot, &world, &motion);
+            assert!(cmd.vx.is_finite() && cmd.vy.is_finite() && cmd.omega.is_finite());
+            let st = catalog.status(0, id, target, &robot, &world);
+            assert!((0.0..=1.0).contains(&st.progress));
+        }
+        // ShootPush desde lejos no es factible (debe reportarlo, no fingir empuje).
+        assert!(!catalog.status(0, SkillId::ShootPush, goal, &robot, &world).feasible);
     }
 
     #[test]

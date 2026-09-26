@@ -10,7 +10,7 @@
 
 use crate::GUI;
 use crate::coach::{Coach, Observation, SkillChoice};
-use crate::motion::{BorderRecovery, Motion, MotionCommand};
+use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig};
 use crate::radio::{RadioTarget, TransportError};
 use crate::skills::{SkillCatalog, SkillId};
 use crate::vision::{Vision, VisionEvent, VisionSource};
@@ -246,8 +246,12 @@ fn dispatch_choices(
             motion,
         );
         let target = match choice.skill_id {
-            SkillId::GoTo | SkillId::FacePoint => Some(choice.target),
-            SkillId::ChaseBall => Some(world.get_ball_state().position),
+            SkillId::GoTo
+            | SkillId::FacePoint
+            | SkillId::ApproachAligned
+            | SkillId::ShootPush
+            | SkillId::BlockLine => Some(choice.target),
+            SkillId::ChaseBall | SkillId::Intercept => Some(world.get_ball_state().position),
             SkillId::Spin => None,
         };
         commands.push(cmd);
@@ -333,7 +337,15 @@ pub async fn run_control_loop(
         config.num_robots,
         config.num_robots,
     )));
-    let tracker_enabled = Arc::new(AtomicBool::new(true));
+    // VSSL_TRACKER=off|0 desactiva el EKF desde el arranque (mediciones de ruido
+    // crudo de cámara). Por defecto el tracker está encendido.
+    let tracker_on_at_start = std::env::var("VSSL_TRACKER")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
+        .unwrap_or(true);
+    if !tracker_on_at_start {
+        eprintln!("[control_loop] VSSL_TRACKER=off → EKF desactivado (poses crudas de visión)");
+    }
+    let tracker_enabled = Arc::new(AtomicBool::new(tracker_on_at_start));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
     let (status_tx, motion_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx) =
@@ -452,7 +464,11 @@ pub async fn run_control_loop(
 
     eprintln!("[control_loop] listo. 60 Hz control loop. Ctrl+C para detener.");
 
-    let motion = Motion::new();
+    let motion_cfg = MotionConfig::from_env();
+    if motion_cfg.bidirectional {
+        eprintln!("[control_loop] VSSL_BIDIRECTIONAL=1 → motion de dos caras (heading mod 180°)");
+    }
+    let motion = Motion::with_config(motion_cfg);
     let mut catalog = SkillCatalog::new(config.num_robots);
     let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
