@@ -289,6 +289,96 @@ fn wheels_to_slots(robot: usize, l: i16, r: i16) -> [(i16, i16); SLOT_COUNT] {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Registro de partido (VSSL_MATCH_LOG) — una fila por robot y tick
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const MATCH_CSV_HEADER: &str = "t_ms,tick,team,robot,own,skill,target_x,target_y,pose_x,pose_y,pose_theta,vel_x,vel_y,omega,cmd_vx,cmd_vy,cmd_omega,ball_x,ball_y,ball_vx,ball_vy\n";
+
+/// CSV de partido: por tick, una fila por robot propio (skill, target y comando)
+/// y una por rival (solo pose, `own=0`). La pelota se repite en cada fila para
+/// que cualquier fila sea autocontenida. Base de las métricas de evaluación
+/// (goles, posesión, toques, tiempo a la pelota) y de la revisión offline de
+/// decisiones.
+pub struct MatchLogger {
+    file: File,
+    own_team: i32,
+}
+
+impl MatchLogger {
+    pub fn new<P: AsRef<Path>>(path: P, own_team: i32) -> std::io::Result<Self> {
+        if let Some(parent) = path.as_ref().parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(path)?;
+        file.write_all(MATCH_CSV_HEADER.as_bytes())?;
+        Ok(Self { file, own_team })
+    }
+
+    pub fn write_tick(&mut self, rec: &TickRecord<'_>) -> std::io::Result<()> {
+        let ball = rec.world.get_ball_state();
+        let ball_cols = format!(
+            "{},{},{},{}",
+            ball.position.x, ball.position.y, ball.velocity.x, ball.velocity.y
+        );
+        // Propios: filas paralelas a `commands`. La choice/target pueden faltar si
+        // el comando vino de control manual (no del coach).
+        for (i, cmd) in rec.commands.iter().enumerate() {
+            let choice = rec.choices.get(i);
+            let target = rec.targets.get(i).copied().flatten();
+            let robot = rec.world.get_robot_state(cmd.id, cmd.team);
+            writeln!(
+                self.file,
+                "{},{},{},{},1,{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                rec.t_ms,
+                rec.tick,
+                cmd.team,
+                cmd.id,
+                skill_label(choice.map(|c| c.skill_id)),
+                opt(target.map(|t| t.x)),
+                opt(target.map(|t| t.y)),
+                opt(robot.map(|r| r.position.x)),
+                opt(robot.map(|r| r.position.y)),
+                opt(robot.map(|r| r.orientation)),
+                opt(robot.map(|r| r.velocity.x)),
+                opt(robot.map(|r| r.velocity.y)),
+                opt(robot.map(|r| r.angular_velocity)),
+                cmd.vx,
+                cmd.vy,
+                cmd.omega,
+                ball_cols
+            )?;
+        }
+        // Rivales: solo pose.
+        let opp = 1 - self.own_team;
+        let opps = if opp == 0 {
+            rec.world.get_blue_team_active()
+        } else {
+            rec.world.get_yellow_team_active()
+        };
+        for r in opps {
+            writeln!(
+                self.file,
+                "{},{},{},{},0,,,,{},{},{},{},{},{},,,,{}",
+                rec.t_ms,
+                rec.tick,
+                r.team,
+                r.id,
+                r.position.x,
+                r.position.y,
+                r.orientation,
+                r.velocity.x,
+                r.velocity.y,
+                r.angular_velocity,
+                ball_cols
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Print humano (NO CSV) — feedback rate-limited a stderr durante el run
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -457,6 +547,43 @@ mod tests {
         let row = ctx.build_skill_row(&rec);
         assert_eq!(row.err_dist, None);
         assert_eq!(row.err_heading, None);
+    }
+
+    #[test]
+    fn match_logger_writes_one_row_per_robot_with_fixed_columns() {
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, Vec2::new(0.1, 0.2), 0.3, Vec2::ZERO, 0.0); // azul 0 (propio)
+        world.update_robot(1, 1, Vec2::new(-0.4, 0.0), 1.0, Vec2::ZERO, 0.0); // amarillo 1 (rival)
+        world.update_ball(Vec2::new(0.5, -0.1), Vec2::new(0.2, 0.0));
+        let cmd = MotionCommand {
+            id: 0,
+            team: 0,
+            vx: 0.5,
+            vy: 0.0,
+            omega: 0.1,
+            orientation: 0.3,
+        };
+        let commands = vec![cmd];
+        let targets: [Option<Vec2>; 1] = [Some(Vec2::new(0.75, 0.0))];
+        let choices = [crate::coach::SkillChoice::new(0, SkillId::ShootPush, Vec2::new(0.75, 0.0))];
+        let rec = empty_tick_record(&world, &commands, &targets, &choices);
+
+        let path = std::env::temp_dir().join(format!("vsss_match_log_test_{}.csv", std::process::id()));
+        {
+            let mut logger = MatchLogger::new(&path, 0).unwrap();
+            logger.write_tick(&rec).unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        let ncols = MATCH_CSV_HEADER.trim_end().split(',').count();
+        assert_eq!(lines.len(), 3, "header + propio + rival: {text}");
+        for l in &lines {
+            assert_eq!(l.split(',').count(), ncols, "columnas en '{l}'");
+        }
+        assert!(lines[1].contains(",1,shoot,0.75,0,"), "fila propia: {}", lines[1]);
+        assert!(lines[2].starts_with("0,0,1,1,0,,,,"), "fila rival: {}", lines[2]);
+        assert!(lines[2].ends_with("0.5,-0.1,0.2,0"), "pelota en fila rival: {}", lines[2]);
     }
 
     #[test]

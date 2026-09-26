@@ -182,6 +182,24 @@ impl Vision {
         }
     }
 
+    /// Socket UDP en `0.0.0.0:port` con `SO_REUSEADDR` (y `SO_REUSEPORT` en Unix)
+    /// para que varios procesos de la misma máquina reciban el mismo multicast de
+    /// visión: dos engines (uno por equipo) en un partido azul vs amarillo, o
+    /// `skill_test` corriendo junto al engine principal. Sin esto, el segundo
+    /// proceso falla con "address in use".
+    fn bind_shared_udp(port: u16) -> Result<UdpSocket, Box<dyn Error>> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        #[cfg(unix)]
+        socket.set_reuse_port(true)?;
+        socket.set_nonblocking(true)?;
+        let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse()?;
+        socket.bind(&addr.into())?;
+        let std_socket: std::net::UdpSocket = socket.into();
+        Ok(UdpSocket::from_std(std_socket)?)
+    }
+
     pub async fn run(
         &mut self,
         sender: mpsc::Sender<VisionEvent>,
@@ -197,8 +215,7 @@ impl Vision {
             self.source, bind_addr, multicast_ip, port
         );
 
-        let socket = UdpSocket::bind(&bind_addr)
-            .await
+        let socket = Self::bind_shared_udp(port)
             .map_err(|e| format!("Error haciendo bind a {}: {}", bind_addr, e))?;
 
         eprintln!("[Vision] Socket creado exitosamente");

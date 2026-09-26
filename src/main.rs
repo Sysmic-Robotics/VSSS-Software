@@ -4,7 +4,6 @@
 use rustengine::GUI;
 
 // ====== Parámetros ======
-const OWN_TEAM: i32 = 0; // 0=azul, 1=amarillo
 const NUM_ROBOTS: usize = 3;
 
 // Frame-skip del coach (Fase 3 — opción E del horizonte de decisión).
@@ -21,9 +20,16 @@ use rustengine::control_loop::{
     CoachDecider, ControlLoopConfig, GuiChannels, GuiSkillCommand, HeadingPid, ManualCommand,
     TickDecider, run_control_loop,
 };
-use rustengine::radio::RadioTarget;
+use rustengine::radio::{RadioTarget, TeamColor};
+use rustengine::skill_log::MatchLogger;
 use rustengine::vision::VisionSource;
 use rustengine::world::World;
+
+/// Equipo propio: `VSSL_TEAM_COLOR=blue|yellow` (default azul). Permite correr
+/// dos engines en la misma máquina, uno por equipo, para partidos en simulador.
+fn own_team_from_env() -> i32 {
+    TeamColor::from_env().as_team_id()
+}
 
 /// Decider que nunca emite skills. Preserva el modo `VSSL_COACH=none` del
 /// pre-refactor: visión y radio siguen vivos, pero no se mandan comandos.
@@ -119,7 +125,7 @@ fn run_with_gui() {
         teleport_tx: Some(teleport_tx),
         estop,
         num_robots: NUM_ROBOTS,
-        own_team: OWN_TEAM as u32,
+        own_team: own_team_from_env() as u32,
         radio_target_label,
         radio_port,
         radio_baud,
@@ -160,7 +166,12 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         vision_source.port()
     );
 
-    let coach = make_coach(OWN_TEAM);
+    let own_team = own_team_from_env();
+    eprintln!(
+        "[main] equipo propio: {} (VSSL_TEAM_COLOR)",
+        if own_team == 0 { "azul" } else { "amarillo" }
+    );
+    let coach = make_coach(own_team);
     eprintln!(
         "[main] coach: {}",
         if coach.is_some() {
@@ -176,12 +187,29 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
     );
 
     let decider: Box<dyn TickDecider> = match coach {
-        Some(c) => Box::new(CoachDecider::new(c, OWN_TEAM, COACH_DECISION_PERIOD)),
+        Some(c) => Box::new(CoachDecider::new(c, own_team, COACH_DECISION_PERIOD)),
         None => Box::new(NoOpDecider),
     };
 
+    // Registro de partido (CSV por tick, propios y rivales) con VSSL_MATCH_LOG=ruta.
+    let on_tick = match std::env::var("VSSL_MATCH_LOG") {
+        Ok(path) if !path.trim().is_empty() => match MatchLogger::new(&path, own_team) {
+            Ok(mut logger) => {
+                eprintln!("[main] registro de partido → {path}");
+                Some(Box::new(move |rec: &rustengine::control_loop::TickRecord<'_>| {
+                    let _ = logger.write_tick(rec);
+                }) as rustengine::control_loop::OnTick)
+            }
+            Err(e) => {
+                eprintln!("[main] no se pudo abrir VSSL_MATCH_LOG={path}: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+
     let config = ControlLoopConfig {
-        own_team: OWN_TEAM,
+        own_team,
         num_robots: NUM_ROBOTS,
         vision_source,
         radio_target,
@@ -203,7 +231,7 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    if let Err(err) = run_control_loop(config, decider, None, gui, shutdown).await {
+    if let Err(err) = run_control_loop(config, decider, on_tick, gui, shutdown).await {
         eprintln!("[main] control loop error: {err}");
     }
 }

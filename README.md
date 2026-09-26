@@ -21,7 +21,11 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_VISION_SOURCE` | `firasim` | `firasim` o `sslvision`. Selecciona la fuente y el parser del `vision_task`. |
 | `VSSL_MULTICAST_IFACE` | (auto) | IPv4 local para forzar la interfaz de multicast (útil si hay varias NICs). |
 | `VSSL_RADIO_TARGET` | `firasim` | `firasim`, `grsim` o `basestation`. Selecciona a quién se le envían los `MotionCommand`. |
-| `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Sólo afecta a `basestation`: filtra qué comandos van al frame serial. |
+| `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Equipo que controla el engine (coach, skills) y, en `basestation`, qué comandos van al frame serial. Permite dos engines en la misma máquina, uno por equipo. |
+| `VSSL_COACH` | `heuristic` | `heuristic` (equipo STP de dos caras), `rule_based` (baseline de roles fijos) o `none`. |
+| `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro. |
+| `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |
+| `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota). |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
 | `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
 
@@ -135,6 +139,12 @@ Variantes:
 # Equipo amarillo.
 VSSL_VISION_SOURCE=sslvision VSSL_RADIO_TARGET=basestation VSSL_TEAM_COLOR=yellow cargo run --release
 
+# Partido en FIRASim: dos engines en la misma máquina (el socket de visión se comparte).
+# Terminal 1 — azul, coach heurístico, con GUI y registro:
+VSSL_TEAM_COLOR=blue VSSL_BIDIRECTIONAL=1 VSSL_DEBUG_GUI=1 VSSL_MATCH_LOG=logs/partido_azul.csv cargo run --release
+# Terminal 2 — amarillo, baseline de regresión:
+VSSL_TEAM_COLOR=yellow VSSL_COACH=rule_based VSSL_MATCH_LOG=logs/partido_amarillo.csv cargo run --release
+
 # Visión real, comandos a FIRASim (debug visual: ver qué decide el engine sin mover los robots).
 VSSL_VISION_SOURCE=sslvision cargo run --release
 
@@ -228,7 +238,7 @@ src/
 
 | Constante | Valor | Descripción |
 |-----------|-------|-------------|
-| `OWN_TEAM` | `0` | Equipo controlado por el binario principal (`0` azul, `1` amarillo) |
+| (env) `VSSL_TEAM_COLOR` | `blue` | Equipo controlado por el binario principal (antes era la constante `OWN_TEAM`) |
 | `NUM_ROBOTS` | `3` | Cantidad de slots de `SkillCatalog` (un slot por robot del equipo propio) |
 | `COACH_DECISION_PERIOD` | `6` | Frame-skip del coach: decide cada 6 ticks (10 Hz) a 60 Hz de control |
 

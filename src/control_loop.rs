@@ -205,6 +205,45 @@ fn zero_commands_for_active_team(
     (cmds, tgts)
 }
 
+/// Límites físicos de la cancha VSSS con margen (m). Fuera de esto la fuente de
+/// visión no es una cancha VSSS (p. ej. grSim con campo SSL de 9×6 m).
+const VSSS_MAX_ABS_X: f32 = 0.95;
+const VSSS_MAX_ABS_Y: f32 = 0.85;
+
+/// Avisa (una sola vez) si algún robot activo o la pelota está fuera de la cancha
+/// VSSS. Casi siempre es un simulador con la geometría equivocada: las skills,
+/// la evasión de paredes y la recuperación de atasco asumen |x| ≤ 0.75, |y| ≤ 0.65
+/// y con posiciones lejanas el robot termina girando sin sentido. Devuelve `true`
+/// si avisó.
+fn warn_if_outside_vsss_field(world: &World) -> bool {
+    let outside = |p: Vec2| p.x.abs() > VSSS_MAX_ABS_X || p.y.abs() > VSSS_MAX_ABS_Y;
+    let mut out: Vec<String> = world
+        .get_blue_team_active()
+        .into_iter()
+        .chain(world.get_yellow_team_active())
+        .filter(|r| outside(r.position))
+        .map(|r| {
+            format!(
+                "robot {} equipo {} en ({:.2}, {:.2})",
+                r.id, r.team, r.position.x, r.position.y
+            )
+        })
+        .collect();
+    let b = world.get_ball_state().position;
+    if outside(b) {
+        out.push(format!("pelota en ({:.2}, {:.2})", b.x, b.y));
+    }
+    if out.is_empty() {
+        return false;
+    }
+    eprintln!(
+        "[control_loop] ⚠ posiciones fuera de la cancha VSSS (1.5×1.3 m): {}. \
+         ¿El simulador está con campo SSL? El engine asume |x|≤0.75, |y|≤0.65 (m).",
+        out.join("; ")
+    );
+    true
+}
+
 /// Mismo dispatcher que tenía `main.rs` pre-refactor (`dispatch_choices`).
 /// Para cada `SkillChoice`, busca el robot del equipo activo y delega en
 /// `SkillCatalog::tick`. Robots no activos se ignoran. Devuelve comando + target
@@ -471,6 +510,7 @@ pub async fn run_control_loop(
     }
     let motion = Motion::with_config(motion_cfg);
     let mut catalog = SkillCatalog::new(config.num_robots);
+    let mut field_scale_warned = false;
     let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
     let started = Instant::now();
@@ -544,6 +584,9 @@ pub async fn run_control_loop(
 
         let (commands, targets, applied_choices) = {
             let world_guard = world.read().await;
+            if !field_scale_warned {
+                field_scale_warned = warn_if_outside_vsss_field(&world_guard);
+            }
             if estop_engaged {
                 let (z_cmds, z_tgts) = zero_commands_for_active_team(&world_guard, config.own_team);
                 (z_cmds, z_tgts, Vec::new())

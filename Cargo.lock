@@ -2916,6 +2916,7 @@ dependencies = [
  "protobuf-codegen",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
  "tokio-serial",
 ]

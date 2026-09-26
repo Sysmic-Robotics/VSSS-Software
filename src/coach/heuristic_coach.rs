@@ -57,6 +57,10 @@ const INTERCEPT_MIN_BALL_SPEED: f32 = 0.30;
 const GK_CLEAR_MAX_BALL_SPEED: f32 = 0.15;
 /// Rival a menos de esto del centro del arco rival cuenta como arquero rival.
 const OPP_KEEPER_RADIUS: f32 = 0.30;
+/// |y| de la pelota desde el que se considera "pegada a la banda".
+const WALL_BAND_Y: f32 = 0.52;
+/// |x| de la pelota desde el que se considera "en el fondo" (fuera de la boca del arco).
+const WALL_BAND_X: f32 = 0.62;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -223,6 +227,43 @@ impl HeuristicCoach {
         Vec2::new(self.attack_sign() * 0.30, side * 0.45)
     }
 
+    /// Pelota pegada a una banda lateral.
+    fn ball_on_side_wall(ball: Vec2) -> bool {
+        ball.y.abs() > WALL_BAND_Y
+    }
+
+    /// Pelota en el fondo (línea de gol fuera de la boca del arco) o en la esquina.
+    fn ball_on_end_wall(ball: Vec2) -> bool {
+        ball.x.abs() > WALL_BAND_X && ball.y.abs() > GOAL_HALF_Y
+    }
+
+    /// Objetivo de empuje del striker según dónde está la pelota. Apuntar al
+    /// arco cuando la pelota está en una pared no sirve: la línea de empuje
+    /// atraviesa la pared y los robots terminan amontonados contra ella.
+    fn striker_target(&self, ball: Vec2, opp: &[RobotView]) -> Vec2 {
+        let s = self.attack_sign();
+        let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
+        let attacking_end = ball.x * s > 0.0;
+        if Self::ball_on_end_wall(ball) {
+            return if attacking_end {
+                // Fondo/esquina rival: sacarla al frente del arco (segunda pelota).
+                Vec2::new(s * (GOAL_AREA_X - 0.12), -side * 0.10)
+            } else {
+                // Fondo/esquina propia: despejar por la banda hacia adelante.
+                Vec2::new(s * 0.20, side * 0.50)
+            };
+        }
+        if Self::ball_on_side_wall(ball) {
+            // Banda: conducir a lo largo de la banda con un ángulo suave hacia
+            // adentro, para que la pelota se despegue de la pared camino al arco.
+            return Vec2::new(ball.x + s * 0.35, side * 0.42);
+        }
+        if self.in_own_half(ball) && (ball.x * -s) > 0.35 {
+            return self.clear_target(ball);
+        }
+        self.aim_point(opp)
+    }
+
     // ── Compromiso por skill ─────────────────────────────────────────────────
 
     /// Aplica el compromiso mínimo: si el robot venía con `prev` y todavía es
@@ -243,12 +284,7 @@ impl HeuristicCoach {
     // ── Tácticas ─────────────────────────────────────────────────────────────
 
     fn striker_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
-        // Objetivo: al arco (o al palo libre); desde el fondo propio, despejar.
-        let target = if self.in_own_half(ball) && (ball.x * -self.attack_sign()) > 0.35 {
-            self.clear_target(ball)
-        } else {
-            self.aim_point(opp)
-        };
+        let target = self.striker_target(ball, opp);
 
         let shoot_ok = shoot_push_feasible(r.pos, ball, target, SHOOT_PUSH_BEHIND_TOL, SHOOT_PUSH_LOSE_RADIUS);
         let ball_speed = ball_vel.length();
@@ -275,6 +311,16 @@ impl HeuristicCoach {
         if defending {
             let skill = self.commit(r.id, SkillId::BlockLine, |_| true);
             return SkillChoice::new(r.id, skill, self.own_goal);
+        }
+        // Pelota en el fondo/esquina rival: el striker la saca al frente del arco;
+        // el support espera ahí la "segunda pelota", del lado contrario, fuera del
+        // área rival (no amontonarse contra la pared con el striker).
+        let s = self.attack_sign();
+        if Self::ball_on_end_wall(ball) && ball.x * s > 0.0 {
+            let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
+            let pos = Vec2::new(s * (GOAL_AREA_X - 0.18), -side * 0.22);
+            let skill = self.commit(r.id, SkillId::GoTo, |_| true);
+            return SkillChoice::new(r.id, skill, pos);
         }
         // Atacando: posición de recepción/rebote detrás de la pelota, del lado
         // contrario al striker (o al lado libre si no hay striker).
@@ -626,6 +672,46 @@ mod tests {
         assert_eq!(choice_of(&ch, 2).target, ATTACK);
         assert!(c.in_own_area(Vec2::new(0.70, 0.1)));
         assert!(!c.in_own_area(Vec2::new(-0.70, 0.1)));
+    }
+
+    #[test]
+    fn striker_drives_along_side_wall_instead_of_aiming_at_goal() {
+        let c = coach();
+        let ball = Vec2::new(0.0, 0.58);
+        let t = c.striker_target(ball, &[]);
+        assert!(t.x > ball.x, "debe empujar hacia adelante: {t:?}");
+        assert!(t.y > 0.0 && t.y < ball.y, "ángulo suave hacia adentro: {t:?}");
+        // Sin pared: apunta al arco.
+        assert_eq!(c.striker_target(Vec2::new(0.0, 0.2), &[]), ATTACK);
+    }
+
+    #[test]
+    fn attacking_corner_pulls_ball_to_goal_front_and_support_waits_opposite() {
+        let mut c = coach();
+        let ball = Vec2::new(0.68, 0.58);
+        let t = c.striker_target(ball, &[]);
+        assert!(t.x < GOAL_AREA_X && t.x > 0.3, "al frente del arco: {t:?}");
+        assert!(t.y < 0.0, "hacia el lado contrario de la esquina: {t:?}");
+
+        let o = obs(
+            ball,
+            Vec2::ZERO,
+            [Vec2::new(0.60, 0.50), Vec2::new(0.2, 0.0), Vec2::new(-0.63, 0.0)],
+        );
+        let ch = c.decide(&o);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        let sup = choice_of(&ch, 1);
+        assert_eq!(sup.skill_id, SkillId::GoTo);
+        assert!(sup.target.y < 0.0, "support del lado contrario: {:?}", sup.target);
+        assert!(sup.target.x < GOAL_AREA_X, "support fuera del área rival: {:?}", sup.target);
+    }
+
+    #[test]
+    fn own_corner_clears_forward_along_wall() {
+        let c = coach();
+        let t = c.striker_target(Vec2::new(-0.68, -0.58), &[]);
+        assert!(t.x > -0.68, "despeje hacia adelante: {t:?}");
+        assert!(t.y < 0.0, "por la misma banda: {t:?}");
     }
 
     #[test]
