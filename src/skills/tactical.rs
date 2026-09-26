@@ -72,18 +72,6 @@ pub fn choose_face(theta: f64, dir: Vec2, motion: &Motion) -> Face {
     }
 }
 
-/// Error angular entre el heading del robot y `dir`, plegado a ±90° si el
-/// motion es bidireccional (la espalda alinea igual que el frente).
-fn heading_error_to(theta: f64, dir: Vec2, motion: &Motion) -> f64 {
-    let desired = (dir.y as f64).atan2(dir.x as f64);
-    let err = Motion::normalize_angle(desired - theta);
-    if motion.config.bidirectional {
-        Motion::fold_bidirectional(err)
-    } else {
-        err
-    }
-}
-
 fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
@@ -172,10 +160,6 @@ impl ApproachAlignedSkill {
             offset -= 0.02;
         }
         Some(clamp_to_logical_field(ball - dir * 0.08))
-    }
-
-    fn aligned(&self, robot: &RobotState, dir: Vec2, motion: &Motion) -> bool {
-        heading_error_to(robot.orientation, dir, motion).abs() <= self.angle_tol
     }
 }
 
