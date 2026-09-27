@@ -88,7 +88,22 @@ pub struct HeuristicCoach {
     referee: Option<SharedReferee>,
     /// Play vigente (derivada del último comando del árbitro).
     current_play: Play,
+    /// Últimos scores del striker (skill, score) — para logs/GUI y tests.
+    last_scores: [(SkillId, f32); 5],
 }
+
+fn clamp01(x: f32) -> f32 {
+    x.clamp(0.0, 1.0)
+}
+
+/// Opciones que compiten por el striker (orden fijo de `last_scores`).
+pub const STRIKER_OPTIONS: [SkillId; 5] = [
+    SkillId::ShootPush,
+    SkillId::Clear,
+    SkillId::SpinKick,
+    SkillId::Intercept,
+    SkillId::ApproachAligned,
+];
 
 impl HeuristicCoach {
     /// Coach de producción: parámetros del JSON vigente y modo de dos caras según
@@ -124,8 +139,20 @@ impl HeuristicCoach {
             ball_in_area_since: None,
             referee: None,
             current_play: Play::Open,
+            last_scores: [
+                (SkillId::ShootPush, 0.0),
+                (SkillId::Clear, 0.0),
+                (SkillId::SpinKick, 0.0),
+                (SkillId::Intercept, 0.0),
+                (SkillId::ApproachAligned, 0.0),
+            ],
             p,
         }
+    }
+
+    /// Scores de la última decisión del striker, en el orden de `STRIKER_OPTIONS`.
+    pub fn last_striker_scores(&self) -> &[(SkillId, f32); 5] {
+        &self.last_scores
     }
 
     /// Conecta el estado del árbitro (listener de `coach::referee`).
@@ -344,48 +371,131 @@ impl HeuristicCoach {
 
     // ── Tácticas ─────────────────────────────────────────────────────────────
 
-    fn striker_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
-        let target = self.striker_target(ball, opp);
-        let s = self.attack_sign();
+    /// `true` si un rival está sobre el segmento pelota→objetivo (tapa el tiro).
+    fn shot_blocked(ball: Vec2, target: Vec2, opp: &[RobotView]) -> bool {
+        let seg = target - ball;
+        let len = seg.length();
+        if len < 1e-3 {
+            return false;
+        }
+        let dir = seg / len;
+        opp.iter().filter(|o| o.active).any(|o| {
+            let rel = o.pos - ball;
+            let along = rel.dot(dir);
+            let lateral = (rel - dir * along).length();
+            along > 0.05 && along < len && lateral < 0.09
+        })
+    }
 
-        let shoot_ok = shoot_push_feasible_now(r.pos, ball, target);
+    /// Scores de viabilidad 0..1 de cada opción del striker (estilo TIGERs:
+    /// puntajes hechos a mano, ajustables sin reescribir reglas). Orden =
+    /// `STRIKER_OPTIONS`.
+    fn striker_scores(
+        &self,
+        r: &RobotView,
+        ball: Vec2,
+        ball_vel: Vec2,
+        opp: &[RobotView],
+        target: Vec2,
+    ) -> [(SkillId, f32); 5] {
+        let p = &self.p;
+        let s = self.attack_sign();
+        let sp = &params().skills;
         let ball_speed = ball_vel.length();
         let dist_ball = (ball - r.pos).length();
-        let intercept_min_speed = self.p.intercept_min_ball_speed;
-        let ball_coming = ball_speed >= intercept_min_speed
-            && (r.pos - ball).normalize_or_zero().dot(ball_vel.normalize_or_zero()) > 0.3;
-
-        // SpinKick: pelota disputada (rival encima) o en el fondo/esquina, quieta,
-        // con el robot cerca y sin poder ponerse detrás para empujar.
-        let opp_on_ball = opp
+        let min_opp_dist = opp
             .iter()
             .filter(|o| o.active)
-            .any(|o| (o.pos - ball).length() < self.p.spin_when_opponent_within);
-        let spin_engage = self.p.spin_engage_radius;
-        let spin_ok = !shoot_ok
-            && dist_ball <= spin_engage
-            && ball_speed < intercept_min_speed
-            && (opp_on_ball || self.ball_on_end_wall(ball));
+            .map(|o| (o.pos - ball).length())
+            .fold(f32::INFINITY, f32::min);
 
-        // Fondo propio: despeje (aproximación + empuje en una skill, tolerancias amplias).
-        let defensive_third = self.in_own_half(ball) && (ball.x * -s) > 0.35;
-
-        let wanted = if spin_ok {
-            SkillId::SpinKick
-        } else if defensive_third && !ball_coming {
-            SkillId::Clear
-        } else if shoot_ok {
-            SkillId::ShootPush
-        } else if ball_coming {
-            SkillId::Intercept
+        // ShootPush: factible (detrás y cerca) × alineación con la línea de empuje,
+        // penalizado si un rival tapa el tiro.
+        let shoot = if shoot_push_feasible_now(r.pos, ball, target) {
+            let dir = (target - ball).normalize_or_zero();
+            let rel = r.pos - ball;
+            let lateral = (rel - dir * rel.dot(dir)).length();
+            let align = clamp01(1.0 - lateral / 0.10);
+            let blocked = if Self::shot_blocked(ball, target, opp) {
+                p.score_shot_blocked_factor
+            } else {
+                1.0
+            };
+            (0.6 + 0.4 * align) * blocked
         } else {
-            SkillId::ApproachAligned
+            0.0
         };
-        let skill = self.commit(r.id, wanted, |prev| match prev {
-            SkillId::ShootPush => shoot_ok,
-            SkillId::Intercept => ball_speed >= intercept_min_speed * 0.5,
-            SkillId::SpinKick => dist_ball <= spin_engage * 1.5,
-            _ => true,
+
+        // Clear: cuanto más cerca de nuestro arco está la pelota y más presión
+        // rival hay, más urge sacarla. Cero en campo rival.
+        let depth = ball.x * -s; // distancia "hacia nuestro arco" desde el centro
+        let danger = clamp01((depth - p.clear_zone_start_x) / (p.clear_zone_full_x - p.clear_zone_start_x).max(1e-3));
+        let pressure = clamp01(1.0 - min_opp_dist / 0.30);
+        let clear = if self.in_own_half(ball) { danger * (0.6 + 0.4 * pressure) } else { 0.0 };
+
+        // SpinKick: pelota quieta y disputada (rival encima) o en el fondo/esquina,
+        // con el robot cerca; pierde valor si igual se puede empujar.
+        let close = clamp01(1.0 - (dist_ball - 0.08) / p.spin_engage_radius.max(1e-3));
+        let slow: f32 = if ball_speed < p.intercept_min_ball_speed { 1.0 } else { 0.0 };
+        let contested: f32 = if min_opp_dist < p.spin_when_opponent_within { 1.0 } else { 0.0 };
+        let wall: f32 = if self.ball_on_end_wall(ball) {
+            1.0
+        } else if self.ball_on_side_wall(ball) {
+            0.5
+        } else {
+            0.0
+        };
+        let spin = close * slow * contested.max(wall) * if shoot > 0.0 { 0.3 } else { 1.0 };
+
+        // Intercept: pelota rápida y viniendo hacia el robot.
+        let vmin = p.intercept_min_ball_speed.max(1e-3);
+        let speed_term = clamp01((ball_speed - 0.5 * vmin) / vmin);
+        let coming = clamp01((r.pos - ball).normalize_or_zero().dot(ball_vel.normalize_or_zero()));
+        let intercept = speed_term * coming;
+
+        // ApproachAligned: fallback con score base (las demás deben superarlo); algo
+        // menos atractivo si el staging está lejos (la pelota "se va").
+        let staging_far = clamp01(dist_ball / (2.0 * sp.approach_staging_offset + 0.6));
+        let approach = p.score_approach_base * (1.0 - 0.3 * staging_far);
+
+        [
+            (SkillId::ShootPush, clamp01(shoot)),
+            (SkillId::Clear, clamp01(clear)),
+            (SkillId::SpinKick, clamp01(spin)),
+            (SkillId::Intercept, clamp01(intercept)),
+            (SkillId::ApproachAligned, clamp01(approach)),
+        ]
+    }
+
+    /// Elige la opción de mayor score con histéresis: la opción vigente (si sigue
+    /// viable) recibe `score_hysteresis` de bono.
+    fn pick_with_hysteresis(&self, scores: &[(SkillId, f32); 5], current: Option<SkillId>) -> SkillId {
+        let mut best = SkillId::ApproachAligned;
+        let mut best_score = f32::NEG_INFINITY;
+        for (skill, score) in scores {
+            let bonus = if Some(*skill) == current && *score > 0.0 {
+                self.p.score_hysteresis
+            } else {
+                0.0
+            };
+            let v = score + bonus;
+            if v > best_score {
+                best = *skill;
+                best_score = v;
+            }
+        }
+        best
+    }
+
+    fn striker_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
+        let target = self.striker_target(ball, opp);
+        let scores = self.striker_scores(r, ball, ball_vel, opp, target);
+        self.last_scores = scores;
+        let current = self.committed[r.id as usize].map(|c| c.skill);
+        let wanted = self.pick_with_hysteresis(&scores, current);
+        // Compromiso mínimo: la opción vigente se mantiene mientras siga viable (score > 0).
+        let skill = self.commit(r.id, wanted, |prev| {
+            scores.iter().any(|(s, v)| *s == prev && *v > 0.0)
         });
         SkillChoice::new(r.id, skill, target)
     }
@@ -1081,6 +1191,68 @@ mod tests {
             assert!(choice_of(&ch, id).target.x < 0.0, "{:?}", choice_of(&ch, id));
         }
         assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+    }
+
+    fn score_of(c: &HeuristicCoach, skill: SkillId) -> f32 {
+        c.last_striker_scores().iter().find(|(s, _)| *s == skill).map(|(_, v)| *v).unwrap()
+    }
+
+    #[test]
+    fn scores_rank_options_as_expected() {
+        let mut c = coach();
+        // Detrás de la pelota, alineado, tiro libre: ShootPush ≈ 1 y gana.
+        let o = obs(
+            Vec2::new(0.2, 0.0),
+            Vec2::ZERO,
+            [Vec2::new(0.08, 0.0), Vec2::new(-0.5, 0.3), Vec2::new(-0.63, 0.0)],
+        );
+        let ch = c.decide(&o);
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::ShootPush);
+        assert!(score_of(&c, SkillId::ShootPush) > 0.95);
+        assert!(score_of(&c, SkillId::Intercept) == 0.0 && score_of(&c, SkillId::Clear) == 0.0);
+
+        // Mismo caso con un rival tapando el tiro: baja pero sigue ganándole al approach.
+        let mut c = coach();
+        let mut o2 = o.clone();
+        o2.opp_robots[0] = robot(Vec2::new(0.45, 0.02), 180.0);
+        c.decide(&o2);
+        let blocked = score_of(&c, SkillId::ShootPush);
+        assert!(blocked < 0.95 && blocked > score_of(&c, SkillId::ApproachAligned), "{blocked}");
+
+        // Pelota en nuestro fondo con presión rival: Clear domina.
+        let mut c = coach();
+        let mut o3 = obs(
+            Vec2::new(-0.55, 0.1),
+            Vec2::ZERO,
+            [Vec2::new(-0.35, 0.1), Vec2::new(0.3, -0.3), Vec2::new(-0.63, 0.0)],
+        );
+        o3.opp_robots[0] = robot(Vec2::new(-0.45, 0.15), 180.0);
+        let ch = c.decide(&o3);
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::Clear);
+        // danger 0.875 × (0.6 + 0.4·presión 0.63) ≈ 0.75
+        assert!(score_of(&c, SkillId::Clear) > 0.6, "{}", score_of(&c, SkillId::Clear));
+    }
+
+    #[test]
+    fn hysteresis_keeps_current_option_when_scores_are_close() {
+        let c = coach();
+        let scores = [
+            (SkillId::ShootPush, 0.50),
+            (SkillId::Clear, 0.0),
+            (SkillId::SpinKick, 0.60),
+            (SkillId::Intercept, 0.0),
+            (SkillId::ApproachAligned, 0.30),
+        ];
+        // Sin opción vigente gana la mayor.
+        assert_eq!(c.pick_with_hysteresis(&scores, None), SkillId::SpinKick);
+        // Con ShootPush vigente y diferencia < histéresis (0.15), se mantiene.
+        assert_eq!(c.pick_with_hysteresis(&scores, Some(SkillId::ShootPush)), SkillId::ShootPush);
+        // Diferencia mayor que la histéresis: cambia.
+        let mut far = scores;
+        far[2].1 = 0.80;
+        assert_eq!(c.pick_with_hysteresis(&far, Some(SkillId::ShootPush)), SkillId::SpinKick);
+        // Una opción vigente con score 0 no recibe bono.
+        assert_eq!(c.pick_with_hysteresis(&scores, Some(SkillId::Intercept)), SkillId::SpinKick);
     }
 
     #[test]

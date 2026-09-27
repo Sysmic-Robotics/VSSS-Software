@@ -15,7 +15,12 @@
     "spin_engage_radius": 0.25,
     "spin_when_opponent_within": 0.1,
     "gk_force_clear_s": 6.0,
-    "mark_distance": 0.15
+    "mark_distance": 0.15,
+    "score_hysteresis": 0.15,
+    "score_approach_base": 0.3,
+    "score_shot_blocked_factor": 0.6,
+    "clear_zone_start_x": 0.2,
+    "clear_zone_full_x": 0.6
   },
   "skills": {
     "approach_staging_offset": 0.14,

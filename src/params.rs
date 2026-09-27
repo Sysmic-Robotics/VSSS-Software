@@ -57,6 +57,18 @@ pub struct CoachParams {
     pub gk_force_clear_s: f32,
     /// Distancia del punto de marca al rival marcado, hacia nuestro arco (m).
     pub mark_distance: f32,
+    /// Bono de score a la opción vigente del striker (histéresis: otra opción
+    /// debe superarla por más que esto para reemplazarla).
+    pub score_hysteresis: f32,
+    /// Score base de `ApproachAligned` (fallback): las demás deben superarlo.
+    pub score_approach_base: f32,
+    /// Factor al score de `ShootPush` cuando un rival tapa la línea de tiro.
+    pub score_shot_blocked_factor: f32,
+    /// Distancia a nuestro arco (|x| desde el centro) desde la que empieza a
+    /// puntuar `Clear` (m)…
+    pub clear_zone_start_x: f32,
+    /// …y desde la que puntúa al máximo (m).
+    pub clear_zone_full_x: f32,
 }
 
 impl Default for CoachParams {
@@ -78,6 +90,11 @@ impl Default for CoachParams {
             spin_when_opponent_within: 0.10,
             gk_force_clear_s: 6.0,
             mark_distance: 0.15,
+            score_hysteresis: 0.15,
+            score_approach_base: 0.30,
+            score_shot_blocked_factor: 0.6,
+            clear_zone_start_x: 0.20,
+            clear_zone_full_x: 0.60,
         }
     }
 }
