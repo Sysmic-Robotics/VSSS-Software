@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod config;
 pub mod tactical;
+pub mod zones;
 
 pub use catalog::{SkillCatalog, SkillId};
 pub use config::SkillConfig;

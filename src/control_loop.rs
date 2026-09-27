@@ -513,6 +513,12 @@ pub async fn run_control_loop(
     }
     let motion = Motion::with_config(motion_cfg);
     let mut catalog = SkillCatalog::new(config.num_robots);
+    // Reglamento §9.5 como restricción dura: solo el arquero en el área propia,
+    // un solo atacante en el área rival (ver `skills::zones`).
+    let zone_guard = crate::skills::zones::ZoneGuard::new(
+        crate::skills::zones::attack_sign_from_env(config.own_team),
+        crate::params::params().coach.keeper_id,
+    );
     let mut field_scale_warned = false;
     let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
@@ -615,6 +621,7 @@ pub async fn run_control_loop(
                 let manual_keys: std::collections::HashSet<(i32, i32)> =
                     manual_state.keys().copied().collect();
                 recovery.guard_commands(&mut cmds, &world_guard, &manual_keys, config.own_team);
+                zone_guard.guard_commands(&mut cmds, &world_guard, config.own_team, &manual_keys);
                 (cmds, tgts, applied)
             }
         };

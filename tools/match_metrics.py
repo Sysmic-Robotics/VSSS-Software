@@ -155,6 +155,7 @@ def analyze(path: str) -> dict:
         if striker_now is not None:
             last_striker = striker_now
 
+    rules = audit_rules(ticks, own_team, attack_sign)
     own_touches = sum(v for (t, _), v in touches.items() if t == own_team)
     opp_touches = sum(v for (t, _), v in touches.items() if t != own_team)
     total_skill = sum(skill_ticks.values()) or 1
@@ -180,6 +181,76 @@ def analyze(path: str) -> dict:
         "atascado_pct_por_robot": {
             str(i): round(100 * stuck_ticks[i] / cmd_ticks[i], 1) for i in sorted(cmd_ticks) if cmd_ticks[i]
         },
+        **rules,
+    }
+
+
+AREA_X = 0.60
+AREA_HALF_Y = 0.35
+RETENTION_TICKS = 600  # 10 s a 60 Hz
+
+
+def in_area(p, side):
+    """Centro del robot/pelota dentro del área del arco del lado `side` (signo de x)."""
+    return p[0] * side >= AREA_X and abs(p[1]) <= AREA_HALF_Y
+
+
+def audit_rules(ticks, own_team, attack_sign) -> dict:
+    """Auditor de reglas (LARC 2026 §9.4-9.5) sobre el registro, para ambos equipos.
+
+    Faltas de área: jugador de campo (no arquero) dentro del área propia; dos o más
+    atacantes dentro del área rival; retención: pelota más de 10 s dentro del área.
+    El arquero propio es el robot con skill `goalkeep` (o el más cercano al arco);
+    el rival, su robot más cercano a su arco.
+    """
+    own_side, opp_side = -attack_sign, attack_sign
+    own_goal = (own_side * 0.75, 0.0)
+    opp_goal = (opp_side * 0.75, 0.0)
+    stats = {
+        "own_area_ticks": 0, "own_area_episodes": 0,
+        "own_double_ticks": 0, "own_retention_episodes": 0,
+        "opp_area_ticks": 0, "opp_area_episodes": 0,
+        "opp_double_ticks": 0, "opp_retention_episodes": 0,
+    }
+    prev = {"own_area": False, "opp_area": False}
+    ball_in_own = ball_in_opp = 0
+    for e in ticks:
+        own = [r for r in e["robots"] if r["own"] and r["pos"][0] is not None]
+        opp = [r for r in e["robots"] if not r["own"] and r["pos"][0] is not None]
+        if not own or not opp:
+            continue
+        keeper = next((r for r in own if r["skill"] == "goalkeep"), None) or min(own, key=lambda r: dist(r["pos"], own_goal))
+        opp_keeper = min(opp, key=lambda r: dist(r["pos"], opp_goal))
+        own_field_in = [r for r in own if r is not keeper and in_area(r["pos"], own_side)]
+        opp_field_in = [r for r in opp if r is not opp_keeper and in_area(r["pos"], opp_side)]
+        own_attackers_in = [r for r in own if in_area(r["pos"], opp_side)]
+        opp_attackers_in = [r for r in opp if in_area(r["pos"], own_side)]
+        for key, cond in (("own_area", bool(own_field_in)), ("opp_area", bool(opp_field_in))):
+            if cond:
+                stats[key + "_ticks"] += 1
+                if not prev[key]:
+                    stats[key + "_episodes"] += 1
+            prev[key] = cond
+        if len(own_attackers_in) >= 2:
+            stats["own_double_ticks"] += 1
+        if len(opp_attackers_in) >= 2:
+            stats["opp_double_ticks"] += 1
+        bx, by = e["ball"][0], e["ball"][1]
+        ball_in_own = ball_in_own + 1 if in_area((bx, by), own_side) else 0
+        ball_in_opp = ball_in_opp + 1 if in_area((bx, by), opp_side) else 0
+        if ball_in_own == RETENTION_TICKS:
+            stats["own_retention_episodes"] += 1
+        if ball_in_opp == RETENTION_TICKS:
+            stats["opp_retention_episodes"] += 1
+    n = max(len(ticks), 1)
+    return {
+        "faltas_area_propia_episodios": stats["own_area_episodes"],
+        "faltas_area_propia_pct": round(100 * stats["own_area_ticks"] / n, 2),
+        "doble_atacante_area_rival_pct": round(100 * stats["own_double_ticks"] / n, 2),
+        "retencion_10s_episodios": stats["own_retention_episodes"],
+        "rival_faltas_area_propia_episodios": stats["opp_area_episodes"],
+        "rival_doble_atacante_pct": round(100 * stats["opp_double_ticks"] / n, 2),
+        "rival_retencion_10s_episodios": stats["opp_retention_episodes"],
     }
 
 
@@ -189,6 +260,9 @@ def print_table(results: list[dict]) -> None:
         "posesion_rival_pct", "pelota_libre_pct", "toques_propios", "toques_rival",
         "dist_media_al_balon_m", "pelota_en_campo_propio_pct", "pelota_en_pared_pct",
         "cambios_de_striker_por_min",
+        "faltas_area_propia_episodios", "faltas_area_propia_pct", "doble_atacante_area_rival_pct",
+        "retencion_10s_episodios", "rival_faltas_area_propia_episodios", "rival_doble_atacante_pct",
+        "rival_retencion_10s_episodios",
     ]
     width = max(len(k) for k in keys) + 2
     header = " " * width + "".join(f"{r['archivo'][-28:]:>30}" for r in results)

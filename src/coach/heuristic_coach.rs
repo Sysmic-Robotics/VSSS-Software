@@ -738,11 +738,19 @@ impl Coach for HeuristicCoach {
 
         self.assign_roles(&own, ball);
         let striker = self.striker_id.and_then(|id| own.iter().find(|r| r.id == id).copied());
+        // Pelota dentro del área propia con arquero activo: la despeja él (§9.5,
+        // solo un robot en el área); los de campo cubren la línea desde afuera.
+        let keeper_active = own.iter().any(|r| r.active && r.id == self.keeper_id);
+        let ball_in_own_area = self.in_own_area(ball) && keeper_active;
 
         let mut choices = Vec::with_capacity(3);
         for r in own.iter().filter(|r| r.active) {
             let choice = match self.role_of(r.id) {
                 Some(Role::Keeper) => self.keeper_choice(r, ball, ball_vel),
+                Some(Role::Striker) if ball_in_own_area => {
+                    let skill = self.commit(r.id, SkillId::BlockLine, |_| true);
+                    SkillChoice::new(r.id, skill, self.own_goal)
+                }
                 Some(Role::Striker) => self.striker_choice(r, ball, ball_vel, &opp),
                 _ => self.support_choice(r, ball, striker.as_ref(), &opp),
             };
@@ -925,6 +933,28 @@ mod tests {
         assert_eq!(gk.skill_id, SkillId::Clear);
         assert!(gk.target.x > -0.62, "despeje hacia adelante: {:?}", gk.target);
         assert!(gk.target.y > 0.0, "despeje al lado de la pelota");
+    }
+
+    #[test]
+    fn field_players_stay_out_when_ball_is_in_own_area() {
+        let mut c = coach();
+        // Pelota quieta dentro del área propia: arquero despeja, striker cubre la
+        // línea desde afuera en vez de entrar (falta de área).
+        let o = obs(
+            Vec2::new(-0.64, 0.05),
+            Vec2::ZERO,
+            [Vec2::new(-0.45, 0.05), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)],
+        );
+        let ch = c.decide(&o);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::BlockLine);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::Clear);
+        // Sin arquero activo, el striker sí va por la pelota.
+        let mut o2 = o.clone();
+        o2.own_robots[2] = RobotObs::default();
+        let mut c2 = coach();
+        let ch2 = c2.decide(&o2);
+        assert_ne!(choice_of(&ch2, 0).skill_id, SkillId::BlockLine);
     }
 
     #[test]

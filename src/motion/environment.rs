@@ -119,6 +119,34 @@ mod tests {
         assert!(!env.collides(Vec2::new(0.3, 0.2)));
     }
 
+    /// Identificación de objetos para el path planning: en un 3v3 completo, el
+    /// entorno de un robot contiene a los OTROS cinco robots activos (ambos
+    /// equipos) y la pelota, nunca a sí mismo ni a robots no detectados.
+    #[test]
+    fn environment_sees_all_other_active_robots_and_the_ball() {
+        let mut world = World::new(3, 3);
+        for id in 0..3 {
+            // Firma de World: (id, team, ...).
+            world.update_robot(id, 0, Vec2::new(-0.3, id as f32 * 0.2), 0.0, Vec2::ZERO, 0.0);
+            world.update_robot(id, 1, Vec2::new(0.3, id as f32 * 0.2), 0.0, Vec2::ZERO, 0.0);
+        }
+        world.update_ball(Vec2::new(0.1, -0.1), Vec2::ZERO);
+        let me = world.get_robot_state(1, 0).unwrap().clone(); // azul 1
+        let env = Environment::new(&world, &me);
+        assert_eq!(env.get_robots().len(), 5);
+        assert!(!env.get_robots().contains(&me.position), "no se incluye a sí mismo");
+        assert!(env.get_robots().contains(&Vec2::new(0.3, 0.4)), "incluye rivales");
+        assert_eq!(env.get_ball_position(), Vec2::new(0.1, -0.1));
+        assert!(env.collides(Vec2::new(0.3, 0.0)), "un rival es obstáculo");
+        assert!(env.collides(Vec2::new(0.1, -0.1)), "la pelota es obstáculo");
+        // Robot inactivo (nunca detectado) no aparece.
+        let mut partial = World::new(3, 3);
+        partial.update_robot(0, 0, Vec2::new(-0.3, 0.0), 0.0, Vec2::ZERO, 0.0); // azul 0 (yo)
+        partial.update_robot(0, 1, Vec2::new(0.3, 0.0), 0.0, Vec2::ZERO, 0.0); // amarillo 0
+        let me = partial.get_robot_state(0, 0).unwrap().clone();
+        assert_eq!(Environment::new(&partial, &me).get_robots().len(), 1);
+    }
+
     #[test]
     fn test_environment_collides_outside_logical_field() {
         let mut world = World::new(3, 3);

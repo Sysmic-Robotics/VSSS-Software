@@ -50,18 +50,7 @@ impl TickDecider for NoOpDecider {
 /// propio arco y en FIRASim los robots terminan cruzando el arco rival a toda
 /// velocidad y rompiendo la física.
 fn goals_for_team(own_team: i32) -> (Vec2, Vec2) {
-    let side = std::env::var("VSSL_SIDE")
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    let defend_left = match side.as_str() {
-        "left" | "izquierda" | "izq" => true,
-        "right" | "derecha" | "der" => false,
-        "" => own_team == 0,
-        other => {
-            eprintln!("[main] VSSL_SIDE='{other}' inválido (left|right); usando el default del color");
-            own_team == 0
-        }
-    };
+    let defend_left = rustengine::skills::zones::defend_left_from_env(own_team);
     eprintln!(
         "[main] lado propio: {} (VSSL_SIDE) → atacamos hacia {}",
         if defend_left { "izquierdo" } else { "derecho" },
