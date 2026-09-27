@@ -69,6 +69,10 @@ pub struct CoachParams {
     pub clear_zone_start_x: f32,
     /// …y desde la que puntúa al máximo (m).
     pub clear_zone_full_x: f32,
+    /// Adaptación por contadores (éxito de tiro por carril, disputas) encendida.
+    pub adapt_enabled: bool,
+    /// Peso de cada observación nueva en las tasas adaptativas (0..1).
+    pub adapt_alpha: f32,
 }
 
 impl Default for CoachParams {
@@ -95,6 +99,8 @@ impl Default for CoachParams {
             score_shot_blocked_factor: 0.6,
             clear_zone_start_x: 0.20,
             clear_zone_full_x: 0.60,
+            adapt_enabled: true,
+            adapt_alpha: 0.3,
         }
     }
 }

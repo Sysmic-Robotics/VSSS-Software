@@ -1,3 +1,4 @@
+pub mod adaptation;
 mod coach_trait;
 pub mod heuristic_coach;
 mod observation;

@@ -22,6 +22,7 @@
 //!
 //! El coach solo ve `Observation` (contrato del engine); no toca motion ni radio.
 
+use crate::coach::adaptation::{Adaptation, Lane};
 use crate::coach::coach_trait::Coach;
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation, RobotObs};
 use crate::coach::plays::{Play, formation};
@@ -90,6 +91,8 @@ pub struct HeuristicCoach {
     current_play: Play,
     /// Últimos scores del striker (skill, score) — para logs/GUI y tests.
     last_scores: [(SkillId, f32); 5],
+    /// Contadores de adaptación al rival (éxito de tiro por carril, disputas).
+    pub adaptation: Adaptation,
 }
 
 fn clamp01(x: f32) -> f32 {
@@ -146,6 +149,7 @@ impl HeuristicCoach {
                 (SkillId::Intercept, 0.0),
                 (SkillId::ApproachAligned, 0.0),
             ],
+            adaptation: Adaptation::new(p.adapt_enabled, p.adapt_alpha),
             p,
         }
     }
@@ -299,11 +303,12 @@ impl HeuristicCoach {
                     .partial_cmp(&(b.pos - self.attack_goal).length())
                     .unwrap()
             });
+        let post_y = GOAL_HALF_Y - 0.06;
         match keeper {
-            Some(k) if k.pos.y.abs() > 0.03 => {
-                Vec2::new(self.attack_goal.x, -k.pos.y.signum() * (GOAL_HALF_Y - 0.06))
-            }
-            _ => self.attack_goal,
+            Some(k) if k.pos.y.abs() > 0.03 => Vec2::new(self.attack_goal.x, -k.pos.y.signum() * post_y),
+            // Sin arquero rival visible: al centro, salvo que los contadores digan
+            // que por el centro no está entrando y otro carril rinde mejor.
+            _ => Vec2::new(self.attack_goal.x, self.adaptation.preferred_aim_y(0.0, post_y)),
         }
     }
 
@@ -421,7 +426,8 @@ impl HeuristicCoach {
             } else {
                 1.0
             };
-            (0.6 + 0.4 * align) * blocked
+            let lane = Lane::of(ball.y, self.adaptation.lane_half_width);
+            (0.6 + 0.4 * align) * blocked * self.adaptation.shot_factor(lane)
         } else {
             0.0
         };
@@ -445,7 +451,11 @@ impl HeuristicCoach {
         } else {
             0.0
         };
-        let spin = close * slow * contested.max(wall) * if shoot > 0.0 { 0.3 } else { 1.0 };
+        let spin = close
+            * slow
+            * contested.max(wall)
+            * if shoot > 0.0 { 0.3 } else { 1.0 }
+            * self.adaptation.spin_factor();
 
         // Intercept: pelota rápida y viniendo hacia el robot.
         let vmin = p.intercept_min_ball_speed.max(1e-3);
@@ -711,6 +721,33 @@ impl Coach for HeuristicCoach {
                 _ => self.support_choice(r, ball, striker.as_ref(), &opp),
             };
             choices.push(choice);
+        }
+
+        // Contadores de adaptación: qué eligió el striker y quién está sobre la pelota.
+        let striker_skill = self
+            .striker_id
+            .and_then(|id| choices.iter().find(|c| c.robot_id == id))
+            .map(|c| c.skill_id);
+        let nearest = |robots: &[RobotView]| {
+            robots
+                .iter()
+                .filter(|r| r.active)
+                .map(|r| (r.pos - ball).length())
+                .fold(f32::INFINITY, f32::min)
+        };
+        let s = self.attack_sign();
+        self.adaptation.observe(
+            self.decision_count,
+            ball,
+            ball_vel,
+            s,
+            striker_skill == Some(SkillId::ShootPush),
+            striker_skill == Some(SkillId::SpinKick),
+            nearest(&own),
+            nearest(&opp),
+        );
+        if self.decision_count.is_multiple_of(600) && self.adaptation.enabled {
+            eprintln!("[coach] adaptación: {}", self.adaptation.summary());
         }
         // Robots inactivos: olvidar su compromiso para que arranquen limpios.
         for r in own.iter().filter(|r| !r.active) {
@@ -1253,6 +1290,56 @@ mod tests {
         assert_eq!(c.pick_with_hysteresis(&far, Some(SkillId::ShootPush)), SkillId::SpinKick);
         // Una opción vigente con score 0 no recibe bono.
         assert_eq!(c.pick_with_hysteresis(&scores, Some(SkillId::Intercept)), SkillId::SpinKick);
+    }
+
+    #[test]
+    fn failed_shots_lower_shoot_score_and_move_aim() {
+        let mut c = coach();
+        let behind = obs(
+            Vec2::new(0.2, 0.0),
+            Vec2::ZERO,
+            [Vec2::new(0.08, 0.0), Vec2::new(-0.5, 0.3), Vec2::new(-0.63, 0.0)],
+        );
+        c.decide(&behind);
+        let before = score_of(&c, SkillId::ShootPush);
+        assert_eq!(choice_of(&c.decide(&behind), 0).target, ATTACK);
+
+        // Tres tiros por el centro que un rival toca de inmediato.
+        for _ in 0..3 {
+            c.decide(&behind); // arranca episodio de tiro (ShootPush)
+            let mut touched = behind.clone();
+            touched.opp_robots[0] = robot(Vec2::new(0.24, 0.0), 180.0); // rival sobre la pelota
+            c.decide(&touched); // cierra el episodio como fallo
+            // Estado limpio para el siguiente intento (sin rival, robot detrás).
+            let reset = obs(
+                Vec2::new(-0.3, 0.0),
+                Vec2::ZERO,
+                [Vec2::new(-0.5, 0.0), Vec2::new(-0.5, 0.3), Vec2::new(-0.63, 0.0)],
+            );
+            for _ in 0..4 {
+                c.decide(&reset);
+            }
+        }
+        assert!(c.adaptation.shot_rate(Lane::Center).samples >= 3);
+        assert!(c.adaptation.shot_rate(Lane::Center).value < 0.35);
+        // Un éxito por arriba hace que el centro deje de ser el objetivo.
+        let up = obs(
+            Vec2::new(0.2, 0.3),
+            Vec2::ZERO,
+            [Vec2::new(0.08, 0.3), Vec2::new(-0.5, -0.3), Vec2::new(-0.63, 0.0)],
+        );
+        c.decide(&up);
+        let scored = obs(
+            Vec2::new(0.66, 0.15),
+            Vec2::new(0.9, 0.0),
+            [Vec2::new(0.3, 0.3), Vec2::new(-0.5, -0.3), Vec2::new(-0.63, 0.0)],
+        );
+        c.decide(&scored);
+        assert_eq!(c.adaptation.last_outcome(), Some(("tiro", true)));
+        c.decide(&behind);
+        let after = score_of(&c, SkillId::ShootPush);
+        assert!(after < before, "score de tiro por el centro debe bajar: {before} → {after}");
+        assert!(choice_of(&c.decide(&behind), 0).target.y > 0.0, "apunta al palo superior");
     }
 
     #[test]

@@ -20,7 +20,9 @@
     "score_approach_base": 0.3,
     "score_shot_blocked_factor": 0.6,
     "clear_zone_start_x": 0.2,
-    "clear_zone_full_x": 0.6
+    "clear_zone_full_x": 0.6,
+    "adapt_enabled": true,
+    "adapt_alpha": 0.3
   },
   "skills": {
     "approach_staging_offset": 0.14,
