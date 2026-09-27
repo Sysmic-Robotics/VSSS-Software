@@ -141,6 +141,7 @@ pub fn skill_label(s: Option<SkillId>) -> &'static str {
         Some(SkillId::Clear) => "clear",
         Some(SkillId::SpinKick) => "spinkick",
         Some(SkillId::Mark) => "mark",
+        Some(SkillId::Hold) => "hold",
         None => "",
     }
 }

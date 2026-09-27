@@ -26,7 +26,7 @@ use crate::motion::{Motion, MotionCommand};
 use crate::skills::{
     ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, ClearSkill, DefendGoalLineSkill,
     FacePointSkill, GoToSkill, InterceptSkill, MarkSkill, ShootPushSkill, Skill, SkillConfig,
-    SkillStatus, SpinKickSkill, SpinSkill,
+    SkillStatus, SpinKickSkill, SpinSkill, StopSkill,
 };
 use crate::world::{RobotState, World};
 use glam::Vec2;
@@ -65,12 +65,14 @@ pub enum SkillId {
     SpinKick = 10,
     /// Posicionamiento mirando a la pelota; `target` = punto (lo calcula la táctica).
     Mark = 11,
+    /// Quieto (STOP/HALT del árbitro). `target` ignorado.
+    Hold = 12,
 }
 
 impl SkillId {
     /// Cantidad de skills en el catálogo. Este es el tamaño del action space
     /// discreto que la policy debe respetar.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     /// Construye una `SkillId` a partir del entero que emite la policy.
     /// Retorna `None` si el id está fuera del rango del catálogo.
@@ -88,6 +90,7 @@ impl SkillId {
             9 => Some(Self::Clear),
             10 => Some(Self::SpinKick),
             11 => Some(Self::Mark),
+            12 => Some(Self::Hold),
             _ => None,
         }
     }
@@ -147,6 +150,7 @@ pub struct SkillCatalog {
     clear: Vec<ClearSkill>,
     spin_kick: Vec<SpinKickSkill>,
     mark: Vec<MarkSkill>,
+    hold: Vec<StopSkill>,
     config: SkillConfig,
 }
 
@@ -193,6 +197,7 @@ impl SkillCatalog {
             .map(|_| SpinKickSkill::new(Vec2::ZERO))
             .collect();
         let mark = (0..num_robots).map(|_| MarkSkill::new(Vec2::ZERO)).collect();
+        let hold = (0..num_robots).map(|_| StopSkill::new()).collect();
         Self {
             go_to,
             face_point,
@@ -206,6 +211,7 @@ impl SkillCatalog {
             clear,
             spin_kick,
             mark,
+            hold,
             config,
         }
     }
@@ -262,6 +268,7 @@ impl SkillCatalog {
                 s.set_point(target);
                 s.status(robot, world)
             }
+            SkillId::Hold => self.hold[robot_id].status(robot, world),
         }
     }
 
@@ -385,6 +392,7 @@ impl SkillCatalog {
                 skill.set_point(target);
                 skill.tick(robot, world, motion)
             }
+            SkillId::Hold => self.hold[robot_id].tick(robot, world, motion),
         }
     }
 }
@@ -428,6 +436,7 @@ mod tests {
             SkillId::Clear,
             SkillId::SpinKick,
             SkillId::Mark,
+            SkillId::Hold,
         ];
         assert_eq!(known.len(), SkillId::COUNT);
         for (i, id) in known.iter().enumerate() {

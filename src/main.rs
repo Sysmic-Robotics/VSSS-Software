@@ -15,7 +15,10 @@ const COACH_DECISION_PERIOD: u32 = 6;
 // ========================
 
 use glam::Vec2;
-use rustengine::coach::{Coach, HeuristicCoach, RuleBasedCoach, SkillChoice};
+use rustengine::coach::{
+    Coach, HeuristicCoach, RuleBasedCoach, SharedReferee, SkillChoice, new_shared_referee,
+    run_referee_listener,
+};
 use rustengine::control_loop::{
     CoachDecider, ControlLoopConfig, GuiChannels, GuiSkillCommand, HeadingPid, ManualCommand,
     TickDecider, run_control_loop,
@@ -55,16 +58,21 @@ fn goals_for_team(own_team: i32) -> (Vec2, Vec2) {
 ///   + tácticas sobre el catálogo completo, robot de dos caras).
 /// - `VSSL_COACH=rule_based`: baseline clásico de roles fijos (regresión).
 /// - `VSSL_COACH=none`: no emite decisiones (útil para test de visión/radio).
-fn make_coach(own_team: i32) -> Option<Box<dyn Coach>> {
+fn make_coach(own_team: i32, referee: &SharedReferee) -> Option<Box<dyn Coach>> {
     let kind = std::env::var("VSSL_COACH").unwrap_or_else(|_| "heuristic".to_string());
     let (attack_goal, own_goal) = goals_for_team(own_team);
+    let heuristic = || {
+        let mut c = HeuristicCoach::new(attack_goal, own_goal);
+        c.set_referee(referee.clone());
+        Box::new(c) as Box<dyn Coach>
+    };
     match kind.as_str() {
-        "heuristic" => Some(Box::new(HeuristicCoach::new(attack_goal, own_goal))),
+        "heuristic" => Some(heuristic()),
         "rule_based" => Some(Box::new(RuleBasedCoach::new(attack_goal, own_goal))),
         "none" => None,
         other => {
             eprintln!("[main] VSSL_COACH='{other}' inválido, usando 'heuristic'");
-            Some(Box::new(HeuristicCoach::new(attack_goal, own_goal)))
+            Some(heuristic())
         }
     }
 }
@@ -173,7 +181,12 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         "[main] equipo propio: {} (VSSL_TEAM_COLOR)",
         if own_team == 0 { "azul" } else { "amarillo" }
     );
-    let coach = make_coach(own_team);
+    // Árbitro (VSSReferee o texto del operador, VSSL_REFEREE_ADDR): estado
+    // compartido que el coach heurístico lee en cada decisión.
+    let referee = new_shared_referee();
+    tokio::spawn(run_referee_listener(referee.clone()));
+
+    let coach = make_coach(own_team, &referee);
     eprintln!(
         "[main] coach: {}",
         if coach.is_some() {

@@ -295,7 +295,7 @@ fn dispatch_choices(
             | SkillId::SpinKick
             | SkillId::Mark => Some(choice.target),
             SkillId::ChaseBall | SkillId::Intercept => Some(world.get_ball_state().position),
-            SkillId::Spin => None,
+            SkillId::Spin | SkillId::Hold => None,
         };
         commands.push(cmd);
         targets.push(target);

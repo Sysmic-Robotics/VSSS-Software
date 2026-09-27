@@ -28,6 +28,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota). |
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
 | `VSSL_VISION_RECORD` | (off) | Ruta donde grabar los paquetes crudos de visión, para `vision_replay`. |
+| `VSSL_REFEREE_ADDR` | `224.5.23.2:10003` | Dónde escucha el engine los comandos del árbitro (VSSReferee o texto de `tools/referee_cli.py`). |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
 | `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
 
@@ -273,6 +274,23 @@ cargo run --release --bin vision_replay -- --file logs/vision.bin --ekf-csv logs
 El modo `--ekf-csv` imprime por entidad el RMS del residuo crudo−filtrado; con el robot quieto ese
 RMS es la σ de la cámara (base de M1). Protocolo de torneo: 15 min de grabación al llegar → replay
 → confirmar Q/R → jugar.
+
+## Árbitro y pelota parada (`src/coach/referee.rs`, `src/coach/plays.rs`)
+
+El coach heurístico lee el estado de juego del árbitro y ejecuta las formaciones del reglamento
+LARC 2026 (§6.6 y §10) antes del silbato: kickoff, free ball (cruz del cuadrante, robot en el punto a
+20 cm del lado propio), penal, free kick (defensores tocando la línea del área, uno por cuadrante) y
+goal kick (lo saca el arquero). Con `GAME_ON` vuelve la táctica normal de inmediato; con `STOP`/`HALT`
+todos quedan quietos (`Hold`). El pateador queda colocado en el staging de `ShootPush`, así empuja
+en el primer tick tras el silbato.
+
+Fuentes, por el mismo puerto (`VSSL_REFEREE_ADDR`): **VSSReferee** (simulador, protobuf
+`VSSRef_Command`) o **texto del operador** para el árbitro humano de la cancha:
+
+```bash
+python tools/referee_cli.py            # interactivo: k b (kickoff azul), b 1 (free ball Q1), go, s, h
+python tools/referee_cli.py penalty yellow
+```
 
 ## Métricas de partido (`tools/match_metrics.py`)
 

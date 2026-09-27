@@ -24,6 +24,8 @@
 
 use crate::coach::coach_trait::Coach;
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation, RobotObs};
+use crate::coach::plays::{Play, formation};
+use crate::coach::referee::SharedReferee;
 use crate::coach::skill_choice::SkillChoice;
 use crate::motion::MotionConfig;
 use crate::params::{CoachParams, params};
@@ -82,6 +84,10 @@ pub struct HeuristicCoach {
     decision_count: u64,
     /// Decisión en la que la pelota entró al área propia (para el límite de 10 s).
     ball_in_area_since: Option<u64>,
+    /// Estado del árbitro (VSSReferee / operador). `None` = siempre juego abierto.
+    referee: Option<SharedReferee>,
+    /// Play vigente (derivada del último comando del árbitro).
+    current_play: Play,
 }
 
 impl HeuristicCoach {
@@ -116,8 +122,57 @@ impl HeuristicCoach {
             committed: [None; 3],
             decision_count: 0,
             ball_in_area_since: None,
+            referee: None,
+            current_play: Play::Open,
             p,
         }
+    }
+
+    /// Conecta el estado del árbitro (listener de `coach::referee`).
+    pub fn set_referee(&mut self, shared: SharedReferee) {
+        self.referee = Some(shared);
+    }
+
+    pub fn current_play(&self) -> Play {
+        self.current_play
+    }
+
+    /// Equipo propio según el lado de ataque (convención del engine: azul ataca +x).
+    fn own_team_id(&self) -> i32 {
+        if self.attack_goal.x > 0.0 { 0 } else { 1 }
+    }
+
+    /// Play según el último comando del árbitro (juego abierto si no hay árbitro).
+    fn read_play(&self) -> Play {
+        match self.referee.as_ref().and_then(|r| r.lock().ok().map(|s| s.command)) {
+            Some(cmd) => Play::from_command(&cmd, self.own_team_id()),
+            None => Play::Open,
+        }
+    }
+
+    /// Decisiones de una play de pelota parada: cada rol va a su punto de la
+    /// formación mirando a la pelota (`Mark`); el arquero sigue en la línea salvo
+    /// que la play le dé un punto explícito (goal kick propio: lo saca él).
+    fn set_piece_choices(&mut self, play: Play, own: &[RobotView], opp: &[RobotView]) -> Vec<SkillChoice> {
+        let s = self.attack_sign();
+        let aim = self.aim_point(opp);
+        let staging = params().skills.approach_staging_offset;
+        let Some(f) = formation(play, s, aim, staging) else {
+            return Vec::new();
+        };
+        // El pateador es el jugador de campo que llega antes a su punto.
+        self.assign_roles(own, f.striker);
+        own.iter()
+            .filter(|r| r.active)
+            .map(|r| match self.role_of(r.id) {
+                Some(Role::Keeper) => match f.keeper {
+                    Some(p) => SkillChoice::new(r.id, SkillId::Mark, p),
+                    None => SkillChoice::new(r.id, SkillId::GoalKeep, self.own_goal),
+                },
+                Some(Role::Striker) => SkillChoice::new(r.id, SkillId::Mark, f.striker),
+                _ => SkillChoice::new(r.id, SkillId::Mark, f.support),
+            })
+            .collect()
     }
 
     /// Rol vigente de cada robot (para GUI/logs). `None` si inactivo.
@@ -506,6 +561,34 @@ impl Coach for HeuristicCoach {
         let ball_vel = Self::ball_vel(obs);
         let own: Vec<RobotView> = obs.own_robots.iter().enumerate().map(|(i, r)| Self::view(i, r)).collect();
         let opp: Vec<RobotView> = obs.opp_robots.iter().enumerate().map(|(i, r)| Self::view(i, r)).collect();
+
+        // Árbitro: al cambiar de play se olvidan los compromisos de skill para que
+        // el silbato (GAME_ON) tenga efecto inmediato.
+        let play = self.read_play();
+        if play != self.current_play {
+            self.committed = [None; 3];
+            self.current_play = play;
+        }
+        match play {
+            Play::Hold => {
+                return own
+                    .iter()
+                    .filter(|r| r.active)
+                    .map(|r| SkillChoice::new(r.id, SkillId::Hold, Vec2::ZERO))
+                    .collect();
+            }
+            p if p.is_set_piece() => return self.set_piece_choices(p, &own, &opp),
+            Play::Open => {}
+            Play::KickoffOurs
+            | Play::KickoffTheirs
+            | Play::FreeBall(_)
+            | Play::PenaltyOurs
+            | Play::PenaltyTheirs
+            | Play::FreeKickOurs
+            | Play::FreeKickTheirs
+            | Play::GoalKickOurs
+            | Play::GoalKickTheirs => {}
+        }
 
         self.assign_roles(&own, ball);
         let striker = self.striker_id.and_then(|id| own.iter().find(|r| r.id == id).copied());
@@ -917,6 +1000,87 @@ mod tests {
         );
         c.decide(&o);
         assert_eq!(c.role_of(2), Some(Role::Striker));
+    }
+
+    #[test]
+    fn referee_drives_hold_set_pieces_and_game_on() {
+        use crate::coach::referee::{Foul, Quadrant, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = coach(); // azul, ataca +x
+        c.set_referee(shared.clone());
+        let o = obs(
+            Vec2::new(0.0, 0.0),
+            Vec2::ZERO,
+            [Vec2::new(-0.3, 0.1), Vec2::new(-0.4, -0.3), Vec2::new(-0.63, 0.0)],
+        );
+        // Sin comando: juego abierto (táctica normal).
+        assert_eq!(c.current_play(), Play::Open);
+        assert_ne!(choice_of(&c.decide(&o), 0).skill_id, SkillId::Hold);
+
+        // HALT → todos quietos.
+        apply_command(&shared, RefereeCommand { foul: Foul::Halt, ..RefereeCommand::GAME_ON });
+        let ch = c.decide(&o);
+        assert_eq!(c.current_play(), Play::Hold);
+        assert!(ch.iter().all(|x| x.skill_id == SkillId::Hold));
+
+        // KICKOFF nuestro → pateador (el más cercano) dentro del círculo detrás de la
+        // pelota, support en nuestra mitad, arquero en la línea.
+        apply_command(
+            &shared,
+            RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Blue, ..RefereeCommand::GAME_ON },
+        );
+        let ch = c.decide(&o);
+        assert_eq!(c.current_play(), Play::KickoffOurs);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        let k = choice_of(&ch, 0);
+        assert_eq!(k.skill_id, SkillId::Mark);
+        assert!(k.target.length() < 0.2 && k.target.x < 0.0, "{:?}", k.target);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        assert!(choice_of(&ch, 1).target.x < 0.0);
+
+        // FREE BALL Q1 → robot en el punto a 0.20 m de la cruz del lado nuestro.
+        apply_command(
+            &shared,
+            RefereeCommand { foul: Foul::FreeBall, quadrant: Quadrant::Q1, ..RefereeCommand::GAME_ON },
+        );
+        let ch = c.decide(&o);
+        let striker_id = if c.role_of(0) == Some(Role::Striker) { 0 } else { 1 };
+        let k = choice_of(&ch, striker_id);
+        assert_eq!(k.target, Vec2::new(0.375 - 0.20, 0.40));
+
+        // GAME_ON → vuelve la táctica normal de inmediato (sin hold de skill).
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        let ch = c.decide(&o);
+        assert_eq!(c.current_play(), Play::Open);
+        assert!(ch.iter().all(|x| x.skill_id != SkillId::Mark || x.robot_id != striker_id));
+        assert!(matches!(
+            choice_of(&ch, striker_id).skill_id,
+            SkillId::ApproachAligned | SkillId::ShootPush | SkillId::Intercept | SkillId::Clear
+        ));
+    }
+
+    #[test]
+    fn yellow_team_reads_referee_colors_correctly() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = HeuristicCoach::with_options(OWN, ATTACK, 2, true); // amarillo, ataca −x
+        c.set_referee(shared.clone());
+        apply_command(
+            &shared,
+            RefereeCommand { foul: Foul::PenaltyKick, team: RefTeam::Blue, ..RefereeCommand::GAME_ON },
+        );
+        let o = obs(
+            Vec2::new(-0.375, 0.0),
+            Vec2::ZERO,
+            [Vec2::new(0.3, 0.1), Vec2::new(0.4, -0.3), Vec2::new(0.63, 0.0)],
+        );
+        let ch = c.decide(&o);
+        assert_eq!(c.current_play(), Play::PenaltyTheirs);
+        // Penal en contra: jugadores de campo en la mitad rival (x < 0 para amarillo).
+        for id in [0, 1] {
+            assert!(choice_of(&ch, id).target.x < 0.0, "{:?}", choice_of(&ch, id));
+        }
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
     }
 
     #[test]
