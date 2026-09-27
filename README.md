@@ -22,6 +22,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_MULTICAST_IFACE` | (auto) | IPv4 local para forzar la interfaz de multicast (útil si hay varias NICs). |
 | `VSSL_RADIO_TARGET` | `firasim` | `firasim`, `grsim` o `basestation`. Selecciona a quién se le envían los `MotionCommand`. |
 | `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Equipo que controla el engine (coach, skills) y, en `basestation`, qué comandos van al frame serial. Permite dos engines en la misma máquina, uno por equipo. |
+| `VSSL_SIDE` | azul `left`, amarillo `right` | Arco que defendemos (`left` = atacamos hacia +X). Cambia en el segundo tiempo y según cómo esté puesto el simulador; el coach avisa al arrancar si los robots están en la mitad contraria. |
 | `VSSL_COACH` | `heuristic` | `heuristic` (equipo STP de dos caras), `rule_based` (baseline de roles fijos) o `none`. |
 | `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro. |
 | `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |

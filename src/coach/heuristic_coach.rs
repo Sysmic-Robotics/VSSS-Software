@@ -93,6 +93,8 @@ pub struct HeuristicCoach {
     last_scores: [(SkillId, f32); 5],
     /// Contadores de adaptación al rival (éxito de tiro por carril, disputas).
     pub adaptation: Adaptation,
+    /// Ya se comparó el lado configurado con la posición inicial del equipo.
+    side_checked: bool,
 }
 
 fn clamp01(x: f32) -> f32 {
@@ -150,6 +152,7 @@ impl HeuristicCoach {
                 (SkillId::ApproachAligned, 0.0),
             ],
             adaptation: Adaptation::new(p.adapt_enabled, p.adapt_alpha),
+            side_checked: false,
             p,
         }
     }
@@ -681,6 +684,29 @@ impl Coach for HeuristicCoach {
         let ball_vel = Self::ball_vel(obs);
         let own: Vec<RobotView> = obs.own_robots.iter().enumerate().map(|(i, r)| Self::view(i, r)).collect();
         let opp: Vec<RobotView> = obs.opp_robots.iter().enumerate().map(|(i, r)| Self::view(i, r)).collect();
+
+        // Chequeo de lado (una vez, con el equipo completo visible): si nuestros
+        // robots están en la mitad del arco "rival", el lado configurado está al
+        // revés (VSSL_SIDE) y atacaríamos nuestro propio arco.
+        if !self.side_checked {
+            let active: Vec<&RobotView> = own.iter().filter(|r| r.active).collect();
+            if active.len() >= 3 {
+                let mean_x = active.iter().map(|r| r.pos.x).sum::<f32>() / active.len() as f32;
+                if mean_x.abs() > 0.10 {
+                    let on_own_side = mean_x * self.attack_sign() < 0.0;
+                    if !on_own_side {
+                        eprintln!(
+                            "[coach] ⚠ nuestros robots están en la mitad del arco RIVAL (x medio {mean_x:.2}, \
+                             atacamos hacia {:+}X): revisa VSSL_SIDE (left|right) o el lado en el simulador",
+                            self.attack_sign() as i32
+                        );
+                    } else {
+                        eprintln!("[coach] lado verificado: robots propios en su mitad (x medio {mean_x:.2})");
+                    }
+                    self.side_checked = true;
+                }
+            }
+        }
 
         // Árbitro: al cambiar de play se olvidan los compromisos de skill para que
         // el silbato (GAME_ON) tenga efecto inmediato.

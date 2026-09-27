@@ -43,10 +43,31 @@ impl TickDecider for NoOpDecider {
     }
 }
 
-/// Direcciones de ataque convencionales según el equipo propio.
-/// Azul ataca a +X, amarillo ataca a -X.
+/// Arcos (ataque, propio) según el lado que defendemos. `VSSL_SIDE=left|right`
+/// dice en qué arco está nuestro portero (cambia en el segundo tiempo y según
+/// cómo esté configurado el simulador); por defecto azul defiende el izquierdo
+/// (ataca a +X) y amarillo el derecho. Con el lado equivocado el equipo ataca su
+/// propio arco y en FIRASim los robots terminan cruzando el arco rival a toda
+/// velocidad y rompiendo la física.
 fn goals_for_team(own_team: i32) -> (Vec2, Vec2) {
-    if own_team == 0 {
+    let side = std::env::var("VSSL_SIDE")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let defend_left = match side.as_str() {
+        "left" | "izquierda" | "izq" => true,
+        "right" | "derecha" | "der" => false,
+        "" => own_team == 0,
+        other => {
+            eprintln!("[main] VSSL_SIDE='{other}' inválido (left|right); usando el default del color");
+            own_team == 0
+        }
+    };
+    eprintln!(
+        "[main] lado propio: {} (VSSL_SIDE) → atacamos hacia {}",
+        if defend_left { "izquierdo" } else { "derecho" },
+        if defend_left { "+X" } else { "-X" }
+    );
+    if defend_left {
         (Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0))
     } else {
         (Vec2::new(-0.75, 0.0), Vec2::new(0.75, 0.0))

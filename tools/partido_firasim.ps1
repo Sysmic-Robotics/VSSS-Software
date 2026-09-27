@@ -15,6 +15,9 @@ param(
     [switch]$SinRuido,
     [switch]$SinAmarillo,
     [switch]$SinArbitro,
+    # Lado donde FIRASim puso al AZUL (mira la cancha: el arco que defiende el azul).
+    # Con el lado al reves cada equipo ataca su propio arco y la fisica de FIRASim revienta.
+    [switch]$AzulDerecha,
     [string]$Rival = "rule_based",
     [string]$Repo = "/mnt/d/Proyectos/VSSS-Software"
 )
@@ -22,6 +25,8 @@ param(
 $ErrorActionPreference = "Stop"
 $target = '$HOME/vsss-target'
 $ruido = if ($SinRuido) { "0" } else { "1" }
+$ladoAzul = if ($AzulDerecha) { "right" } else { "left" }
+$ladoAmarillo = if ($AzulDerecha) { "left" } else { "right" }
 
 function Start-WslWindow([string]$titulo, [string]$comando) {
     # El `read` final deja la ventana abierta para leer el log cuando el proceso termina.
@@ -33,13 +38,13 @@ Write-Host "1/4 FIRASim"
 Start-WslWindow "FIRASim" '~/FIRASim/bin/FIRASim'
 Start-Sleep -Seconds 4
 
-Write-Host "2/4 engine azul (heuristic, ruido=$ruido, GUI, log)"
-Start-WslWindow "AZUL" ("cd $Repo && CARGO_TARGET_DIR=$target VSSL_TEAM_COLOR=blue VSSL_BIDIRECTIONAL=1 " +
+Write-Host "2/4 engine azul (heuristic, lado $ladoAzul, ruido=$ruido, GUI, log)"
+Start-WslWindow "AZUL" ("cd $Repo && CARGO_TARGET_DIR=$target VSSL_TEAM_COLOR=blue VSSL_SIDE=$ladoAzul VSSL_BIDIRECTIONAL=1 " +
     "VSSL_VISION_NOISE=$ruido VSSL_DEBUG_GUI=1 VSSL_MATCH_LOG=logs/partido_azul.csv cargo run --release")
 
 if (-not $SinAmarillo) {
-    Write-Host "3/4 engine amarillo ($Rival, log)"
-    Start-WslWindow "AMARILLO" ("cd $Repo && CARGO_TARGET_DIR=$target VSSL_TEAM_COLOR=yellow VSSL_COACH=$Rival " +
+    Write-Host "3/4 engine amarillo ($Rival, lado $ladoAmarillo, log)"
+    Start-WslWindow "AMARILLO" ("cd $Repo && CARGO_TARGET_DIR=$target VSSL_TEAM_COLOR=yellow VSSL_SIDE=$ladoAmarillo VSSL_COACH=$Rival " +
         "VSSL_VISION_NOISE=$ruido VSSL_MATCH_LOG=logs/partido_amarillo.csv cargo run --release")
 }
 
