@@ -44,6 +44,9 @@ def load(path: str):
     own_team = None
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
+            # Fila truncada (el engine sigue escribiendo el CSV): se ignora.
+            if row.get("ball_vy") in (None, "") or row.get("tick") in (None, ""):
+                continue
             tick = int(row["tick"])
             entry = ticks.setdefault(tick, {"t": int(row["t_ms"]), "robots": []})
             entry["ball"] = (

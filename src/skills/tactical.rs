@@ -96,6 +96,42 @@ pub fn shoot_push_feasible(
     along <= behind_tol && (ball - robot_pos).length() <= lose_radius
 }
 
+/// Holgura para rodear la pelota: media diagonal del robot (0.057) + radio de la
+/// pelota (0.021) + margen.
+pub const BALL_ROUTE_CLEARANCE: f32 = 0.09;
+
+/// Si el segmento `from`→`to` pasa por la pelota (a menos de `clearance` y con la
+/// pelota entre medio), devuelve un punto de rodeo al costado de la pelota; si no,
+/// devuelve `to`. Evita que una skill "atraviese" la pelota para llegar a un punto
+/// que queda detrás de ella: en la cancha es un empujón involuntario y en FIRASim
+/// la pelota aprisionada entre dos robots hace explotar la física.
+pub fn route_around_ball(from: Vec2, to: Vec2, ball: Vec2, clearance: f32) -> Vec2 {
+    let seg = to - from;
+    let len = seg.length();
+    if len < 1e-4 {
+        return to;
+    }
+    let dir = seg / len;
+    let rel = ball - from;
+    let along = rel.dot(dir);
+    if along <= 0.0 || along >= len {
+        return to;
+    }
+    let lateral = rel - dir * along;
+    let lat_len = lateral.length();
+    if lat_len >= clearance {
+        return to;
+    }
+    // Rodear por el lado contrario a donde la pelota se desvía del segmento (el
+    // más despejado); si está justo en línea, por la izquierda.
+    let perp = if lat_len > 1e-4 {
+        -lateral / lat_len
+    } else {
+        Vec2::new(-dir.y, dir.x)
+    };
+    clamp_to_logical_field(ball + perp * (clearance + 0.06))
+}
+
 /// `shoot_push_feasible` con las tolerancias vigentes de `config/team_params.json`
 /// (las mismas que usa `ShootPushSkill::new`). Es lo que consulta el coach.
 pub fn shoot_push_feasible_now(robot_pos: Vec2, ball: Vec2, target: Vec2) -> bool {
@@ -182,13 +218,15 @@ impl Skill for ApproachAlignedSkill {
         }
 
         // Lejos: navegar al staging mirando al staging; cerca: ya mirar a la pelota
-        // para llegar orientado.
+        // para llegar orientado. Si la pelota queda en el camino (el robot está
+        // "delante" de ella), rodearla en vez de atravesarla.
+        let waypoint = route_around_ball(robot.position, staging, ball, BALL_ROUTE_CLEARANCE);
         let face_target = if dist < self.pre_align_radius {
             ball
         } else {
-            staging
+            waypoint
         };
-        motion.move_and_face(robot, staging, face_target, world, self.kp, self.ki, self.kd)
+        motion.move_and_face(robot, waypoint, face_target, world, self.kp, self.ki, self.kd)
     }
 
     fn is_done(&self, robot: &RobotState, world: &World) -> bool {
@@ -625,7 +663,8 @@ impl Skill for ClearSkill {
             return cmd;
         }
         let staging = self.staging(ball, dir);
-        motion.move_and_face(robot, staging, ball, world, self.kp, self.ki, self.kd)
+        let waypoint = route_around_ball(robot.position, staging, ball, BALL_ROUTE_CLEARANCE);
+        motion.move_and_face(robot, waypoint, ball, world, self.kp, self.ki, self.kd)
     }
 
     fn is_done(&self, robot: &RobotState, world: &World) -> bool {
@@ -774,14 +813,19 @@ impl Skill for SpinKickSkill {
         }
         let (center, sign) = self.choose_center(robot.position, ball, dir);
         let dist = (center - robot.position).length();
-        if !self.spinning && dist > self.pos_tol {
-            // Cerca: directo al punto de contacto (la pelota NO es obstáculo).
-            if dist < 0.15 {
+        // Ya tocando la pelota (aunque no exactamente en el centro): girar igual, en
+        // vez de seguir empujándola para "llegar" al punto de contacto.
+        let touching = (ball - robot.position).length() <= self.contact_radius + 0.01;
+        if !self.spinning && dist > self.pos_tol && !touching {
+            // Si la pelota está entre el robot y el punto de contacto, rodearla.
+            let waypoint =
+                route_around_ball(robot.position, center, ball, self.contact_radius + 0.02);
+            if dist < 0.15 && waypoint == center {
                 let mut cmd = motion.move_direct(robot, center);
                 cmd.omega = 0.0;
                 return cmd;
             }
-            return motion.move_and_face(robot, center, ball, world, self.kp, self.ki, self.kd);
+            return motion.move_and_face(robot, waypoint, ball, world, self.kp, self.ki, self.kd);
         }
         self.spinning = true;
         self.spin_sign = sign;
@@ -937,6 +981,56 @@ mod tests {
         let robot = robot_at(staging.x, staging.y, 180.0);
         assert!(skill.is_done(&robot, &world));
         assert_eq!(skill.status(&robot, &world).face, Face::Back);
+    }
+
+    #[test]
+    fn route_around_ball_detours_only_when_ball_is_in_the_way() {
+        let ball = Vec2::ZERO;
+        // Pelota justo en el camino: punto de rodeo al costado, a la holgura + margen.
+        let wp = route_around_ball(Vec2::new(0.25, 0.0), Vec2::new(-0.14, 0.0), ball, 0.09);
+        assert!(wp.y.abs() > 0.12, "rodeo lateral: {wp:?}");
+        assert!(wp.x.abs() < 0.02, "a la altura de la pelota: {wp:?}");
+        // Pelota fuera del segmento (detrás del destino): sin rodeo.
+        let to = Vec2::new(-0.14, 0.0);
+        assert_eq!(route_around_ball(Vec2::new(-0.5, 0.0), to, ball, 0.09), to);
+        // Pelota lejos de la línea (a 0.11 m del segmento): sin rodeo.
+        assert_eq!(route_around_ball(Vec2::new(0.25, 0.5), to, ball, 0.09), to);
+    }
+
+    #[test]
+    fn approach_from_in_front_goes_around_the_ball_not_through_it() {
+        let motion = bidir_motion();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        // Robot delante de la pelota respecto del arco (+x): el staging queda detrás.
+        let robot = robot_at(0.25, 0.0, 180.0);
+        let mut skill = ApproachAlignedSkill::new(Vec2::new(0.75, 0.0));
+        let cmd = skill.tick(&robot, &world, &motion);
+        assert!(cmd.vy.abs() > 0.15, "debe desviarse lateralmente: {cmd:?}");
+        // Clear en la misma geometría también rodea.
+        let mut clear = ClearSkill::new(Vec2::new(0.75, 0.0));
+        let cmd = clear.tick(&robot, &world, &motion);
+        assert!(cmd.vy.abs() > 0.15, "clear debe rodear: {cmd:?}");
+    }
+
+    #[test]
+    fn spin_kick_spins_when_already_touching_and_detours_when_ball_blocks_center() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let mut skill = SpinKickSkill::new(Vec2::new(0.75, 0.0));
+        // Tocando la pelota por el lado equivocado: gira igual (no la empuja más).
+        let touching = robot_at(-0.06, 0.0, 0.0);
+        let cmd = skill.tick(&touching, &world, &motion);
+        assert!(skill.is_spinning());
+        assert_eq!(cmd.vx, 0.0);
+        // Robot delante de la pelota sobre la línea de tiro: los centros de contacto
+        // (0, ±0.065) quedan "detrás" de la pelota → rodeo lateral, sin girar.
+        let mut skill2 = SpinKickSkill::new(Vec2::new(0.75, 0.0));
+        let in_front = robot_at(0.12, 0.0, 0.0);
+        let cmd = skill2.tick(&in_front, &world, &motion);
+        assert!(!skill2.is_spinning());
+        assert!(cmd.vy.abs() > 0.03, "rodea lateralmente: {cmd:?}");
     }
 
     #[test]
