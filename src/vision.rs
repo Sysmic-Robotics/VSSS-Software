@@ -1,5 +1,5 @@
 use glam::Vec2;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::net::Ipv4Addr;
 use std::sync::{
@@ -17,6 +17,7 @@ use crate::protos::fira_packet::Environment as FiraEnvironment;
 use crate::protos::ssl_vision_detection::{SSL_DetectionBall, SSL_DetectionRobot};
 use crate::protos::ssl_vision_wrapper::SSL_WrapperPacket;
 use crate::tracker::Tracker;
+use crate::vision_tools::{NoiseProxy, VisionRecorder};
 use protobuf::Message;
 
 /// Eventos de estado que vision envía a la GUI.
@@ -131,15 +132,164 @@ pub struct Vision {
     /// Último `Instant` visto por entidad. Key: `(team, id)`; pelota usa `(-1, -1)`.
     /// Se usa para calcular `dt` por wall-clock en lugar de asumir 60 Hz fijos.
     last_seen: HashMap<(i32, i32), Instant>,
+    /// Proxy de ruido de cámara para el simulador (`VSSL_VISION_NOISE=1`).
+    noise: Option<NoiseProxy>,
+    /// Grabación de paquetes crudos (`VSSL_VISION_RECORD=ruta`).
+    recorder: Option<VisionRecorder>,
+    /// Paquetes retenidos por la latencia del proxy: (instante de liberación, bytes).
+    delayed: VecDeque<(Instant, Vec<u8>)>,
+    /// Paquetes descartados por el proxy (pérdida de frames simulada).
+    dropped: u64,
+}
+
+/// Contadores del receptor (para los logs periódicos).
+#[derive(Default)]
+struct RxStats {
+    packet_count: u64,
+    detection_count: u64,
+    geometry_only_count: u64,
 }
 
 impl Vision {
     pub fn new(source: VisionSource, tracker_enabled: Arc<AtomicBool>) -> Self {
+        let noise = NoiseProxy::from_env(&crate::params::params().vision);
+        if let Some(n) = noise.as_ref() {
+            eprintln!(
+                "[Vision] proxy de ruido ACTIVO ({}): {}",
+                crate::vision_tools::VISION_NOISE_ENV,
+                n.describe()
+            );
+        }
+        let recorder = VisionRecorder::from_env(source);
+        if recorder.is_some() {
+            eprintln!(
+                "[Vision] grabando paquetes crudos en {}",
+                std::env::var(crate::vision_tools::VISION_RECORD_ENV).unwrap_or_default()
+            );
+        }
         Self {
             source,
             tracker: Tracker::new(),
             tracker_enabled,
             last_seen: HashMap::new(),
+            noise,
+            recorder,
+            delayed: VecDeque::new(),
+            dropped: 0,
+        }
+    }
+
+    /// Posición con el ruido del proxy (identidad si el proxy está apagado).
+    fn noisy_pos(&mut self, x: f64, y: f64) -> (f64, f64) {
+        match self.noise.as_mut() {
+            Some(n) => n.perturb_pos(x, y),
+            None => (x, y),
+        }
+    }
+
+    /// Pose con el ruido del proxy (identidad si el proxy está apagado).
+    fn noisy_pose(&mut self, x: f64, y: f64, theta: f64) -> (f64, f64, f64) {
+        match self.noise.as_mut() {
+            Some(n) => {
+                let (x, y) = n.perturb_pos(x, y);
+                (x, y, n.perturb_theta(theta))
+            }
+            None => (x, y, theta),
+        }
+    }
+
+    /// Parsea y procesa un paquete de visión (FIRA o SSL-Vision según la fuente).
+    async fn handle_packet(
+        &mut self,
+        data: &[u8],
+        sender: &mpsc::Sender<VisionEvent>,
+        status_tx: &mpsc::Sender<StatusUpdate>,
+        stats: &mut RxStats,
+    ) {
+        let mut handled = false;
+
+        // En modo FIRASim, intentar primero el protocolo FIRA
+        // (fira_message.sim_to_ref.Environment, VSSSLeague/FIRAClient).
+        // En modo SslVision saltamos directo a SSL_WrapperPacket
+        // para no pagar el parse-y-fallar por paquete.
+        if matches!(self.source, VisionSource::FiraSim)
+            && let Ok(env) = FiraEnvironment::parse_from_bytes(data)
+            && let Some(frame) = env.frame.as_ref()
+        {
+            stats.detection_count += 1;
+            let robot_count = frame.robots_yellow.len() + frame.robots_blue.len();
+            let ball_count = if frame.ball.is_some() { 1 } else { 0 };
+
+            if stats.detection_count <= 3
+                || stats.detection_count.is_multiple_of(VISION_LOG_DETECTION_EVERY_N)
+            {
+                eprintln!(
+                    "[Vision] ✓ DETECTION (FIRA) #{}: {} robots, {} balls",
+                    stats.detection_count, robot_count, ball_count
+                );
+            }
+
+            Self::send_status_best_effort(status_tx, StatusUpdate::BallDetected(ball_count));
+            Self::send_status_best_effort(status_tx, StatusUpdate::RobotsDetected(robot_count));
+
+            if let Some(ball) = frame.ball.as_ref() {
+                let _ = self.process_ball_fira(sender, status_tx, ball).await;
+            }
+            for robot in frame.robots_yellow.iter() {
+                let _ = self.process_robot_fira(sender, status_tx, robot, 1).await;
+            }
+            for robot in frame.robots_blue.iter() {
+                let _ = self.process_robot_fira(sender, status_tx, robot, 0).await;
+            }
+            handled = true;
+        }
+
+        // SSL Vision: fuente principal en modo SslVision (vsss-vision-sysmic),
+        // fallback en modo FiraSim si el paquete no parseó como FIRA.
+        if !handled {
+            match SSL_WrapperPacket::parse_from_bytes(data) {
+                Ok(packet) => {
+                    if let Some(detection) = packet.detection.as_ref() {
+                        stats.detection_count += 1;
+                        let robot_count =
+                            detection.robots_yellow.len() + detection.robots_blue.len();
+                        let ball_count = detection.balls.len();
+
+                        if stats.detection_count <= 3
+                            || stats.detection_count.is_multiple_of(VISION_LOG_DETECTION_EVERY_N)
+                        {
+                            eprintln!(
+                                "[Vision] ✓ DETECTION (SSL) #{}: {} robots, {} balls",
+                                stats.detection_count, robot_count, ball_count
+                            );
+                        }
+
+                        Self::send_status_best_effort(
+                            status_tx,
+                            StatusUpdate::BallDetected(ball_count),
+                        );
+                        Self::send_status_best_effort(
+                            status_tx,
+                            StatusUpdate::RobotsDetected(robot_count),
+                        );
+
+                        for ball in detection.balls.iter() {
+                            let _ = self.process_ball(sender, status_tx, ball).await;
+                        }
+                        for robot in detection.robots_yellow.iter() {
+                            let _ = self.process_robot(sender, status_tx, robot, 1).await;
+                        }
+                        for robot in detection.robots_blue.iter() {
+                            let _ = self.process_robot(sender, status_tx, robot, 0).await;
+                        }
+                    } else {
+                        stats.geometry_only_count += 1;
+                    }
+                }
+                Err(_) => {
+                    stats.geometry_only_count += 1;
+                }
+            }
         }
     }
 
@@ -301,11 +451,9 @@ impl Vision {
         eprintln!("[Vision] ========================================");
 
         let mut buf = [0u8; 65536];
-        let mut packet_count = 0u64;
+        let mut stats = RxStats::default();
         let mut last_packet_time = Instant::now();
         let mut last_status_print = Instant::now();
-        let mut detection_count = 0u64;
-        let mut geometry_only_count = 0u64;
 
         eprintln!("[Vision] === INICIANDO RECEPCIÓN DE PAQUETES ===");
         eprintln!(
@@ -314,96 +462,48 @@ impl Vision {
         );
 
         loop {
+            // Con el proxy de latencia activo, el paquete retenido más antiguo fija
+            // cuándo hay que despertar aunque no llegue nada nuevo.
+            let next_release = self.delayed.front().map(|(t, _)| *t);
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, addr)) => {
-                            packet_count += 1;
+                            stats.packet_count += 1;
                             last_packet_time = Instant::now();
                             let data = &buf[..len];
 
                             // Log primer paquete y cada 120 paquetes
-                            if packet_count == 1 {
+                            if stats.packet_count == 1 {
                                 eprintln!("[Vision] ✓ PRIMER PAQUETE de {} ({} bytes)", addr, len);
                                 eprintln!("[Vision] Hex: {:02x?}", &data[..len.min(48)]);
                             }
 
                             Self::send_status_best_effort(&status_tx, StatusUpdate::PacketReceived);
 
-                            let mut handled = false;
-
-                            // En modo FIRASim, intentar primero el protocolo FIRA
-                            // (fira_message.sim_to_ref.Environment, VSSSLeague/FIRAClient).
-                            // En modo SslVision saltamos directo a SSL_WrapperPacket
-                            // para no pagar el parse-y-fallar por paquete.
-                            if matches!(self.source, VisionSource::FiraSim)
-                                && let Ok(env) = FiraEnvironment::parse_from_bytes(data)
-                                && let Some(frame) = env.frame.as_ref()
+                            // Grabación: SIEMPRE el paquete crudo, antes del proxy.
+                            if let Some(rec) = self.recorder.as_mut()
+                                && let Err(e) = rec.write(data)
                             {
-                                detection_count += 1;
-                                let robot_count = frame.robots_yellow.len() + frame.robots_blue.len();
-                                let ball_count = if frame.ball.is_some() { 1 } else { 0 };
-
-                                if detection_count <= 3 || detection_count.is_multiple_of(VISION_LOG_DETECTION_EVERY_N) {
-                                    eprintln!("[Vision] ✓ DETECTION (FIRA) #{}: {} robots, {} balls",
-                                             detection_count, robot_count, ball_count);
-                                }
-
-                                Self::send_status_best_effort(&status_tx, StatusUpdate::BallDetected(ball_count));
-                                Self::send_status_best_effort(&status_tx, StatusUpdate::RobotsDetected(robot_count));
-
-                                if let Some(ball) = frame.ball.as_ref() {
-                                    let _ = self.process_ball_fira(&sender, &status_tx, ball).await;
-                                }
-                                for robot in frame.robots_yellow.iter() {
-                                    let _ = self.process_robot_fira(&sender, &status_tx, robot, 1).await;
-                                }
-                                for robot in frame.robots_blue.iter() {
-                                    let _ = self.process_robot_fira(&sender, &status_tx, robot, 0).await;
-                                }
-                                handled = true;
+                                eprintln!("[Vision] ✗ error grabando: {e}");
+                                self.recorder = None;
                             }
 
-                            // SSL Vision: fuente principal en modo SslVision (vsss-vision-sysmic),
-                            // fallback en modo FiraSim si el paquete no parseó como FIRA.
-                            if !handled {
-                                match SSL_WrapperPacket::parse_from_bytes(data) {
-                                    Ok(packet) => {
-                                        if let Some(detection) = packet.detection.as_ref() {
-                                            detection_count += 1;
-                                            let robot_count = detection.robots_yellow.len() + detection.robots_blue.len();
-                                            let ball_count = detection.balls.len();
-
-                                            if detection_count <= 3 || detection_count.is_multiple_of(VISION_LOG_DETECTION_EVERY_N) {
-                                                eprintln!("[Vision] ✓ DETECTION (SSL) #{}: {} robots, {} balls",
-                                                         detection_count, robot_count, ball_count);
-                                            }
-
-                                            Self::send_status_best_effort(&status_tx, StatusUpdate::BallDetected(ball_count));
-                                            Self::send_status_best_effort(&status_tx, StatusUpdate::RobotsDetected(robot_count));
-
-                                            for ball in detection.balls.iter() {
-                                                let _ = self.process_ball(&sender, &status_tx, ball).await;
-                                            }
-                                            for robot in detection.robots_yellow.iter() {
-                                                let _ = self.process_robot(&sender, &status_tx, robot, 1).await;
-                                            }
-                                            for robot in detection.robots_blue.iter() {
-                                                let _ = self.process_robot(&sender, &status_tx, robot, 0).await;
-                                            }
-                                        } else {
-                                            geometry_only_count += 1;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        geometry_only_count += 1;
+                            match self.noise.as_mut() {
+                                Some(noise) => {
+                                    if noise.drop_packet() {
+                                        self.dropped += 1;
+                                    } else {
+                                        let release = Instant::now() + noise.latency;
+                                        self.delayed.push_back((release, data.to_vec()));
                                     }
                                 }
+                                None => self.handle_packet(data, &sender, &status_tx, &mut stats).await,
                             }
 
-                            if packet_count > 0 && packet_count.is_multiple_of(VISION_LOG_PACKET_STATS_EVERY_N) {
-                                eprintln!("[Vision] Stats: {} packets ({} detection, {} geometry-only)",
-                                         packet_count, detection_count, geometry_only_count);
+                            if stats.packet_count.is_multiple_of(VISION_LOG_PACKET_STATS_EVERY_N) {
+                                eprintln!("[Vision] Stats: {} packets ({} detection, {} geometry-only, {} descartados por proxy)",
+                                         stats.packet_count, stats.detection_count, stats.geometry_only_count, self.dropped);
                             }
                         },
                         Err(e) => {
@@ -412,8 +512,24 @@ impl Vision {
                         }
                     }
                 }
+                _ = async {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(
+                        next_release.unwrap_or_else(Instant::now),
+                    ))
+                    .await
+                }, if next_release.is_some() => {
+                    // Liberar todos los paquetes cuya latencia ya venció, en orden.
+                    let now = Instant::now();
+                    while let Some((release, _)) = self.delayed.front() {
+                        if *release > now {
+                            break;
+                        }
+                        let (_, data) = self.delayed.pop_front().expect("front comprobado");
+                        self.handle_packet(&data, &sender, &status_tx, &mut stats).await;
+                    }
+                }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    if packet_count == 0 {
+                    if stats.packet_count == 0 {
                         if last_status_print.elapsed() >= Duration::from_secs(5) {
                             eprintln!("[Vision] ⚠ Sin paquetes. Verifica que la fuente {:?} esté publicando en {}:{}",
                                      self.source, multicast_ip, port);
@@ -421,7 +537,7 @@ impl Vision {
                         }
                     } else if last_packet_time.elapsed() > Duration::from_secs(5) {
                         eprintln!("[Vision] ⚠ Sin paquetes en 5s (total: {}, detection: {})",
-                                 packet_count, detection_count);
+                                 stats.packet_count, stats.detection_count);
                     }
                 }
             }
@@ -434,8 +550,7 @@ impl Vision {
         status_tx: &mpsc::Sender<StatusUpdate>,
         ball: &FiraBall,
     ) -> Result<(), Box<dyn Error>> {
-        let x_m = ball.x;
-        let y_m = ball.y;
+        let (x_m, y_m) = self.noisy_pos(ball.x, ball.y);
         let dt_f64 = self.compute_dt((-1, -1)) as f64;
 
         let (xf_m, yf_m, vx, vy) = if self.tracker_enabled.load(Ordering::Relaxed) {
@@ -473,9 +588,7 @@ impl Vision {
         team: i32,
     ) -> Result<(), Box<dyn Error>> {
         let id = robot.robot_id;
-        let x_m = robot.x;
-        let y_m = robot.y;
-        let theta = robot.orientation;
+        let (x_m, y_m, theta) = self.noisy_pose(robot.x, robot.y, robot.orientation);
         let dt_f64 = self.compute_dt((team, id as i32)) as f64;
 
         let (xf_m, yf_m, thetaf, vx, vy, omega) = if self.tracker_enabled.load(Ordering::Relaxed) {
@@ -533,8 +646,7 @@ impl Vision {
         let raw_y = ball.y();
 
         // Convert to meters for internal processing (tracker works in meters)
-        let x_m = raw_x as f64 / 1000.0;
-        let y_m = raw_y as f64 / 1000.0;
+        let (x_m, y_m) = self.noisy_pos(raw_x as f64 / 1000.0, raw_y as f64 / 1000.0);
         let dt_f64 = self.compute_dt((-1, -1)) as f64;
 
         // Usar tracker solo si está habilitado
@@ -604,9 +716,11 @@ impl Vision {
         let raw_theta = robot.orientation();
 
         // Convert to meters for internal processing (tracker works in meters)
-        let x_m = raw_x as f64 / 1000.0;
-        let y_m = raw_y as f64 / 1000.0;
-        let theta = raw_theta as f64;
+        let (x_m, y_m, theta) = self.noisy_pose(
+            raw_x as f64 / 1000.0,
+            raw_y as f64 / 1000.0,
+            raw_theta as f64,
+        );
         let dt_f64 = self.compute_dt((team, id as i32)) as f64;
 
         // Usar tracker solo si está habilitado

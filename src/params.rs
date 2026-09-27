@@ -240,6 +240,65 @@ impl Default for SimRobotParams {
     }
 }
 
+/// Percepción: EKF del tracker (`tracker/ekf.rs`) y proxy de ruido para el
+/// simulador (`vision_tools.rs`). Calibrar con la medición M1 (cámara real):
+/// `r_*` = varianza medida del ruido de la cámara; `proxy_*` = los mismos números
+/// para reproducirlo en FIRASim. Defaults: literatura (σ_pos ≈ 1.85 mm, σ_θ ≈
+/// 0.031 rad, latencia 90 ms) para el proxy; para el EKF, valores conservadores.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisionParams {
+    /// Varianza de medición de posición (m²). 1e-4 → σ ≈ 1 cm.
+    pub r_pos: f64,
+    /// Varianza de medición de orientación (rad²). 2.5e-3 → σ ≈ 2.9°.
+    pub r_theta: f64,
+    /// Ruido de proceso: posición (m² por paso).
+    pub q_pos: f64,
+    /// Ruido de proceso: sin/cos de la orientación.
+    pub q_angle: f64,
+    /// Ruido de proceso: velocidad lineal ((m/s)² por paso).
+    pub q_vel: f64,
+    /// Ruido de proceso: velocidad angular ((rad/s)² por paso).
+    pub q_omega: f64,
+    /// Gating de innovación (χ² con 3 g.l.; 16.27 ≈ p 0.999).
+    pub gating_chi2: f64,
+    /// Velocidad lineal máxima plausible para el gate físico (m/s).
+    pub max_lin_speed: f64,
+    /// Velocidad angular máxima plausible (rad/s); también acota ω del estado.
+    pub max_omega: f64,
+    /// Margen sobre el máximo físico en el gate.
+    pub gate_margin: f64,
+    /// Proxy (sim): σ de posición inyectada (m).
+    pub proxy_sigma_pos_m: f64,
+    /// Proxy (sim): σ de orientación inyectada (rad).
+    pub proxy_sigma_theta_rad: f64,
+    /// Proxy (sim): latencia de visión (ms).
+    pub proxy_latency_ms: f64,
+    /// Proxy (sim): probabilidad de perder un frame [0, 1].
+    pub proxy_drop_prob: f64,
+}
+
+impl Default for VisionParams {
+    fn default() -> Self {
+        Self {
+            r_pos: 1e-4,
+            r_theta: 2.5e-3,
+            q_pos: 1e-7,
+            q_angle: 1e-4,
+            q_vel: 1e-4,
+            q_omega: 1e-2,
+            gating_chi2: 16.27,
+            max_lin_speed: 4.0,
+            max_omega: 45.0,
+            gate_margin: 2.0,
+            proxy_sigma_pos_m: 0.00185,
+            proxy_sigma_theta_rad: 0.031,
+            proxy_latency_ms: 90.0,
+            proxy_drop_prob: 0.02,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TeamParams {
@@ -248,6 +307,7 @@ pub struct TeamParams {
     pub motion: MotionParams,
     pub robot: RobotParams,
     pub sim: SimRobotParams,
+    pub vision: VisionParams,
 }
 
 static PARAMS: OnceLock<TeamParams> = OnceLock::new();

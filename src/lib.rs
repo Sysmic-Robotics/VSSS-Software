@@ -17,4 +17,5 @@ pub mod skill_log;
 pub mod skills;
 pub mod tracker;
 pub mod vision;
+pub mod vision_tools;
 pub mod world;

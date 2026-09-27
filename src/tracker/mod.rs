@@ -11,13 +11,21 @@ use std::collections::HashMap;
 /// - Balón: team = -1, id = -1
 pub struct Tracker {
     filters: HashMap<(i32, i32), ExtendedKalmanFilter>,
+    /// Parámetros con los que se crean los filtros nuevos.
+    params: crate::params::VisionParams,
 }
 
 impl Tracker {
-    /// Crea un nuevo Tracker vacío
+    /// Tracker con los parámetros vigentes del proceso (`config/team_params.json`).
     pub fn new() -> Self {
+        Self::with_params(crate::params::params().vision.clone())
+    }
+
+    /// Tracker con parámetros explícitos (replay offline con otro JSON).
+    pub fn with_params(params: crate::params::VisionParams) -> Self {
         Self {
             filters: HashMap::new(),
+            params,
         }
     }
 
@@ -45,18 +53,14 @@ impl Tracker {
         let key = (team, id);
 
         // Obtener o crear filtro para este (team, id)
+        let params = &self.params;
         let filter = self
             .filters
             .entry(key)
-            .or_insert_with(Self::create_initial_filter);
+            .or_insert_with(|| ExtendedKalmanFilter::from_params(params));
 
         // Filtrar la pose y retornar resultado
         filter.filter_pose(x, y, theta, dt)
-    }
-
-    /// Crea un filtro Kalman inicializado
-    fn create_initial_filter() -> ExtendedKalmanFilter {
-        ExtendedKalmanFilter::new()
     }
 
     /// Limpia filtros que no se han usado recientemente (opcional, para limpieza de memoria)

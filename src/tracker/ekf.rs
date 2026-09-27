@@ -1,3 +1,4 @@
+use crate::params::VisionParams;
 use nalgebra::{SMatrix, SVector};
 
 // Estado: [x, y, sin(θ), cos(θ), vx, vy, ω]
@@ -5,23 +6,9 @@ type StateVector = SVector<f64, 7>;
 type CovarianceMatrix = SMatrix<f64, 7, 7>;
 type MeasurementVector = SVector<f64, 3>; // [x, y, θ]
 
-/// Varianza de medición de posición (m²). std ≈ 1 cm — realista para visión VSSS.
-/// (Antes 1e-6 ⇒ std ≈ 1 mm, sobre-confiado; hacía seguir cualquier glitch.)
-const R_POS: f64 = 1e-4;
-/// Varianza de medición de orientación (rad²). std ≈ 2.9°.
-const R_THETA: f64 = 2.5e-3;
-/// Umbral de gating de innovación: distancia de Mahalanobis (χ² con 3 g.l., p≈0.999).
-/// Mediciones cuyo residuo normalizado lo supere se descartan (outliers por
-/// solape/intercambio de detección) para no disparar velocidad/ω.
-const GATING_CHI2_3DOF: f64 = 16.27;
-
-/// Velocidad lineal máxima físicamente plausible de un robot VSSS (m/s).
-const MAX_LIN_SPEED: f64 = 4.0;
-/// Velocidad angular máxima físicamente plausible (rad/s). Por encima del máx de
-/// tuning (~40) con margen; también acota ω del estado (defensa ante glitches).
-const MAX_OMEGA: f64 = 45.0;
-/// Margen sobre el máximo físico para el gate de innovación (tolerancia).
-const GATE_MARGIN: f64 = 2.0;
+// Q, R, gating y límites físicos vienen de `VisionParams`
+// (`config/team_params.json` → "vision"); ver ahí la documentación de cada uno.
+// Antes eran constantes (R_POS 1e-4, R_THETA 2.5e-3, χ² 16.27, v_max 4, ω_max 45).
 
 /// Extended Kalman Filter para tracking de robots y balón
 ///
@@ -36,11 +23,21 @@ pub struct ExtendedKalmanFilter {
     /// Si el filtro ya recibió su primera medición. Reemplaza la heurística de
     /// posición≈(0,0), que reiniciaba el filtro en el centro de la cancha.
     initialized: bool,
+    gating_chi2: f64,
+    max_lin_speed: f64,
+    max_omega: f64,
+    gate_margin: f64,
 }
 
 impl ExtendedKalmanFilter {
-    /// Crea un nuevo filtro Kalman con matrices inicializadas
+    /// Filtro con los parámetros por defecto (`VisionParams::default()`).
     pub fn new() -> Self {
+        Self::from_params(&VisionParams::default())
+    }
+
+    /// Filtro con Q/R/gating explícitos (los del JSON vigente en producción; los
+    /// de un archivo alternativo en `vision_replay --ekf-csv --params`).
+    pub fn from_params(p: &VisionParams) -> Self {
         // Inicializar estado en cero
         let x_ = StateVector::zeros();
 
@@ -48,8 +45,8 @@ impl ExtendedKalmanFilter {
         // medición (se inicializa con ella); velocidad/ω arrancan inciertas.
         #[allow(non_snake_case)]
         let mut P_ = CovarianceMatrix::zeros();
-        P_[(0, 0)] = R_POS; // x
-        P_[(1, 1)] = R_POS; // y
+        P_[(0, 0)] = p.r_pos; // x
+        P_[(1, 1)] = p.r_pos; // y
         P_[(2, 2)] = 1e-4; // sin(theta)
         P_[(3, 3)] = 1e-4; // cos(theta)
         P_[(4, 4)] = 1.0; // vx
@@ -59,20 +56,20 @@ impl ExtendedKalmanFilter {
         // Ruido de proceso Q (diagonal)
         #[allow(non_snake_case)]
         let mut Q_ = CovarianceMatrix::zeros();
-        Q_[(0, 0)] = 1e-7; // x
-        Q_[(1, 1)] = 1e-7; // y
-        Q_[(2, 2)] = 1e-4; // sin(theta)
-        Q_[(3, 3)] = 1e-4; // cos(theta)
-        Q_[(4, 4)] = 1e-4; // vx
-        Q_[(5, 5)] = 1e-4; // vy
-        Q_[(6, 6)] = 1e-2; // omega
+        Q_[(0, 0)] = p.q_pos; // x
+        Q_[(1, 1)] = p.q_pos; // y
+        Q_[(2, 2)] = p.q_angle; // sin(theta)
+        Q_[(3, 3)] = p.q_angle; // cos(theta)
+        Q_[(4, 4)] = p.q_vel; // vx
+        Q_[(5, 5)] = p.q_vel; // vy
+        Q_[(6, 6)] = p.q_omega; // omega
 
-        // Ruido de medición R (diagonal), calibrado a magnitudes realistas.
+        // Ruido de medición R (diagonal).
         #[allow(non_snake_case)]
         let mut R_ = SMatrix::<f64, 3, 3>::zeros();
-        R_[(0, 0)] = R_POS; // x
-        R_[(1, 1)] = R_POS; // y
-        R_[(2, 2)] = R_THETA; // theta
+        R_[(0, 0)] = p.r_pos; // x
+        R_[(1, 1)] = p.r_pos; // y
+        R_[(2, 2)] = p.r_theta; // theta
 
         Self {
             x_,
@@ -80,6 +77,10 @@ impl ExtendedKalmanFilter {
             Q_,
             R_,
             initialized: false,
+            gating_chi2: p.gating_chi2,
+            max_lin_speed: p.max_lin_speed,
+            max_omega: p.max_omega,
+            gate_margin: p.gate_margin,
         }
     }
 
@@ -113,8 +114,8 @@ impl ExtendedKalmanFilter {
 
         // Gate físico: un robot no puede moverse/rotar más de lo físicamente posible
         // en `dt`. Un salto mayor = detección espuria (solape/intercambio) → descartar.
-        let max_dpos = MAX_LIN_SPEED * dt * GATE_MARGIN;
-        let max_dtheta = MAX_OMEGA * dt * GATE_MARGIN;
+        let max_dpos = self.max_lin_speed * dt * self.gate_margin;
+        let max_dtheta = self.max_omega * dt * self.gate_margin;
         let dpos = (y[0] * y[0] + y[1] * y[1]).sqrt();
         if dpos > max_dpos || y[2].abs() > max_dtheta {
             return;
@@ -140,7 +141,7 @@ impl ExtendedKalmanFilter {
         // grande = medición outlier (solape/intercambio de detección): se descarta
         // para no propagar velocidad/ω irreales.
         let mahalanobis = (y.transpose() * S_inv * y)[(0, 0)];
-        if mahalanobis > GATING_CHI2_3DOF {
+        if mahalanobis > self.gating_chi2 {
             return;
         }
 
@@ -161,7 +162,7 @@ impl ExtendedKalmanFilter {
         }
 
         // Acotar ω a su máximo físico (defensa ante cualquier glitch que sobreviva).
-        self.x_[6] = self.x_[6].clamp(-MAX_OMEGA, MAX_OMEGA);
+        self.x_[6] = self.x_[6].clamp(-self.max_omega, self.max_omega);
 
         // Actualización de la covarianza: P = (I - K * H) * P
         #[allow(non_snake_case)]
@@ -480,6 +481,31 @@ mod tests {
                 "valor no finito en iter {i}"
             );
         }
+    }
+
+    /// Con R más chico el filtro sigue más de cerca la medición (menos suavizado):
+    /// los parámetros del JSON realmente cambian el comportamiento.
+    #[test]
+    fn params_change_filter_behaviour() {
+        let dt = 0.016;
+        // Gate desactivado: aquí se mide el efecto de R en la ganancia, no el gating
+        // (con R muy chico el salto de 3 cm sería rechazado como outlier).
+        let run = |r_pos: f64| {
+            let mut ekf = ExtendedKalmanFilter::from_params(&VisionParams {
+                r_pos,
+                gating_chi2: 1e9,
+                ..VisionParams::default()
+            });
+            for _ in 0..20 {
+                ekf.filter_pose(0.0, 0.0, 0.0, dt);
+            }
+            // Salto de 3 cm: ¿cuánto lo sigue en un solo frame?
+            let (x, ..) = ekf.filter_pose(0.03, 0.0, 0.0, dt);
+            x
+        };
+        let tight = run(1e-6);
+        let loose = run(1e-3);
+        assert!(tight > loose, "R chico debe seguir más la medición: {tight} vs {loose}");
     }
 
     #[test]

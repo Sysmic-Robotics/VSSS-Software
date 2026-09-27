@@ -26,6 +26,8 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro. |
 | `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |
 | `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota). |
+| `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
+| `VSSL_VISION_RECORD` | (off) | Ruta donde grabar los paquetes crudos de visión, para `vision_replay`. |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
 | `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
 
@@ -246,6 +248,31 @@ log (`[main] parámetros: archivo config/team_params.json`).
 - El JSON puede ser parcial: lo que falta toma el default. Un campo con nombre desconocido es
   error y el proceso no arranca (evita que un typo en una calibración pase en silencio).
 - Cambiar un parámetro NO requiere recompilar: editar el JSON y volver a lanzar.
+
+## Percepción: EKF calibrable, proxy de ruido y replay
+
+La derrota pasada fue de percepción (ruido de cámara + EKF mal tuneado), así que la cadena completa
+es calibrable y verificable con datos reales:
+
+- **EKF desde el JSON.** Q, R, gating y límites físicos del tracker viven en `config/team_params.json`
+  → `vision` (`r_pos`, `r_theta`, `q_*`, `gating_chi2`, ...). Sin recompilar.
+- **Proxy de ruido en el simulador.** `VSSL_VISION_NOISE=1` inyecta, ANTES del tracker, el ruido
+  de `vision.proxy_*` (σ de posición y orientación, latencia como retención de paquetes, pérdida de
+  frames). Los defaults son de literatura; la medición M1 los reemplaza por los de nuestra cámara.
+- **Grabación y replay.** `VSSL_VISION_RECORD=logs/vision.bin` guarda los paquetes crudos. Luego:
+
+```bash
+# Re-publicar la grabación en el multicast (el engine la consume como si fuera en vivo):
+cargo run --release --bin vision_replay -- --file logs/vision.bin --publish --loop
+
+# Pasar la grabación por el EKF offline y comparar dos calibraciones sobre los MISMOS datos:
+cargo run --release --bin vision_replay -- --file logs/vision.bin --ekf-csv logs/ekf_a.csv
+cargo run --release --bin vision_replay -- --file logs/vision.bin --ekf-csv logs/ekf_b.csv --params config/otro.json
+```
+
+El modo `--ekf-csv` imprime por entidad el RMS del residuo crudo−filtrado; con el robot quieto ese
+RMS es la σ de la cámara (base de M1). Protocolo de torneo: 15 min de grabación al llegar → replay
+→ confirmar Q/R → jugar.
 
 ## Métricas de partido (`tools/match_metrics.py`)
 
