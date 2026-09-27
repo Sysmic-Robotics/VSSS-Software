@@ -27,7 +27,14 @@ pub struct ExtendedKalmanFilter {
     max_lin_speed: f64,
     max_omega: f64,
     gate_margin: f64,
+    /// Mediciones consecutivas rechazadas por los gates. Un outlier aislado se
+    /// descarta; una racha significa que el ESTADO está mal (divergió) y hay que
+    /// reiniciar desde la medición, si no la pose se extrapola al infinito.
+    rejected_streak: u32,
 }
+
+/// Rechazos seguidos tras los que el filtro se reinicia desde la medición.
+const REJECT_STREAK_RESET: u32 = 6;
 
 impl ExtendedKalmanFilter {
     /// Filtro con los parámetros por defecto (`VisionParams::default()`).
@@ -81,6 +88,38 @@ impl ExtendedKalmanFilter {
             max_lin_speed: p.max_lin_speed,
             max_omega: p.max_omega,
             gate_margin: p.gate_margin,
+            rejected_streak: 0,
+        }
+    }
+
+    /// Reinicia el estado desde una medición (posición, orientación; velocidades
+    /// en cero) y devuelve la covarianza a su valor inicial.
+    fn reinitialize(&mut self, x: f64, y: f64, theta: f64) {
+        self.x_[0] = x;
+        self.x_[1] = y;
+        self.x_[2] = theta.sin();
+        self.x_[3] = theta.cos();
+        self.x_[4] = 0.0;
+        self.x_[5] = 0.0;
+        self.x_[6] = 0.0;
+        let r_pos = self.R_[(0, 0)];
+        self.P_ = CovarianceMatrix::zeros();
+        self.P_[(0, 0)] = r_pos;
+        self.P_[(1, 1)] = r_pos;
+        self.P_[(2, 2)] = 1e-4;
+        self.P_[(3, 3)] = 1e-4;
+        self.P_[(4, 4)] = 1.0;
+        self.P_[(5, 5)] = 1.0;
+        self.P_[(6, 6)] = 1.0;
+        self.rejected_streak = 0;
+    }
+
+    /// Un gate rechazó la medición: cuenta la racha y, si ya son demasiadas
+    /// seguidas, reinicia desde esa medición.
+    fn on_rejected(&mut self, z: &MeasurementVector) {
+        self.rejected_streak += 1;
+        if self.rejected_streak >= REJECT_STREAK_RESET {
+            self.reinitialize(z[0], z[1], z[2]);
         }
     }
 
@@ -118,6 +157,7 @@ impl ExtendedKalmanFilter {
         let max_dtheta = self.max_omega * dt * self.gate_margin;
         let dpos = (y[0] * y[0] + y[1] * y[1]).sqrt();
         if dpos > max_dpos || y[2].abs() > max_dtheta {
+            self.on_rejected(&z);
             return;
         }
 
@@ -142,8 +182,10 @@ impl ExtendedKalmanFilter {
         // para no propagar velocidad/ω irreales.
         let mahalanobis = (y.transpose() * S_inv * y)[(0, 0)];
         if mahalanobis > self.gating_chi2 {
+            self.on_rejected(&z);
             return;
         }
+        self.rejected_streak = 0;
 
         // Ganancia de Kalman: K = P * H^T * S^(-1)
         #[allow(non_snake_case)]
@@ -481,6 +523,28 @@ mod tests {
                 "valor no finito en iter {i}"
             );
         }
+    }
+
+    /// Si el estado divergió (p. ej. velocidad inflada por ráfagas de paquetes),
+    /// las mediciones reales quedan fuera de los gates; una racha de rechazos
+    /// debe reiniciar el filtro sobre la medición en vez de extrapolar para siempre.
+    #[test]
+    fn reacquires_after_a_streak_of_rejected_measurements() {
+        let mut ekf = ExtendedKalmanFilter::new();
+        let dt = 0.016;
+        for _ in 0..30 {
+            ekf.filter_pose(0.0, 0.0, 0.0, dt);
+        }
+        // Estado corrupto: velocidad enorme → la predicción se va lejos.
+        ekf.x_[4] = 5.0;
+        let mut last_x = 0.0;
+        for _ in 0..(REJECT_STREAK_RESET as usize + 2) {
+            let (x, ..) = ekf.filter_pose(0.0, 0.0, 0.0, dt);
+            last_x = x;
+        }
+        assert!(last_x.abs() < 0.05, "no se recuperó: x={last_x}");
+        let (.., vx, _, _) = ekf.filter_pose(0.0, 0.0, 0.0, dt);
+        assert!(vx.abs() < 0.5, "velocidad no se reinició: {vx}");
     }
 
     /// Con R más chico el filtro sigue más de cerca la medición (menos suavizado):

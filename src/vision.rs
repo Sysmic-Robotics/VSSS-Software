@@ -295,7 +295,11 @@ impl Vision {
 
     /// Calcula el delta de tiempo desde la última vez que se vio esta entidad.
     /// El primer frame y los gaps largos se acotan a un rango razonable
-    /// (5 ms – 100 ms) para que el EKF no se desestabilice.
+    /// (12 ms – 100 ms) para que el EKF no se desestabilice. El mínimo es ~3/4 de
+    /// frame a 60 Hz: si dos paquetes se procesan casi juntos (ráfaga porque el
+    /// proceso se atrasó, o cola de latencia del proxy) igual representan frames
+    /// separados ~16 ms; con dt ≈ 5 ms el filtro triplicaba la velocidad
+    /// estimada, el gate rechazaba todo y la pose se extrapolaba al infinito.
     fn compute_dt(&mut self, key: (i32, i32)) -> f32 {
         let now = Instant::now();
         let dt = self
@@ -303,7 +307,7 @@ impl Vision {
             .get(&key)
             .map(|t| now.duration_since(*t).as_secs_f32())
             .unwrap_or(0.016)
-            .clamp(0.005, 0.1);
+            .clamp(0.012, 0.1);
         self.last_seen.insert(key, now);
         dt
     }

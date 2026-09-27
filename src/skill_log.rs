@@ -307,23 +307,38 @@ pub const MATCH_CSV_HEADER: &str = "t_ms,tick,team,robot,own,skill,target_x,targ
 /// (goles, posesión, toques, tiempo a la pelota) y de la revisión offline de
 /// decisiones.
 pub struct MatchLogger {
-    file: File,
+    /// Con buffer: 6 escrituras sin buffer por tick sobre un disco lento (p. ej.
+    /// `/mnt/d` desde WSL) bajaban el loop de 60 Hz a 13 Hz y hacían divergir el
+    /// tracker (paquetes de visión procesados en ráfagas).
+    file: std::io::BufWriter<File>,
     own_team: i32,
+    ticks: u64,
 }
 
 impl MatchLogger {
+    /// Cada cuántos ticks se vacía el buffer al disco (~1 s a 60 Hz).
+    const FLUSH_EVERY_TICKS: u64 = 60;
+
     pub fn new<P: AsRef<Path>>(path: P, own_team: i32) -> std::io::Result<Self> {
         if let Some(parent) = path.as_ref().parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = File::create(path)?;
+        let mut file = std::io::BufWriter::with_capacity(1 << 16, File::create(path)?);
         file.write_all(MATCH_CSV_HEADER.as_bytes())?;
-        Ok(Self { file, own_team })
+        Ok(Self {
+            file,
+            own_team,
+            ticks: 0,
+        })
     }
 
     pub fn write_tick(&mut self, rec: &TickRecord<'_>) -> std::io::Result<()> {
+        self.ticks += 1;
+        if self.ticks.is_multiple_of(Self::FLUSH_EVERY_TICKS) {
+            self.file.flush()?;
+        }
         let ball = rec.world.get_ball_state();
         let ball_cols = format!(
             "{},{},{},{}",
@@ -382,6 +397,12 @@ impl MatchLogger {
             )?;
         }
         Ok(())
+    }
+}
+
+impl Drop for MatchLogger {
+    fn drop(&mut self) {
+        let _ = self.file.flush();
     }
 }
 
