@@ -158,6 +158,127 @@ pub fn spin_relative_target(skill_target_x: f32, robot_x_m: f32) -> Vec2 {
     Vec2::new(sign, 0.0)
 }
 
+/// Botones del runner de skills, agrupados: `(título, skills en orden)`. Es la
+/// única fuente de los botones de la sección Skills; el test
+/// `every_catalog_skill_has_button_and_help` falla si una skill del catálogo no
+/// aparece exactamente una vez.
+const SKILL_GROUPS: [(&str, &[SkillId]); 4] = [
+    (
+        "Navegación",
+        &[SkillId::GoTo, SkillId::FacePoint, SkillId::Spin],
+    ),
+    (
+        "Ataque",
+        &[
+            SkillId::ChaseBall,
+            SkillId::ApproachAligned,
+            SkillId::ShootPush,
+            SkillId::Clear,
+            SkillId::SpinKick,
+        ],
+    ),
+    (
+        "Defensa",
+        &[
+            SkillId::Intercept,
+            SkillId::BlockLine,
+            SkillId::GoalKeep,
+            SkillId::Mark,
+        ],
+    ),
+    ("Quieto", &[SkillId::Hold]),
+];
+
+/// Línea de ayuda de la skill activa: qué significa el click para esa skill (el
+/// `target` de `SkillCatalog::tick`) o que no se usa. `None` = sin skill (coach).
+pub fn skill_help(skill: Option<SkillId>) -> &'static str {
+    match skill {
+        None => "Ninguna: el coach controla el robot. Elige una skill y haz click en la cancha.",
+        Some(SkillId::GoTo) => "click = destino.",
+        Some(SkillId::FacePoint) => "click = punto a mirar (gira en el lugar).",
+        Some(SkillId::Spin) => "click = sentido de giro: x mayor que el robot → CCW, x menor → CW.",
+        Some(SkillId::ChaseBall) => "el click no se usa: persigue la pelota.",
+        Some(SkillId::ApproachAligned) => {
+            "click = hacia dónde apuntar: se pone detrás de la pelota, alineado con la \
+             línea pelota→click."
+        }
+        Some(SkillId::ShootPush) => {
+            "click = a dónde mandar la pelota. Solo empuja si ya está detrás de la \
+             pelota; si no, queda quieto (usa ApproachAligned antes)."
+        }
+        Some(SkillId::Clear) => {
+            "click = punto de despeje: se pone detrás de la pelota por el camino corto \
+             y empuja."
+        }
+        Some(SkillId::SpinKick) => {
+            "click = hacia dónde lanzar la pelota (contacto lateral + giro, con la ω de \
+             team_params, no la de Tuning)."
+        }
+        Some(SkillId::Intercept) => {
+            "el click no se usa: va al punto de intercepción predicho de la pelota."
+        }
+        Some(SkillId::BlockLine) => {
+            "el click no se usa: cubre la línea pelota→arco propio (lado según VSSL_SIDE)."
+        }
+        Some(SkillId::GoalKeep) => {
+            "el click no se usa: arquero en la línea del arco propio (VSSL_SIDE). Solo el \
+             robot coach.keeper_id puede entrar al área."
+        }
+        Some(SkillId::Mark) => "click = dónde pararse; queda mirando a la pelota.",
+        Some(SkillId::Hold) => "el click no se usa: quieto (v = 0, ω = 0).",
+    }
+}
+
+/// Centro del arco propio (m, marco mundo) según el lado que defendemos. Mismo
+/// punto que `goals_for_team` de `main`.
+pub fn own_goal_center(defend_left: bool) -> Vec2 {
+    let x = if defend_left {
+        -crate::coach::FIELD_HALF_X
+    } else {
+        crate::coach::FIELD_HALF_X
+    };
+    Vec2::new(x, 0.0)
+}
+
+/// Target que la GUI manda al loop para `skill`. `Spin`: sentido relativo al
+/// robot (`spin_relative_target`). `BlockLine`/`GoalKeep`: el arco propio, porque
+/// su `target` es el centro del arco propio y no un punto que se pueda clickear.
+/// Resto: el click (las skills que ignoran el target lo reciben igual).
+pub fn effective_skill_target(skill: SkillId, click: Vec2, robot_x_m: f32, own_goal: Vec2) -> Vec2 {
+    match skill {
+        SkillId::Spin => spin_relative_target(click.x, robot_x_m),
+        SkillId::BlockLine | SkillId::GoalKeep => own_goal,
+        _ => click,
+    }
+}
+
+/// Dónde dibujar el marcador del target en la cancha: el arco propio en
+/// `BlockLine`/`GoalKeep`, el click en las skills que lo usan (incluida `Spin`,
+/// que usa su lado) y ninguno en las que lo ignoran (`ChaseBall`, `Intercept`, `Hold`).
+pub fn skill_marker(skill: SkillId, click: Vec2, own_goal: Vec2) -> Option<Vec2> {
+    match skill {
+        SkillId::BlockLine | SkillId::GoalKeep => Some(own_goal),
+        s if s.uses_target() || s.uses_target_sign() => Some(click),
+        _ => None,
+    }
+}
+
+/// Aviso para `GoalKeep` en un robot que no es el arquero: el `ZoneGuard` del
+/// loop solo deja entrar al área propia a `coach.keeper_id`, y la GUI no se
+/// exime del guardia (mismo comportamiento que `main` y `skill_test`).
+pub fn keeper_warning(
+    skill: Option<SkillId>,
+    selected_robot: u32,
+    keeper_id: i32,
+) -> Option<String> {
+    (skill == Some(SkillId::GoalKeep) && selected_robot as i32 != keeper_id).then(|| {
+        format!(
+            "⚠ este robot no es el arquero (keeper_id = {keeper_id} en team_params.json): \
+             el guardia no lo deja entrar al área"
+        )
+    })
+}
+
 /// Agrega una muestra a una serie de telemetría, descartando las más viejas al
 /// superar la ventana de retención máxima.
 fn push_capped<T>(q: &mut VecDeque<T>, item: T) {
@@ -180,7 +301,7 @@ fn wrap_angle(a: f32) -> f32 {
 
 /// Botón de selección de skill; resaltado si es la skill activa.
 fn skill_button<'a>(
-    label: &'a str,
+    label: String,
     sk: Option<SkillId>,
     active: Option<SkillId>,
 ) -> iced::widget::Button<'a, Message> {
@@ -444,6 +565,13 @@ pub struct VisionGui {
     /// Target de la skill activa (metros, marco mundo), fijado con click.
     skill_target: Vec2,
     skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
+    /// Centro del arco propio (m), desde `VSSL_SIDE` para el equipo propio. Se lee
+    /// una vez al arrancar, igual que `main` y el `ZoneGuard`.
+    own_goal: Vec2,
+    /// Motion de dos caras (`MotionConfig::from_env`, misma lectura que el loop).
+    bidirectional: bool,
+    /// Único robot que el `ZoneGuard` deja entrar al área propia (`coach.keeper_id`).
+    keeper_id: i32,
     /// Velocidad angular de Spin (rad/s), tuneable en vivo.
     spin_omega: f64,
     spin_omega_str: String,
@@ -570,6 +698,11 @@ impl VisionGui {
                 active_skill: None,
                 skill_target: Vec2::ZERO,
                 skill_tx: setup.skill_tx,
+                own_goal: own_goal_center(crate::skills::zones::defend_left_from_env(
+                    setup.own_team as i32,
+                )),
+                bidirectional: crate::motion::MotionConfig::from_env().bidirectional,
+                keeper_id: crate::params::params().coach.keeper_id,
                 spin_omega: SPIN_OMEGA_DEFAULT,
                 spin_omega_str: format!("{SPIN_OMEGA_DEFAULT}"),
                 pid_kp: PID_KP_DEFAULT,
@@ -886,18 +1019,15 @@ impl VisionGui {
                 if !self.manual_enabled
                     && let (Some(skill), Some(tx)) = (self.active_skill, &self.skill_tx)
                 {
-                    // Spin: el sentido se elige relativo al robot (signo de
-                    // click.x − robot.x). Las demás skills usan el target tal cual.
-                    let target = if skill == SkillId::Spin {
-                        let robot_x_m = self
-                            .robots
-                            .get(&(self.selected_team, self.selected_robot))
-                            .map(|r| r.position.x / 1000.0)
-                            .unwrap_or(0.0);
-                        spin_relative_target(self.skill_target.x, robot_x_m)
-                    } else {
-                        self.skill_target
-                    };
+                    // Target efectivo: Spin elige el sentido relativo al robot,
+                    // BlockLine/GoalKeep usan el arco propio y el resto el click.
+                    let robot_x_m = self
+                        .robots
+                        .get(&(self.selected_team, self.selected_robot))
+                        .map(|r| r.position.x / 1000.0)
+                        .unwrap_or(0.0);
+                    let target =
+                        effective_skill_target(skill, self.skill_target, robot_x_m, self.own_goal);
                     let _ = tx.try_send(GuiSkillCommand {
                         team: self.selected_team as i32,
                         id: self.selected_robot as i32,
@@ -1402,25 +1532,72 @@ impl VisionGui {
         .into()
     }
 
-    /// Contenido de la sección **Skills**: selector de skill + Spin ω.
+    /// Contenido de la sección **Skills**: botones de todo el catálogo por grupo
+    /// (`SKILL_GROUPS`), ayuda de la skill activa y estado de solo lectura
+    /// (bidireccional, arco propio, arquero).
     fn skills_section(&self) -> Element<'_, Message> {
-        column![
-            row![
-                skill_button("Ninguna", None, self.active_skill),
-                skill_button("GoTo", Some(SkillId::GoTo), self.active_skill),
-                skill_button("FacePoint", Some(SkillId::FacePoint), self.active_skill),
-            ]
-            .spacing(4),
-            row![
-                skill_button("ChaseBall", Some(SkillId::ChaseBall), self.active_skill),
-                skill_button("Spin", Some(SkillId::Spin), self.active_skill),
-            ]
-            .spacing(4),
-            text("click en la cancha = target / lado de giro").size(10),
-            text("(Spin ω y PID en la sección Tuning)").size(10),
-        ]
-        .spacing(6)
-        .into()
+        let mut col = column![skill_button(
+            "Ninguna (coach)".to_string(),
+            None,
+            self.active_skill
+        )]
+        .spacing(6);
+        // Un título por grupo y filas de hasta 3 botones (caben en el sidebar).
+        for (title, skills) in SKILL_GROUPS {
+            col = col.push(
+                text(title)
+                    .size(theme::FS_XS)
+                    .style(|_t: &Theme| text::Style {
+                        color: Some(theme::TEXT_DIM),
+                    }),
+            );
+            for chunk in skills.chunks(3) {
+                col = col.push(
+                    iced::widget::Row::with_children(chunk.iter().map(|&id| {
+                        skill_button(format!("{id:?}"), Some(id), self.active_skill).into()
+                    }))
+                    .spacing(4),
+                );
+            }
+        }
+        col = col.push(text(skill_help(self.active_skill)).size(theme::FS_SM));
+        if let Some(warning) =
+            keeper_warning(self.active_skill, self.selected_robot, self.keeper_id)
+        {
+            col = col.push(
+                text(warning)
+                    .size(theme::FS_SM)
+                    .style(|_t: &Theme| text::Style {
+                        color: Some(theme::WARN),
+                    }),
+            );
+        }
+        let motion = if self.bidirectional {
+            "Motion: bidireccional ON (heading mod 180°)"
+        } else {
+            "Motion: una cara (bidireccional OFF)"
+        };
+        let side = if self.own_goal.x < 0.0 {
+            "izquierdo"
+        } else {
+            "derecho"
+        };
+        col.push(text(motion).size(theme::FS_XS))
+            .push(
+                text(format!(
+                    "Arco propio: {side} (VSSL_SIDE) · arquero: robot {} (coach.keeper_id)",
+                    self.keeper_id
+                ))
+                .size(theme::FS_XS),
+            )
+            .push(
+                text(
+                    "Tuning: Spin ω solo afecta a Spin; el PID de heading, solo a \
+                     GoTo/FacePoint/ChaseBall",
+                )
+                .size(theme::FS_XS),
+            )
+            .into()
     }
 
     /// Contenido de la sección **Teleport** (solo sim): reposicionar robot y pelota.
@@ -1811,7 +1988,9 @@ impl VisionGui {
             motion: &self.motion_debug,
             cache: &self.field_cache,
             selected,
-            skill_target: self.active_skill.map(|_| self.skill_target),
+            skill_target: self
+                .active_skill
+                .and_then(|s| skill_marker(s, self.skill_target, self.own_goal)),
             trace: &self.trace,
             show_trace: self.trace_enabled,
         })
@@ -1999,6 +2178,87 @@ mod tests {
         assert_eq!(spin_relative_target(0.2, 0.2).x, 1.0);
         // y siempre 0 (giro puro).
         assert_eq!(spin_relative_target(0.5, 0.0).y, 0.0);
+    }
+
+    /// Cada skill del catálogo tiene exactamente un botón y texto de ayuda: una
+    /// skill que se agregue a `SkillId` sin botón en la GUI rompe este test.
+    #[test]
+    fn every_catalog_skill_has_button_and_help() {
+        let buttons: Vec<SkillId> = SKILL_GROUPS
+            .iter()
+            .flat_map(|(_, skills)| skills.iter().copied())
+            .collect();
+        for n in 0..SkillId::COUNT as u8 {
+            let id = SkillId::from_u8(n).expect("id válido");
+            let count = buttons.iter().filter(|&&b| b == id).count();
+            assert_eq!(
+                count, 1,
+                "{id:?} tiene {count} botones en SKILL_GROUPS (debe tener 1)"
+            );
+            assert!(
+                !skill_help(Some(id)).is_empty(),
+                "{id:?} sin texto de ayuda"
+            );
+        }
+        assert_eq!(buttons.len(), SkillId::COUNT);
+        assert!(!skill_help(None).is_empty());
+    }
+
+    /// BlockLine/GoalKeep mandan el arco propio, Spin el sentido y el resto el click.
+    #[test]
+    fn effective_target_per_skill() {
+        let own_goal = Vec2::new(-0.75, 0.0);
+        let click = Vec2::new(0.3, -0.2);
+        for id in [SkillId::BlockLine, SkillId::GoalKeep] {
+            assert_eq!(effective_skill_target(id, click, 0.0, own_goal), own_goal);
+            assert_eq!(
+                effective_skill_target(id, Vec2::new(0.7, 0.5), 0.0, own_goal),
+                own_goal
+            );
+        }
+        assert_eq!(
+            effective_skill_target(SkillId::Spin, click, 0.0, own_goal),
+            Vec2::new(1.0, 0.0)
+        );
+        assert_eq!(
+            effective_skill_target(SkillId::Spin, click, 0.5, own_goal),
+            Vec2::new(-1.0, 0.0)
+        );
+        for id in [SkillId::GoTo, SkillId::ShootPush, SkillId::Mark] {
+            assert_eq!(effective_skill_target(id, click, 0.0, own_goal), click);
+        }
+    }
+
+    /// El marcador muestra el target efectivo y nada en las skills que lo ignoran.
+    #[test]
+    fn skill_marker_shows_effective_target() {
+        let own_goal = Vec2::new(0.75, 0.0);
+        let click = Vec2::new(-0.1, 0.4);
+        for id in [SkillId::ChaseBall, SkillId::Intercept, SkillId::Hold] {
+            assert_eq!(skill_marker(id, click, own_goal), None, "{id:?}");
+        }
+        for id in [SkillId::BlockLine, SkillId::GoalKeep] {
+            assert_eq!(skill_marker(id, click, own_goal), Some(own_goal), "{id:?}");
+        }
+        for id in [SkillId::GoTo, SkillId::Spin, SkillId::SpinKick] {
+            assert_eq!(skill_marker(id, click, own_goal), Some(click), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn own_goal_center_by_side() {
+        assert_eq!(own_goal_center(true), Vec2::new(-0.75, 0.0));
+        assert_eq!(own_goal_center(false), Vec2::new(0.75, 0.0));
+    }
+
+    /// El aviso aparece solo con GoalKeep en un robot que no es el arquero.
+    #[test]
+    fn keeper_warning_only_for_goalkeep_off_keeper() {
+        let w = keeper_warning(Some(SkillId::GoalKeep), 1, 2).expect("robot 1 no es el arquero");
+        assert!(w.contains("keeper_id = 2"), "{w}");
+        assert_eq!(keeper_warning(Some(SkillId::GoalKeep), 2, 2), None);
+        assert_eq!(keeper_warning(Some(SkillId::BlockLine), 1, 2), None);
+        assert_eq!(keeper_warning(None, 1, 2), None);
     }
 
     /// Round-trip del preset de tuning (serialize → deserialize preserva valores).
