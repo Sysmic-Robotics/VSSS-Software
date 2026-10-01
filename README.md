@@ -42,7 +42,7 @@ cargo build --release                # build optimizado (necesario para tiempo r
 cargo run --release                  # main headless (coach decide) — default FIRASim
 VSSL_DEBUG_GUI=1 cargo run --release # main con GUI Iced
 cargo run --bin scenario --release   # banco "editar y correr" para 1 skill, GUI siempre on, CSV opcional a logs/
-cargo run --bin skill_test --release -- --help   # probador CLI (modo skill o wheels)
+cargo run --bin skill_test --release -- --help   # probador CLI (modo skill o vw)
 cargo test                           # suite completa (lib + bin + doctests)
 cargo clippy                         # lint
 cargo fmt                            # formato
@@ -106,7 +106,7 @@ config sigue viniendo del entorno y los bytes enviados son idénticos.
 **3 binarios:**
 - `rustengine` (default): producción headless o con `VSSL_DEBUG_GUI=1`. Coach decide qué skill correr.
 - `scenario`: banco de pruebas tipo "editar y correr". Una skill a la vez, configurada como constantes en la zona de edición al inicio de `src/bin/scenario.rs`. GUI siempre activa. CSV opcional a `logs/scenario_<skill>_<epoch>.csv` (toggle con la constante `log: Option<PathBuf>`: `Some(scenario_log_path(&scenario))` escribe, `None` desactiva el archivo y deja solo el resumen humano a stderr).
-- `skill_test`: probador CLI. Modo `skill` (lazo cerrado, sim o real) y modo `wheels` (lazo abierto, mm/s directos al robot real para bring-up). Ver `--help`.
+- `skill_test`: probador CLI. Modo `skill` (lazo cerrado, sim o real) y modo `vw` (lazo abierto: v en mm/s y ω en °/s directos al robot real, para bring-up). Ver `--help`.
 
 ### Probar contra robots reales
 
@@ -152,13 +152,15 @@ VSSL_TEAM_COLOR=yellow VSSL_COACH=rule_based VSSL_MATCH_LOG=logs/partido_amarill
 # Visión real, comandos a FIRASim (debug visual: ver qué decide el engine sin mover los robots).
 VSSL_VISION_SOURCE=sslvision cargo run --release
 
-# Bring-up de hardware: mandar L/R mm/s directos a un robot sin pasar por visión ni skills.
-# Útil para diagnosticar signos de rueda, comunicación y unidades.
-# Secuencia recomendada para descubrir signos invertidos:
-cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 500  --right 0    --dur 1   # solo izquierda → pivota a la derecha
-cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 0    --right 500  --dur 1   # solo derecha → pivota a la izquierda
-cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 500  --right 500  --dur 1   # ambas → debe AVANZAR RECTO (si gira: signo invertido en alguna rueda)
-cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left -500 --right 500  --dur 1   # giro CCW sobre el eje (confirma convención Spin)
+# Bring-up de hardware: mandar (v mm/s, ω °/s) directos a un robot sin pasar por visión ni skills.
+# Útil para diagnosticar signos de rueda, giroscopio, comunicación y unidades.
+# Encender el robot QUIETO (calibra el gyro). --robot 1 = robot con MI_ROBOT_ID 2.
+# Qué significa cada falla: ver `skill_test --help` (SECUENCIA DE BRING-UP).
+cargo run --bin skill_test --release -- --transport base-station --mode vw --team blue --robot 1 --v 300  --w 0   --dur 2   # avanza recto
+cargo run --bin skill_test --release -- --transport base-station --mode vw --team blue --robot 1 --v -300 --w 0   --dur 2   # retrocede recto
+cargo run --bin skill_test --release -- --transport base-station --mode vw --team blue --robot 1 --v 0    --w 90  --dur 2   # gira antihorario (~1 vuelta/4 s)
+cargo run --bin skill_test --release -- --transport base-station --mode vw --team blue --robot 1 --v 0    --w -90 --dur 2   # gira horario
+cargo run --bin skill_test --release -- --transport base-station --mode vw --team blue --robot 1 --v 300  --w 45  --dur 2   # arco hacia la izquierda (radio ≈ 0.38 m)
 ```
 
 Smoke test del watchdog (200 ms en firmware, `COMM_TIMEOUT_MS` en `config.h`): con los robots moviéndose, `Ctrl+C` y deben detenerse rápido.
@@ -185,9 +187,10 @@ Fuente de visión (FIRASim 224.0.0.1:10002 | vsss-vision-sysmic 224.5.23.2:10015
           radio/         despacha vía RobotTransport (VSSL_RADIO_TARGET):
                          ├─ FiraSimTransport     → UDP protobuf 127.0.0.1:20011
                          ├─ GrSimTransport       → UDP protobuf grSim
-                         └─ BaseStationTransport → cinemática inversa diferencial
-                                                   → ASCII "L,R mm/s" por USB serial
+                         └─ BaseStationTransport → (v, ω) proyectados al heading
+                                                   → ASCII "V,W" (mm/s, °/s) por USB serial
                                                    → ESP32 base → ESP-NOW → robots
+                                                     (el firmware reparte a las ruedas)
 ```
 
 ### Módulos principales
@@ -219,7 +222,7 @@ src/
 ├── vision.rs              # Recepción multicast (FIRA o SSL_WrapperPacket) + filtros
 ├── bin/
 │   ├── scenario.rs        # Banco "editar y correr": 1 skill, GUI on, CSV a logs/
-│   └── skill_test.rs      # Probador CLI: --mode skill|wheels (bring-up real)
+│   └── skill_test.rs      # Probador CLI: --mode skill|vw (bring-up real)
 ├── world/                 # World, RobotState, BallState (Arc<RwLock>)
 ├── tracker/               # EKF por entidad
 ├── coach/                 # Coach trait + RuleBasedCoach + Observation (52 floats RL)
@@ -348,27 +351,28 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 
 ### Parámetros de la base station (`src/radio/base_station.rs`)
 
-`BaseStationTransport` hace la **cinemática inversa diferencial en Rust** y envía velocidades de rueda en mm/s a la base ESP32 nueva (`base_station2.ino` en la raíz del repo monorepo). La base reenvía un binario de 24 bytes por ESP-NOW al robot, que las aplica directamente con su PID interno.
+`BaseStationTransport` envía a la base ESP32 la consigna **(v, ω)** de cada robot. La base vigente es `VSSL-firmware/test/base_station_lineal_angulo.ino` (rama `Peluche` del firmware). Reenvía un binario de 24 bytes por ESP-NOW cada 50 ms, y el **firmware** hace la cinemática diferencial (`WHEEL_TRACK_MM`), corrige ω con el giroscopio y cierra el PID de cada rueda. Contrato verificado en `docs/contrato_comunicacion_v2.md`.
 
-| Constante | Valor | Descripción |
+| Parámetro | Valor | Descripción |
 |-----------|-------|-------------|
-| `WHEEL_BASE_M` | `0.07` | Separación física entre ruedas del robot real, en metros (medida 2026-06-13). Calibración fina del giro pendiente de validar |
-| `MAX_WHEEL_MM_S` | `1500` | Clamp duro de seguridad (mismo límite que aplica la base en `base_station2.ino`) |
-| `SLOT_COUNT` | `5` | Slots del frame ASCII; el robot físico con `MI_ROBOT_ID = N` (firmware, 1-based) lee `slots[N-1]` |
+| `robot.max_v_mm_s` (`config/team_params.json`) | `1500` | Tope de v, el mismo clamp que aplica la base (`MAX_V_MM_S`) |
+| `robot.max_w_deg_s` (`config/team_params.json`) | `720` | Tope de ω en grados/s, el mismo clamp que aplica la base (`MAX_W_DEG_S`) |
+| `SLOT_COUNT` | `5` | Slots del frame ASCII; el robot físico con `MI_ROBOT_ID = N` (firmware, desde 1) lee `slots[N-1]`. El robot del checkout actual es `MI_ROBOT_ID 2` → slot 1 |
 
-**Cinemática inversa** (en `command_to_wheel_mm_s`):
+**Conversión** (en `command_to_vw`, única fuente de verdad del frame, el CSV y la GUI):
 ```
-v     = vx·cos(orientation) + vy·sin(orientation)   // m/s (proyección al heading)
-v_izq = v − (omega · WHEEL_BASE_M) / 2              // m/s
-v_der = v + (omega · WHEEL_BASE_M) / 2              // m/s
+v [mm/s] = round((vx·cos(orientation) + vy·sin(orientation)) · 1000)   // proyección al heading
+w [°/s]  = round(omega · 180/π)
 ```
-Convención: `omega > 0` → CCW visto desde arriba → rueda derecha más rápida (matchea la convención `Spin` del catálogo).
+Ambos se recortan a los topes de arriba. Convención: `omega > 0` → `w > 0` → antihorario visto desde arriba (en el firmware, rueda derecha más rápida; coincide con la convención `Spin`).
 
-**Frame serial:** `"L1,R1,L2,R2,L3,R3,L4,R4,L5,R5\n"` (enteros decimales, mm/s, terminador `\n`), 115200 baud. Solo se incluyen comandos del equipo propio (`VSSL_TEAM_COLOR`).
+**Tope por rueda del firmware:** si (v, ω) le pide más de 450 mm/s a una rueda (`MAX_WHEEL_MM_S`), el firmware escala **ambas ruedas** por el mismo factor: conserva la curva y baja la velocidad. El PC no replica ese tope, así que el robot puede ejecutar menos de lo enviado (v ≤ 0.45 m/s en recta, ω ≤ ~12 rad/s en giro puro).
 
-**NaN/Inf safety:** si cualquier campo del `MotionCommand` es no-finito, `command_to_wheel_mm_s` devuelve `(0, 0)` sin pánico (estado seguro, igual al watchdog del firmware).
+**Frame serial:** `"V1,W1,V2,W2,V3,W3,V4,W4,V5,W5\n"` (enteros decimales, terminador `\n`), 115200 baud. Solo se incluyen comandos del equipo propio (`VSSL_TEAM_COLOR`). La base descarta una línea con decimales y sigue enviando el comando anterior. **No tiene timeout de serial**: si el PC deja de mandar, repite lo último; el watchdog de 200 ms del robot solo cubre la pérdida de radio.
 
-**Bring-up directo de ruedas** (sin pasar por cinemática inversa): `BaseStationTransport::send_raw_wheels_frame(slots)` o el binario `skill_test --mode wheels`.
+**NaN/Inf safety:** si cualquier campo del `MotionCommand` no es finito, `command_to_vw` devuelve `(0, 0)` sin pánico.
+
+**Bring-up directo** (sin skills): `BaseStationTransport::send_raw_vw_frame(slots)` o el binario `skill_test --mode vw --v MM_S --w DEG_S`.
 
 ---
 
@@ -497,5 +501,5 @@ Requiere `matplotlib` (`pip install matplotlib`). Sin `matplotlib` funciona el r
 | `[control_loop] radio error: No such file or directory` | Base station no enchufada o `VSSL_BASESTATION_DEVICE` mal | `ls /dev/ttyUSB* /dev/ttyACM*`; exportar la ruta correcta |
 | `[control_loop] radio error: Permission denied` | Usuario no está en grupo `dialout` | `sudo usermod -aG dialout $USER` + re-login, o `sudo chmod 666 /dev/ttyUSBX` |
 | `[Vision] Sin paquetes` con `sslvision` | Publisher caído, grupo/puerto equivocado, o multicast en interfaz que no es | Verificar con `sudo tcpdump -ni any udp port 10015`; si llega pero el Rust no ve, probar `VSSL_MULTICAST_IFACE=<ip_local>` |
-| Robots detectados en GUI pero no se mueven | `MI_ROBOT_ID` (firmware) no matchea el id que la visión asigna; o `#define MODO_BASESTATION` comentado en firmware | Confirmar IDs en GUI y en `config.h`. Probar bring-up directo: `cargo run --bin skill_test --release -- --transport base-station --mode wheels --team blue --robot 0 --left 500 --right 500 --dur 1` |
+| Robots detectados en GUI pero no se mueven | `MI_ROBOT_ID` (firmware) no matchea el id que la visión asigna; o `#define MODO_BASESTATION` comentado en firmware | Confirmar IDs en GUI y en `config.h`. Probar bring-up directo: `cargo run --bin skill_test --release -- --transport base-station --mode vw --team blue --robot 1 --v 300 --w 0 --dur 2` (`--robot` = `MI_ROBOT_ID` − 1) |
 | Frame `?,?,?,?,...` en consola pero robot inerte | `#define MODO_BASESTATION` está comentado → firmware compila en modo BLE/RemoteXY y no escucha ESP-NOW | Descomentar línea en `VSSL-firmware/include/config.h:10` y reflashear |

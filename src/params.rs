@@ -1,8 +1,8 @@
 //! Parámetros de calibración y táctica FUERA del código (`config/team_params.json`).
 //!
-//! Todo lo que se ajusta con mediciones o con partidos de prueba (wheelbase real,
-//! velocidades, distancias de las skills, umbrales del coach) vive aquí, para que
-//! calibrar sea editar un archivo y no recompilar.
+//! Todo lo que se ajusta con mediciones o con partidos de prueba (topes del robot
+//! real, velocidades, distancias de las skills, umbrales del coach) vive aquí, para
+//! que calibrar sea editar un archivo y no recompilar.
 //!
 //! Carga (`TeamParams::load`):
 //! 1. `VSSL_PARAMS=<ruta>` si está definida (error si el archivo no existe o no parsea);
@@ -222,21 +222,25 @@ impl Default for MotionParams {
     }
 }
 
-/// Robot REAL (frame a la base station). Calibrar con M2.
+/// Robot REAL: topes del frame `V,W` que va a la base station.
+///
+/// La cinemática diferencial la hace el firmware (`WHEEL_TRACK_MM`), así que el PC
+/// no guarda la geometría del robot real; la del simulador está en `SimRobotParams`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RobotParams {
-    /// Separación entre ruedas (m). Hoy: valor medido a mano el 2026-06-13.
-    pub wheel_base_m: f64,
-    /// Tope por rueda que aplica la base (mm/s).
-    pub max_wheel_mm_s: i32,
+    /// Tope de velocidad lineal (mm/s). Mismo clamp que la base
+    /// (`MAX_V_MM_S`, `base_station_lineal_angulo.ino`).
+    pub max_v_mm_s: i32,
+    /// Tope de velocidad angular (grados/s). Mismo clamp que la base (`MAX_W_DEG_S`).
+    pub max_w_deg_s: i32,
 }
 
 impl Default for RobotParams {
     fn default() -> Self {
         Self {
-            wheel_base_m: 0.07,
-            max_wheel_mm_s: 1500,
+            max_v_mm_s: 1500,
+            max_w_deg_s: 720,
         }
     }
 }
@@ -423,13 +427,29 @@ mod tests {
     #[test]
     fn partial_json_overrides_only_given_fields() {
         let p = TeamParams::from_json(
-            r#"{ "coach": { "keeper_id": 0 }, "robot": { "wheel_base_m": 0.0812 } }"#,
+            r#"{ "coach": { "keeper_id": 0 }, "robot": { "max_v_mm_s": 400 } }"#,
         )
         .unwrap();
         assert_eq!(p.coach.keeper_id, 0);
         assert_eq!(p.coach.role_min_hold, CoachParams::default().role_min_hold);
-        assert!((p.robot.wheel_base_m - 0.0812).abs() < 1e-9);
+        assert_eq!(p.robot.max_v_mm_s, 400);
+        assert_eq!(p.robot.max_w_deg_s, RobotParams::default().max_w_deg_s);
         assert_eq!(p.sim, SimRobotParams::default());
+    }
+
+    #[test]
+    fn robot_defaults_match_base_station_clamps() {
+        let r = RobotParams::default();
+        assert_eq!(r.max_v_mm_s, 1500);
+        assert_eq!(r.max_w_deg_s, 720);
+    }
+
+    #[test]
+    fn robot_wheel_base_is_rejected() {
+        // La geometría del robot real vive en el firmware: un JSON viejo con
+        // `robot.wheel_base_m` debe fallar nombrando el campo, no ignorarse.
+        let err = TeamParams::from_json(r#"{ "robot": { "wheel_base_m": 0.07 } }"#).unwrap_err();
+        assert!(err.contains("wheel_base_m"), "{err}");
     }
 
     #[test]
@@ -466,6 +486,8 @@ mod tests {
         // El archivo del repo debe ser siempre cargable (sin campos desconocidos).
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH);
         let p = TeamParams::from_file(&path).unwrap_or_else(|e| panic!("{e}"));
-        assert!(p.robot.wheel_base_m > 0.0);
+        assert!(p.robot.max_v_mm_s > 0);
+        assert!(p.robot.max_w_deg_s > 0);
+        assert_eq!(p.sim.wheel_base_m, 0.085);
     }
 }

@@ -5,20 +5,19 @@ use std::collections::VecDeque;
 use super::Message;
 use super::theme;
 
-/// Escala vertical del gráfico: ±1500 mm/s (mismo clamp que la base station).
-const WHEEL_MAX_MM_S: f32 = 1500.0;
-
-/// Gráfico temporal de la velocidad de rueda comandada L/R (mm/s) del robot
-/// seleccionado. Solo lectura; no afecta comandos ni headless.
-pub struct WheelChart<'a> {
-    /// Muestras `(t_segundos, wheel_l_mm_s, wheel_r_mm_s)`, más viejas al frente.
+/// Gráfico temporal de la consigna que LLEGA al robot seleccionado: v (mm/s) y
+/// ω (grados/s) del frame `V,W`. Como las unidades difieren, cada serie se escala
+/// a su propio tope (`params().robot`): una serie saturada toca el borde.
+/// Solo lectura; no afecta comandos ni headless.
+pub struct VwChart<'a> {
+    /// Muestras `(t_segundos, v_mm_s, w_deg_s)`, más viejas al frente.
     pub history: &'a VecDeque<(f64, i16, i16)>,
     /// Ventana de tiempo mostrada (s): solo se dibujan las muestras recientes.
     pub window_s: f64,
     pub cache: &'a Cache,
 }
 
-impl<'a> canvas::Program<Message> for WheelChart<'a> {
+impl<'a> canvas::Program<Message> for VwChart<'a> {
     type State = ();
 
     fn draw(
@@ -29,6 +28,10 @@ impl<'a> canvas::Program<Message> for WheelChart<'a> {
         bounds: Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Vec<Geometry> {
+        let robot = &crate::params::params().robot;
+        let max_v = robot.max_v_mm_s.max(1) as f32;
+        let max_w = robot.max_w_deg_s.max(1) as f32;
+
         let geometry = self.cache.draw(renderer, bounds.size(), |frame| {
             let width = bounds.width;
             let height = bounds.height;
@@ -45,11 +48,8 @@ impl<'a> canvas::Program<Message> for WheelChart<'a> {
                 None => Vec::new(),
             };
 
-            // Mapea un valor mm/s a la coordenada Y del gráfico.
-            let map_y = |v: f32| -> f32 {
-                let clamped = v.clamp(-WHEEL_MAX_MM_S, WHEEL_MAX_MM_S);
-                mid_y - (clamped / WHEEL_MAX_MM_S) * (height / 2.0 - 4.0)
-            };
+            // Mapea una fracción del tope (-1..1) a la coordenada Y del gráfico.
+            let map_y = |frac: f32| -> f32 { mid_y - frac.clamp(-1.0, 1.0) * (height / 2.0 - 4.0) };
 
             // Fondo + borde
             let background = Path::rectangle(Point::ORIGIN, bounds.size());
@@ -59,15 +59,15 @@ impl<'a> canvas::Program<Message> for WheelChart<'a> {
                 Stroke::default().with_width(2.0).with_color(theme::BORDER),
             );
 
-            // Gridlines de referencia: 0 (fuerte), ±750 y ±1500 (tenues).
-            for (val, strong) in [
+            // Gridlines de referencia: 0 (fuerte), ±50 % y ±100 % del tope (tenues).
+            for (frac, strong) in [
                 (0.0_f32, true),
-                (750.0, false),
-                (-750.0, false),
-                (1500.0, false),
-                (-1500.0, false),
+                (0.5, false),
+                (-0.5, false),
+                (1.0, false),
+                (-1.0, false),
             ] {
-                let y = map_y(val);
+                let y = map_y(frac);
                 frame.stroke(
                     &Path::line(Point::new(0.0, y), Point::new(width, y)),
                     Stroke::default()
@@ -76,24 +76,10 @@ impl<'a> canvas::Program<Message> for WheelChart<'a> {
                 );
             }
 
-            // Etiquetas de eje
+            // Etiqueta de escalas (cada serie, su tope)
             frame.fill_text(canvas::Text {
-                content: "+1500".to_string(),
+                content: format!("v ±{max_v} mm/s · w ±{max_w} °/s"),
                 position: Point::new(4.0, 2.0),
-                color: theme::AXIS_TEXT,
-                size: (theme::FS_XS as f32).into(),
-                ..Default::default()
-            });
-            frame.fill_text(canvas::Text {
-                content: "-1500".to_string(),
-                position: Point::new(4.0, height - 14.0),
-                color: theme::AXIS_TEXT,
-                size: (theme::FS_XS as f32).into(),
-                ..Default::default()
-            });
-            frame.fill_text(canvas::Text {
-                content: "Ruedas L/R (mm/s)".to_string(),
-                position: Point::new(width / 2.0 - 56.0, 2.0),
                 color: theme::AXIS_TEXT,
                 size: (theme::FS_XS as f32).into(),
                 ..Default::default()
@@ -113,15 +99,23 @@ impl<'a> canvas::Program<Message> for WheelChart<'a> {
             let n = samples.len();
             let dx = width / (n - 1) as f32;
 
-            // Curva rueda izquierda (cyan) y derecha (magenta).
-            for (pick, color) in [
-                ((|s: &(f64, i16, i16)| s.1) as fn(&(f64, i16, i16)) -> i16, theme::DATA_L),
-                ((|s: &(f64, i16, i16)| s.2) as fn(&(f64, i16, i16)) -> i16, theme::DATA_R),
+            // Curva v (cyan) y ω (magenta), cada una normalizada a su tope.
+            for (pick, max, color) in [
+                (
+                    (|s: &(f64, i16, i16)| s.1) as fn(&(f64, i16, i16)) -> i16,
+                    max_v,
+                    theme::DATA_L,
+                ),
+                (
+                    (|s: &(f64, i16, i16)| s.2) as fn(&(f64, i16, i16)) -> i16,
+                    max_w,
+                    theme::DATA_R,
+                ),
             ] {
                 let path = Path::new(|b| {
                     for (i, sample) in samples.iter().enumerate() {
                         let x = i as f32 * dx;
-                        let y = map_y(pick(sample) as f32);
+                        let y = map_y(pick(sample) as f32 / max);
                         if i == 0 {
                             b.move_to(Point::new(x, y));
                         } else {
@@ -132,18 +126,18 @@ impl<'a> canvas::Program<Message> for WheelChart<'a> {
                 frame.stroke(&path, Stroke::default().with_width(2.0).with_color(color));
             }
 
-            // Lectura numérica del valor actual (última muestra) L/R.
-            let (_, last_l, last_r) = *samples.last().unwrap();
+            // Lectura numérica del valor actual (última muestra), en unidades nativas.
+            let (_, last_v, last_w) = *samples.last().unwrap();
             frame.fill_text(canvas::Text {
-                content: format!("L {last_l}"),
-                position: Point::new(width - 96.0, 2.0),
+                content: format!("v {last_v}"),
+                position: Point::new(width - 104.0, 2.0),
                 color: theme::DATA_L,
                 size: (theme::FS_SM as f32).into(),
                 ..Default::default()
             });
             frame.fill_text(canvas::Text {
-                content: format!("R {last_r}"),
-                position: Point::new(width - 44.0, 2.0),
+                content: format!("w {last_w}"),
+                position: Point::new(width - 48.0, 2.0),
                 color: theme::DATA_R,
                 size: (theme::FS_SM as f32).into(),
                 ..Default::default()

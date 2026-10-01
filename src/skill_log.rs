@@ -9,7 +9,7 @@
 //! - `format_human_summary`: línea humana corta para el print rate-limited a stderr (NO CSV).
 
 use crate::control_loop::TickRecord;
-use crate::radio::base_station::{SLOT_COUNT, build_frame_from_wheels, command_to_wheel_mm_s};
+use crate::radio::base_station::{SLOT_COUNT, build_frame_from_vw, command_to_vw};
 use crate::radio::{RadioTarget, TeamColor};
 use crate::skills::SkillId;
 use crate::vision::VisionSource;
@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-pub const CSV_HEADER: &str = "t_ms,tick,mode,transport,vision,robot,team,skill,pose_x,pose_y,pose_theta,target_x,target_y,cmd_vx,cmd_vy,cmd_omega,wheel_L_mm_s,wheel_R_mm_s,frame_str,err_dist,err_heading,ball_x,ball_y,ball_vx,ball_vy\n";
+pub const CSV_HEADER: &str = "t_ms,tick,mode,transport,vision,robot,team,skill,pose_x,pose_y,pose_theta,target_x,target_y,cmd_vx,cmd_vy,cmd_omega,v_mm_s,w_deg_s,frame_str,err_dist,err_heading,ball_x,ball_y,ball_vx,ball_vy\n";
 
 pub struct CsvLogger {
     file: File,
@@ -52,8 +52,8 @@ impl CsvLogger {
             opt(row.cmd_vx),
             opt(row.cmd_vy),
             opt(row.cmd_omega),
-            opt(row.wheel_l),
-            opt(row.wheel_r),
+            opt(row.v_mm_s),
+            opt(row.w_deg_s),
             row.frame_str,
             opt(row.err_dist),
             opt(row.err_heading),
@@ -87,13 +87,15 @@ pub struct CsvRow<'a> {
     pub cmd_vx: Option<f64>,
     pub cmd_vy: Option<f64>,
     pub cmd_omega: Option<f64>,
-    pub wheel_l: Option<i16>,
-    pub wheel_r: Option<i16>,
+    /// Lo que LLEGA al robot: velocidad lineal (mm/s) y angular (grados/s) del
+    /// frame `V,W` (`command_to_vw`).
+    pub v_mm_s: Option<i16>,
+    pub w_deg_s: Option<i16>,
     pub frame_str: String,
     pub err_dist: Option<f32>,
     pub err_heading: Option<f64>,
     /// Pelota (posición y velocidad filtradas por el tracker, o crudas si está
-    /// apagado). Vacías en modo wheels. Necesarias para medir contacto por cara.
+    /// apagado). Vacías en modo vw. Necesarias para medir contacto por cara.
     pub ball_x: Option<f32>,
     pub ball_y: Option<f32>,
     pub ball_vx: Option<f32>,
@@ -167,7 +169,7 @@ impl SkillLogCtx {
     ///
     /// Reglas (deben coincidir con la requirement "Logging CSV estructurado por tick"
     /// de la capability skill-test-harness):
-    /// - `wheel_L/R` = `command_to_wheel_mm_s(&cmd.motion)` SIEMPRE, independiente del transport.
+    /// - `v_mm_s`/`w_deg_s` = `command_to_vw(&cmd.motion)` SIEMPRE, independiente del transport.
     /// - `frame_str` = ASCII completo SOLO si `transport == BaseStation`, sino vacío.
     /// - `err_dist`/`err_heading` solo si la skill usa target espacial (GoTo, FacePoint, Spin).
     pub fn build_skill_row(&self, rec: &TickRecord<'_>) -> CsvRow<'static> {
@@ -183,10 +185,10 @@ impl SkillLogCtx {
         let cmd_vy = cmd.map(|c| c.vy);
         let cmd_omega = cmd.map(|c| c.omega);
 
-        // Wheels via command_to_wheel_mm_s SIEMPRE (independiente del transport)
-        let (wl, wr) = cmd.map(command_to_wheel_mm_s).unwrap_or((0, 0));
-        let wheel_l = cmd.map(|_| wl);
-        let wheel_r = cmd.map(|_| wr);
+        // (v, w) vía command_to_vw SIEMPRE (independiente del transport)
+        let (v, w) = cmd.map(command_to_vw).unwrap_or((0, 0));
+        let v_mm_s = cmd.map(|_| v);
+        let w_deg_s = cmd.map(|_| w);
 
         // Target espacial visible
         let target_xy = rec.targets.first().and_then(|t| *t);
@@ -196,8 +198,8 @@ impl SkillLogCtx {
         // Frame str (solo para base-station)
         let frame_str = match self.transport {
             RadioTarget::BaseStation => {
-                let slots = wheels_to_slots(self.robot, wl, wr);
-                build_frame_from_wheels(slots).trim_end().to_string()
+                let slots = vw_to_slots(self.robot, v, w);
+                build_frame_from_vw(slots).trim_end().to_string()
             }
             _ => String::new(),
         };
@@ -265,8 +267,8 @@ impl SkillLogCtx {
             cmd_vx,
             cmd_vy,
             cmd_omega,
-            wheel_l,
-            wheel_r,
+            v_mm_s,
+            w_deg_s,
             frame_str,
             err_dist,
             err_heading,
@@ -287,10 +289,10 @@ fn find_robot_state(world: &crate::world::World, robot_id: i32, team: i32) -> Op
     robots.into_iter().find(|r| r.id == robot_id).cloned()
 }
 
-fn wheels_to_slots(robot: usize, l: i16, r: i16) -> [(i16, i16); SLOT_COUNT] {
+fn vw_to_slots(robot: usize, v: i16, w: i16) -> [(i16, i16); SLOT_COUNT] {
     let mut slots: [(i16, i16); SLOT_COUNT] = [(0, 0); SLOT_COUNT];
     if robot < SLOT_COUNT {
-        slots[robot] = (l, r);
+        slots[robot] = (v, w);
     }
     slots
 }
@@ -422,12 +424,12 @@ pub fn format_human_summary(row: &CsvRow<'_>) -> String {
         (Some(vx), Some(vy), Some(om)) => format!("cmd=({vx:.2},{vy:.2},{om:.2})"),
         _ => "cmd=N/A".to_string(),
     };
-    let wheels_str = match (row.wheel_l, row.wheel_r) {
-        (Some(l), Some(r)) => format!("wheels=({l},{r})"),
-        _ => "wheels=N/A".to_string(),
+    let vw_str = match (row.v_mm_s, row.w_deg_s) {
+        (Some(v), Some(w)) => format!("vw=({v},{w})"),
+        _ => "vw=N/A".to_string(),
     };
     format!(
-        "[{} t={t:.1}s tick={} {pose_str} {cmd_str} {wheels_str}]",
+        "[{} t={t:.1}s tick={} {pose_str} {cmd_str} {vw_str}]",
         row.mode, row.tick
     )
 }
@@ -468,11 +470,13 @@ mod tests {
     fn csv_header_has_25_columns() {
         let cols = CSV_HEADER.trim_end().split(',').count();
         assert_eq!(cols, 25);
+        assert!(CSV_HEADER.contains(",cmd_omega,v_mm_s,w_deg_s,frame_str,"));
+        assert!(!CSV_HEADER.contains("wheel_"));
         assert!(CSV_HEADER.trim_end().ends_with("ball_x,ball_y,ball_vx,ball_vy"));
     }
 
     #[test]
-    fn build_row_no_command_zero_wheels() {
+    fn build_row_no_command_no_vw() {
         let world = World::new(3, 3);
         let ctx = SkillLogCtx {
             transport: RadioTarget::FiraSim,
@@ -483,14 +487,14 @@ mod tests {
         };
         let rec = empty_tick_record(&world, &[], &[], &[]);
         let row = ctx.build_skill_row(&rec);
-        assert_eq!(row.wheel_l, None);
-        assert_eq!(row.wheel_r, None);
+        assert_eq!(row.v_mm_s, None);
+        assert_eq!(row.w_deg_s, None);
         assert!(row.frame_str.is_empty());
     }
 
     #[test]
-    fn build_row_forward_command_wheels_500() {
-        // (vx=0.5, vy=0, omega=0, orientation=0) → (500, 500) via command_to_wheel_mm_s.
+    fn build_row_forward_command_vw_500_0() {
+        // (vx=0.5, vy=0, omega=0, orientation=0) → (500, 0) vía command_to_vw.
         let world = World::new(3, 3);
         let cmd = MotionCommand {
             id: 0,
@@ -511,8 +515,8 @@ mod tests {
         let targets = [Some(Vec2::new(0.3, 0.0))];
         let rec = empty_tick_record(&world, &commands, &targets, &[]);
         let row = ctx.build_skill_row(&rec);
-        assert_eq!(row.wheel_l, Some(500));
-        assert_eq!(row.wheel_r, Some(500));
+        assert_eq!(row.v_mm_s, Some(500));
+        assert_eq!(row.w_deg_s, Some(0));
         // transport != BaseStation → frame_str vacío
         assert!(row.frame_str.is_empty());
         // labels
@@ -545,8 +549,8 @@ mod tests {
         let targets = [Some(Vec2::new(0.3, 0.0))];
         let rec = empty_tick_record(&world, &commands, &targets, &[]);
         let row = ctx.build_skill_row(&rec);
-        // (500,500) en slot 0, resto cero
-        assert_eq!(row.frame_str, "500,500,0,0,0,0,0,0,0,0");
+        // (500, 0) en slot 0, resto cero
+        assert_eq!(row.frame_str, "500,0,0,0,0,0,0,0,0,0");
         assert_eq!(row.transport, "base-station");
     }
 
@@ -633,8 +637,8 @@ mod tests {
             cmd_vx: Some(0.4),
             cmd_vy: Some(0.0),
             cmd_omega: Some(0.0),
-            wheel_l: Some(400),
-            wheel_r: Some(400),
+            v_mm_s: Some(400),
+            w_deg_s: Some(-90),
             frame_str: String::new(),
             err_dist: Some(0.18),
             err_heading: Some(0.05),
@@ -646,6 +650,6 @@ mod tests {
         let s = format_human_summary(&row);
         assert!(s.contains("tick=90"));
         assert!(s.contains("pose=(0.12"));
-        assert!(s.contains("wheels=(400,400)"));
+        assert!(s.contains("vw=(400,-90)"));
     }
 }

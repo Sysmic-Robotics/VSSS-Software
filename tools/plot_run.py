@@ -11,17 +11,23 @@ Uso:
 Paneles:
   1. Trayectoria (pose x,y) + target + punto de inicio  → "dónde está / a dónde va".
   2. Errores en el tiempo (err_dist [m], err_heading [rad]).
-  3. Velocidades de rueda L/R [mm/s]                     → "lo que le LLEGA al robot".
+  3. v [mm/s] y ω [°/s] del frame V,W                   → "lo que le LLEGA al robot".
   4. Comando vx, vy [m/s] y omega [rad/s]               → "lo que INTENTA hacer".
 
 Requiere matplotlib (`pip install matplotlib`). El resumen de texto funciona sin él.
 Columnas esperadas (header de skill_log): t_ms, pose_x, pose_y, pose_theta,
-target_x, target_y, cmd_vx, cmd_vy, cmd_omega, wheel_L_mm_s, wheel_R_mm_s,
-err_dist, err_heading, skill, robot, transport.
+target_x, target_y, cmd_vx, cmd_vy, cmd_omega, v_mm_s, w_deg_s,
+err_dist, err_heading, skill, robot, transport. Un CSV viejo (wheel_L/R_mm_s, protocolo
+L,R) se abre igual, pero el panel 3 queda vacío.
 """
 import argparse
 import csv
 import sys
+
+# Topes del frame V,W: los defaults de `robot` en config/team_params.json
+# (mismos clamps que la base station). Solo se usan para alertar saturación.
+MAX_V_MM_S = 1500
+MAX_W_DEG_S = 720
 
 
 def fnum(s):
@@ -82,16 +88,17 @@ def text_summary(rows):
 
     stat("err_dist", "m")
     stat("err_heading", "rad")
-    stat("wheel_L_mm_s", "mm/s")
-    stat("wheel_R_mm_s", "mm/s")
+    stat("v_mm_s", "mm/s")
+    stat("w_deg_s", "°/s")
 
-    # Alerta de saturación de rueda (±1500 mm/s).
-    wl = [v for v in col(rows, "wheel_L_mm_s") if v is not None]
-    wr = [v for v in col(rows, "wheel_R_mm_s") if v is not None]
-    sat = sum(1 for v in wl + wr if abs(v) >= 1500)
-    if sat:
-        print(f"  ⚠ {sat} muestras de rueda saturadas a ±1500 mm/s "
-              f"(¿velocidad/omega demasiado altos?)")
+    # Alerta de saturación del frame (topes de la base / config/team_params.json).
+    vs = [v for v in col(rows, "v_mm_s") if v is not None]
+    ws = [w for w in col(rows, "w_deg_s") if w is not None]
+    sat_v = sum(1 for v in vs if abs(v) >= MAX_V_MM_S)
+    sat_w = sum(1 for w in ws if abs(w) >= MAX_W_DEG_S)
+    if sat_v or sat_w:
+        print(f"  ⚠ muestras saturadas: v={sat_v} (±{MAX_V_MM_S} mm/s), "
+              f"ω={sat_w} (±{MAX_W_DEG_S} °/s)")
     print()
 
 
@@ -167,21 +174,26 @@ def main():
     ax.set_xlabel("t [s]")
     ax.grid(True, alpha=0.3)
 
-    # 3) Ruedas (lo que le llega al robot)
+    # 3) Frame V,W (lo que le llega al robot): v en mm/s, ω en °/s (eje derecho)
     ax = axs[1][0]
-    wl_x, wl_y = pairs(t, col(rows, "wheel_L_mm_s"))
-    wr_x, wr_y = pairs(t, col(rows, "wheel_R_mm_s"))
-    if wl_x:
-        ax.plot(wl_x, wl_y, color="tab:orange", label="L [mm/s]")
-    if wr_x:
-        ax.plot(wr_x, wr_y, color="tab:green", label="R [mm/s]")
-    ax.axhline(1500, color="grey", ls="--", lw=0.7, alpha=0.6)
-    ax.axhline(-1500, color="grey", ls="--", lw=0.7, alpha=0.6)
-    ax.set_title("Velocidades de rueda (lo que LLEGA al robot)")
+    v_x, v_y = pairs(t, col(rows, "v_mm_s"))
+    w_x, w_y = pairs(t, col(rows, "w_deg_s"))
+    if v_x:
+        ax.plot(v_x, v_y, color="tab:orange", label="v [mm/s]")
+    ax.axhline(MAX_V_MM_S, color="grey", ls="--", lw=0.7, alpha=0.6)
+    ax.axhline(-MAX_V_MM_S, color="grey", ls="--", lw=0.7, alpha=0.6)
+    ax.set_ylabel("v [mm/s]", color="tab:orange")
+    if w_x:
+        ax2 = ax.twinx()
+        ax2.plot(w_x, w_y, color="tab:green", label="ω [°/s]")
+        ax2.set_ylabel("ω [°/s]", color="tab:green")
+    ax.set_title("v y ω del frame (lo que LLEGA al robot)")
     ax.set_xlabel("t [s]")
-    ax.set_ylabel("mm/s")
     ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    if v_x:
+        ax.legend(fontsize=8, loc="upper left")
+    if w_x:
+        ax2.legend(fontsize=8, loc="upper right")
 
     # 4) Comando (lo que intenta hacer)
     ax = axs[1][1]

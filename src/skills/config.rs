@@ -20,8 +20,8 @@
 
 /// Defaults razonables del catálogo. Calibrados para FIRASim a 60 Hz.
 ///
-/// Si cambian estos valores, hay que actualizar la versión del contrato
-/// del catálogo y reentrenar cualquier modelo RL que dependa de ellos.
+/// Ya no son un contrato de RL congelado (el paradigma es STP; el RL es una capa
+/// opcional): se recalibran con mediciones del robot real.
 #[derive(Debug, Clone)]
 pub struct SkillConfig {
     /// Ganancia proporcional del PID de heading usado por GoTo, FacePoint
@@ -43,9 +43,12 @@ impl Default for SkillConfig {
             control_ki: 0.08,
             control_kd: 0.20,
             // Tiro por giro: magnitud alta para que el cuerpo impulse la pelota
-            // (el diff-drive no tiene pateador). Queda holgada bajo el clamp de
-            // rueda (±1500 mm/s ≈ 42 rad/s en giro puro). CONTRATO RL: si cambia,
-            // subir la versión del catálogo y reentrenar. (era 2.0)
+            // (el diff-drive no tiene pateador). Parámetro a calibrar tras medir en
+            // banco (era 2.0). En FIRASim es ejecutable (0.85 m/s por rueda < 1.2).
+            // En el robot real NO: el frame recorta ω a 720 °/s (≈ 12.6 rad/s) y el
+            // firmware satura en ~12 rad/s (450 mm/s por rueda sobre una vía de
+            // 75 mm). OJO: Spin toma este default de código; el `skills.spin_omega`
+            // de config/team_params.json es el de SpinKick.
             spin_omega: 20.0,
         }
     }
@@ -56,19 +59,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spin_omega_within_wheel_clamp() {
-        // Spin no pasa por el clamp angular de Motion (lo ignora), así que el
-        // límite real es el clamp de rueda de la base: en giro puro cada rueda
-        // va a `omega · WHEEL_BASE/2 · 1000` mm/s y no debe superar ±1500.
-        const WHEEL_BASE_M: f64 = 0.07; // igual que radio::base_station::WHEEL_BASE_M
-        const MAX_WHEEL_MM_S: f64 = 1500.0;
+    fn spin_omega_within_sim_wheel_clamp() {
+        // Spin no pasa por el clamp angular de Motion (lo ignora). En el sim, el
+        // límite es el clamp de rueda de FIRASim: en giro puro cada rueda va a
+        // `omega · L/2` m/s y no debe superar `max_wheel_rad_s · r`. En el robot
+        // real el frame recorta ω a `robot.max_w_deg_s` (test en radio::base_station).
+        let sim = &crate::params::params().sim;
         let cfg = SkillConfig::default();
-        let wheel_mm_s = cfg.spin_omega.abs() * WHEEL_BASE_M / 2.0 * 1000.0;
+        let wheel_m_s = cfg.spin_omega.abs() * sim.wheel_base_m / 2.0;
+        let max_wheel_m_s = sim.max_wheel_rad_s * sim.wheel_radius_m;
         assert!(
-            wheel_mm_s <= MAX_WHEEL_MM_S,
-            "spin_omega={} → {} mm/s excede el clamp de rueda",
-            cfg.spin_omega,
-            wheel_mm_s
+            wheel_m_s <= max_wheel_m_s,
+            "spin_omega={} → {wheel_m_s} m/s excede el clamp de rueda del sim ({max_wheel_m_s} m/s)",
+            cfg.spin_omega
         );
     }
 

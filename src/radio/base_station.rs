@@ -38,38 +38,46 @@ impl TeamColor {
     }
 }
 
-/// Cantidad de slots en el frame ASCII (firmware espera 5 pares L,R).
+/// Cantidad de slots en el frame ASCII (la base espera 5 pares V,W).
 pub const SLOT_COUNT: usize = 5;
 
-/// Límite de velocidad de rueda en mm/s — el mismo clamp que aplica la base
-/// (`base_station2.ino:14`, `MAX_WHEEL_MM_S = 1500`). Defensa en profundidad:
-/// la base también recortaría, pero saturar en Rust mantiene el frame
-/// explícito y deja preparado el lugar para futuro logging de saturación.
-pub const MAX_WHEEL_MM_S: i32 = 1500;
+// Contrato del frame ASCII PC → base ESP32. Verificado el 2026-09-30 contra
+// `VSSL-firmware/test/base_station_lineal_angulo.ino` y `VSSL-firmware/src`
+// (rama `Peluche`); detalle en `docs/contrato_comunicacion_v2.md`.
+//   - Formato exacto: "V1,W1,V2,W2,V3,W3,V4,W4,V5,W5\n". Son 10 enteros decimales
+//     separados por coma, con terminador '\n' (sin '\r'). La base hace
+//     sscanf("%d,...") y, si la línea no trae 10 enteros (p. ej. con decimales),
+//     la descarta y sigue enviando el comando anterior.
+//   - V = velocidad lineal del robot en mm/s; W = velocidad angular en GRADOS/s.
+//     La base recorta a ±1500 mm/s y ±720 °/s; aquí se aplican los mismos topes,
+//     leídos de `params().robot` (`max_v_mm_s`, `max_w_deg_s`).
+//   - Slots desde 0: el par en la posición i es el robot con cmd.id = i. El robot
+//     con MI_ROBOT_ID = N (firmware, desde 1) lee robots[N - 1]
+//     (communication.cpp:96), así que cmd.id = MI_ROBOT_ID - 1. El robot del
+//     checkout actual del firmware tiene MI_ROBOT_ID 2 → slot 1
+//     (`skill_test --robot 1`).
+//   - La cinemática diferencial (reparto a cada rueda con WHEEL_TRACK_MM) y un PI
+//     de guiñada con el giroscopio los hace el FIRMWARE. El PC no calcula ruedas.
+//   - El firmware topa cada rueda en 450 mm/s (MAX_WHEEL_MM_S) escalando AMBAS
+//     ruedas por el mismo factor: conserva la curvatura (v/ω) y baja la velocidad.
+//     El PC no replica ese tope: necesitaría WHEEL_TRACK_MM, y recortar solo v
+//     cambiaría la curva. Por eso el robot puede ejecutar menos de lo enviado.
+//   - Convención: omega > 0 → W > 0 → giro antihorario visto desde arriba (en el
+//     firmware, rueda derecha más rápida). Coincide con la convención de Spin.
 
-/// Separación física entre ruedas izquierda y derecha del robot real, en metros.
-/// Usada en la cinemática inversa diferencial `(v, ω) → (v_izq, v_der)`.
-// medido 2026-06-13; calibración fina del giro pendiente de validar en banco
-pub const WHEEL_BASE_M: f64 = 0.07;
-
-// Contrato del frame ASCII PC → base ESP32 (verificado contra base_station2.ino:142-172):
-//   - Formato exacto: "L1,R1,L2,R2,L3,R3,L4,R4,L5,R5\n"
-//   - 10 enteros decimales separados por coma, terminador '\n' (sin '\r').
-//   - Unidad: mm/s, clamp ±MAX_WHEEL_MM_S.
-//   - Slots 0-based: el par en posición i corresponde a cmd.id = i (i ∈ 0..SLOT_COUNT).
-//   - Mapeo a firmware: el robot físico con MI_ROBOT_ID = N (firmware, 1-based)
-//     lee robots[N - 1] del binario que arma la base (communication.cpp:91-94).
-//     Por tanto cmd.id en Rust (0-based) = MI_ROBOT_ID - 1 en firmware.
-//   - La cinemática inversa diferencial se hace en PC (este archivo); el firmware
-//     en modo ESP-NOW solo aplica velocidades de rueda directas.
-//
-// Cinemática inversa diferencial:
-//   v     = vx·cos(orientation) + vy·sin(orientation)   // m/s (proyección al heading)
-//   v_izq = v − (omega · WHEEL_BASE_M) / 2              // m/s
-//   v_der = v + (omega · WHEEL_BASE_M) / 2              // m/s
-// Convención: omega > 0 → CCW visto desde arriba → rueda derecha más rápida.
-// Coincide con la convención Spin del catálogo de skills.
-pub fn command_to_wheel_mm_s(motion: &crate::motion::MotionCommand) -> (i16, i16) {
+/// Convierte un `MotionCommand` (marco mundo, m/s y rad/s) en lo que llega al
+/// robot real: `(v_mm_s, w_deg_s)`.
+///
+/// - `v` = proyección de `(vx, vy)` al heading (`orientation`), en mm/s. La
+///   componente lateral se descarta porque el robot diferencial no la ejecuta.
+/// - `w` = `omega` en grados/s.
+/// - Ambos se redondean al entero más cercano y se recortan con `clamp_vw`.
+/// - Si algún campo no es finito, devuelve `(0, 0)` (estado seguro).
+///
+/// Es la ÚNICA fuente de verdad de lo que se envía: la usan el frame, el CSV de
+/// auditoría (`skill_log`) y el debug de la GUI. No replica el tope de 450 mm/s
+/// por rueda del firmware (ver el comentario del contrato, arriba).
+pub fn command_to_vw(motion: &crate::motion::MotionCommand) -> (i16, i16) {
     if !motion.vx.is_finite()
         || !motion.vy.is_finite()
         || !motion.omega.is_finite()
@@ -78,24 +86,28 @@ pub fn command_to_wheel_mm_s(motion: &crate::motion::MotionCommand) -> (i16, i16
         return (0, 0);
     }
 
-    // Geometría del robot real desde `config/team_params.json` (calibrable con M2);
-    // las constantes de arriba son solo los defaults documentados.
-    let robot = &crate::params::params().robot;
-    let cos_t = motion.orientation.cos();
-    let sin_t = motion.orientation.sin();
-    let v = motion.vx * cos_t + motion.vy * sin_t;
-    let half_wheel_term = motion.omega * robot.wheel_base_m / 2.0;
-
-    let v_left_mm_s = ((v - half_wheel_term) * 1000.0).round() as i32;
-    let v_right_mm_s = ((v + half_wheel_term) * 1000.0).round() as i32;
-
-    let left = v_left_mm_s.clamp(-robot.max_wheel_mm_s, robot.max_wheel_mm_s) as i16;
-    let right = v_right_mm_s.clamp(-robot.max_wheel_mm_s, robot.max_wheel_mm_s) as i16;
-    (left, right)
+    let v_m_s = motion.vx * motion.orientation.cos() + motion.vy * motion.orientation.sin();
+    clamp_vw(v_m_s * 1000.0, motion.omega.to_degrees())
 }
 
-/// Construye el frame ASCII "L1,R1,...,L5,R5\n" a partir de comandos del equipo propio.
-/// Slot index = cmd.id (0-based); ids fuera de rango se ignoran; slots sin comando salen 0,0.
+/// Redondea y recorta un par `(v_mm_s, w_deg_s)` a ±`max_v_mm_s` / ±`max_w_deg_s`
+/// de `params().robot`. El clamp se hace en f64 y el cast `as i16` satura, así
+/// que ningún valor de params puede hacer overflow ni wrap.
+pub fn clamp_vw(v_mm_s: f64, w_deg_s: f64) -> (i16, i16) {
+    let robot = &crate::params::params().robot;
+    (
+        clamp_round(v_mm_s, robot.max_v_mm_s),
+        clamp_round(w_deg_s, robot.max_w_deg_s),
+    )
+}
+
+fn clamp_round(value: f64, max: i32) -> i16 {
+    let max = f64::from(max.max(0));
+    value.round().clamp(-max, max) as i16
+}
+
+/// Construye el frame ASCII "V1,W1,...,V5,W5\n" a partir de comandos del equipo propio.
+/// Slot = cmd.id (desde 0); ids fuera de rango se ignoran; los slots sin comando salen 0,0.
 pub fn build_frame(commands: &[RobotCommand], own_team: TeamColor) -> String {
     let mut slots = [(0i16, 0i16); SLOT_COUNT];
     for cmd in commands {
@@ -104,31 +116,27 @@ pub fn build_frame(commands: &[RobotCommand], own_team: TeamColor) -> String {
         }
         let idx = cmd.id as usize;
         if idx < SLOT_COUNT {
-            slots[idx] = command_to_wheel_mm_s(&cmd.motion);
+            slots[idx] = command_to_vw(&cmd.motion);
         }
     }
-    build_frame_from_wheels(slots)
+    build_frame_from_vw(slots)
 }
 
-/// Camino "raw wheels" para bring-up: arma el frame ASCII directamente desde
-/// pares `(left_mm_s, right_mm_s)` ya calculados, sin pasar por cinemática
-/// inversa. Bypasea `command_to_wheel_mm_s` — útil cuando se quiere comandar
-/// velocidad de rueda directa (modo `wheels` de `skill_test`) sin sintetizar
-/// un `MotionCommand`.
+/// Arma el frame ASCII directamente desde pares `(v_mm_s, w_deg_s)` ya
+/// calculados (modo `vw` de `skill_test`, bring-up en lazo abierto).
 ///
-/// **No clampea**: el contrato es que el caller entrega valores ya en rango
-/// (típicamente vía `send_raw_wheels_frame`, que sí clampea defensivamente).
-/// Esto mantiene la función pura y barata.
+/// **No clampea**: el caller entrega valores ya en rango (normalmente vía
+/// `send_raw_vw_frame`, que sí clampea). Así la función queda pura y barata.
 ///
-/// Coincide byte a byte con `build_frame` cuando los slots resueltos por
-/// `build_frame` se le pasan acá (ver test `build_frame_paths_equivalent`).
-pub fn build_frame_from_wheels(slots: [(i16, i16); SLOT_COUNT]) -> String {
+/// Para los mismos slots coincide byte a byte con `build_frame` (ver el test
+/// `build_frame_paths_equivalent`).
+pub fn build_frame_from_vw(slots: [(i16, i16); SLOT_COUNT]) -> String {
     let mut out = String::with_capacity(64);
-    for (i, (l, r)) in slots.iter().enumerate() {
+    for (i, (v, w)) in slots.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        out.push_str(&format!("{l},{r}"));
+        out.push_str(&format!("{v},{w}"));
     }
     out.push('\n');
     out
@@ -166,21 +174,17 @@ impl BaseStationTransport {
         Self::new(&device, baud, own_team)
     }
 
-    /// Envío directo de velocidades de rueda crudas, sin pasar por
-    /// `command_to_wheel_mm_s`. Diseñado para el modo `wheels` del probador
-    /// `skill_test`: bring-up de comunicación y signos del robot real.
+    /// Envío directo de pares `(v_mm_s, w_deg_s)` sin pasar por `command_to_vw`.
+    /// Pensado para el modo `vw` del probador `skill_test` (bring-up del robot real).
     ///
-    /// Clampea defensivamente a ±`MAX_WHEEL_MM_S` antes de armar el frame.
-    /// Esto duplica el clamp del CLI (cinturón + tirantes); `build_frame_from_wheels`
-    /// como función pura no clampea.
-    pub async fn send_raw_wheels_frame(
+    /// Clampea con `clamp_vw` antes de armar el frame, como defensa en profundidad
+    /// (el CLI ya clampea); `build_frame_from_vw`, como función pura, no lo hace.
+    pub async fn send_raw_vw_frame(
         &mut self,
         slots: [(i16, i16); SLOT_COUNT],
     ) -> Result<(), TransportError> {
-        let max = MAX_WHEEL_MM_S as i16;
-        let clamped: [(i16, i16); SLOT_COUNT] =
-            slots.map(|(l, r)| (l.clamp(-max, max), r.clamp(-max, max)));
-        let frame = build_frame_from_wheels(clamped);
+        let clamped = slots.map(|(v, w)| clamp_vw(f64::from(v), f64::from(w)));
+        let frame = build_frame_from_vw(clamped);
         match self.port.write_all(frame.as_bytes()).await {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -209,6 +213,7 @@ impl RobotTransport for BaseStationTransport {
 mod tests {
     use super::*;
     use crate::motion::{KickerCommand, MotionCommand};
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
     fn make_cmd(
         team: i32,
@@ -250,107 +255,127 @@ mod tests {
         }
     }
 
-    /// Half-wheel contribution of omega to a single wheel, en mm/s, computado desde
-    /// la constante para que un cambio del const no rompa el test silenciosamente.
-    fn spin_half_mm_s(omega: f64) -> i16 {
-        (omega * WHEEL_BASE_M / 2.0 * 1000.0).round() as i16
+    /// Topes con los que trabaja `command_to_vw` (los mismos params que la función).
+    fn limits() -> (i16, i16) {
+        let robot = &crate::params::params().robot;
+        (robot.max_v_mm_s as i16, robot.max_w_deg_s as i16)
     }
 
-    // ---------- Cinemática ----------
+    // ---------- Conversión (v, ω) ----------
 
     #[test]
-    fn kinematics_pure_forward_zero_heading() {
-        // Avance puro, sin omega: ambas ruedas iguales, en mm/s = vx · 1000.
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(1.0, 0.0, 0.0, 0.0)),
-            (1000, 1000)
-        );
+    fn vw_pure_forward_zero_heading() {
+        assert_eq!(command_to_vw(&motion(1.0, 0.0, 0.0, 0.0)), (1000, 0));
     }
 
     #[test]
-    fn kinematics_pure_forward_heading_pi_over_2() {
+    fn vw_pure_forward_heading_pi_over_2() {
         // Robot mirando a +Y: la proyección al heading recupera v = vy.
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(0.0, 0.5, 0.0, std::f64::consts::FRAC_PI_2)),
-            (500, 500)
-        );
+        assert_eq!(command_to_vw(&motion(0.0, 0.5, 0.0, FRAC_PI_2)), (500, 0));
     }
 
     #[test]
-    fn kinematics_pure_ccw_spin() {
-        // Giro puro CCW (omega > 0): rueda derecha avanza, izquierda retrocede.
-        let half = spin_half_mm_s(2.0);
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(0.0, 0.0, 2.0, 0.0)),
-            (-half, half)
-        );
+    fn vw_lateral_velocity_is_discarded() {
+        // Velocidad perpendicular al heading: el diferencial no la ejecuta.
+        assert_eq!(command_to_vw(&motion(0.0, 0.5, 0.0, 0.0)), (0, 0));
     }
 
     #[test]
-    fn kinematics_forward_plus_spin() {
-        // Combinación: avance + giro. Calculado desde la constante.
-        let half = spin_half_mm_s(2.0);
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(0.5, 0.0, 2.0, 0.0)),
-            (500 - half, 500 + half)
-        );
+    fn vw_pure_ccw_spin() {
+        assert_eq!(command_to_vw(&motion(0.0, 0.0, FRAC_PI_2, 0.0)), (0, 90));
+    }
+
+    #[test]
+    fn vw_pure_cw_spin_negative_omega() {
+        assert_eq!(command_to_vw(&motion(0.0, 0.0, -FRAC_PI_2, 0.0)), (0, -90));
+    }
+
+    #[test]
+    fn vw_forward_plus_turn() {
+        assert_eq!(command_to_vw(&motion(0.3, 0.0, FRAC_PI_4, 0.0)), (300, 45));
+    }
+
+    #[test]
+    fn vw_rounds_small_omega_to_nearest_degree() {
+        // 0.01 rad/s = 0.573 °/s → 1.
+        assert_eq!(command_to_vw(&motion(0.0, 0.0, 0.01, 0.0)), (0, 1));
     }
 
     // ---------- Clamp ----------
 
     #[test]
-    fn clamp_saturates_both_wheels() {
-        // v enorme → ambos saturan al mismo signo.
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(5.0, 0.0, 0.0, 0.0)),
-            (1500, 1500)
-        );
+    fn clamp_v_forward() {
+        let (max_v, _) = limits();
+        assert_eq!(command_to_vw(&motion(5.0, 0.0, 0.0, 0.0)), (max_v, 0));
     }
 
     #[test]
-    fn clamp_saturates_opposite_signs() {
-        // omega enorme → un lado +1500, otro −1500.
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(0.0, 0.0, 100.0, 0.0)),
-            (-1500, 1500)
-        );
+    fn clamp_v_backward() {
+        let (max_v, _) = limits();
+        assert_eq!(command_to_vw(&motion(-5.0, 0.0, 0.0, 0.0)), (-max_v, 0));
+    }
+
+    #[test]
+    fn clamp_w_both_signs() {
+        let (_, max_w) = limits();
+        assert_eq!(command_to_vw(&motion(0.0, 0.0, 100.0, 0.0)), (0, max_w));
+        assert_eq!(command_to_vw(&motion(0.0, 0.0, -100.0, 0.0)), (0, -max_w));
+    }
+
+    #[test]
+    fn clamp_spin_20_rad_s_saturates_w() {
+        // Spin manda 20 rad/s (≈ 1146 °/s): en el robot real se recorta al tope angular.
+        let (_, max_w) = limits();
+        assert!(20.0_f64.to_degrees() > f64::from(max_w));
+        assert_eq!(command_to_vw(&motion(0.0, 0.0, 20.0, 0.0)), (0, max_w));
     }
 
     #[test]
     fn clamp_borderline_does_not_overflow() {
-        // ±1.5 m/s exactos saturan a ±1500 sin overflow ni panic.
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(1.5, 0.0, 0.0, 0.0)),
-            (1500, 1500)
-        );
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(-1.5, 0.0, 0.0, 0.0)),
-            (-1500, -1500)
-        );
+        let (max_v, _) = limits();
+        let edge = f64::from(max_v) / 1000.0;
+        assert_eq!(command_to_vw(&motion(edge, 0.0, 0.0, 0.0)), (max_v, 0));
+        assert_eq!(command_to_vw(&motion(-edge, 0.0, 0.0, 0.0)), (-max_v, 0));
+    }
+
+    #[test]
+    fn firmware_wheel_cap_is_not_replicated() {
+        // (0.45 m/s, 180 °/s) le pide > 450 mm/s a una rueda en el firmware, que
+        // escala ambas en bloque. El PC lo manda tal cual.
+        let (max_v, max_w) = limits();
+        assert!(450 <= max_v && 180 <= max_w);
+        assert_eq!(command_to_vw(&motion(0.45, 0.0, PI, 0.0)), (450, 180));
+    }
+
+    #[test]
+    fn clamp_vw_saturates_raw_pairs() {
+        // Mismo helper que usa `send_raw_vw_frame` antes de armar el frame.
+        let (max_v, max_w) = limits();
+        assert_eq!(clamp_vw(3000.0, -3000.0), (max_v, -max_w));
+        assert_eq!(clamp_vw(-300.0, 45.0), (-300, 45));
     }
 
     // ---------- Robustez ante no-finitos ----------
 
     #[test]
-    fn robustness_nan_returns_zero() {
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(f64::NAN, 0.0, 0.0, 0.0)),
-            (0, 0)
-        );
+    fn robustness_nan_vx_returns_zero() {
+        assert_eq!(command_to_vw(&motion(f64::NAN, 0.0, 0.0, 0.0)), (0, 0));
+    }
+
+    #[test]
+    fn robustness_nan_vy_returns_zero() {
+        assert_eq!(command_to_vw(&motion(0.0, f64::NAN, 0.0, 0.0)), (0, 0));
     }
 
     #[test]
     fn robustness_inf_omega_returns_zero() {
-        assert_eq!(
-            command_to_wheel_mm_s(&motion(0.0, 0.0, f64::INFINITY, 0.0)),
-            (0, 0)
-        );
+        assert_eq!(command_to_vw(&motion(0.0, 0.0, f64::INFINITY, 0.0)), (0, 0));
     }
 
     #[test]
     fn robustness_neg_inf_orientation_returns_zero() {
         assert_eq!(
-            command_to_wheel_mm_s(&motion(1.0, 0.0, 0.0, f64::NEG_INFINITY)),
+            command_to_vw(&motion(1.0, 0.0, 0.0, f64::NEG_INFINITY)),
             (0, 0)
         );
     }
@@ -360,19 +385,29 @@ mod tests {
     #[test]
     fn frame_golden_forward_blue_slot_0() {
         let cmds = vec![make_cmd(0, 0, 0.5, 0.0, 0.0, 0.0)];
-        let frame = build_frame(&cmds, TeamColor::Blue);
-        assert_eq!(frame, "500,500,0,0,0,0,0,0,0,0\n");
+        assert_eq!(
+            build_frame(&cmds, TeamColor::Blue),
+            "500,0,0,0,0,0,0,0,0,0\n"
+        );
     }
 
     #[test]
-    fn frame_golden_spin_blue_slot_2() {
-        // El golden se construye desde la constante para no romper silenciosamente
-        // si WHEEL_BASE_M se recalibra.
-        let half = spin_half_mm_s(2.0);
-        let cmds = vec![make_cmd(0, 2, 0.0, 0.0, 2.0, 0.0)];
-        let frame = build_frame(&cmds, TeamColor::Blue);
-        let expected = format!("0,0,0,0,{},{},0,0,0,0\n", -half, half);
-        assert_eq!(frame, expected);
+    fn frame_golden_ccw_spin_blue_slot_1() {
+        // Slot 1 = robot con MI_ROBOT_ID 2 (el del checkout actual del firmware).
+        let cmds = vec![make_cmd(0, 1, 0.0, 0.0, FRAC_PI_2, 0.0)];
+        assert_eq!(
+            build_frame(&cmds, TeamColor::Blue),
+            "0,0,0,90,0,0,0,0,0,0\n"
+        );
+    }
+
+    #[test]
+    fn frame_negative_omega_slot_4() {
+        let cmds = vec![make_cmd(0, 4, 0.0, 0.0, -FRAC_PI_2, 0.0)];
+        assert_eq!(
+            build_frame(&cmds, TeamColor::Blue),
+            "0,0,0,0,0,0,0,0,0,-90\n"
+        );
     }
 
     // ---------- Filtro de team y descarte ----------
@@ -381,15 +416,13 @@ mod tests {
     fn frame_filters_opposing_team() {
         // own_team = Blue, comando con team = Yellow → ignorado.
         let cmds = vec![make_cmd(1, 0, 1.0, 0.0, 0.0, 0.0)];
-        let frame = build_frame(&cmds, TeamColor::Blue);
-        assert_eq!(frame, "0,0,0,0,0,0,0,0,0,0\n");
+        assert_eq!(build_frame(&cmds, TeamColor::Blue), "0,0,0,0,0,0,0,0,0,0\n");
     }
 
     #[test]
     fn frame_drops_id_out_of_range() {
         let cmds = vec![make_cmd(0, 9, 1.0, 0.0, 0.0, 0.0)];
-        let frame = build_frame(&cmds, TeamColor::Blue);
-        assert_eq!(frame, "0,0,0,0,0,0,0,0,0,0\n");
+        assert_eq!(build_frame(&cmds, TeamColor::Blue), "0,0,0,0,0,0,0,0,0,0\n");
     }
 
     #[test]
@@ -399,77 +432,45 @@ mod tests {
             make_cmd(0, 0, 1.0, 0.0, 0.0, 0.0),
             make_cmd(1, 1, 0.5, 0.0, 0.0, 0.0),
         ];
-        let frame = build_frame(&cmds, TeamColor::Yellow);
-        assert_eq!(frame, "0,0,500,500,0,0,0,0,0,0\n");
-    }
-
-    // ---------- build_frame_from_wheels (raw wheels path) ----------
-
-    #[test]
-    fn build_from_wheels_golden_slot_0() {
-        let slots: [(i16, i16); SLOT_COUNT] = [(500, 500), (0, 0), (0, 0), (0, 0), (0, 0)];
-        assert_eq!(build_frame_from_wheels(slots), "500,500,0,0,0,0,0,0,0,0\n");
-    }
-
-    #[test]
-    fn build_from_wheels_golden_slot_2_opposite_signs() {
-        let slots: [(i16, i16); SLOT_COUNT] = [(0, 0), (0, 0), (-500, 500), (0, 0), (0, 0)];
-        assert_eq!(build_frame_from_wheels(slots), "0,0,0,0,-500,500,0,0,0,0\n");
-    }
-
-    #[test]
-    fn build_from_wheels_does_not_clamp() {
-        // Función pura: caller es responsable del clamp. Valores en rango se
-        // emiten tal cual.
-        let slots: [(i16, i16); SLOT_COUNT] = [(1500, -1500), (0, 0), (0, 0), (0, 0), (0, 0)];
         assert_eq!(
-            build_frame_from_wheels(slots),
-            "1500,-1500,0,0,0,0,0,0,0,0\n"
+            build_frame(&cmds, TeamColor::Yellow),
+            "0,0,500,0,0,0,0,0,0,0\n"
         );
     }
 
-    /// Equivalencia byte a byte: si build_frame con un set de comandos resuelve
-    /// slots S, build_frame_from_wheels(S) produce el mismo string.
-    #[test]
-    fn build_frame_paths_equivalent() {
-        // Caso 1: avance puro en slot 0.
-        let cmds = vec![make_cmd(0, 0, 0.5, 0.0, 0.0, 0.0)];
-        let frame_via_cmds = build_frame(&cmds, TeamColor::Blue);
-        let slots_resolved: [(i16, i16); SLOT_COUNT] = [
-            command_to_wheel_mm_s(&cmds[0].motion),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-            (0, 0),
-        ];
-        assert_eq!(frame_via_cmds, build_frame_from_wheels(slots_resolved));
+    // ---------- build_frame_from_vw (camino crudo) ----------
 
-        // Caso 2: spin puro en slot 2.
-        let cmds2 = vec![make_cmd(0, 2, 0.0, 0.0, 2.0, 0.0)];
-        let frame2 = build_frame(&cmds2, TeamColor::Blue);
-        let slots2: [(i16, i16); SLOT_COUNT] = [
-            (0, 0),
-            (0, 0),
-            command_to_wheel_mm_s(&cmds2[0].motion),
-            (0, 0),
-            (0, 0),
-        ];
-        assert_eq!(frame2, build_frame_from_wheels(slots2));
+    #[test]
+    fn build_from_vw_golden_slot_2_with_signs() {
+        let slots: [(i16, i16); SLOT_COUNT] = [(0, 0), (0, 0), (-300, 45), (0, 0), (0, 0)];
+        assert_eq!(build_frame_from_vw(slots), "0,0,0,0,-300,45,0,0,0,0\n");
     }
 
-    /// `send_raw_wheels_frame` clampa defensivamente a ±1500 antes de armar
-    /// el frame. No podemos abrir el puerto, pero podemos verificar el clamp
-    /// vía la misma lógica que ejecuta el método (reusar el helper).
     #[test]
-    fn send_raw_wheels_clamps_defensively() {
-        let input: [(i16, i16); SLOT_COUNT] = [(3000, -3000), (0, 0), (0, 0), (0, 0), (0, 0)];
-        let max = MAX_WHEEL_MM_S as i16;
-        let clamped: [(i16, i16); SLOT_COUNT] =
-            input.map(|(l, r)| (l.clamp(-max, max), r.clamp(-max, max)));
-        assert_eq!(clamped[0], (1500, -1500));
+    fn build_from_vw_does_not_clamp() {
+        // Función pura: el caller es responsable del clamp.
+        let slots: [(i16, i16); SLOT_COUNT] = [(3000, -1000), (0, 0), (0, 0), (0, 0), (0, 0)];
+        assert_eq!(build_frame_from_vw(slots), "3000,-1000,0,0,0,0,0,0,0,0\n");
+    }
+
+    /// Equivalencia byte a byte: si build_frame resuelve los slots S para un set de
+    /// comandos, build_frame_from_vw(S) produce el mismo string.
+    #[test]
+    fn build_frame_paths_equivalent() {
+        let cmds = vec![
+            make_cmd(0, 0, 0.5, 0.0, 0.0, 0.0),
+            make_cmd(0, 2, 0.3, 0.0, FRAC_PI_4, 0.0),
+        ];
+        let slots: [(i16, i16); SLOT_COUNT] = [
+            command_to_vw(&cmds[0].motion),
+            (0, 0),
+            command_to_vw(&cmds[1].motion),
+            (0, 0),
+            (0, 0),
+        ];
         assert_eq!(
-            build_frame_from_wheels(clamped),
-            "1500,-1500,0,0,0,0,0,0,0,0\n"
+            build_frame(&cmds, TeamColor::Blue),
+            build_frame_from_vw(slots)
         );
     }
 }

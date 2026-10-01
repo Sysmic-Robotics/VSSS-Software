@@ -361,10 +361,10 @@ impl<'a> canvas::Program<Message> for FieldCanvas<'a> {
                         }
                     }
 
-                    // Ruedas comandadas (lo que LLEGA al robot, mm/s).
+                    // Consigna que LLEGA al robot (v mm/s, w °/s).
                     // Texto debajo del robot para no chocar con la flecha/heading.
                     frame.fill_text(canvas::Text {
-                        content: format!("L:{} R:{}", m.wheel_l_mm_s, m.wheel_r_mm_s),
+                        content: format!("v:{} w:{}", m.v_mm_s, m.w_deg_s),
                         position: Point::new(
                             robot_pos.x - ROBOT_RADIUS_MM * scale,
                             robot_pos.y + ROBOT_RADIUS_MM * scale + 2.0,

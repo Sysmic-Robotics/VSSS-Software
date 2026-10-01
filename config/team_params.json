@@ -62,8 +62,8 @@
     "bidirectional": false
   },
   "robot": {
-    "wheel_base_m": 0.07,
-    "max_wheel_mm_s": 1500
+    "max_v_mm_s": 1500,
+    "max_w_deg_s": 720
   },
   "sim": {
     "wheel_base_m": 0.085,

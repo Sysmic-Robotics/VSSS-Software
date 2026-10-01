@@ -61,9 +61,9 @@ pub const NEUTRAL: Color = rgb(0.55, 0.60, 0.66);
 // Paleta — datos (charts)
 // ---------------------------------------------------------------------------
 
-/// Serie de datos "izquierda" (rueda L) — cyan.
+/// Serie de datos 1 (p. ej. v en el chart v/ω) — cyan.
 pub const DATA_L: Color = rgb(0.15, 0.75, 1.0);
-/// Serie de datos "derecha" (rueda R) — magenta.
+/// Serie de datos 2 (p. ej. ω en el chart v/ω) — magenta.
 pub const DATA_R: Color = rgb(1.0, 0.35, 0.75);
 /// Barras de paquetes (chart de visión).
 pub const DATA_BARS: Color = rgb(0.13, 0.78, 0.83);

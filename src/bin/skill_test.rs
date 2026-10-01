@@ -1,8 +1,8 @@
 //! Probador de skills + bring-up de hardware.
 //!
 //! Ejecuta una skill (lazo cerrado, reusando exactamente el mismo loop que `main`)
-//! o velocidades de rueda directas en mm/s (lazo abierto, solo `--transport base-station`)
-//! con la misma CLI en simulador y en robot real.
+//! o una consigna (v mm/s, ω °/s) directa al robot real (lazo abierto, modo `vw`,
+//! solo `--transport base-station`), con la misma CLI en simulador y en robot real.
 //!
 //! Ver `cargo run --bin skill_test -- --help` para uso.
 
@@ -11,8 +11,9 @@ use rustengine::control_loop::{
     ControlLoopConfig, FixedSkillDecider, GuiChannels, TickRecord, run_control_loop,
 };
 use rustengine::radio::{
-    BaseStationTransport, RadioTarget, TeamColor, base_station::SLOT_COUNT,
-    base_station::build_frame_from_wheels,
+    BaseStationTransport, RadioTarget, TeamColor,
+    base_station::SLOT_COUNT,
+    base_station::{build_frame_from_vw, clamp_vw},
 };
 use rustengine::skill_log::{
     CsvLogger, CsvRow, SkillLogCtx, format_human_summary, team_label, transport_label,
@@ -26,15 +27,13 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-const MAX_WHEEL_MM_S: i32 = 1500;
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Args
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Wheels,
+    Vw,
     Skill,
 }
 
@@ -51,8 +50,8 @@ struct Args {
     vision_timeout_s: f64,
     skill: Option<SkillId>,
     target: Option<Vec2>,
-    left: Option<i32>,
-    right: Option<i32>,
+    v_mm_s: Option<i32>,
+    w_deg_s: Option<i32>,
 }
 
 const HELP_TEXT: &str = r#"skill_test — probador de skills + bring-up de hardware
@@ -62,12 +61,14 @@ USO:
 
 FLAGS COMUNES (obligatorios):
     --transport <firasim|grsim|base-station>
-    --robot N          índice 0-based del robot (0..5)
+    --robot N          índice del robot, desde 0 (0..5)
                        Convención: el robot físico que ejecuta este comando es
                        el que tiene MI_ROBOT_ID = N + 1 compilado en su
-                       VSSL-firmware/include/config.h
+                       VSSL-firmware/include/config.h. El robot del checkout
+                       actual del firmware (rama Peluche) es MI_ROBOT_ID 2
+                       → --robot 1.
     --team <blue|yellow>
-    --mode <wheels|skill>
+    --mode <vw|skill>
     --dur S            segundos antes del auto-stop (float > 0)
 
 FLAGS COMUNES (opcionales):
@@ -94,30 +95,47 @@ VARIABLES DE ENTORNO:
     VSSL_TRACKER=off       arranca con el EKF apagado → el CSV registra poses
                            CRUDAS de visión (para medir ruido de cámara).
 
-FLAGS MODO wheels (solo --transport base-station):
-    --left L             mm/s rueda izquierda. Se clampa a ±1500.
-    --right R            mm/s rueda derecha.   Se clampa a ±1500.
+FLAGS MODO vw (solo --transport base-station, lazo abierto):
+    --v MM_S             velocidad lineal en mm/s. Se clampa a ±max_v_mm_s
+                         (config/team_params.json; 1500 por defecto).
+    --w DEG_S            velocidad angular en grados/s (+ = antihorario). Se
+                         clampa a ±max_w_deg_s (720 por defecto).
+                         Va a la base como frame "V1,W1,...,V5,W5". El firmware
+                         reparte a las ruedas, corrige ω con el giroscopio y topa
+                         cada rueda en 450 mm/s (escala ambas, conserva la curva).
 
-SECUENCIA DE BRING-UP (modo wheels) para diagnosticar el giro descontrolado:
-    1) --left 500  --right 0    → solo rueda izquierda (pivota a la derecha)
-    2) --left 0    --right 500  → solo rueda derecha   (pivota a la izquierda)
-    3) --left 500  --right 500  → debe AVANZAR RECTO. Si gira, hay un signo
-                                  invertido en una rueda (LEFT/RIGHT_WHEEL_SIGN
-                                  en VSSL-firmware/include/config.h).
-    4) --left -500 --right 500  → giro CCW sobre el eje (confirma convención Spin).
+SECUENCIA DE BRING-UP (modo vw). Encender el robot QUIETO (calibra el gyro);
+--dur 2 por paso. Si algo falla, parar y anotar qué pasó.
+    1) --v 300 --w 0     → avanza recto.
+         Se desvía y termina girando cada vez más rápido → GYRO_Z_SIGN.
+         Va hacia atrás o gira en el lugar → LEFT/RIGHT_WHEEL_SIGN
+         (VSSL-firmware/include/config.h).
+    2) --v -300 --w 0    → retrocede recto.
+         Si (1) anduvo y (2) no: marcha atrás de una rueda (driver o
+         feedforward), no signos.
+    3) --v 0 --w 90      → gira antihorario visto desde arriba (~1 vuelta/4 s).
+         Gira horario con (1) bien → canales de motor izq./der. intercambiados
+         (cableado o pines). Gira mucho más rápido → GYRO_Z_SIGN.
+         No arranca → zona muerta (pide solo ±59 mm/s por rueda); probar
+         --w 180 para distinguir zona muerta de fricción.
+    4) --v 0 --w -90     → gira horario.
+         Si (3) anduvo y (4) no: asimetría de una rueda.
+    5) --v 300 --w 45    → arco hacia la izquierda (radio ≈ 0.38 m).
+         Va a la derecha → mismo diagnóstico que el giro horario de (3).
+         Radio muy distinto → WHEEL_TRACK_MM o gyro.
 
 EJEMPLOS:
     # Sim, skill cerrada:
     cargo run --bin skill_test -- --transport firasim --vision sim \
         --mode skill --skill goto --target 0.3,0.0 --robot 0 --team blue --dur 5
 
-    # Robot real, bring-up de wheels:
+    # Robot real (MI_ROBOT_ID 2), paso 1 del bring-up:
     cargo run --bin skill_test -- --transport base-station \
-        --mode wheels --team blue --robot 0 --left 500 --right 500 --dur 2
+        --mode vw --team blue --robot 1 --v 300 --w 0 --dur 2
 
     # Robot real, skill cerrada (requiere visión real corriendo):
     cargo run --bin skill_test -- --transport base-station --vision real \
-        --mode skill --skill spin --target 1,0 --robot 0 --team blue --dur 3 \
+        --mode skill --skill spin --target 1,0 --robot 1 --team blue --dur 3 \
         --log /tmp/spin.csv
 
     # Sim, empuje de dos caras hacia el arco rival:
@@ -141,8 +159,8 @@ impl Args {
         let mut vision_timeout_s: f64 = 5.0;
         let mut skill: Option<SkillId> = None;
         let mut target: Option<Vec2> = None;
-        let mut left: Option<i32> = None;
-        let mut right: Option<i32> = None;
+        let mut v_mm_s: Option<i32> = None;
+        let mut w_deg_s: Option<i32> = None;
 
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -197,11 +215,16 @@ impl Args {
                 "--mode" => {
                     let v = iter.next().ok_or("--mode requiere un valor")?;
                     mode = Some(match v.as_str() {
-                        "wheels" => Mode::Wheels,
+                        "vw" => Mode::Vw,
                         "skill" => Mode::Skill,
+                        "wheels" => {
+                            return Err("--mode wheels ya no existe (era del protocolo L,R): \
+                                        usar --mode vw --v MM_S --w DEG_S"
+                                .to_string());
+                        }
                         other => {
                             return Err(format!(
-                                "--mode: valor inválido '{other}' (esperaba wheels|skill)"
+                                "--mode: valor inválido '{other}' (esperaba vw|skill)"
                             ));
                         }
                     });
@@ -274,19 +297,24 @@ impl Args {
                         .map_err(|e| format!("--target y: {e}"))?;
                     target = Some(Vec2::new(x, y));
                 }
-                "--left" => {
-                    let v = iter.next().ok_or("--left requiere un valor")?;
-                    left = Some(
+                "--v" => {
+                    let v = iter.next().ok_or("--v requiere un valor")?;
+                    v_mm_s = Some(
                         v.parse()
-                            .map_err(|e| format!("--left: '{v}' no es entero ({e})"))?,
+                            .map_err(|e| format!("--v: '{v}' no es entero ({e})"))?,
                     );
                 }
-                "--right" => {
-                    let v = iter.next().ok_or("--right requiere un valor")?;
-                    right = Some(
+                "--w" => {
+                    let v = iter.next().ok_or("--w requiere un valor")?;
+                    w_deg_s = Some(
                         v.parse()
-                            .map_err(|e| format!("--right: '{v}' no es entero ({e})"))?,
+                            .map_err(|e| format!("--w: '{v}' no es entero ({e})"))?,
                     );
+                }
+                "--left" | "--right" => {
+                    return Err(format!(
+                        "{arg} ya no existe (era del protocolo L,R): usar --mode vw --v MM_S --w DEG_S"
+                    ));
                 }
                 other => return Err(format!("argumento desconocido: '{other}'")),
             }
@@ -301,26 +329,26 @@ impl Args {
 
         // Validaciones por modo
         match mode {
-            Mode::Wheels => {
+            Mode::Vw => {
                 if transport != RadioTarget::BaseStation {
-                    return Err("modo wheels solo aplica a --transport base-station".to_string());
+                    return Err("modo vw solo aplica a --transport base-station".to_string());
                 }
                 if vision.is_some() {
-                    return Err("modo wheels NO usa --vision".to_string());
+                    return Err("modo vw NO usa --vision".to_string());
                 }
                 if skill.is_some() || target.is_some() {
-                    return Err("modo wheels NO acepta --skill ni --target".to_string());
+                    return Err("modo vw NO acepta --skill ni --target".to_string());
                 }
-                if left.is_none() || right.is_none() {
-                    return Err("modo wheels requiere --left y --right".to_string());
+                if v_mm_s.is_none() || w_deg_s.is_none() {
+                    return Err("modo vw requiere --v y --w".to_string());
                 }
             }
             Mode::Skill => {
                 let vision = vision.ok_or("modo skill requiere --vision")?;
                 let _ = vision;
                 let skill_id = skill.ok_or("modo skill requiere --skill")?;
-                if left.is_some() || right.is_some() {
-                    return Err("modo skill NO acepta --left ni --right".to_string());
+                if v_mm_s.is_some() || w_deg_s.is_some() {
+                    return Err("modo skill NO acepta --v ni --w".to_string());
                 }
                 if matches!(
                     skill_id,
@@ -356,31 +384,29 @@ impl Args {
             vision_timeout_s,
             skill,
             target,
-            left,
-            right,
+            v_mm_s,
+            w_deg_s,
         })
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Modo wheels
+//  Modo vw
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), String> {
-    let max = MAX_WHEEL_MM_S;
-    let raw_l = args.left.expect("validated");
-    let raw_r = args.right.expect("validated");
-    let l = raw_l.clamp(-max, max) as i16;
-    let r = raw_r.clamp(-max, max) as i16;
-    if raw_l != l as i32 {
-        eprintln!("[skill_test] --left saturado de {raw_l} a {l} mm/s");
+async fn run_vw_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), String> {
+    let raw_v = args.v_mm_s.expect("validated");
+    let raw_w = args.w_deg_s.expect("validated");
+    let (v, w) = clamp_vw(f64::from(raw_v), f64::from(raw_w));
+    if i32::from(v) != raw_v {
+        eprintln!("[skill_test] --v saturado de {raw_v} a {v} mm/s");
     }
-    if raw_r != r as i32 {
-        eprintln!("[skill_test] --right saturado de {raw_r} a {r} mm/s");
+    if i32::from(w) != raw_w {
+        eprintln!("[skill_test] --w saturado de {raw_w} a {w} °/s");
     }
 
     let mut slots: [(i16, i16); SLOT_COUNT] = [(0, 0); SLOT_COUNT];
-    slots[args.robot] = (l, r);
+    slots[args.robot] = (v, w);
     let zero_slots: [(i16, i16); SLOT_COUNT] = [(0, 0); SLOT_COUNT];
 
     let mut csv_logger = match &args.log {
@@ -389,7 +415,7 @@ async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), S
     };
 
     if args.dry_run {
-        let frame = build_frame_from_wheels(slots);
+        let frame = build_frame_from_vw(slots);
         print!("{frame}");
         return Ok(());
     }
@@ -398,7 +424,7 @@ async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), S
         BaseStationTransport::from_env(args.team).map_err(|e| format!("base-station: {e}"))?;
 
     eprintln!(
-        "[skill_test] modo wheels: slots[{}] = ({l},{r}) mm/s, dur={}s",
+        "[skill_test] modo vw: slots[{}] = (v={v} mm/s, w={w} °/s), dur={}s",
         args.robot, args.dur
     );
 
@@ -411,19 +437,19 @@ async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), S
     while !shutdown.load(Ordering::Relaxed) && Instant::now() < deadline {
         interval.tick().await;
         transport
-            .send_raw_wheels_frame(slots)
+            .send_raw_vw_frame(slots)
             .await
             .map_err(|e| format!("send error: {e}"))?;
 
         let t_ms = started.elapsed().as_millis() as u64;
-        let frame = build_frame_from_wheels(slots);
+        let frame = build_frame_from_vw(slots);
         let frame_stripped = frame.trim_end().to_string();
 
         if let Some(ref mut log) = csv_logger {
             let _ = log.write_row(&CsvRow {
                 t_ms,
                 tick,
-                mode: "wheels",
+                mode: "vw",
                 transport: transport_label(args.transport),
                 vision: "",
                 robot: args.robot,
@@ -437,8 +463,8 @@ async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), S
                 cmd_vx: None,
                 cmd_vy: None,
                 cmd_omega: None,
-                wheel_l: Some(l),
-                wheel_r: Some(r),
+                v_mm_s: Some(v),
+                w_deg_s: Some(w),
                 frame_str: frame_stripped.clone(),
                 err_dist: None,
                 err_heading: None,
@@ -451,7 +477,7 @@ async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), S
 
         if last_print.elapsed() >= Duration::from_secs(1) {
             eprintln!(
-                "[skill_test t={:.1}s tick={tick} wheels=({l},{r})]",
+                "[skill_test t={:.1}s tick={tick} vw=({v},{w})]",
                 started.elapsed().as_secs_f64()
             );
             last_print = Instant::now();
@@ -462,7 +488,7 @@ async fn run_wheels_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), S
 
     eprintln!("[skill_test] stop secuence (5 frames a cero)");
     for _ in 0..5 {
-        let _ = transport.send_raw_wheels_frame(zero_slots).await;
+        let _ = transport.send_raw_vw_frame(zero_slots).await;
     }
     Ok(())
 }
@@ -475,7 +501,7 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
     if args.dry_run {
         eprintln!(
             "[skill_test] --dry-run en modo skill no abre transporte; no se ejecuta el control loop. \
-             Para imprimir el frame que produciría una skill, usar --mode wheels --dry-run."
+             Para imprimir un frame sin hardware, usar --mode vw --dry-run."
         );
         return Ok(());
     }
@@ -577,7 +603,7 @@ fn main() {
 
     let result = rt.block_on(async {
         match args.mode {
-            Mode::Wheels => run_wheels_mode(&args, shutdown.clone()).await,
+            Mode::Vw => run_vw_mode(&args, shutdown.clone()).await,
             Mode::Skill => run_skill_mode(&args, shutdown.clone()).await,
         }
     });
@@ -603,29 +629,29 @@ mod tests {
     // ---------- Casos válidos ----------
 
     #[test]
-    fn wheels_full_valid() {
+    fn vw_full_valid() {
         let a = parse(&[
             "--transport",
             "base-station",
             "--mode",
-            "wheels",
+            "vw",
             "--team",
             "blue",
             "--robot",
             "0",
-            "--left",
+            "--v",
             "500",
-            "--right",
+            "--w",
             "500",
             "--dur",
             "2",
         ])
         .unwrap();
-        assert_eq!(a.mode, Mode::Wheels);
+        assert_eq!(a.mode, Mode::Vw);
         assert_eq!(a.transport, RadioTarget::BaseStation);
         assert_eq!(a.robot, 0);
-        assert_eq!(a.left, Some(500));
-        assert_eq!(a.right, Some(500));
+        assert_eq!(a.v_mm_s, Some(500));
+        assert_eq!(a.w_deg_s, Some(500));
         assert_eq!(a.dur, 2.0);
     }
 
@@ -711,14 +737,14 @@ mod tests {
             "--transport",
             "base-station",
             "--mode",
-            "wheels",
+            "vw",
             "--team",
             "blue",
             "--robot",
             "0",
-            "--left",
+            "--v",
             "0",
-            "--right",
+            "--w",
             "0",
             "--dur",
             "1",
@@ -732,12 +758,12 @@ mod tests {
     // ---------- Casos inválidos ----------
 
     #[test]
-    fn wheels_without_left_right_fails() {
+    fn vw_without_v_w_fails() {
         let err = parse(&[
             "--transport",
             "base-station",
             "--mode",
-            "wheels",
+            "vw",
             "--team",
             "blue",
             "--robot",
@@ -746,26 +772,23 @@ mod tests {
             "1",
         ])
         .unwrap_err();
-        assert!(
-            err.contains("--left") && err.contains("--right"),
-            "got: {err}"
-        );
+        assert!(err.contains("--v") && err.contains("--w"), "got: {err}");
     }
 
     #[test]
-    fn wheels_with_firasim_fails() {
+    fn vw_with_firasim_fails() {
         let err = parse(&[
             "--transport",
             "firasim",
             "--mode",
-            "wheels",
+            "vw",
             "--team",
             "blue",
             "--robot",
             "0",
-            "--left",
+            "--v",
             "0",
-            "--right",
+            "--w",
             "0",
             "--dur",
             "1",
@@ -914,10 +937,102 @@ mod tests {
     }
 
     #[test]
+    fn vw_with_vision_fails() {
+        let err = parse(&[
+            "--transport",
+            "base-station",
+            "--vision",
+            "real",
+            "--mode",
+            "vw",
+            "--team",
+            "blue",
+            "--robot",
+            "1",
+            "--v",
+            "300",
+            "--w",
+            "0",
+            "--dur",
+            "1",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--vision"), "got: {err}");
+    }
+
+    #[test]
+    fn old_wheels_mode_points_to_vw() {
+        let err = parse(&[
+            "--transport",
+            "base-station",
+            "--mode",
+            "wheels",
+            "--team",
+            "blue",
+            "--robot",
+            "0",
+            "--dur",
+            "1",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--mode vw"), "got: {err}");
+    }
+
+    #[test]
+    fn old_left_right_flags_point_to_vw() {
+        for flag in ["--left", "--right"] {
+            let err = parse(&["--transport", "base-station", flag, "500"]).unwrap_err();
+            assert!(
+                err.contains(flag) && err.contains("--v") && err.contains("--w"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_with_v_fails() {
+        let err = parse(&[
+            "--transport",
+            "firasim",
+            "--vision",
+            "sim",
+            "--mode",
+            "skill",
+            "--skill",
+            "goto",
+            "--target",
+            "0,0",
+            "--robot",
+            "0",
+            "--team",
+            "blue",
+            "--v",
+            "300",
+            "--dur",
+            "1",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--v"), "got: {err}");
+    }
+
+    #[test]
     fn help_text_documents_bring_up_sequence() {
-        // Verifica que el --help menciona la secuencia de bring-up y MI_ROBOT_ID.
-        assert!(HELP_TEXT.contains("MI_ROBOT_ID = N + 1"));
-        assert!(HELP_TEXT.contains("SECUENCIA DE BRING-UP"));
-        assert!(HELP_TEXT.contains("500"));
+        // El --help documenta la convención de slot, el robot del checkout y la
+        // secuencia de bring-up del modo vw con sus diagnósticos.
+        for needle in [
+            "MI_ROBOT_ID = N + 1",
+            "--robot 1",
+            "SECUENCIA DE BRING-UP",
+            "GYRO_Z_SIGN",
+            "LEFT/RIGHT_WHEEL_SIGN",
+            "--v 300 --w 0",
+            "--v -300 --w 0",
+            "--v 0 --w 90",
+            "--v 0 --w -90",
+            "--v 300 --w 45",
+            "--w 180",
+        ] {
+            assert!(HELP_TEXT.contains(needle), "falta '{needle}' en el --help");
+        }
     }
 }

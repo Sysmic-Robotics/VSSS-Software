@@ -3,7 +3,7 @@ mod motion_chart;
 mod radio_panel;
 mod theme;
 mod vision_status;
-mod wheel_chart;
+mod vw_chart;
 
 use glam::Vec2;
 use iced::futures::SinkExt;
@@ -28,7 +28,7 @@ use crate::skills::SkillId;
 use serde::{Deserialize, Serialize};
 use field::FieldCanvas;
 use motion_chart::LineChart;
-use wheel_chart::WheelChart;
+use vw_chart::VwChart;
 pub use crate::vision::StatusUpdate;
 
 /// Velocidad lineal máx (m/s) por defecto del control manual (ajustable en la GUI).
@@ -45,7 +45,7 @@ const MANUAL_ANG_ACCEL: f64 = 12.0;
 const MANUAL_TICK_DT: f64 = 0.033;
 /// Retención máxima de muestras de telemetría (rueda/motion/error). ~30 s @ 60 Hz,
 /// suficiente para cubrir la ventana de tiempo máxima seleccionable.
-const WHEEL_HISTORY_MAX: usize = 1800;
+const TELEMETRY_HISTORY_MAX: usize = 1800;
 /// Presets de ventana de tiempo de la telemetría (segundos mostrados).
 const TELEMETRY_WINDOWS_S: [f64; 3] = [5.0, 15.0, 30.0];
 /// Ventana de tiempo por defecto (s).
@@ -162,7 +162,7 @@ pub fn spin_relative_target(skill_target_x: f32, robot_x_m: f32) -> Vec2 {
 /// superar la ventana de retención máxima.
 fn push_capped<T>(q: &mut VecDeque<T>, item: T) {
     q.push_back(item);
-    while q.len() > WHEEL_HISTORY_MAX {
+    while q.len() > TELEMETRY_HISTORY_MAX {
         q.pop_front();
     }
 }
@@ -208,10 +208,10 @@ pub struct RobotMotionDebug {
     pub omega: f32,
     /// Destino del skill activo (metros, frame mundial). None si no aplica.
     pub target: Option<Vec2>,
-    /// Velocidades de rueda que LLEGAN al robot (mm/s), ya clampadas a ±1500.
-    /// Mismo cálculo que el CSV de auditoría (`command_to_wheel_mm_s`).
-    pub wheel_l_mm_s: i16,
-    pub wheel_r_mm_s: i16,
+    /// Lo que LLEGA al robot: velocidad lineal (mm/s) y angular (grados/s) del
+    /// frame `V,W`, ya clampadas. Mismo cálculo que el CSV de auditoría (`command_to_vw`).
+    pub v_mm_s: i16,
+    pub w_deg_s: i16,
 }
 
 /// Ritmo de refresco del campo en GUI. La visión/control siguen a tasa completa;
@@ -467,8 +467,9 @@ pub struct VisionGui {
     /// Mensaje breve de estado de guardar/cargar preset.
     preset_status: String,
     estop: Arc<AtomicBool>,
-    wheel_history: VecDeque<(f64, i16, i16)>,
-    wheel_chart_cache: Cache,
+    /// Serie `(t, v_mm_s, w_deg_s)` del frame que llega al robot seleccionado.
+    vw_history: VecDeque<(f64, i16, i16)>,
+    vw_chart_cache: Cache,
     /// Serie `(t, v_comandada, v_medida)` en m/s del robot seleccionado.
     vel_history: VecDeque<(f64, f32, f32)>,
     vel_chart_cache: Cache,
@@ -587,8 +588,8 @@ impl VisionGui {
                 preset_name: "tuning.json".to_string(),
                 preset_status: String::new(),
                 estop: setup.estop,
-                wheel_history: VecDeque::new(),
-                wheel_chart_cache: Cache::default(),
+                vw_history: VecDeque::new(),
+                vw_chart_cache: Cache::default(),
                 vel_history: VecDeque::new(),
                 vel_chart_cache: Cache::default(),
                 omega_history: VecDeque::new(),
@@ -720,11 +721,8 @@ impl VisionGui {
                         && m.id == self.selected_robot
                         && !self.telemetry_frozen
                     {
-                        // Rueda comandada (mm/s).
-                        push_capped(
-                            &mut self.wheel_history,
-                            (t, m.wheel_l_mm_s, m.wheel_r_mm_s),
-                        );
+                        // Consigna que llega al robot (v mm/s, w °/s).
+                        push_capped(&mut self.vw_history, (t, m.v_mm_s, m.w_deg_s));
 
                         // Comandado vs medido: velocidad lineal (m/s) y ω (rad/s).
                         let cmd_v = (m.vx * m.vx + m.vy * m.vy).sqrt();
@@ -747,7 +745,7 @@ impl VisionGui {
                             push_capped(&mut self.skill_err_history, (t, heading_err, dist));
                         }
 
-                        self.wheel_chart_cache.clear();
+                        self.vw_chart_cache.clear();
                         self.vel_chart_cache.clear();
                         self.omega_chart_cache.clear();
                         self.skill_err_chart_cache.clear();
@@ -1078,7 +1076,7 @@ impl VisionGui {
             }
             Message::SetTelemetryWindow(s) => {
                 self.telemetry_window_s = s;
-                self.wheel_chart_cache.clear();
+                self.vw_chart_cache.clear();
                 self.vel_chart_cache.clear();
                 self.omega_chart_cache.clear();
                 self.skill_err_chart_cache.clear();
@@ -1089,11 +1087,11 @@ impl VisionGui {
 
     /// Reinicia todas las series de telemetría y sus caches (al cambiar de robot/equipo).
     fn clear_telemetry(&mut self) {
-        self.wheel_history.clear();
+        self.vw_history.clear();
         self.vel_history.clear();
         self.omega_history.clear();
         self.skill_err_history.clear();
-        self.wheel_chart_cache.clear();
+        self.vw_chart_cache.clear();
         self.vel_chart_cache.clear();
         self.omega_chart_cache.clear();
         self.skill_err_chart_cache.clear();
@@ -1538,13 +1536,13 @@ impl VisionGui {
                 None => ("—".to_string(), "—".to_string(), "—".to_string()),
             };
             let lr = match motion {
-                Some(m) => format!("L:{} R:{}", m.wheel_l_mm_s, m.wheel_r_mm_s),
-                None => "L:— R:—".to_string(),
+                Some(m) => format!("v:{} mm/s  w:{} °/s", m.v_mm_s, m.w_deg_s),
+                None => "v:— w:—".to_string(),
             };
             column![
                 text(format!("pos {pos}")).size(theme::FS_XS),
                 text(format!("v {v}   ω {w}")).size(theme::FS_XS),
-                text(format!("rueda {lr}")).size(theme::FS_XS),
+                text(format!("radio {lr}")).size(theme::FS_XS),
             ]
             .spacing(theme::SP_XS)
         };
@@ -1583,10 +1581,10 @@ impl VisionGui {
             );
         }
 
-        let wheel_chart = Canvas::new(WheelChart {
-            history: &self.wheel_history,
+        let vw_chart = Canvas::new(VwChart {
+            history: &self.vw_history,
             window_s: self.telemetry_window_s,
-            cache: &self.wheel_chart_cache,
+            cache: &self.vw_chart_cache,
         })
         .width(Length::Fill)
         .height(Length::Fixed(120.0));
@@ -1636,7 +1634,7 @@ impl VisionGui {
         column![
             readout,
             window_row,
-            wheel_chart,
+            vw_chart,
             vel_chart,
             omega_chart,
             skill_chart,
@@ -2027,15 +2025,15 @@ mod tests {
     /// 4.5 — La ventana de telemetría descarta muestras viejas (misma lógica
     /// que `Message::MotionUpdate`).
     #[test]
-    fn wheel_history_respects_window() {
+    fn vw_history_respects_window() {
         let mut hist: VecDeque<(f64, i16, i16)> = VecDeque::new();
-        for i in 0..(WHEEL_HISTORY_MAX + 50) {
+        for i in 0..(TELEMETRY_HISTORY_MAX + 50) {
             hist.push_back((i as f64, i as i16, -(i as i16)));
-            while hist.len() > WHEEL_HISTORY_MAX {
+            while hist.len() > TELEMETRY_HISTORY_MAX {
                 hist.pop_front();
             }
         }
-        assert_eq!(hist.len(), WHEEL_HISTORY_MAX);
+        assert_eq!(hist.len(), TELEMETRY_HISTORY_MAX);
         // Las 50 muestras más viejas fueron descartadas.
         assert!(hist.front().unwrap().0 >= 50.0);
     }
