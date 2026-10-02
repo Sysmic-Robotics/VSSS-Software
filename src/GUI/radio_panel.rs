@@ -17,6 +17,7 @@ pub fn view<'a>(
     own_team: u32,
     transport_connected: Option<bool>,
     packet_frequency: f64,
+    slot_map_lines: &[String],
 ) -> Element<'a, Message> {
     let (conn_text, conn_color) = match transport_connected {
         Some(true) => ("CONECTADO", theme::OK),
@@ -98,6 +99,15 @@ pub fn view<'a>(
             .spacing(5)
             .align_y(iced::Alignment::Center),
         );
+        // Mapeo id de visión → posición de radio (`robot.radio_slot_by_vision_id`).
+        body = body.push(
+            text("Mapeo visión → radio (el número de robot de la GUI es el de visión):")
+                .font(font::Font::MONOSPACE)
+                .size(12),
+        );
+        for line in slot_map_lines {
+            body = body.push(text(line.clone()).font(font::Font::MONOSPACE).size(12));
+        }
         body = body.push(
             text("Nota: aplicar puerto/baud requiere reiniciar el proceso (env VSSL_BASESTATION_DEVICE/BAUD).")
                 .font(font::Font::MONOSPACE)

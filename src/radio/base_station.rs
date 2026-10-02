@@ -1,6 +1,7 @@
 use crate::motion::RobotCommand;
 use crate::radio::transport::{RobotTransport, TransportError};
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
@@ -51,11 +52,14 @@ pub const SLOT_COUNT: usize = 5;
 //   - V = velocidad lineal del robot en mm/s; W = velocidad angular en GRADOS/s.
 //     La base recorta a ±1500 mm/s y ±720 °/s; aquí se aplican los mismos topes,
 //     leídos de `params().robot` (`max_v_mm_s`, `max_w_deg_s`).
-//   - Slots desde 0: el par en la posición i es el robot con cmd.id = i. El robot
-//     con MI_ROBOT_ID = N (firmware, desde 1) lee robots[N - 1]
-//     (communication.cpp:96), así que cmd.id = MI_ROBOT_ID - 1. El robot del
-//     checkout actual del firmware tiene MI_ROBOT_ID 2 → slot 1
-//     (`skill_test --robot 1`).
+//   - Slots desde 0: el robot con MI_ROBOT_ID = N (firmware, desde 1) lee
+//     robots[N - 1] (communication.cpp:96), es decir, la posición N - 1 del frame.
+//     El robot del checkout actual del firmware tiene MI_ROBOT_ID 2 → slot 1
+//     (`skill_test --mode vw --robot 1`).
+//   - cmd.id es el id de VISIÓN (parche de colores; con él aparece en World y en
+//     la GUI). La posición sale de `radio_slot`: `robot.radio_slot_by_vision_id`
+//     de team_params.json si el id tiene entrada, o el mismo id si no. Sin mapa,
+//     posición = cmd.id. FIRASim/grSim no usan esto (id directo).
 //   - La cinemática diferencial (reparto a cada rueda con WHEEL_TRACK_MM) y un PI
 //     de guiñada con el giroscopio los hace el FIRMWARE. El PC no calcula ruedas.
 //   - El firmware topa cada rueda en 450 mm/s (MAX_WHEEL_MM_S) escalando AMBAS
@@ -106,16 +110,42 @@ fn clamp_round(value: f64, max: i32) -> i16 {
     value.round().clamp(-max, max) as i16
 }
 
+/// Posición en el frame del robot con id de visión `vision_id`: la entrada del
+/// mapa (`robot.radio_slot_by_vision_id`) o el mismo id si no tiene. `None` si el
+/// id es negativo o la posición queda fuera de `0..SLOT_COUNT` (se descarta).
+pub fn radio_slot(vision_id: i32, slot_map: &BTreeMap<u32, u32>) -> Option<usize> {
+    let id = u32::try_from(vision_id).ok()?;
+    let slot = slot_map.get(&id).copied().unwrap_or(id) as usize;
+    (slot < SLOT_COUNT).then_some(slot)
+}
+
+/// Mapeo vigente en texto, una línea por entrada más la regla del resto. Única
+/// fuente para el log de `BaseStationTransport::new` y el panel de radio de la GUI.
+pub fn describe_slot_map(slot_map: &BTreeMap<u32, u32>) -> Vec<String> {
+    if slot_map.is_empty() {
+        return vec!["sin mapa: visión #N → radio pos N (MI_ROBOT_ID N + 1)".to_string()];
+    }
+    slot_map
+        .iter()
+        .map(|(id, slot)| format!("visión #{id} → radio pos {slot} (MI_ROBOT_ID {})", slot + 1))
+        .chain(std::iter::once("resto: visión #N → radio pos N".to_string()))
+        .collect()
+}
+
 /// Construye el frame ASCII "V1,W1,...,V5,W5\n" a partir de comandos del equipo propio.
-/// Slot = cmd.id (desde 0); ids fuera de rango se ignoran; los slots sin comando salen 0,0.
-pub fn build_frame(commands: &[RobotCommand], own_team: TeamColor) -> String {
+/// Posición = `radio_slot(cmd.id, slot_map)`; ids fuera de rango se ignoran; los
+/// slots sin comando salen 0,0.
+pub fn build_frame(
+    commands: &[RobotCommand],
+    own_team: TeamColor,
+    slot_map: &BTreeMap<u32, u32>,
+) -> String {
     let mut slots = [(0i16, 0i16); SLOT_COUNT];
     for cmd in commands {
         if cmd.team != own_team.as_team_id() {
             continue;
         }
-        let idx = cmd.id as usize;
-        if idx < SLOT_COUNT {
+        if let Some(idx) = radio_slot(cmd.id, slot_map) {
             slots[idx] = command_to_vw(&cmd.motion);
         }
     }
@@ -146,6 +176,8 @@ pub struct BaseStationTransport {
     port: SerialStream,
     own_team: TeamColor,
     device: String,
+    /// `robot.radio_slot_by_vision_id`, copiado de los params al abrir.
+    slot_map: BTreeMap<u32, u32>,
 }
 
 impl BaseStationTransport {
@@ -157,10 +189,15 @@ impl BaseStationTransport {
             "[BaseStation] Abierto {device} @ {baud} baud, equipo propio = {:?}",
             own_team
         );
+        let slot_map = crate::params::params().robot.radio_slot_by_vision_id.clone();
+        for line in describe_slot_map(&slot_map) {
+            eprintln!("[BaseStation] {line}");
+        }
         Ok(Self {
             port,
             own_team,
             device: device.to_string(),
+            slot_map,
         })
     }
 
@@ -198,7 +235,7 @@ impl BaseStationTransport {
 #[async_trait]
 impl RobotTransport for BaseStationTransport {
     async fn send_commands(&mut self, commands: &[RobotCommand]) -> Result<(), TransportError> {
-        let frame = build_frame(commands, self.own_team);
+        let frame = build_frame(commands, self.own_team, &self.slot_map);
         match self.port.write_all(frame.as_bytes()).await {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -386,7 +423,7 @@ mod tests {
     fn frame_golden_forward_blue_slot_0() {
         let cmds = vec![make_cmd(0, 0, 0.5, 0.0, 0.0, 0.0)];
         assert_eq!(
-            build_frame(&cmds, TeamColor::Blue),
+            build_frame(&cmds, TeamColor::Blue, &no_map()),
             "500,0,0,0,0,0,0,0,0,0\n"
         );
     }
@@ -396,7 +433,7 @@ mod tests {
         // Slot 1 = robot con MI_ROBOT_ID 2 (el del checkout actual del firmware).
         let cmds = vec![make_cmd(0, 1, 0.0, 0.0, FRAC_PI_2, 0.0)];
         assert_eq!(
-            build_frame(&cmds, TeamColor::Blue),
+            build_frame(&cmds, TeamColor::Blue, &no_map()),
             "0,0,0,90,0,0,0,0,0,0\n"
         );
     }
@@ -405,7 +442,7 @@ mod tests {
     fn frame_negative_omega_slot_4() {
         let cmds = vec![make_cmd(0, 4, 0.0, 0.0, -FRAC_PI_2, 0.0)];
         assert_eq!(
-            build_frame(&cmds, TeamColor::Blue),
+            build_frame(&cmds, TeamColor::Blue, &no_map()),
             "0,0,0,0,0,0,0,0,0,-90\n"
         );
     }
@@ -416,13 +453,13 @@ mod tests {
     fn frame_filters_opposing_team() {
         // own_team = Blue, comando con team = Yellow → ignorado.
         let cmds = vec![make_cmd(1, 0, 1.0, 0.0, 0.0, 0.0)];
-        assert_eq!(build_frame(&cmds, TeamColor::Blue), "0,0,0,0,0,0,0,0,0,0\n");
+        assert_eq!(build_frame(&cmds, TeamColor::Blue, &no_map()), "0,0,0,0,0,0,0,0,0,0\n");
     }
 
     #[test]
     fn frame_drops_id_out_of_range() {
         let cmds = vec![make_cmd(0, 9, 1.0, 0.0, 0.0, 0.0)];
-        assert_eq!(build_frame(&cmds, TeamColor::Blue), "0,0,0,0,0,0,0,0,0,0\n");
+        assert_eq!(build_frame(&cmds, TeamColor::Blue, &no_map()), "0,0,0,0,0,0,0,0,0,0\n");
     }
 
     #[test]
@@ -433,8 +470,64 @@ mod tests {
             make_cmd(1, 1, 0.5, 0.0, 0.0, 0.0),
         ];
         assert_eq!(
-            build_frame(&cmds, TeamColor::Yellow),
+            build_frame(&cmds, TeamColor::Yellow, &no_map()),
             "0,0,500,0,0,0,0,0,0,0\n"
+        );
+    }
+
+    // ---------- Mapa id de visión → posición de radio ----------
+
+    fn no_map() -> BTreeMap<u32, u32> {
+        BTreeMap::new()
+    }
+
+    fn lab_map() -> BTreeMap<u32, u32> {
+        BTreeMap::from([(0, 1), (1, 0)])
+    }
+
+    #[test]
+    fn frame_maps_vision_id_to_radio_slot() {
+        // La visión ve el robot como #1, pero escucha la posición 0 (MI_ROBOT_ID 1).
+        let cmds = vec![make_cmd(0, 1, 0.5, 0.0, 0.0, 0.0)];
+        assert_eq!(
+            build_frame(&cmds, TeamColor::Blue, &lab_map()),
+            "500,0,0,0,0,0,0,0,0,0\n"
+        );
+    }
+
+    #[test]
+    fn frame_unmapped_id_keeps_its_own_slot() {
+        let cmds = vec![make_cmd(0, 2, 0.5, 0.0, 0.0, 0.0)];
+        assert_eq!(
+            build_frame(&cmds, TeamColor::Blue, &lab_map()),
+            "0,0,0,0,500,0,0,0,0,0\n"
+        );
+    }
+
+    #[test]
+    fn radio_slot_rules() {
+        assert_eq!(radio_slot(1, &no_map()), Some(1));
+        assert_eq!(radio_slot(1, &lab_map()), Some(0));
+        assert_eq!(radio_slot(0, &lab_map()), Some(1));
+        assert_eq!(radio_slot(-1, &lab_map()), None);
+        assert_eq!(radio_slot(9, &no_map()), None);
+        // Un id de visión alto puede ir a una posición válida.
+        assert_eq!(radio_slot(7, &BTreeMap::from([(7, 2)])), Some(2));
+    }
+
+    #[test]
+    fn describe_slot_map_with_and_without_map() {
+        assert_eq!(
+            describe_slot_map(&lab_map()),
+            vec![
+                "visión #0 → radio pos 1 (MI_ROBOT_ID 2)",
+                "visión #1 → radio pos 0 (MI_ROBOT_ID 1)",
+                "resto: visión #N → radio pos N",
+            ]
+        );
+        assert_eq!(
+            describe_slot_map(&no_map()),
+            vec!["sin mapa: visión #N → radio pos N (MI_ROBOT_ID N + 1)"]
         );
     }
 
@@ -469,7 +562,7 @@ mod tests {
             (0, 0),
         ];
         assert_eq!(
-            build_frame(&cmds, TeamColor::Blue),
+            build_frame(&cmds, TeamColor::Blue, &no_map()),
             build_frame_from_vw(slots)
         );
     }

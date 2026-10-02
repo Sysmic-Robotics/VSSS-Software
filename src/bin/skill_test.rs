@@ -13,7 +13,7 @@ use rustengine::control_loop::{
 use rustengine::radio::{
     BaseStationTransport, RadioTarget, TeamColor,
     base_station::SLOT_COUNT,
-    base_station::{build_frame_from_vw, clamp_vw},
+    base_station::{build_frame_from_vw, clamp_vw, radio_slot},
 };
 use rustengine::skill_log::{
     CsvLogger, CsvRow, SkillLogCtx, format_human_summary, team_label, transport_label,
@@ -62,11 +62,16 @@ USO:
 FLAGS COMUNES (obligatorios):
     --transport <firasim|grsim|base-station>
     --robot N          índice del robot, desde 0 (0..5)
-                       Convención: el robot físico que ejecuta este comando es
-                       el que tiene MI_ROBOT_ID = N + 1 compilado en su
+                       --mode vw: N es la POSICIÓN de radio en el frame. El
+                       robot físico que ejecuta el comando es el que tiene
+                       MI_ROBOT_ID = N + 1 compilado en su
                        VSSL-firmware/include/config.h. El robot del checkout
                        actual del firmware (rama Peluche) es MI_ROBOT_ID 2
                        → --robot 1.
+                       --mode skill: N es el id de VISIÓN (parche de colores,
+                       el mismo número que muestra la GUI). Con base-station,
+                       la posición de radio sale de robot.radio_slot_by_vision_id
+                       (config/team_params.json); sin entrada, posición = N.
     --team <blue|yellow>
     --mode <vw|skill>
     --dur S            segundos antes del auto-stop (float > 0)
@@ -541,6 +546,11 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
         transport: args.transport,
         vision: args.vision,
         robot: args.robot,
+        // --robot en modo skill es el id de visión; el frame va a su posición de radio.
+        radio_slot: radio_slot(
+            args.robot as i32,
+            &rustengine::params::params().robot.radio_slot_by_vision_id,
+        ),
         team: args.team,
         skill: skill_id,
     };
@@ -1022,6 +1032,8 @@ mod tests {
         for needle in [
             "MI_ROBOT_ID = N + 1",
             "--robot 1",
+            "id de VISIÓN",
+            "robot.radio_slot_by_vision_id",
             "SECUENCIA DE BRING-UP",
             "GYRO_Z_SIGN",
             "LEFT/RIGHT_WHEEL_SIGN",

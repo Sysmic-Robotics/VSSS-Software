@@ -159,7 +159,11 @@ pub fn skill_label(s: Option<SkillId>) -> &'static str {
 pub struct SkillLogCtx {
     pub transport: RadioTarget,
     pub vision: Option<VisionSource>,
+    /// Id de VISIÓN del robot comandado (columna `robot`, búsqueda en `World`).
     pub robot: usize,
+    /// Posición en el frame de la base: `radio_slot(robot, mapa de params)`. Es la
+    /// que usa `frame_str`, para mostrar el frame realmente enviado.
+    pub radio_slot: Option<usize>,
     pub team: TeamColor,
     pub skill: SkillId,
 }
@@ -198,7 +202,7 @@ impl SkillLogCtx {
         // Frame str (solo para base-station)
         let frame_str = match self.transport {
             RadioTarget::BaseStation => {
-                let slots = vw_to_slots(self.robot, v, w);
+                let slots = vw_to_slots(self.radio_slot, v, w);
                 build_frame_from_vw(slots).trim_end().to_string()
             }
             _ => String::new(),
@@ -289,10 +293,10 @@ fn find_robot_state(world: &crate::world::World, robot_id: i32, team: i32) -> Op
     robots.into_iter().find(|r| r.id == robot_id).cloned()
 }
 
-fn vw_to_slots(robot: usize, v: i16, w: i16) -> [(i16, i16); SLOT_COUNT] {
+fn vw_to_slots(slot: Option<usize>, v: i16, w: i16) -> [(i16, i16); SLOT_COUNT] {
     let mut slots: [(i16, i16); SLOT_COUNT] = [(0, 0); SLOT_COUNT];
-    if robot < SLOT_COUNT {
-        slots[robot] = (v, w);
+    if let Some(slot) = slot.filter(|s| *s < SLOT_COUNT) {
+        slots[slot] = (v, w);
     }
     slots
 }
@@ -482,6 +486,7 @@ mod tests {
             transport: RadioTarget::FiraSim,
             vision: Some(VisionSource::FiraSim),
             robot: 0,
+            radio_slot: Some(0),
             team: TeamColor::Blue,
             skill: SkillId::GoTo,
         };
@@ -509,6 +514,7 @@ mod tests {
             transport: RadioTarget::FiraSim,
             vision: Some(VisionSource::FiraSim),
             robot: 0,
+            radio_slot: Some(0),
             team: TeamColor::Blue,
             skill: SkillId::GoTo,
         };
@@ -543,6 +549,7 @@ mod tests {
             transport: RadioTarget::BaseStation,
             vision: None,
             robot: 0,
+            radio_slot: Some(0),
             team: TeamColor::Blue,
             skill: SkillId::GoTo,
         };
@@ -552,6 +559,34 @@ mod tests {
         // (500, 0) en slot 0, resto cero
         assert_eq!(row.frame_str, "500,0,0,0,0,0,0,0,0,0");
         assert_eq!(row.transport, "base-station");
+    }
+
+    #[test]
+    fn build_row_base_station_frame_str_uses_mapped_slot() {
+        // Visión ve el robot como #1; escucha la posición 0 (mapa {1: 0, 0: 1}).
+        let world = World::new(3, 3);
+        let cmd = MotionCommand {
+            id: 1,
+            team: 0,
+            vx: 0.5,
+            vy: 0.0,
+            omega: 0.0,
+            orientation: 0.0,
+        };
+        let commands = vec![cmd];
+        let ctx = SkillLogCtx {
+            transport: RadioTarget::BaseStation,
+            vision: None,
+            robot: 1,
+            radio_slot: Some(0),
+            team: TeamColor::Blue,
+            skill: SkillId::GoTo,
+        };
+        let targets = [Some(Vec2::new(0.3, 0.0))];
+        let rec = empty_tick_record(&world, &commands, &targets, &[]);
+        let row = ctx.build_skill_row(&rec);
+        assert_eq!(row.robot, 1);
+        assert_eq!(row.frame_str, "500,0,0,0,0,0,0,0,0,0");
     }
 
     #[test]
@@ -571,6 +606,7 @@ mod tests {
             transport: RadioTarget::FiraSim,
             vision: Some(VisionSource::FiraSim),
             robot: 0,
+            radio_slot: Some(0),
             team: TeamColor::Blue,
             skill: SkillId::ChaseBall,
         };

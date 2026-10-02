@@ -250,6 +250,10 @@ async fn async_run(
         transport,
         vision: Some(vision),
         robot: robot_id as usize,
+        radio_slot: rustengine::radio::base_station::radio_slot(
+            robot_id,
+            &rustengine::params::params().robot.radio_slot_by_vision_id,
+        ),
         team,
         skill: scenario.skill_id,
     };

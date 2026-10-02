@@ -85,6 +85,14 @@ para fijar el target (marcador verde). La skill se inyecta como `SkillChoice` al
 Precedencia: control manual (velocidad cruda) > skill de GUI > coach. Con "Ninguna" el robot
 vuelve al coach.
 
+El número de robot que se elige en la GUI es el **id de visión** (el del parche de colores).
+Una skill solo corre si ese robot es del equipo propio y está activo en el `World` (lo ve la
+visión). Si no, la sección Skills muestra `⚠ la skill no corre: el robot azul #1 no está en la
+visión. La visión ve: azul #0, amarillo #2`, y la terminal imprime lo mismo, como máximo una
+vez por segundo. Si el robot aparece con otro número o color, hay que corregir la selección o
+el mapa `robot.radio_slot_by_vision_id`. El control manual no tiene esta restricción: manda
+aunque la visión no vea al robot.
+
 La sección **Inspector** muestra los datos de visión del robot seleccionado: posición, θ,
 rapidez (m/s), ω (rad/s), estado activo/inactivo y antigüedad del último dato. En la cancha,
 overlays de diagnóstico: **vector de velocidad medida** (naranja, distinto de la flecha blanca
@@ -99,7 +107,8 @@ La sección **Teleport (sim)** reposiciona el robot seleccionado a `(x, y, θ)` 
 En base station (robots reales) es no-op.
 
 La sección **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
-estado de conexión y PPS. Editar puerto/baud requiere reiniciar el proceso (se aplican por
+estado de conexión, PPS y, con base station, el **mapeo visión → radio** vigente (por ejemplo
+`visión #1 → radio pos 0 (MI_ROBOT_ID 1)`). Editar puerto/baud requiere reiniciar el proceso (se aplican por
 `VSSL_BASESTATION_DEVICE` / `VSSL_BASESTATION_BAUD`). En headless nada de esto aplica: la
 config sigue viniendo del entorno y los bytes enviados son idénticos.
 
@@ -136,6 +145,19 @@ VSSL_BASESTATION_DEVICE=/dev/ttyUSB0 \
 VSSL_DEBUG_GUI=1 \
 cargo run --release
 ```
+
+**Línea de lanzamiento del laboratorio** (visión real + base station + GUI, robots de dos caras):
+
+```bash
+VSSL_VISION_SOURCE=sslvision VSSL_RADIO_TARGET=basestation VSSL_BASESTATION_DEVICE=/dev/ttyUSB0 \
+VSSL_DEBUG_GUI=1 VSSL_BIDIRECTIONAL=1 cargo run --release
+```
+
+Al arrancar, confirmar en la terminal:
+- `[Vision] orientación de la visión real corregida en +180°`;
+- el mapeo `[BaseStation] visión #N → radio pos …`.
+
+En la GUI, el robot se elige por su **id de visión**. Si una skill no mueve al robot, la sección Skills dice por qué: el robot no está en la visión, o es de otro equipo, y muestra qué robots sí ve la visión.
 
 Variantes:
 
@@ -261,6 +283,13 @@ es calibrable y verificable con datos reales:
 
 - **EKF desde el JSON.** Q, R, gating y límites físicos del tracker viven en `config/team_params.json`
   → `vision` (`r_pos`, `r_theta`, `q_*`, `gating_chi2`, ...). Sin recompilar.
+- **Orientación de la visión real.** vsss-vision-sysmic entrega el heading de los robots girado 180°
+  (lo que llama "adelante" es la espalda). `vision.real_theta_offset_deg` se suma a la orientación
+  de cada robot y se normaliza a [-π, π], **solo** con `VSSL_VISION_SOURCE=sslvision`, al parsear el
+  paquete: antes del EKF, de la GUI y del `World`. FIRASim no se toca. Default en código `0`; en el
+  JSON del repo `180`. Al arrancar, el engine imprime `[Vision] orientación de la visión real
+  corregida en +180°`. Si algún día se corrige en la visión, hay que volver el JSON a `0`. El
+  replay offline (`vision_replay --ekf-csv`) aplica la misma corrección.
 - **Proxy de ruido en el simulador.** `VSSL_VISION_NOISE=1` inyecta, ANTES del tracker, el ruido
   de `vision.proxy_*` (σ de posición y orientación, latencia como retención de paquetes, pérdida de
   frames). Los defaults son de literatura; la medición M1 los reemplaza por los de nuestra cámara.
@@ -358,6 +387,19 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 | `robot.max_v_mm_s` (`config/team_params.json`) | `1500` | Tope de v, el mismo clamp que aplica la base (`MAX_V_MM_S`) |
 | `robot.max_w_deg_s` (`config/team_params.json`) | `720` | Tope de ω en grados/s, el mismo clamp que aplica la base (`MAX_W_DEG_S`) |
 | `SLOT_COUNT` | `5` | Slots del frame ASCII; el robot físico con `MI_ROBOT_ID = N` (firmware, desde 1) lee `slots[N-1]`. El robot del checkout actual es `MI_ROBOT_ID 2` → slot 1 |
+| `robot.radio_slot_by_vision_id` (`config/team_params.json`) | `{}` | Mapa id de visión → posición del frame (ver abajo) |
+
+**Ids de visión y de radio.** Cada robot real tiene dos ids:
+- **id de visión:** el del parche de colores. Con él aparece en el `World` y en la GUI, y es el número que se elige en la GUI y en `skill_test --mode skill --robot`.
+- **id de radio:** `MI_ROBOT_ID` del firmware. El robot escucha la posición `MI_ROBOT_ID − 1` del frame.
+
+Si no calzan, se declara el mapa en `robot.radio_slot_by_vision_id` como `{"<id de visión>": <posición>}`. Por ejemplo, `{"0": 1, "1": 0}`: la visión ve el robot como #1, pero ese robot tiene `MI_ROBOT_ID 1`, es decir, la posición 0. Un id sin entrada usa su propio número. Así, el manual, las skills y el coach le llegan al robot correcto.
+
+Reglas, validadas al cargar los params (si no se cumplen, el proceso no arranca y el error dice qué corregir):
+- toda posición está en `0..4`;
+- dos ids de visión nunca caen en la misma posición, **contando los ids sin entrada**. Por eso `{"1": 0}` solo no vale: el #0 seguiría yendo a la posición 0. Hay que mapear también el #0 a una posición libre.
+
+El mapa solo afecta a la base station; FIRASim y grSim usan el id directo. Al abrir la base, la terminal imprime el mapeo vigente (`[BaseStation] visión #1 → radio pos 0 (MI_ROBOT_ID 1)`), y la sección Radio de la GUI lo muestra. `skill_test --mode vw --robot N` **no** pasa por el mapa: ahí N es la posición de radio cruda (bring-up sin visión).
 
 **Conversión** (en `command_to_vw`, única fuente de verdad del frame, el CSV y la GUI):
 ```

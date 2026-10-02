@@ -356,7 +356,12 @@ pub fn parse_detections(source: VisionSource, data: &[u8]) -> Vec<Detection> {
                     id: r.robot_id() as i32,
                     x: r.x() as f64 / 1000.0,
                     y: r.y() as f64 / 1000.0,
-                    theta: r.orientation() as f64,
+                    // Misma corrección que el engine en vivo (`Vision::process_robot`).
+                    theta: crate::vision::apply_theta_offset(
+                        source,
+                        r.orientation() as f64,
+                        crate::params::params().vision.real_theta_offset_deg,
+                    ),
                 });
             }
         }

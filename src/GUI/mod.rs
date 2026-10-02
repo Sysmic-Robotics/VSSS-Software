@@ -464,7 +464,8 @@ impl FieldSnapshotBuffer {
         match update {
             StatusUpdate::Connected(_, _)
             | StatusUpdate::PacketReceived
-            | StatusUpdate::TransportStatus(_) => Some(update),
+            | StatusUpdate::TransportStatus(_)
+            | StatusUpdate::SkillWarning(_) => Some(update),
             StatusUpdate::BallDetected(count) => {
                 self.ball_count = Some(count);
                 None
@@ -572,6 +573,11 @@ pub struct VisionGui {
     bidirectional: bool,
     /// Único robot que el `ZoneGuard` deja entrar al área propia (`coach.keeper_id`).
     keeper_id: i32,
+    /// Aviso del control loop si la skill de GUI no corre (robot fuera de `World`
+    /// o de otro equipo). Se muestra solo mientras hay una skill activa.
+    skill_warning: Option<String>,
+    /// Mapeo visión → radio vigente (`describe_slot_map`), para el panel de radio.
+    slot_map_lines: Vec<String>,
     /// Velocidad angular de Spin (rad/s), tuneable en vivo.
     spin_omega: f64,
     spin_omega_str: String,
@@ -703,6 +709,10 @@ impl VisionGui {
                 )),
                 bidirectional: crate::motion::MotionConfig::from_env().bidirectional,
                 keeper_id: crate::params::params().coach.keeper_id,
+                skill_warning: None,
+                slot_map_lines: crate::radio::base_station::describe_slot_map(
+                    &crate::params::params().robot.radio_slot_by_vision_id,
+                ),
                 spin_omega: SPIN_OMEGA_DEFAULT,
                 spin_omega_str: format!("{SPIN_OMEGA_DEFAULT}"),
                 pid_kp: PID_KP_DEFAULT,
@@ -819,6 +829,9 @@ impl VisionGui {
                     }
                     StatusUpdate::TransportStatus(ok) => {
                         self.transport_connected = Some(ok);
+                    }
+                    StatusUpdate::SkillWarning(warning) => {
+                        self.skill_warning = warning;
                     }
                 }
             }
@@ -1561,6 +1574,18 @@ impl VisionGui {
             }
         }
         col = col.push(text(skill_help(self.active_skill)).size(theme::FS_SM));
+        // Aviso del loop (fuente de verdad: `World`) cuando la skill no corre.
+        if self.active_skill.is_some()
+            && let Some(warning) = &self.skill_warning
+        {
+            col = col.push(
+                text(format!("⚠ {warning}"))
+                    .size(theme::FS_SM)
+                    .style(|_t: &Theme| text::Style {
+                        color: Some(theme::WARN),
+                    }),
+            );
+        }
         if let Some(warning) =
             keeper_warning(self.active_skill, self.selected_robot, self.keeper_id)
         {
@@ -1865,6 +1890,7 @@ impl VisionGui {
                     self.selected_team,
                     self.transport_connected,
                     self.packet_frequency,
+                    &self.slot_map_lines,
                 ),
                 Section::Vision => vision_status::view(
                     self.connected,
@@ -2077,6 +2103,21 @@ mod tests {
         assert_eq!(snapshot.robots[0].team, 0);
         assert_eq!(snapshot.robots[0].position, Vec2::new(3.0, 4.0));
         assert_eq!(snapshot.robots[0].orientation, 0.2);
+    }
+
+    #[test]
+    fn field_snapshot_buffer_forwards_skill_warning_immediately() {
+        let mut buffer = FieldSnapshotBuffer::default();
+        let w = "la skill no corre: el robot azul #1 no está en la visión".to_string();
+        assert!(matches!(
+            buffer.push(StatusUpdate::SkillWarning(Some(w.clone()))),
+            Some(StatusUpdate::SkillWarning(Some(ref got))) if *got == w
+        ));
+        assert!(matches!(
+            buffer.push(StatusUpdate::SkillWarning(None)),
+            Some(StatusUpdate::SkillWarning(None))
+        ));
+        assert!(buffer.drain_snapshot().is_none());
     }
 
     #[test]

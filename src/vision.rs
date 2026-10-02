@@ -33,6 +33,9 @@ pub enum StatusUpdate {
     /// Estado de conexión del transporte de radio (lo emite el control loop, no
     /// la visión). `true` = último envío OK, `false` = último envío falló.
     TransportStatus(bool),
+    /// Aviso de skill de GUI que no corre (lo emite el control loop contra
+    /// `World`). `None` = sin aviso. Ver `control_loop::gui_skill_warning`.
+    SkillWarning(Option<String>),
 }
 
 /// Log por cada robot azul enviado a la GUI (SSL). Desactivado por defecto; usar `[FieldAudit]` en main.
@@ -94,6 +97,17 @@ impl VisionSource {
     }
 }
 
+/// Corrige la orientación de un robot de la visión real con
+/// `vision.real_theta_offset_deg` (vsss-vision-sysmic entrega el heading girado
+/// 180°). Solo para `SslVision`: con FIRASim, o con offset 0, devuelve `theta`
+/// exacto. El resultado queda en [-π, π].
+pub fn apply_theta_offset(source: VisionSource, theta: f64, offset_deg: f64) -> f64 {
+    if source != VisionSource::SslVision || offset_deg == 0.0 {
+        return theta;
+    }
+    crate::motion::Motion::normalize_angle(theta + offset_deg.to_radians())
+}
+
 // --- Data Structures ---
 
 #[derive(Debug, Clone)]
@@ -140,6 +154,8 @@ pub struct Vision {
     delayed: VecDeque<(Instant, Vec<u8>)>,
     /// Paquetes descartados por el proxy (pérdida de frames simulada).
     dropped: u64,
+    /// `vision.real_theta_offset_deg` (solo se aplica con `SslVision`).
+    theta_offset_deg: f64,
 }
 
 /// Contadores del receptor (para los logs periódicos).
@@ -160,6 +176,13 @@ impl Vision {
                 n.describe()
             );
         }
+        let theta_offset_deg = crate::params::params().vision.real_theta_offset_deg;
+        if source == VisionSource::SslVision && theta_offset_deg != 0.0 {
+            eprintln!(
+                "[Vision] orientación de la visión real corregida en {theta_offset_deg:+}° \
+                 (vision.real_theta_offset_deg)"
+            );
+        }
         let recorder = VisionRecorder::from_env(source);
         if recorder.is_some() {
             eprintln!(
@@ -176,6 +199,7 @@ impl Vision {
             recorder,
             delayed: VecDeque::new(),
             dropped: 0,
+            theta_offset_deg,
         }
     }
 
@@ -717,14 +741,14 @@ impl Vision {
         // SSL Vision coordinates are in millimeters, with origin at center of field
         let raw_x = robot.x();
         let raw_y = robot.y();
-        let raw_theta = robot.orientation();
+        // Corrección de la visión real ANTES del proxy, del EKF y de la GUI: todos
+        // ven la misma orientación.
+        let raw_theta =
+            apply_theta_offset(self.source, robot.orientation() as f64, self.theta_offset_deg);
 
         // Convert to meters for internal processing (tracker works in meters)
-        let (x_m, y_m, theta) = self.noisy_pose(
-            raw_x as f64 / 1000.0,
-            raw_y as f64 / 1000.0,
-            raw_theta as f64,
-        );
+        let (x_m, y_m, theta) =
+            self.noisy_pose(raw_x as f64 / 1000.0, raw_y as f64 / 1000.0, raw_theta);
         let dt_f64 = self.compute_dt((team, id as i32)) as f64;
 
         // Usar tracker solo si está habilitado
@@ -797,6 +821,68 @@ mod tests {
         assert_eq!(VisionSource::FiraSim.port(), 10002);
         assert_eq!(VisionSource::SslVision.multicast_ip(), "224.5.23.2");
         assert_eq!(VisionSource::SslVision.port(), 10015);
+    }
+
+    #[test]
+    fn theta_offset_inverts_and_normalizes_ssl_vision() {
+        use std::f64::consts::PI;
+        let a = apply_theta_offset(VisionSource::SslVision, 0.5, 180.0);
+        assert!((a - (0.5 - PI)).abs() < 1e-12, "{a}");
+        let b = apply_theta_offset(VisionSource::SslVision, -2.0, 180.0);
+        assert!((b - (-2.0 + PI)).abs() < 1e-12, "{b}");
+        for t in [-3.1, -1.0, 0.0, 1.0, 3.1] {
+            let c = apply_theta_offset(VisionSource::SslVision, t, 180.0);
+            assert!((-PI..=PI).contains(&c), "{t} → {c}");
+        }
+    }
+
+    #[test]
+    fn theta_offset_leaves_firasim_untouched() {
+        for t in [-3.0, -0.5, 0.0, 0.5, 3.0] {
+            assert_eq!(apply_theta_offset(VisionSource::FiraSim, t, 180.0), t);
+        }
+    }
+
+    #[test]
+    fn theta_offset_zero_leaves_ssl_vision_untouched() {
+        for t in [-3.0, -0.5, 0.0, 0.5, 3.0] {
+            assert_eq!(apply_theta_offset(VisionSource::SslVision, t, 0.0), t);
+        }
+    }
+
+    /// La corrección se aplica al parsear: el evento al `World` y el estado a la
+    /// GUI llevan la misma orientación corregida.
+    #[tokio::test]
+    async fn process_robot_applies_offset_before_world_and_gui() {
+        let mut vis = Vision::new(VisionSource::SslVision, Arc::new(AtomicBool::new(false)));
+        vis.theta_offset_deg = 180.0;
+        let mut robot = SSL_DetectionRobot::new();
+        robot.set_confidence(0.9);
+        robot.set_pixel_x(100.0);
+        robot.set_pixel_y(100.0);
+        robot.set_robot_id(1);
+        robot.set_x(250.0);
+        robot.set_y(-100.0);
+        robot.set_orientation(0.5);
+        let (tx, mut rx) = mpsc::channel(4);
+        let (status_tx, mut status_rx) = mpsc::channel(4);
+        vis.process_robot(&tx, &status_tx, &robot, 0).await.unwrap();
+
+        let expected = 0.5 - std::f32::consts::PI;
+        match rx.try_recv() {
+            Ok(VisionEvent::Robot(r)) => {
+                assert_eq!(r.id, 1);
+                assert!((r.orientation - expected).abs() < 1e-5, "{}", r.orientation);
+            }
+            other => panic!("se esperaba VisionEvent::Robot: {other:?}"),
+        }
+        match status_rx.try_recv() {
+            Ok(StatusUpdate::RobotPosition(id, _, _, theta, _, _)) => {
+                assert_eq!(id, 1);
+                assert!((theta - expected).abs() < 1e-5, "{theta}");
+            }
+            other => panic!("se esperaba RobotPosition: {other:?}"),
+        }
     }
 
     /// Exercises `from_env` para todos los valores en un solo test para evitar

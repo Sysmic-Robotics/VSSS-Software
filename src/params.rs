@@ -17,6 +17,7 @@
 //! si nadie lo instaló, p. ej. en tests, devuelve los defaults).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -234,6 +235,11 @@ pub struct RobotParams {
     pub max_v_mm_s: i32,
     /// Tope de velocidad angular (grados/s). Mismo clamp que la base (`MAX_W_DEG_S`).
     pub max_w_deg_s: i32,
+    /// Id de visión (parche de colores) → posición en el frame de la base
+    /// (`MI_ROBOT_ID − 1` del firmware). Un id sin entrada usa su propio número.
+    /// Solo lo usa la base station (`radio::base_station::radio_slot`); validado en
+    /// `validate`.
+    pub radio_slot_by_vision_id: BTreeMap<u32, u32>,
 }
 
 impl Default for RobotParams {
@@ -241,7 +247,48 @@ impl Default for RobotParams {
         Self {
             max_v_mm_s: 1500,
             max_w_deg_s: 720,
+            radio_slot_by_vision_id: BTreeMap::new(),
         }
+    }
+}
+
+impl RobotParams {
+    /// Valida `radio_slot_by_vision_id`: toda posición en `0..SLOT_COUNT` y dos ids
+    /// de visión nunca en la misma posición, contando también los ids sin entrada
+    /// (usan su propio número). Si dos comandos cayeran en la misma posición, el
+    /// frame se quedaría con el último y el robot recibiría consignas alternadas.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::radio::base_station::SLOT_COUNT;
+        let map = &self.radio_slot_by_vision_id;
+        for (id, slot) in map {
+            if *slot as usize >= SLOT_COUNT {
+                return Err(format!(
+                    "robot.radio_slot_by_vision_id: visión #{id} → pos {slot} fuera de rango (0..{})",
+                    SLOT_COUNT - 1
+                ));
+            }
+        }
+        // Primero las entradas explícitas (el error más directo), luego los ids sin
+        // entrada, que usan su propio número.
+        let unmapped = (0..SLOT_COUNT as u32)
+            .filter(|i| !map.contains_key(i))
+            .map(|i| (i, i));
+        let mut taken: BTreeMap<u32, u32> = BTreeMap::new(); // posición → id de visión
+        for (id, slot) in map.iter().map(|(i, s)| (*i, *s)).chain(unmapped) {
+            if let Some(prev) = taken.insert(slot, id) {
+                let describe = |i: u32| match map.get(&i) {
+                    Some(s) => format!("visión #{i} (→ pos {s})"),
+                    None => format!("visión #{i} (sin entrada, usa pos {i})"),
+                };
+                return Err(format!(
+                    "robot.radio_slot_by_vision_id: {} y {} caen en la misma posición de radio {slot}; \
+                     agrega o corrige la entrada de visión #{id} hacia una posición libre",
+                    describe(prev),
+                    describe(id)
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -303,6 +350,10 @@ pub struct VisionParams {
     pub proxy_latency_ms: f64,
     /// Proxy (sim): probabilidad de perder un frame [0, 1].
     pub proxy_drop_prob: f64,
+    /// Offset (grados) que se suma a la orientación de cada robot SOLO con la
+    /// visión real (`VSSL_VISION_SOURCE=sslvision`), antes del EKF y de la GUI.
+    /// vsss-vision-sysmic entrega el heading girado 180°. FIRASim no se toca.
+    pub real_theta_offset_deg: f64,
 }
 
 impl Default for VisionParams {
@@ -322,6 +373,7 @@ impl Default for VisionParams {
             proxy_sigma_theta_rad: 0.031,
             proxy_latency_ms: 90.0,
             proxy_drop_prob: 0.02,
+            real_theta_offset_deg: 0.0,
         }
     }
 }
@@ -349,7 +401,9 @@ impl TeamParams {
     pub const ENV_VAR: &'static str = "VSSL_PARAMS";
 
     pub fn from_json(text: &str) -> Result<Self, String> {
-        serde_json::from_str(text).map_err(|e| e.to_string())
+        let p: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        p.robot.validate()?;
+        Ok(p)
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
@@ -489,5 +543,61 @@ mod tests {
         assert!(p.robot.max_v_mm_s > 0);
         assert!(p.robot.max_w_deg_s > 0);
         assert_eq!(p.sim.wheel_base_m, 0.085);
+        // La visión real entrega el heading girado 180° (vsss-vision-sysmic).
+        assert_eq!(p.vision.real_theta_offset_deg, 180.0);
+    }
+
+    #[test]
+    fn vision_without_offset_defaults_to_zero() {
+        let p = TeamParams::from_json(r#"{ "vision": { "r_pos": 0.0002 } }"#).unwrap();
+        assert_eq!(p.vision.real_theta_offset_deg, 0.0);
+        assert!(TeamParams::default().robot.radio_slot_by_vision_id.is_empty());
+    }
+
+    fn slot_map_err(map: &str) -> String {
+        TeamParams::from_json(&format!(
+            r#"{{ "robot": {{ "radio_slot_by_vision_id": {map} }} }}"#
+        ))
+        .unwrap_err()
+    }
+
+    #[test]
+    fn slot_map_swap_is_valid() {
+        let p = TeamParams::from_json(
+            r#"{ "robot": { "radio_slot_by_vision_id": { "0": 1, "1": 0 } } }"#,
+        )
+        .unwrap();
+        assert_eq!(p.robot.radio_slot_by_vision_id.get(&1), Some(&0));
+        assert_eq!(p.robot.radio_slot_by_vision_id.get(&0), Some(&1));
+    }
+
+    #[test]
+    fn slot_map_explicit_duplicate_is_rejected() {
+        let err = slot_map_err(r#"{ "1": 0, "2": 0 }"#);
+        assert!(err.contains("radio_slot_by_vision_id"), "{err}");
+        assert!(err.contains("visión #1") && err.contains("visión #2"), "{err}");
+        assert!(err.contains("posición de radio 0"), "{err}");
+    }
+
+    #[test]
+    fn slot_map_clash_with_unmapped_id_is_rejected() {
+        // {"1": 0} sin entrada para #0: el #0 usa su propia posición (0) y choca.
+        let err = slot_map_err(r#"{ "1": 0 }"#);
+        assert!(err.contains("visión #0 (sin entrada, usa pos 0)"), "{err}");
+        assert!(err.contains("visión #1 (→ pos 0)"), "{err}");
+        assert!(err.contains("entrada de visión #0"), "{err}");
+    }
+
+    #[test]
+    fn slot_map_out_of_range_is_rejected() {
+        let err = slot_map_err(r#"{ "1": 5 }"#);
+        assert!(err.contains("radio_slot_by_vision_id"), "{err}");
+        assert!(err.contains("pos 5 fuera de rango (0..4)"), "{err}");
+    }
+
+    #[test]
+    fn slot_map_negative_or_non_numeric_is_rejected() {
+        assert!(TeamParams::from_json(r#"{ "robot": { "radio_slot_by_vision_id": { "1": -1 } } }"#).is_err());
+        assert!(TeamParams::from_json(r#"{ "robot": { "radio_slot_by_vision_id": { "a": 0 } } }"#).is_err());
     }
 }

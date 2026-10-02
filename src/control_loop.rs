@@ -161,6 +161,10 @@ pub struct HeadingPid {
 /// enviar y el comando expira, devolviendo el control al decider. 15 ticks ≈ 250 ms.
 const MANUAL_STALE_TICKS: u32 = 15;
 
+/// Período del aviso "la skill no corre": máximo un log por período en la
+/// terminal, y reenvío a la GUI con la misma cadencia (por si se perdió uno).
+const SKILL_WARNING_PERIOD: Duration = Duration::from_secs(1);
+
 /// Canales opcionales para alimentar el GUI (mismo shape que el código pre-refactor).
 pub struct GuiChannels {
     pub status_tx: mpsc::Sender<GUI::StatusUpdate>,
@@ -332,6 +336,70 @@ fn apply_gui_skill_overrides(
     }
 }
 
+fn team_color_name(team: i32) -> &'static str {
+    if team == 0 { "azul" } else { "amarillo" }
+}
+
+/// Aviso para las skills de GUI vigentes que el loop descarta en silencio, con la
+/// misma regla que `apply_gui_skill_overrides` + `dispatch_choices`: el robot debe
+/// ser del equipo propio y estar activo en `World`. La regla no cambia (una skill
+/// sin pose no puede correr); esto solo la hace visible. Agrega los robots que sí
+/// ve la visión (azules y luego amarillos, por id). `None` = toda skill corre.
+///
+/// Función pura: única fuente del texto para la terminal y la GUI.
+fn gui_skill_warning(
+    skill_state: &HashMap<(i32, i32), (GuiSkillCommand, u32)>,
+    world: &World,
+    own_team: i32,
+) -> Option<String> {
+    let own_active = if own_team == 0 {
+        world.get_blue_team_active()
+    } else {
+        world.get_yellow_team_active()
+    };
+    let mut keys: Vec<(i32, i32)> = skill_state.keys().copied().collect();
+    keys.sort();
+    let reasons: Vec<String> = keys
+        .into_iter()
+        .filter_map(|(team, id)| {
+            if team != own_team {
+                Some(format!(
+                    "el robot {} #{id} no es del equipo propio ({})",
+                    team_color_name(team),
+                    team_color_name(own_team)
+                ))
+            } else if !own_active.iter().any(|r| r.id == id) {
+                Some(format!(
+                    "el robot {} #{id} no está en la visión",
+                    team_color_name(team)
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if reasons.is_empty() {
+        return None;
+    }
+    let mut seen: Vec<(i32, i32)> = world
+        .get_blue_team_active()
+        .into_iter()
+        .chain(world.get_yellow_team_active())
+        .map(|r| (r.team, r.id))
+        .collect();
+    seen.sort();
+    let seen = if seen.is_empty() {
+        "La visión no ve ningún robot".to_string()
+    } else {
+        let list: Vec<String> = seen
+            .iter()
+            .map(|(t, i)| format!("{} #{i}", team_color_name(*t)))
+            .collect();
+        format!("La visión ve: {}", list.join(", "))
+    };
+    Some(format!("la skill no corre: {}. {seen}", reasons.join("; ")))
+}
+
 /// Aplica los comandos manuales vigentes sobre los comandos del decider.
 /// Para cada robot con comando manual, reemplaza el comando del decider (mismo
 /// `id`/`team`) o lo inserta si no existía, tomando `orientation` del `World`
@@ -416,6 +484,9 @@ pub async fn run_control_loop(
     // Última señal de conexión del transporte reportada a la GUI (para emitir
     // solo en transiciones y no inundar el canal de estado).
     let mut last_transport_ok: Option<bool> = None;
+    // Aviso "la skill no corre": último log a terminal y último envío a la GUI.
+    let mut skill_warning_logged_at: Option<Instant> = None;
+    let mut skill_warning_sent: Option<(Option<String>, Instant)> = None;
 
     // Vision
     {
@@ -591,11 +662,14 @@ pub async fn run_control_loop(
             skill_state.clear();
         }
 
+        let skill_warning: Option<String>;
         let (commands, targets, applied_choices) = {
             let world_guard = world.read().await;
             if !field_scale_warned {
                 field_scale_warned = warn_if_outside_vsss_field(&world_guard);
             }
+            // Con la parada activa `skill_state` ya está vacío → sin aviso.
+            skill_warning = gui_skill_warning(&skill_state, &world_guard, config.own_team);
             if estop_engaged {
                 let (z_cmds, z_tgts) = zero_commands_for_active_team(&world_guard, config.own_team);
                 (z_cmds, z_tgts, Vec::new())
@@ -626,6 +700,27 @@ pub async fn run_control_loop(
             }
         };
         tick_counter = tick_counter.wrapping_add(1);
+
+        // Aviso de skill de GUI que no corre: terminal con límite de frecuencia y
+        // GUI al cambiar o cada período. Antes del `continue` por comandos vacíos:
+        // si el único robot comandado no se ve, no hay comandos.
+        let now = Instant::now();
+        let due = |last: Option<Instant>| {
+            last.is_none_or(|t| now.duration_since(t) >= SKILL_WARNING_PERIOD)
+        };
+        if let Some(w) = &skill_warning
+            && due(skill_warning_logged_at)
+        {
+            eprintln!("[control_loop] ⚠ {w}");
+            skill_warning_logged_at = Some(now);
+        }
+        if let Some(ref tx) = status_tx {
+            let changed = skill_warning_sent.as_ref().map(|(w, _)| w) != Some(&skill_warning);
+            if changed || due(skill_warning_sent.as_ref().map(|(_, t)| *t)) {
+                let _ = tx.try_send(GUI::StatusUpdate::SkillWarning(skill_warning.clone()));
+                skill_warning_sent = Some((skill_warning.clone(), now));
+            }
+        }
 
         // Hook de logging — recibe snapshot del mundo + comandos + choices que se aplicaron.
         if let Some(ref mut hook) = on_tick {
@@ -972,6 +1067,71 @@ mod tests {
         // Robot 2 insertado (ChaseBall).
         let c2 = choices.iter().find(|c| c.robot_id == 2).unwrap();
         assert_eq!(c2.skill_id, SkillId::ChaseBall);
+    }
+
+    fn gui_skill_state(team: i32, id: i32) -> HashMap<(i32, i32), (GuiSkillCommand, u32)> {
+        let mut state = HashMap::new();
+        state.insert(
+            (team, id),
+            (
+                GuiSkillCommand {
+                    team,
+                    id,
+                    skill_id: SkillId::GoTo,
+                    target: Vec2::ZERO,
+                    spin_omega: 20.0,
+                },
+                0,
+            ),
+        );
+        state
+    }
+
+    fn see(world: &mut World, team: i32, id: i32) {
+        world.update_robot(id, team, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
+    }
+
+    #[test]
+    fn gui_skill_warning_own_robot_not_in_vision_lists_seen_robots() {
+        let mut world = World::new(3, 3);
+        see(&mut world, 1, 2);
+        see(&mut world, 0, 0);
+        let w = gui_skill_warning(&gui_skill_state(0, 1), &world, 0).unwrap();
+        assert_eq!(
+            w,
+            "la skill no corre: el robot azul #1 no está en la visión. \
+             La visión ve: azul #0, amarillo #2"
+        );
+    }
+
+    #[test]
+    fn gui_skill_warning_without_any_robot() {
+        let world = World::new(3, 3);
+        let w = gui_skill_warning(&gui_skill_state(0, 1), &world, 0).unwrap();
+        assert_eq!(
+            w,
+            "la skill no corre: el robot azul #1 no está en la visión. \
+             La visión no ve ningún robot"
+        );
+    }
+
+    #[test]
+    fn gui_skill_warning_robot_of_other_team() {
+        let mut world = World::new(3, 3);
+        see(&mut world, 1, 1);
+        let w = gui_skill_warning(&gui_skill_state(1, 1), &world, 0).unwrap();
+        assert!(
+            w.starts_with("la skill no corre: el robot amarillo #1 no es del equipo propio (azul)"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn gui_skill_warning_none_when_skill_runs_or_absent() {
+        let mut world = World::new(3, 3);
+        see(&mut world, 0, 1);
+        assert_eq!(gui_skill_warning(&gui_skill_state(0, 1), &world, 0), None);
+        assert_eq!(gui_skill_warning(&HashMap::new(), &world, 0), None);
     }
 
     /// 1.4 — La parada produce comando cero por cada robot activo del equipo propio.
