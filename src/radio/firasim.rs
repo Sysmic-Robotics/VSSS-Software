@@ -174,7 +174,7 @@ impl FIRASimClient {
                     pos.robot_id = id;
                     pos.x = x;
                     pos.y = y;
-                    pos.orientation = theta;
+                    pos.orientation = theta; // grados, como `TeleportItem`
                     let mut rr = RobotReplacement::new();
                     rr.position = protobuf::MessageField::some(pos);
                     rr.yellowteam = team == 1;
@@ -375,5 +375,19 @@ mod tests {
             result.unwrap(),
             "127.0.0.1:20011".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn teleport_orientation_goes_in_degrees() {
+        use crate::protos::fira_packet::Packet;
+        let sim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sim.local_addr().unwrap().port();
+        let client = FIRASimClient::new("127.0.0.1", port).await.unwrap();
+        let item = TeleportItem::Robot { team: 0, id: 1, x: 0.1, y: 0.2, theta: 90.0 };
+        client.teleport(&[item]).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = sim.recv(&mut buf).await.unwrap();
+        let pkt = Packet::parse_from_bytes(&buf[..n]).unwrap();
+        assert_eq!(pkt.replace.robots[0].position.orientation, 90.0);
     }
 }

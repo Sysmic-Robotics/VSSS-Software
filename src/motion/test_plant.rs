@@ -103,8 +103,8 @@ impl Plant {
     }
 }
 
-/// Un tick de una corrida: pose antes del comando, si la recuperación estaba en escape
-/// y el `done` de la skill.
+/// Un tick de una corrida: pose antes del comando, si la recuperación estaba en escape,
+/// el `done` de la skill y la `omega` comandada (después de los reflejos).
 #[derive(Clone)]
 pub(crate) struct Step {
     pub x: f32,
@@ -112,6 +112,7 @@ pub(crate) struct Step {
     pub th: f64,
     pub escaping: bool,
     pub done: bool,
+    pub omega: f64,
 }
 
 pub(crate) struct Trace {
@@ -195,6 +196,7 @@ pub(crate) fn run(case: &Case) -> Trace {
             th: plant.th,
             escaping,
             done,
+            omega: cmds[0].omega,
         });
         plant.step(&cmds[0]);
     }

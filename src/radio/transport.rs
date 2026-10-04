@@ -4,7 +4,8 @@ use async_trait::async_trait;
 pub type TransportError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Solicitud de reposicionamiento (teleport) en simulador. Coordenadas en metros,
-/// marco mundo; `theta` en radianes. Sin efecto en base station (robots reales).
+/// marco mundo; `theta` en **grados**, la unidad del replacement de FIRASim y de grSim
+/// (se pasa sin convertir). Sin efecto en base station (robots reales).
 #[derive(Debug, Clone, Copy)]
 pub enum TeleportItem {
     Robot {

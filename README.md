@@ -105,6 +105,7 @@ también al coach). Además guarda/carga **presets** de todo el tuning en un arc
 
 La sección **Teleport (sim)** reposiciona el robot seleccionado a `(x, y, θ)` y la pelota a
 `(x, y)` en el simulador (FIRASim/grSim) — útil para armar situaciones reproducibles de test.
+`x, y` van en metros y **θ en grados** (la unidad del replacement de los dos simuladores).
 En base station (robots reales) es no-op.
 
 La sección **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
@@ -379,6 +380,20 @@ El estado de control de cada robot (PID de heading y rampa) se reinicia cuando e
 
 Solo desvían los obstáculos (robots y pelota) que están por delante respecto del destino. No hay paredes virtuales: el borde lo cubren el `ZoneGuard` (áreas) y la recuperación de atasco.
 
+El `ZoneGuard` cuenta como área el rectángulo de 70 × 15 cm **más el arco del reglamento** sobre su frente (cuerda de 20 cm, flecha de 5 cm), con margen de medio robot. Es más conservador que VSSReferee, que cuenta solo el rectángulo y por el centro del robot; el auditor de faltas sigue con el criterio de VSSReferee.
+
+### Parámetros de las skills tácticas (`skills` en `config/team_params.json`)
+
+| Parámetro | Valor | Descripción |
+|-----------|-------|-------------|
+| `shoot_lateral_tol` | `0.05 m` | ShootPush, Clear y el coach empujan solo con el robot a esta distancia lateral (o menos) de la recta de empuje: de costado, la pelota sale de lado. Debe ser ≥ `approach_pos_tol`: la carga lo valida |
+| `spin_pos_tol` | `0.05 m` | A esta distancia del punto de contacto SpinKick deja de navegar a él y cierra sobre la pelota; gira solo con la pelota al alcance de las esquinas. Debe ser mayor que `motion.arrival_threshold`: la carga lo valida |
+| `block_distance` | `0.30 m` | Distancia del punto de bloqueo al arco propio. Si cae en el área, BlockLine lo corre hacia afuera por la misma línea (mismo criterio que el `ZoneGuard`) |
+
+**`skills.block_max_abs_x` ya no existe**: un JSON local que todavía tenga la clave **deja de cargar** con error, hay que borrarla. Un JSON con `spin_pos_tol ≤ arrival_threshold` o con `shoot_lateral_tol < approach_pos_tol` tampoco carga.
+
+Al cambiar de skill, el catálogo reinicia el estado interno de la skill que se activa (`Skill::reset`; hoy solo SpinKick guarda estado).
+
 ### Parámetros de skills de balón (`src/skills/mod.rs`)
 
 Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre todo para pruebas manuales en `scenario` y como base para una capa futura de strategy.
@@ -528,12 +543,19 @@ Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales 
 
 ## Aceptación de motion (`motion_bench`)
 
-`motion_bench` corre casos fijos (GoTo, FacePoint, ChaseBall, Mark, Intercept, ApproachAligned, BlockLine, entradas al área y casos de skills) contra FIRASim, por el mismo `run_control_loop` que `main`. Imprime una línea JSON por caso y un resumen de los 17 casos de navegación: llegadas, giro acumulado hasta llegar, ticks de escape y tiempo medio. `b2_blockline_open` se informa aparte (penetración del área y escapes), porque su punto de bloqueo cae en la zona prohibida. Se configura con las mismas variables que producción.
+`motion_bench` corre casos fijos (GoTo, FacePoint, ChaseBall, Mark, Intercept, ApproachAligned, BlockLine, entradas al área y casos de skills) contra FIRASim, por el mismo `run_control_loop` que `main`. Cada caso es un guion de una o más fases (skill, target, duración) y tiene un criterio de éxito (llegar, no tocar el área, patear hacia el objetivo, no empujar de costado, arquero en su punto mirando la pelota). Imprime una línea JSON por repetición, un resumen de los 17 casos de navegación (llegadas, giro acumulado hasta llegar, ticks de escape y tiempo medio, sobre la repetición 0) y la tasa de éxito por caso. `b2_blockline_open` se informa aparte. En los casos de GoalKeep el robot de prueba es el arquero (`coach.keeper_id`). Se configura con las mismas variables que producción.
+
+- `skills` corre los 11 casos de los bugs de skills; `all`, todos.
+- `--repeat N`: N repeticiones por caso; la 0 con la pose del caso y las demás con un jitter determinista (±0.02 m, ±10°).
+- `--out FILE`: agrega cada repetición a un JSONL y, al relanzar con el mismo archivo, salta las que ya tienen resultado (para reanudar si FIRASim se cae).
+- Una repetición con FIRASim caído, sin datos del robot o con la física explotada (salto de pose de más de 0.3 m entre ticks) es **falla de infraestructura**: no cuenta en la tasa, se reintenta hasta 2 veces y, si no se recupera, el binario sale con código 3. El resumen informa cuántas se perdieron.
+- `--csv-dir DIR` escribe un CSV por tick y por repetición (`<caso><tag>_r<N>.csv`); con `--csv-failures-only`, solo de las que fallan.
 
 ```bash
 # FIRASim corriendo. Regla del equipo: nada se acepta en sim limpio, siempre con el proxy de ruido.
 VSSL_VISION_NOISE=1 cargo run --release --bin motion_bench -- all
 VSSL_VISION_NOISE=1 VSSL_BIDIRECTIONAL=1 cargo run --release --bin motion_bench -- all --csv-dir /tmp/mb --tag _bd1
+VSSL_VISION_NOISE=1 cargo run --release --bin motion_bench -- skills --repeat 20 --out r.jsonl --csv-dir csv --csv-failures-only
 cargo run --release --bin motion_bench -- --list
 ```
 
@@ -541,13 +563,13 @@ cargo run --release --bin motion_bench -- --list
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (307 tests)
-cargo test --bin motion_bench    # métricas del bench de aceptación (5 tests)
+cargo test --lib                 # solo lib (324 tests)
+cargo test --bin motion_bench    # métricas, criterios y reanudación del bench de aceptación (14 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI (19 tests)
 ```
 
-**337 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard, PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim), skills (catálogo congelado), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos), skill_log (CsvLogger + row-builder compartido).
+**363 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos), skill_log (CsvLogger + row-builder compartido).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

@@ -124,6 +124,11 @@ pub struct SkillParams {
     pub shoot_lose_radius: f32,
     /// ShootPush: margen para "detrás de la pelota" sobre la línea de empuje (m).
     pub shoot_behind_tol: f32,
+    /// ShootPush y Clear: distancia lateral máxima del robot a la recta de empuje para
+    /// empujar (m). Menor que medio frente + radio de la pelota (0.059: más allá la pelota
+    /// ya no está frente a la cara) y ≥ `approach_pos_tol` (lo que ApproachAligned da por
+    /// terminado es factible para ShootPush).
+    pub shoot_lateral_tol: f32,
     /// ShootPush: velocidad de la pelota hacia el objetivo que cuenta como soltada (m/s).
     pub shoot_release_ball_speed: f32,
     /// Intercept: horizonte de predicción (s).
@@ -136,10 +141,9 @@ pub struct SkillParams {
     pub intercept_reaction_delay: f32,
     /// Intercept: distancia robot–pelota que cuenta como alcanzada (m).
     pub intercept_reach_radius: f32,
-    /// BlockLine: distancia del punto de bloqueo al arco propio (m).
+    /// BlockLine: distancia del punto de bloqueo al arco propio (m). Si el punto cae en el
+    /// área propia, la skill lo corre hacia afuera por la línea de bloqueo.
     pub block_distance: f32,
-    /// BlockLine: |x| máximo del bloqueo (no entrar al área propia).
-    pub block_max_abs_x: f32,
     /// Clear: staging corto detrás de la pelota (m).
     pub clear_staging_offset: f32,
     /// Clear: margen "detrás de la pelota" (más amplio que ShootPush) (m).
@@ -152,7 +156,9 @@ pub struct SkillParams {
     pub spin_contact_radius: f32,
     /// SpinKick: velocidad angular del giro (rad/s).
     pub spin_omega: f64,
-    /// SpinKick: tolerancia para "en el punto de contacto" (m).
+    /// SpinKick: a esta distancia del punto de contacto deja de navegar a él y cierra
+    /// sobre la pelota hasta tenerla al alcance (gira solo tocándola) (m). Mayor que
+    /// `motion.arrival_threshold`: si no, motion lo detiene antes y queda quieto.
     pub spin_pos_tol: f32,
     /// SpinKick: velocidad de la pelota hacia el objetivo que cuenta como lanzada (m/s).
     pub spin_release_ball_speed: f32,
@@ -170,6 +176,7 @@ impl Default for SkillParams {
             shoot_push_overshoot: 0.25,
             shoot_lose_radius: 0.30,
             shoot_behind_tol: 0.03,
+            shoot_lateral_tol: 0.05,
             shoot_release_ball_speed: 0.6,
             intercept_horizon: 1.5,
             intercept_min_ball_speed: 0.08,
@@ -177,14 +184,13 @@ impl Default for SkillParams {
             intercept_reaction_delay: 0.10,
             intercept_reach_radius: 0.09,
             block_distance: 0.30,
-            block_max_abs_x: 0.58,
             clear_staging_offset: 0.10,
             clear_behind_tol: 0.06,
             clear_lose_radius: 0.35,
             clear_release_ball_speed: 0.5,
             spin_contact_radius: 0.065,
             spin_omega: 20.0,
-            spin_pos_tol: 0.03,
+            spin_pos_tol: 0.05,
             spin_release_ball_speed: 0.4,
             spin_max_time_s: 1.0,
         }
@@ -414,22 +420,38 @@ impl TeamParams {
     pub fn from_json(text: &str) -> Result<Self, String> {
         let p: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
         p.robot.validate()?;
-        p.validate_arrival()?;
+        p.validate_tolerances()?;
         Ok(p)
     }
 
-    /// Motion se detiene a `arrival_threshold` del destino: si eso queda por encima de
-    /// la tolerancia de `ApproachAligned`, la skill nunca alcanza su staging.
-    fn validate_arrival(&self) -> Result<(), String> {
-        if self.motion.arrival_threshold < self.skills.approach_pos_tol {
-            Ok(())
-        } else {
-            Err(format!(
+    /// Tolerancias cruzadas entre motion y skills:
+    /// - motion se detiene a `arrival_threshold` del destino: si eso queda por encima de
+    ///   la tolerancia de `ApproachAligned` o de `SpinKick`, la skill nunca llega;
+    /// - lo que `ApproachAligned` da por terminado debe ser factible para `ShootPush`.
+    fn validate_tolerances(&self) -> Result<(), String> {
+        let (m, s) = (&self.motion, &self.skills);
+        if m.arrival_threshold >= s.approach_pos_tol {
+            return Err(format!(
                 "motion.arrival_threshold ({}) debe ser menor que skills.approach_pos_tol ({}): \
                  si no, ApproachAligned nunca alcanza su staging",
-                self.motion.arrival_threshold, self.skills.approach_pos_tol
-            ))
+                m.arrival_threshold, s.approach_pos_tol
+            ));
         }
+        if m.arrival_threshold >= s.spin_pos_tol {
+            return Err(format!(
+                "motion.arrival_threshold ({}) debe ser menor que skills.spin_pos_tol ({}): \
+                 si no, SpinKick puede quedar detenido sin empezar a girar",
+                m.arrival_threshold, s.spin_pos_tol
+            ));
+        }
+        if s.shoot_lateral_tol < s.approach_pos_tol {
+            return Err(format!(
+                "skills.shoot_lateral_tol ({}) debe ser mayor o igual que skills.approach_pos_tol ({}): \
+                 si no, un staging que ApproachAligned da por terminado no es factible para ShootPush",
+                s.shoot_lateral_tol, s.approach_pos_tol
+            ));
+        }
+        Ok(())
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
@@ -592,6 +614,36 @@ mod tests {
         // Se eliminó: un JSON local que todavía la tenga falla al cargar.
         let err = TeamParams::from_json(r#"{ "motion": { "coupling_floor": 0.22 } }"#).unwrap_err();
         assert!(err.contains("coupling_floor"), "{err}");
+    }
+
+    #[test]
+    fn block_max_abs_x_is_no_longer_accepted() {
+        // BlockLine deriva el límite del área del `ZoneGuard`: la clave vieja no carga.
+        let err = TeamParams::from_json(r#"{ "skills": { "block_max_abs_x": 0.58 } }"#).unwrap_err();
+        assert!(err.contains("block_max_abs_x"), "{err}");
+    }
+
+    #[test]
+    fn spin_tolerance_must_exceed_arrival_threshold() {
+        // Con spin_pos_tol ≤ arrival_threshold, motion detiene al robot antes del contacto.
+        let err = TeamParams::from_json(
+            r#"{ "motion": { "arrival_threshold": 0.04 }, "skills": { "spin_pos_tol": 0.04 } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("arrival_threshold") && err.contains("spin_pos_tol"), "{err}");
+        let d = TeamParams::default();
+        assert!(d.motion.arrival_threshold < d.skills.spin_pos_tol);
+    }
+
+    #[test]
+    fn lateral_push_tolerance_covers_the_approach_tolerance() {
+        let err = TeamParams::from_json(
+            r#"{ "skills": { "approach_pos_tol": 0.05, "shoot_lateral_tol": 0.04 } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("shoot_lateral_tol") && err.contains("approach_pos_tol"), "{err}");
+        let d = TeamParams::default();
+        assert!(d.skills.shoot_lateral_tol >= d.skills.approach_pos_tol);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Zonas prohibidas por reglamento (LARC VSSS 2026 §9.5) como restricción DURA
 //! sobre los comandos, independiente de lo que decida la táctica:
 //!
-//! - **Área propia (70 × 15 cm):** solo el arquero. Dos robots propios adentro
+//! - **Área propia (70 × 15 cm más el arco sobre su frente):** solo el arquero. Dos robots propios adentro
 //!   es "falta de área" → penal. Un jugador de campo nunca entra, aunque la
 //!   pelota esté adentro (la despeja el arquero).
 //! - **Área rival:** como máximo un atacante. El segundo que intente entrar se
@@ -27,6 +27,13 @@ pub const AREA_HALF_Y: f32 = 0.35;
 /// Medio lado del robot: el centro debe quedar a esta distancia del borde para
 /// que el cuerpo no toque la zona.
 pub const ROBOT_HALF: f32 = 0.04;
+/// Arco del reglamento sobre el frente del área: cuerda de 20 cm centrada en el frente
+/// y flecha de 5 cm hacia la cancha (vértice en |x| = 0.55). Es un segmento del círculo
+/// de radio `(0.10² + 0.05²) / (2·0.05) = 0.125` m con centro en
+/// |x| = 0.60 − 0.05 + 0.125 = 0.675; la parte del círculo detrás del frente ya está
+/// dentro del rectángulo.
+pub const ARC_RADIUS: f32 = 0.125;
+pub const ARC_CENTER_X: f32 = AREA_X - 0.05 + ARC_RADIUS;
 /// Horizonte con el que se anticipa la entrada (s). El robot frena con aceleración
 /// limitada y la pose llega con latencia (90 ms en el proxy de ruido): en FIRASim con
 /// ruido, 0.08 s penetraba 0.10–0.12 m, 0.25 s todavía 2–21 mm en 7 de 12 corridas, y
@@ -73,12 +80,20 @@ impl AreaRect {
         Self { side: attack_sign }
     }
 
-    /// `true` si un robot centrado en `p` tocaría el área (margen de medio robot).
+    /// `true` si un robot centrado en `p` tocaría el área, rectángulo o arco (margen de
+    /// medio robot).
     pub fn touches(&self, p: Vec2) -> bool {
-        p.x * self.side >= AREA_X - ROBOT_HALF && p.y.abs() <= AREA_HALF_Y + ROBOT_HALF
+        self.touches_with(p, ROBOT_HALF)
     }
 
-    /// `true` si el centro `p` está dentro del área (sin margen; criterio del auditor).
+    /// `true` si `p` está a `margin` o menos del área (rectángulo o arco).
+    pub fn touches_with(&self, p: Vec2, margin: f32) -> bool {
+        let rect = p.x * self.side >= AREA_X - margin && p.y.abs() <= AREA_HALF_Y + margin;
+        rect || (p - Vec2::new(self.side * ARC_CENTER_X, 0.0)).length() <= ARC_RADIUS + margin
+    }
+
+    /// `true` si el centro `p` está dentro del rectángulo del área (sin margen ni arco;
+    /// criterio del auditor, el mismo que VSSReferee).
     pub fn contains(&self, p: Vec2) -> bool {
         p.x * self.side >= AREA_X && p.y.abs() <= AREA_HALF_Y
     }
@@ -230,9 +245,9 @@ mod tests {
     #[test]
     fn moving_parallel_to_the_area_front_is_untouched() {
         let guard = ZoneGuard::new(1.0, 2);
-        // Frente al área (x = −0.53) con heading 90°, avanzando en +y.
-        let w = world_with(&[(0, 0, -0.53, -0.2, std::f32::consts::FRAC_PI_2)]);
-        let mut c = cmd(0, 0.0, 0.8);
+        // Frente al área (x = −0.53) con heading 90°, avanzando en +y, lejos del arco central.
+        let w = world_with(&[(0, 0, -0.53, -0.3, std::f32::consts::FRAC_PI_2)]);
+        let mut c = cmd(0, 0.0, 0.3);
         c.orientation = std::f64::consts::FRAC_PI_2;
         let mut cmds = vec![c.clone()];
         guard.guard_commands(&mut cmds, &w, 0, &HashSet::new());
@@ -344,14 +359,14 @@ mod tests {
     fn second_attacker_is_kept_out_of_opponent_area() {
         let guard = ZoneGuard::new(1.0, 2);
         // Robot 1 ya está en el área rival (x ≥ 0.60); robot 0 quiere entrar.
-        let w = world_with(&[(0, 1, 0.65, 0.0, 0.0), (0, 0, 0.52, 0.0, 0.0)]);
+        let w = world_with(&[(0, 1, 0.65, 0.0, 0.0), (0, 0, 0.45, 0.0, 0.0)]);
         let mut cmds = vec![cmd(0, 1.0, 0.0), cmd(1, 1.0, 0.0)];
         guard.guard_commands(&mut cmds, &w, 0, &HashSet::new());
         assert_eq!(cmds[0].vx, 0.0, "segundo atacante bloqueado");
         // Robot 1 (adentro, el único) no se recorta: puede seguir jugando adentro.
         assert_eq!(cmds[1].vx, 1.0);
         // Con el área rival vacía, robot 0 sí puede entrar.
-        let w2 = world_with(&[(0, 1, 0.0, 0.3, 0.0), (0, 0, 0.52, 0.0, 0.0)]);
+        let w2 = world_with(&[(0, 1, 0.0, 0.3, 0.0), (0, 0, 0.45, 0.0, 0.0)]);
         let mut cmds2 = vec![cmd(0, 1.0, 0.0)];
         guard.guard_commands(&mut cmds2, &w2, 0, &HashSet::new());
         assert_eq!(cmds2[0].vx, 1.0);
@@ -363,10 +378,53 @@ mod tests {
         assert!(guard.own_area().contains(Vec2::new(0.65, 0.1)));
         assert!(!guard.own_area().contains(Vec2::new(-0.65, 0.1)));
         assert!(guard.opp_area().contains(Vec2::new(-0.65, 0.1)));
-        let w = world_with(&[(0, 0, 0.52, 0.0, 0.0)]);
+        // (0.52, 0) ya toca el arco del área derecha: se prueba la anticipación desde más lejos.
+        let w = world_with(&[(0, 0, 0.45, 0.0, 0.0)]);
         let mut cmds = vec![cmd(0, 1.0, 0.0)];
         guard.guard_commands(&mut cmds, &w, 0, &HashSet::new());
         assert_eq!(cmds[0].vx, 0.0);
+    }
+
+    #[test]
+    fn regulation_arc_counts_as_area() {
+        let own = AreaRect::own(1.0);
+        // Frente al centro del área, fuera del rectángulo con margen: toca el arco.
+        assert!(own.touches(Vec2::new(-0.52, 0.0)));
+        assert!(!own.touches(Vec2::new(-0.52, 0.20)));
+        // El auditor sigue contando solo el rectángulo, por el centro (como VSSReferee).
+        assert!(!own.contains(Vec2::new(-0.57, 0.0)));
+        let mirrored = AreaRect::own(-1.0);
+        assert!(mirrored.touches(Vec2::new(0.52, 0.0)));
+        assert!(!mirrored.touches(Vec2::new(-0.52, 0.0)));
+    }
+
+    #[test]
+    fn set_play_field_positions_stay_out_of_own_area() {
+        use crate::coach::plays::{Play, formation};
+        use crate::coach::referee::Quadrant;
+        let plays = [
+            Play::KickoffOurs,
+            Play::KickoffTheirs,
+            Play::FreeBall(Quadrant::None),
+            Play::FreeBall(Quadrant::Q1),
+            Play::FreeBall(Quadrant::Q2),
+            Play::FreeBall(Quadrant::Q3),
+            Play::FreeBall(Quadrant::Q4),
+            Play::PenaltyOurs,
+            Play::PenaltyTheirs,
+            Play::FreeKickOurs,
+            Play::FreeKickTheirs,
+            Play::GoalKickOurs,
+            Play::GoalKickTheirs,
+        ];
+        for s in [1.0f32, -1.0] {
+            for play in plays {
+                let f = formation(play, s, Vec2::new(0.75 * s, 0.0), 0.14).unwrap();
+                for p in [f.striker, f.support] {
+                    assert!(!AreaRect::own(s).touches(p), "{play:?} s={s}: {p:?} toca el área propia");
+                }
+            }
+        }
     }
 
     #[test]

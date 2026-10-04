@@ -55,7 +55,7 @@ impl GrSimClient {
                     let mut r = GrSim_RobotReplacement::new();
                     r.set_x(x);
                     r.set_y(y);
-                    r.set_dir(theta.to_degrees());
+                    r.set_dir(theta); // grados, como `TeleportItem`
                     r.set_id(id);
                     r.set_yellowteam(team == 1);
                     r.set_turnon(true);
@@ -114,5 +114,20 @@ mod tests {
             result.unwrap(),
             "127.0.0.1:20011".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn teleport_orientation_goes_in_degrees() {
+        // `TeleportItem.theta` ya viene en grados (la unidad de `dir`): sin convertir.
+        use crate::protos::grSim_Packet::GrSim_Packet;
+        let sim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sim.local_addr().unwrap().port();
+        let client = GrSimClient::new("127.0.0.1", port).await.unwrap();
+        let item = TeleportItem::Robot { team: 1, id: 2, x: 0.1, y: 0.2, theta: 90.0 };
+        client.teleport(&[item]).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = sim.recv(&mut buf).await.unwrap();
+        let pkt = GrSim_Packet::parse_from_bytes(&buf[..n]).unwrap();
+        assert_eq!(pkt.replacement.robots[0].dir(), 90.0);
     }
 }

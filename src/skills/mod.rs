@@ -61,6 +61,12 @@ pub trait Skill: Send + Sync {
             face: Face::Front,
         }
     }
+
+    /// Reinicia el estado interno de la skill. El catálogo la llama sobre la skill que se
+    /// activa cuando un robot cambia de skill, para que no herede el estado de una
+    /// activación anterior. Por defecto no hace nada: la mayoría de las skills no guarda
+    /// estado entre ticks.
+    fn reset(&mut self) {}
 }
 
 pub(crate) fn stop_cmd(robot: &RobotState) -> MotionCommand {
@@ -403,9 +409,17 @@ impl DefendGoalLineSkill {
         )
     }
 
-    fn defend_target(&self, robot: &RobotState, ball: Vec2, ball_velocity: Vec2) -> Vec2 {
+    fn inside_band(&self, robot: &RobotState) -> bool {
         let (band_min_x, band_max_x) = self.band_limits();
-        let target_x = robot.position.x.clamp(band_min_x, band_max_x);
+        robot.position.x >= band_min_x && robot.position.x <= band_max_x
+    }
+
+    /// Destino: dentro de la banda, la x actual (la banda es histéresis, sin
+    /// micro-movimientos); fuera, el centro de la banda. Apuntar al borde dejaba al
+    /// arquero detenido fuera de ella: motion lo da por llegado a `arrival_threshold`
+    /// (0.04), más que el medio ancho de la banda (0.03).
+    fn defend_target(&self, robot: &RobotState, ball: Vec2, ball_velocity: Vec2) -> Vec2 {
+        let target_x = if self.inside_band(robot) { robot.position.x } else { self.defend_x };
         let block_y = self.block_y(ball, ball_velocity);
         let target_y = if (block_y - robot.position.y).abs() < self.y_deadband {
             robot.position.y
@@ -416,11 +430,14 @@ impl DefendGoalLineSkill {
         Vec2::new(target_x, target_y)
     }
 
-    fn should_face_ball(&self, robot: &RobotState, move_target: Vec2) -> bool {
-        let (band_min_x, band_max_x) = self.band_limits();
-        let inside_band = robot.position.x >= band_min_x && robot.position.x <= band_max_x;
+    /// Mira la pelota si ya llegó al destino (`arrival`: motion no lo va a trasladar más)
+    /// o si está en la banda con la y asentada; si no, mira hacia donde va. Exigir la y
+    /// asentada al llegar lo dejaba mirando de costado: la banda muerta en y (0.03) es
+    /// menor que la llegada de motion (0.04).
+    fn should_face_ball(&self, robot: &RobotState, move_target: Vec2, arrival: f32) -> bool {
         let settled_y = (move_target.y - robot.position.y).abs() < self.y_deadband;
-        inside_band && settled_y
+        let arrived = (move_target - robot.position).length() < arrival;
+        arrived || (settled_y && self.inside_band(robot))
     }
 }
 
@@ -429,7 +446,8 @@ impl Skill for DefendGoalLineSkill {
         let ball = world.get_ball_state().position;
         let ball_velocity = world.get_ball_state().velocity;
         let move_target = self.defend_target(robot, ball, ball_velocity);
-        let face_target = if self.should_face_ball(robot, move_target) {
+        let arrival = motion.config.arrival_threshold;
+        let face_target = if self.should_face_ball(robot, move_target, arrival) {
             ball
         } else {
             move_target
@@ -754,18 +772,20 @@ mod tests {
     }
 
     #[test]
-    fn defend_goal_line_skill_keeps_target_inside_defensive_band() {
+    fn defend_goal_line_skill_aims_at_band_center_from_outside() {
         let skill = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
-        let robot = make_robot(2, -0.80, 0.0, 0.0);
         let ball = Vec2::new(0.0, 0.12);
-
-        let target = skill.defend_target(&robot, ball, Vec2::ZERO);
-        let (band_min_x, band_max_x) = skill.band_limits();
-
-        assert!((target.x - band_min_x).abs() < 1e-6);
-        assert!(target.x >= band_min_x);
-        assert!(target.x <= band_max_x);
-        assert!((target.y - ball.y).abs() < 1e-6);
+        // Fuera de la banda (detrás o delante): al centro, no al borde.
+        for x in [-0.80, -0.40] {
+            let target = skill.defend_target(&make_robot(2, x, 0.0, 0.0), ball, Vec2::ZERO);
+            assert!((target.x - skill.defend_x).abs() < 1e-6, "x={x}: {target:?}");
+            assert!((target.y - ball.y).abs() < 1e-6);
+        }
+        // Dentro de la banda: se queda en su x (histéresis).
+        let (band_min_x, _) = skill.band_limits();
+        let inside = make_robot(2, band_min_x + 0.01, 0.0, 0.0);
+        let target = skill.defend_target(&inside, ball, Vec2::ZERO);
+        assert!((target.x - inside.position.x).abs() < 1e-6);
     }
 
     #[test]
@@ -783,14 +803,51 @@ mod tests {
     fn defend_goal_line_skill_faces_ball_only_when_already_stable() {
         let skill = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
 
+        let arrival = 0.04;
+
         let stable_robot = make_robot(2, skill.defend_x, 0.10, 0.0);
         let stable_target = skill.defend_target(&stable_robot, Vec2::new(0.0, 0.115), Vec2::ZERO);
-        assert!(skill.should_face_ball(&stable_robot, stable_target));
+        assert!(skill.should_face_ball(&stable_robot, stable_target, arrival));
 
         let recovering_robot = make_robot(2, skill.defend_x + 0.08, 0.0, 0.0);
         let recovering_target =
             skill.defend_target(&recovering_robot, Vec2::new(0.0, 0.15), Vec2::ZERO);
-        assert!(!skill.should_face_ball(&recovering_robot, recovering_target));
+        assert!(!skill.should_face_ball(&recovering_robot, recovering_target, arrival));
+
+        // N10: fuera de la banda pero ya llegado (motion lo detuvo a < arrival del centro).
+        let parked = make_robot(2, skill.defend_x + 0.035, 0.10, 0.0);
+        let parked_target = skill.defend_target(&parked, Vec2::new(0.0, 0.11), Vec2::ZERO);
+        assert!(skill.should_face_ball(&parked, parked_target, arrival));
+
+        // En la banda, a 0.035 de la y objetivo (fuera de la banda muerta) pero ya llegado.
+        let near = make_robot(2, skill.defend_x, 0.115, 0.0);
+        let near_target = skill.defend_target(&near, Vec2::new(0.0, 0.15), Vec2::ZERO);
+        assert!((near_target.y - 0.15).abs() < 1e-6, "la y no está asentada");
+        assert!(skill.should_face_ball(&near, near_target, arrival));
+    }
+
+    #[test]
+    fn goal_keep_arriving_from_the_field_ends_in_band_facing_the_ball() {
+        // N10: llegaba desde la cancha, se detenía fuera de la banda (x ≈ −0.58) y miraba
+        // a su destino, detrás de él: en frontal quedaba mirando a su propio arco.
+        use crate::motion::test_plant::{Case, run};
+        let ball = Vec2::new(0.0, -0.15);
+        let gk = DefendGoalLineSkill::new(Vec2::new(-0.75, 0.0));
+        let spot = Vec2::new(gk.defend_x, -0.15);
+        let tol = crate::params::params().motion.arrival_threshold + 0.01;
+        for bidir in [false, true] {
+            let mut case = Case::new(SkillId::GoalKeep, Vec2::new(-0.75, 0.0), (-0.4, 0.2, 0.0), ball);
+            case.keeper_id = 0;
+            case.motion.bidirectional = bidir;
+            let t = run(&case);
+            let l = t.last();
+            let p = Vec2::new(l.x, l.y);
+            assert!((p - spot).length() <= tol, "bidir={bidir}: final {p:?}, punto {spot:?}");
+            let to_ball = ((ball.y - l.y) as f64).atan2((ball.x - l.x) as f64);
+            let err = Motion::normalize_angle(to_ball - l.th);
+            let err = if bidir { Motion::fold_bidirectional(err) } else { err };
+            assert!(err.abs().to_degrees() < 20.0, "bidir={bidir}: error a la pelota {:.0}°", err.to_degrees());
+        }
     }
 
     #[test]

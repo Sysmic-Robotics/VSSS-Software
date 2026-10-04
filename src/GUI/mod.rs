@@ -1634,7 +1634,7 @@ impl VisionGui {
                 .width(Length::Fixed(56.0))
         };
         column![
-            text(format!("Robot {} (x, y, θ)", self.selected_robot)).size(12),
+            text(format!("Robot {} (x, y, θ°)", self.selected_robot)).size(12),
             row![
                 field(&self.tp_robot_x, Message::TpRobotXChanged),
                 field(&self.tp_robot_y, Message::TpRobotYChanged),
@@ -1655,7 +1655,7 @@ impl VisionGui {
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),
-            text("metros, marco mundo · solo FIRASim/grSim").size(10),
+            text("metros y grados, marco mundo · solo FIRASim/grSim").size(10),
         ]
         .spacing(6)
         .into()

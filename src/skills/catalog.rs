@@ -220,6 +220,25 @@ impl SkillCatalog {
         }
     }
 
+    /// La instancia de `skill_id` del robot `robot_id`, como `dyn Skill` (para `reset`).
+    fn skill_mut(&mut self, robot_id: usize, skill_id: SkillId) -> &mut dyn Skill {
+        match skill_id {
+            SkillId::GoTo => &mut self.go_to[robot_id],
+            SkillId::FacePoint => &mut self.face_point[robot_id],
+            SkillId::ChaseBall => &mut self.chase_ball[robot_id],
+            SkillId::Spin => &mut self.spin[robot_id],
+            SkillId::ApproachAligned => &mut self.approach[robot_id],
+            SkillId::ShootPush => &mut self.shoot[robot_id],
+            SkillId::Intercept => &mut self.intercept[robot_id],
+            SkillId::BlockLine => &mut self.block[robot_id],
+            SkillId::GoalKeep => &mut self.goal_keep[robot_id],
+            SkillId::Clear => &mut self.clear[robot_id],
+            SkillId::SpinKick => &mut self.spin_kick[robot_id],
+            SkillId::Mark => &mut self.mark[robot_id],
+            SkillId::Hold => &mut self.hold[robot_id],
+        }
+    }
+
     /// Estado observable (`SkillStatus`) de la skill `skill_id` para `robot_id`,
     /// con el mismo `target` que se le pasaría a `tick`. No muta estado de control.
     pub fn status(
@@ -344,8 +363,10 @@ impl SkillCatalog {
         );
 
         if self.last_skill[robot_id] != Some(skill_id) {
-            // Cambio de skill: sin integral ni derivada heredadas, rampa desde cero.
+            // Cambio de skill: sin integral ni derivada heredadas, rampa desde cero, y la
+            // skill que se activa sin estado de una activación anterior.
             motion.reset_robot(robot.team, robot.id);
+            self.skill_mut(robot_id, skill_id).reset();
             self.last_skill[robot_id] = Some(skill_id);
         }
 
@@ -688,6 +709,37 @@ mod tests {
         }
         let cmd = catalog.tick(0, SkillId::Mark, Vec2::ZERO, &robot, &world, &motion);
         assert_eq!(cmd.omega, 0.0, "estado heredado de la skill anterior: ω={}", cmd.omega);
+    }
+
+    #[test]
+    fn interrupted_spin_kick_starts_clean_when_reactivated() {
+        // B4: girando junto a la pelota → GoTo → SpinKick de nuevo, a 0.16 m de la pelota
+        // y lejos del punto de contacto. Sin reinicio heredaba el giro: giraba en el lugar
+        // sin acercarse y con el timeout ya consumido.
+        let mut catalog = SkillCatalog::new(3);
+        let mut world = World::new(3, 3);
+        let ball = Vec2::new(0.2, -0.3);
+        world.update_ball(ball, Vec2::ZERO);
+        let motion = Motion::new();
+        let tgt = Vec2::new(0.0, 0.3);
+        let probe = SpinKickSkill::new(tgt);
+        let (ccw, _) = probe.contact_centers(ball, (tgt - ball).normalize());
+        let at = make_robot(0, ccw.x, ccw.y, 0.0);
+        let mut w = 0.0;
+        for _ in 0..10 {
+            w = catalog.tick(0, SkillId::SpinKick, tgt, &at, &world, &motion).omega;
+        }
+        assert!((w.abs() - probe.omega).abs() < 1e-9, "girando: ω={w}");
+        let off = make_robot(0, ball.x + 0.10, ball.y + 0.12, 0.0);
+        // Misma skill consecutiva: no se reinicia, el giro sigue.
+        let w = catalog.tick(0, SkillId::SpinKick, tgt, &off, &world, &motion).omega;
+        assert!((w.abs() - probe.omega).abs() < 1e-9, "sin cambio de skill sigue girando: ω={w}");
+        for _ in 0..30 {
+            catalog.tick(0, SkillId::GoTo, Vec2::ZERO, &off, &world, &motion);
+        }
+        let c = catalog.tick(0, SkillId::SpinKick, tgt, &off, &world, &motion);
+        assert!(c.omega.abs() <= motion.config.max_angular_speed + 1e-9, "relanzada gira en el lugar: ω={}", c.omega);
+        assert!(!catalog.status(0, SkillId::SpinKick, tgt, &off, &world).done);
     }
 
     #[test]

@@ -17,8 +17,9 @@
 //! | BlockLine        | arco propio        | se ubica sobre la línea pelota→arco propio a distancia fija del arco |
 
 use super::{clamp_to_logical_field, is_inside_logical_field, stop_cmd, Skill};
-use crate::motion::{Motion, MotionCommand};
+use crate::motion::{Motion, MotionCommand, MotionConfig};
 use crate::params::params;
+use crate::skills::zones::{AreaRect, ROBOT_HALF};
 use crate::world::{RobotState, World};
 use glam::Vec2;
 
@@ -80,20 +81,23 @@ fn clamp01(x: f32) -> f32 {
 /// Criterio geométrico de factibilidad de `ShootPush`, compartido con la capa
 /// táctica (el coach decide con la MISMA regla que la skill ejecuta):
 /// el robot está detrás de la pelota respecto de `target` (proyección sobre la
-/// línea de empuje ≤ `behind_tol`) y a menos de `lose_radius` de ella.
+/// línea de empuje ≤ `behind_tol`), sobre esa línea (distancia lateral ≤
+/// `lateral_tol`: de costado, la pelota no está frente a la cara y el empuje la
+/// manda de lado) y a menos de `lose_radius` de ella.
 pub fn shoot_push_feasible(
     robot_pos: Vec2,
     ball: Vec2,
     target: Vec2,
     behind_tol: f32,
+    lateral_tol: f32,
     lose_radius: f32,
 ) -> bool {
     let dir = (target - ball).normalize_or_zero();
     if dir.length_squared() < f32::EPSILON {
         return false;
     }
-    let along = (robot_pos - ball).dot(dir);
-    along <= behind_tol && (ball - robot_pos).length() <= lose_radius
+    let rel = robot_pos - ball;
+    rel.dot(dir) <= behind_tol && rel.perp_dot(dir).abs() <= lateral_tol && rel.length() <= lose_radius
 }
 
 /// Holgura para rodear la pelota: media diagonal del robot (0.057) + radio de la
@@ -136,7 +140,7 @@ pub fn route_around_ball(from: Vec2, to: Vec2, ball: Vec2, clearance: f32) -> Ve
 /// (las mismas que usa `ShootPushSkill::new`). Es lo que consulta el coach.
 pub fn shoot_push_feasible_now(robot_pos: Vec2, ball: Vec2, target: Vec2) -> bool {
     let p = &params().skills;
-    shoot_push_feasible(robot_pos, ball, target, p.shoot_behind_tol, p.shoot_lose_radius)
+    shoot_push_feasible(robot_pos, ball, target, p.shoot_behind_tol, p.shoot_lateral_tol, p.shoot_lose_radius)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,6 +160,9 @@ pub struct ApproachAlignedSkill {
     pub angle_tol: f64,
     /// Radio desde el que el robot ya empieza a mirar a la pelota (m).
     pub pre_align_radius: f32,
+    /// Modo del motion con el que corre (en `tick` se toma del `Motion`): en frontal,
+    /// `is_done` exige el frente; con dos caras, cualquiera de las dos.
+    pub bidirectional: bool,
     pub kp: f64,
     pub ki: f64,
     pub kd: f64,
@@ -170,6 +177,7 @@ impl ApproachAlignedSkill {
             pos_tol: p.approach_pos_tol,
             angle_tol: p.approach_angle_tol,
             pre_align_radius: p.approach_pre_align_radius,
+            bidirectional: MotionConfig::from_env().bidirectional,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
@@ -205,6 +213,7 @@ impl ApproachAlignedSkill {
 
 impl Skill for ApproachAlignedSkill {
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
+        self.bidirectional = motion.config.bidirectional;
         let ball = world.get_ball_state().position;
         let (Some(dir), Some(staging)) = (self.line_dir(ball), self.staging_point(ball)) else {
             return stop_cmd(robot);
@@ -234,11 +243,9 @@ impl Skill for ApproachAlignedSkill {
         let (Some(dir), Some(staging)) = (self.line_dir(ball), self.staging_point(ball)) else {
             return false;
         };
-        // Sin acceso al motion acá: usamos el criterio plegado (válido para ambos
-        // modos, ya que en modo frontal el PID igual converge a error ~0).
-        let err = Motion::fold_bidirectional(Motion::normalize_angle(
-            (dir.y as f64).atan2(dir.x as f64) - robot.orientation,
-        ));
+        // En frontal el empuje es con el frente: de espaldas no está terminado.
+        let raw = Motion::normalize_angle((dir.y as f64).atan2(dir.x as f64) - robot.orientation);
+        let err = if self.bidirectional { Motion::fold_bidirectional(raw) } else { raw };
         (staging - robot.position).length() <= self.pos_tol && err.abs() <= self.angle_tol
     }
 
@@ -297,6 +304,8 @@ pub struct ShootPushSkill {
     pub lose_radius: f32,
     /// Margen para considerar "detrás de la pelota" (m, proyección sobre la línea).
     pub behind_tol: f32,
+    /// Distancia lateral máxima a la línea de empuje para empujar (m).
+    pub lateral_tol: f32,
     /// Velocidad de la pelota hacia el objetivo que se considera "soltada" (m/s).
     pub release_ball_speed: f32,
     pub kp: f64,
@@ -312,6 +321,7 @@ impl ShootPushSkill {
             push_overshoot: p.shoot_push_overshoot,
             lose_radius: p.shoot_lose_radius,
             behind_tol: p.shoot_behind_tol,
+            lateral_tol: p.shoot_lateral_tol,
             release_ball_speed: p.shoot_release_ball_speed,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
@@ -328,14 +338,15 @@ impl ShootPushSkill {
         (d.length_squared() > f32::EPSILON).then_some(d)
     }
 
-    /// Factible = detrás de la pelota (proyección sobre la línea ≤ tolerancia) y
-    /// dentro del radio de trabajo.
+    /// Factible = detrás de la pelota y sobre la línea de empuje, dentro del radio de
+    /// trabajo (ver `shoot_push_feasible`).
     pub fn is_feasible(&self, robot: &RobotState, ball: Vec2) -> bool {
         shoot_push_feasible(
             robot.position,
             ball,
             self.target,
             self.behind_tol,
+            self.lateral_tol,
             self.lose_radius,
         )
     }
@@ -513,15 +524,19 @@ impl Skill for InterceptSkill {
 //  BlockLine
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Distancia (m) que BlockLine deja entre su punto y la zona prohibida (además del medio
+/// robot): en FIRASim con ruido, el robot se pasa hasta ~2 cm al llegar y, con el punto
+/// justo en el borde, tocaba el área 3–10 mm.
+const BLOCK_AREA_MARGIN: f32 = 0.03;
+
 /// Se ubica sobre la línea pelota→arco propio a `distance` del arco (cobertura
 /// del tiro), mirando a la pelota. Con robot bidireccional puede cubrir de
-/// espaldas y despejar sin girar.
+/// espaldas y despejar sin girar. Si ese punto toca el área propia (zona prohibida
+/// del `ZoneGuard` para un jugador de campo), lo corre hacia afuera por la misma línea.
 pub struct BlockLineSkill {
     pub own_goal: Vec2,
     /// Distancia del punto de bloqueo al centro del arco propio (m).
     pub distance: f32,
-    /// Límite para no meterse en el área propia (|x| máximo del bloqueo).
-    pub max_abs_x: f32,
     pub kp: f64,
     pub ki: f64,
     pub kd: f64,
@@ -533,7 +548,6 @@ impl BlockLineSkill {
         Self {
             own_goal,
             distance: p.block_distance,
-            max_abs_x: p.block_max_abs_x,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
@@ -544,14 +558,21 @@ impl BlockLineSkill {
         self.own_goal = g;
     }
 
+    /// Punto de bloqueo: sobre la línea pelota→arco a `distance` del arco o, si queda a
+    /// menos de medio robot + `BLOCK_AREA_MARGIN` del área propia (el criterio del
+    /// `ZoneGuard` con más margen), el primero hacia afuera por esa línea que ya no lo
+    /// está (pasos de 1 cm, hasta 0.75 m del arco).
     pub fn block_point(&self, ball: Vec2) -> Option<Vec2> {
         let dir = (ball - self.own_goal).normalize_or_zero();
         if dir.length_squared() < f32::EPSILON {
             return None;
         }
-        let mut p = clamp_to_logical_field(self.own_goal + dir * self.distance);
-        p.x = p.x.clamp(-self.max_abs_x, self.max_abs_x);
-        Some(p)
+        let area = AreaRect { side: self.own_goal.x.signum() };
+        let mut s = self.distance;
+        while area.touches_with(self.own_goal + dir * s, ROBOT_HALF + BLOCK_AREA_MARGIN) && s < 0.75 {
+            s += 0.01;
+        }
+        Some(clamp_to_logical_field(self.own_goal + dir * s))
     }
 }
 
@@ -598,6 +619,8 @@ pub struct ClearSkill {
     pub target: Vec2,
     pub staging_offset: f32,
     pub behind_tol: f32,
+    /// Distancia lateral máxima a la recta de despeje para empujar (la de ShootPush).
+    pub lateral_tol: f32,
     pub lose_radius: f32,
     pub push_overshoot: f32,
     pub release_ball_speed: f32,
@@ -613,6 +636,7 @@ impl ClearSkill {
             target,
             staging_offset: p.clear_staging_offset,
             behind_tol: p.clear_behind_tol,
+            lateral_tol: p.shoot_lateral_tol,
             lose_radius: p.clear_lose_radius,
             push_overshoot: p.shoot_push_overshoot,
             release_ball_speed: p.clear_release_ball_speed,
@@ -631,9 +655,17 @@ impl ClearSkill {
         (d.length_squared() > f32::EPSILON).then_some(d)
     }
 
-    /// `true` cuando ya está detrás de la pelota y empuja (fase 2).
+    /// `true` cuando ya está detrás de la pelota, sobre la recta de despeje, y empuja
+    /// (fase 2). Desde el costado va primero al staging.
     pub fn is_pushing(&self, robot: &RobotState, ball: Vec2) -> bool {
-        shoot_push_feasible(robot.position, ball, self.target, self.behind_tol, self.lose_radius)
+        shoot_push_feasible(
+            robot.position,
+            ball,
+            self.target,
+            self.behind_tol,
+            self.lateral_tol,
+            self.lose_radius,
+        )
     }
 
     fn staging(&self, ball: Vec2, dir: Vec2) -> Vec2 {
@@ -654,13 +686,12 @@ impl Skill for ClearSkill {
             return stop_cmd(robot);
         };
         if self.is_pushing(robot, ball) {
+            // Empuje con la ley del diferencial: el staging no exige llegar alineado, así
+            // que si el heading no está sobre la recta de despeje primero gira (avance ∝
+            // cos del error) en vez de avanzar de costado y salirse de ella. La pelota no
+            // desvía: queda a menos de 1.5 radios de influencia del punto de empuje.
             let push_point = ball + dir * self.push_overshoot;
-            let mut cmd = motion.move_direct(robot, push_point);
-            let desired = (dir.y as f64).atan2(dir.x as f64);
-            cmd.omega = motion
-                .face_to_angle(robot, desired, self.kp, self.ki, self.kd)
-                .omega;
-            return cmd;
+            return motion.move_and_face(robot, push_point, push_point, world, self.kp, self.ki, self.kd);
         }
         let staging = self.staging(ball, dir);
         let waypoint = route_around_ball(robot.position, staging, ball, BALL_ROUTE_CLEARANCE);
@@ -721,6 +752,11 @@ impl Skill for ClearSkill {
 /// ponerse detrás. La cara no importa: cualquier lado del cuerpo cuadrado
 /// lanza igual. El sentido de giro (CCW/CW) se elige por el centro de contacto
 /// más cercano y se mantiene hasta soltar la pelota.
+/// Velocidad del robot (m/s, del tracker) bajo la que SpinKick empieza a girar: en FIRASim,
+/// arrancar el giro a ~0.2 m/s empujaba la pelota hacia afuera mientras las ruedas
+/// invertían su sentido. Recalibrar con la sysid del robot real.
+const SPIN_START_MAX_SPEED: f32 = 0.08;
+
 pub struct SpinKickSkill {
     pub target: Vec2,
     /// Distancia centro del robot–pelota en el contacto (m).
@@ -761,12 +797,6 @@ impl SpinKickSkill {
         self.target = p;
     }
 
-    pub fn reset(&mut self) {
-        self.spin_sign = 0.0;
-        self.spinning = false;
-        self.spin_ticks = 0;
-    }
-
     pub fn is_spinning(&self) -> bool {
         self.spinning
     }
@@ -785,6 +815,10 @@ impl SpinKickSkill {
         (ccw, cw)
     }
 
+    /// Centro de contacto y sentido de giro. Mientras gira, el sentido ya elegido; si no,
+    /// el centro más cercano al robot entre los que quedan dentro del campo lógico (con la
+    /// pelota contra la pared, uno de los dos queda detrás de ella), o el más cercano si
+    /// ninguno lo está.
     fn choose_center(&self, robot_pos: Vec2, ball: Vec2, dir: Vec2) -> (Vec2, f32) {
         let (ccw, cw) = self.contact_centers(ball, dir);
         if self.spin_sign > 0.0 {
@@ -793,11 +827,12 @@ impl SpinKickSkill {
         if self.spin_sign < 0.0 {
             return (cw, -1.0);
         }
-        if (ccw - robot_pos).length() <= (cw - robot_pos).length() {
-            (ccw, 1.0)
-        } else {
-            (cw, -1.0)
-        }
+        let ccw_first = match (is_inside_logical_field(ccw), is_inside_logical_field(cw)) {
+            (true, false) => true,
+            (false, true) => false,
+            _ => (ccw - robot_pos).length() <= (cw - robot_pos).length(),
+        };
+        if ccw_first { (ccw, 1.0) } else { (cw, -1.0) }
     }
 }
 
@@ -811,21 +846,45 @@ impl Skill for SpinKickSkill {
         if self.spinning && (ball - robot.position).length() > self.contact_radius * 2.0 + 0.05 {
             self.reset();
         }
+        // Timeout: giró `max_spin_ticks` y la pelota sigue al lado (trabada); queda quieto
+        // con `is_done` hasta que la reinicien (cambio de skill) o la pelota se aleje.
+        if self.spin_ticks >= self.max_spin_ticks {
+            return stop_cmd(robot);
+        }
         let (center, sign) = self.choose_center(robot.position, ball, dir);
         let dist = (center - robot.position).length();
-        // Ya tocando la pelota (aunque no exactamente en el centro): girar igual, en
-        // vez de seguir empujándola para "llegar" al punto de contacto.
-        let touching = (ball - robot.position).length() <= self.contact_radius + 0.01;
-        if !self.spinning && dist > self.pos_tol && !touching {
-            // Si la pelota está entre el robot y el punto de contacto, rodearla.
-            let waypoint =
-                route_around_ball(robot.position, center, ball, self.contact_radius + 0.02);
-            if dist < 0.15 && waypoint == center {
-                let mut cmd = motion.move_direct(robot, center);
-                cmd.omega = 0.0;
-                return cmd;
+        // Gira con la pelota a `contact_radius` y el robot casi quieto: más lejos las
+        // esquinas no la tocan o la rozan hacia afuera; avanzando rápido, el giro tarda en
+        // levantarse (torque limitado) y el robot la empuja en vez de patearla.
+        // (+2 mm de tolerancia: en el centro exacto, `reach` = `contact_radius` ± redondeo.)
+        let reach = (ball - robot.position).length();
+        let in_reach = reach <= self.contact_radius + 0.002;
+        let settled = robot.velocity.length() < SPIN_START_MAX_SPEED;
+        let spin = self.spinning || (in_reach && settled);
+        if !spin {
+            if dist > self.pos_tol && reach > self.contact_radius + 0.01 {
+                // Al centro de contacto con la ley del diferencial (también de costado),
+                // rodeando la pelota si está en medio. El destino se corre
+                // `arrival_threshold` más allá a lo largo de la aproximación: motion
+                // detiene al robot en el centro y no antes.
+                let waypoint =
+                    route_around_ball(robot.position, center, ball, self.contact_radius + 0.02);
+                let goal = if waypoint == center {
+                    center + (center - robot.position).normalize_or_zero() * motion.config.arrival_threshold
+                } else {
+                    waypoint
+                };
+                return motion.move_and_face(robot, goal, ball, world, self.kp, self.ki, self.kd);
             }
-            return motion.move_and_face(robot, waypoint, ball, world, self.kp, self.ki, self.kd);
+            // En el centro sin la pelota a `contact_radius`: arrimarse a `min_linear_speed`
+            // (con la latencia de la visión, a velocidad normal llega a empujarla).
+            let mut cmd = motion.move_and_face(robot, ball, ball, world, self.kp, self.ki, self.kd);
+            let (v, creep) = (cmd.vx.hypot(cmd.vy), motion.config.min_linear_speed);
+            if v > creep {
+                cmd.vx *= creep / v;
+                cmd.vy *= creep / v;
+            }
+            return cmd;
         }
         self.spinning = true;
         self.spin_sign = sign;
@@ -850,6 +909,12 @@ impl Skill for SpinKickSkill {
 
     fn current_target(&self, world: &World) -> Option<Vec2> {
         Some(world.get_ball_state().position)
+    }
+
+    fn reset(&mut self) {
+        self.spin_sign = 0.0;
+        self.spinning = false;
+        self.spin_ticks = 0;
     }
 
     fn status(&self, robot: &RobotState, world: &World) -> SkillStatus {
@@ -938,7 +1003,6 @@ impl Skill for MarkSkill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::motion::MotionConfig;
 
     fn robot_at(x: f32, y: f32, deg: f32) -> RobotState {
         let mut r = RobotState::new(0, 0);
@@ -972,15 +1036,22 @@ mod tests {
     }
 
     #[test]
-    fn approach_done_accepts_back_face_alignment() {
+    fn approach_done_accepts_the_back_face_only_with_two_faces() {
+        // N13: en frontal el empuje es con el frente; antes `is_done` plegaba siempre y
+        // daba por terminado al robot de espaldas.
         let mut world = World::new(3, 3);
         world.update_ball(Vec2::new(0.0, 0.0), Vec2::ZERO);
-        let skill = ApproachAlignedSkill::new(Vec2::new(0.75, 0.0));
+        let mut skill = ApproachAlignedSkill::new(Vec2::new(0.75, 0.0));
         let staging = skill.staging_point(Vec2::ZERO).unwrap();
-        // Robot en staging mirando a -x (de espaldas a la línea): con dos caras cuenta.
-        let robot = robot_at(staging.x, staging.y, 180.0);
-        assert!(skill.is_done(&robot, &world));
-        assert_eq!(skill.status(&robot, &world).face, Face::Back);
+        let back = robot_at(staging.x, staging.y, 180.0);
+        let front = robot_at(staging.x, staging.y, 0.0);
+        // El modo lo toma del motion con el que corre.
+        skill.tick(&back, &world, &Motion::new());
+        assert!(!skill.is_done(&back, &world), "frontal, de espaldas");
+        assert!(skill.is_done(&front, &world), "frontal, de frente");
+        skill.tick(&back, &world, &bidir_motion());
+        assert!(skill.is_done(&back, &world), "bidireccional, de espaldas");
+        assert_eq!(skill.status(&back, &world).face, Face::Back);
     }
 
     #[test]
@@ -1109,6 +1180,62 @@ mod tests {
     }
 
     #[test]
+    fn shoot_push_is_infeasible_from_the_side_and_stops() {
+        // B3: al costado de la pelota (proyección 0 sobre la línea de empuje) ya no es
+        // "detrás": empujar desde ahí manda la pelota de lado.
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let target = Vec2::new(0.75, 0.0);
+        let mut skill = ShootPushSkill::new(target);
+        for y in [0.10f32, 0.25] {
+            let side = robot_at(0.0, y, -90.0);
+            assert!(!shoot_push_feasible_now(side.position, Vec2::ZERO, target), "y={y}");
+            assert!(!skill.is_feasible(&side, Vec2::ZERO));
+            let cmd = skill.tick(&side, &world, &motion);
+            assert_eq!((cmd.vx, cmd.vy, cmd.omega), (0.0, 0.0, 0.0), "y={y}: {cmd:?}");
+        }
+        // Detrás y casi sobre la línea: factible.
+        assert!(shoot_push_feasible_now(Vec2::new(-0.12, 0.02), Vec2::ZERO, target));
+    }
+
+    #[test]
+    fn clear_from_the_side_goes_to_staging_first() {
+        let ball = Vec2::new(-0.4, -0.2);
+        let skill = ClearSkill::new(Vec2::new(0.3, -0.2));
+        // Al costado de la pelota, perpendicular a la recta de despeje.
+        assert!(!skill.is_pushing(&robot_at(-0.4, 0.0, 0.0), ball));
+        assert!(skill.is_pushing(&robot_at(-0.5, -0.21, 0.0), ball));
+    }
+
+    #[test]
+    fn clear_reaches_the_ball_pushing_without_oscillating() {
+        // N9: desde (−0.2, 0.3) el robot pasaba por posiciones "detrás" pero de costado y
+        // alternaba entre ir al staging y empujar sin llegar a la pelota. La planta no
+        // tiene física de pelota: se mira hasta el primer contacto. Pelota en (−0.30, 0):
+        // más cerca del área, el staging o el rodeo de la pelota caen en el arco, donde un
+        // jugador de campo no puede ir (motion no planifica alrededor de las áreas).
+        use crate::motion::test_plant::{Case, run};
+        use crate::skills::SkillId;
+        let ball = Vec2::new(-0.30, 0.0);
+        let target = Vec2::new(0.2, 0.45);
+        let skill = ClearSkill::new(target);
+        for case in [
+            Case::new(SkillId::Clear, target, (-0.2, 0.3, 0.0), ball),
+            Case::new(SkillId::Clear, target, (-0.2, 0.3, 0.0), ball).bidirectional(),
+        ] {
+            let t = run(&case);
+            let pushing: Vec<bool> = t.steps.iter().map(|s| skill.is_pushing(&robot_at(s.x, s.y, 0.0), ball)).collect();
+            let contact = t.steps.iter().position(|s| (Vec2::new(s.x, s.y) - ball).length() < 0.065);
+            let bidir = case.motion.bidirectional;
+            let k = contact.unwrap_or_else(|| panic!("bidir={bidir}: no llega a la pelota en 6 s"));
+            let toggles = pushing[..=k].windows(2).filter(|w| w[0] != w[1]).count();
+            assert!(toggles <= 2, "bidir={bidir}: {toggles} cambios de fase antes del contacto");
+            assert!(pushing[k], "bidir={bidir}: llega a la pelota sin estar empujando");
+        }
+    }
+
+    #[test]
     fn intercept_leads_moving_ball() {
         let motion = Motion::new();
         let mut world = World::new(3, 3);
@@ -1141,7 +1268,52 @@ mod tests {
         let to_p = (p - skill.own_goal).normalize();
         assert!(to_ball.dot(to_p) > 0.999, "no está sobre la línea");
         assert!(((p - skill.own_goal).length() - skill.distance).abs() < 1e-3);
-        assert!(p.x.abs() <= skill.max_abs_x + 1e-6);
+        assert!(!AreaRect::own(1.0).touches(p));
+    }
+
+    /// Distancia de `p` a la recta arco → pelota.
+    fn dist_to_line(goal: Vec2, ball: Vec2, p: Vec2) -> f32 {
+        let d = (ball - goal).normalize();
+        (p - goal).perp_dot(d).abs()
+    }
+
+    #[test]
+    fn block_point_beside_the_area_moves_out_along_the_line() {
+        // B2: con la pelota abierta por el costado del área, el punto a `block_distance`
+        // del arco cae en la zona prohibida; se corre hacia afuera por la misma línea.
+        let goal = Vec2::new(-0.75, 0.0);
+        let skill = BlockLineSkill::new(goal);
+        for ball in [Vec2::new(-0.45, 0.55), Vec2::new(-0.65, -0.50)] {
+            let p = skill.block_point(ball).unwrap();
+            assert!(!AreaRect::own(1.0).touches(p), "ball={ball:?} p={p:?} toca el área");
+            // Con margen: queda a más de medio robot + `BLOCK_AREA_MARGIN` del área.
+            let margin = ROBOT_HALF + BLOCK_AREA_MARGIN;
+            assert!(!AreaRect::own(1.0).touches_with(p, margin), "ball={ball:?} p={p:?} sin margen");
+            assert!(dist_to_line(goal, ball, p) < 1e-3, "ball={ball:?} p={p:?} fuera de la línea");
+            assert!((p - goal).length() >= skill.distance);
+        }
+        // Pelota al centro: el punto no toca y queda a `block_distance`, como antes.
+        let p = skill.block_point(Vec2::new(0.2, 0.0)).unwrap();
+        assert!((p - Vec2::new(-0.45, 0.0)).length() < 1e-6, "p={p:?}");
+    }
+
+    #[test]
+    fn block_line_reaches_its_point_beside_the_area() {
+        use crate::motion::test_plant::{Case, run};
+        use crate::skills::SkillId;
+        let goal = Vec2::new(-0.75, 0.0);
+        let ball = Vec2::new(-0.45, 0.55);
+        let p = BlockLineSkill::new(goal).block_point(ball).unwrap();
+        let tol = params().motion.arrival_threshold + 0.01;
+        for case in [
+            Case::new(SkillId::BlockLine, goal, (-0.3, 0.0, 0.0), ball),
+            Case::new(SkillId::BlockLine, goal, (-0.3, 0.0, 0.0), ball).bidirectional(),
+        ] {
+            let t = run(&case);
+            let end = Vec2::new(t.last().x, t.last().y);
+            assert!((end - p).length() <= tol, "bidir={}: final {end:?}, punto {p:?}", case.motion.bidirectional);
+            assert!(t.steps.iter().all(|s| !AreaRect::own(1.0).touches(Vec2::new(s.x, s.y))));
+        }
     }
 
     #[test]
@@ -1159,10 +1331,15 @@ mod tests {
             cmd = skill.tick(&front, &world, &motion);
         }
         assert!(cmd.vx.abs() + cmd.vy.abs() > 0.1);
-        // Detrás (lado del arco propio): empuja hacia el objetivo.
+        // Detrás (lado del arco propio): empuja hacia el objetivo. Motion fresco: el robot
+        // "salta" de pose y la rampa no debe arrastrar el avance de la otra fase.
         let behind = robot_at(-0.58, -0.04, 0.0);
         assert!(skill.is_pushing(&behind, Vec2::new(-0.5, 0.0)));
-        let cmd = skill.tick(&behind, &world, &motion);
+        let motion = bidir_motion();
+        let mut cmd = skill.tick(&behind, &world, &motion);
+        for _ in 0..20 {
+            cmd = skill.tick(&behind, &world, &motion);
+        }
         assert!(cmd.vx > 0.2, "empuje hacia +x: {cmd:?}");
         // Pelota lanzada hacia el objetivo → done.
         world.update_ball(Vec2::new(-0.3, 0.12), Vec2::new(0.6, 0.4));
@@ -1184,6 +1361,59 @@ mod tests {
             assert!(v_cw.normalize().dot(dir) > 0.999, "CW dir={dir:?} v={v_cw:?}");
             assert!(((ccw - ball).length() - skill.contact_radius).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn spin_kick_stops_after_its_timeout() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let mut skill = SpinKickSkill::new(Vec2::new(0.75, 0.0));
+        let (ccw, _) = skill.contact_centers(Vec2::ZERO, Vec2::X);
+        let at = robot_at(ccw.x, ccw.y, 0.0);
+        for _ in 0..skill.max_spin_ticks {
+            assert!(skill.tick(&at, &world, &motion).omega > 0.0);
+        }
+        // La pelota sigue al lado (trabada): quieto y terminado hasta el próximo reinicio.
+        let cmd = skill.tick(&at, &world, &motion);
+        assert_eq!((cmd.vx, cmd.vy, cmd.omega), (0.0, 0.0, 0.0), "{cmd:?}");
+        assert!(skill.is_done(&at, &world));
+        skill.reset();
+        assert!(skill.tick(&at, &world, &motion).omega > 0.0, "tras reset vuelve a girar");
+    }
+
+    #[test]
+    fn spin_kick_final_approach_from_the_side_reaches_contact_and_spins() {
+        // N7: de costado a 0.10 m del centro de contacto, la aproximación final holonómica
+        // (`move_direct` con ω = 0) proyectaba 0 sobre el heading: ni avanzaba ni giraba.
+        use crate::motion::test_plant::{Case, run};
+        use crate::skills::SkillId;
+        let spin = params().skills.spin_omega;
+        for case in [
+            Case::new(SkillId::SpinKick, Vec2::new(0.75, 0.0), (-0.10, 0.065, 90.0), Vec2::ZERO),
+            Case::new(SkillId::SpinKick, Vec2::new(0.75, 0.0), (-0.10, 0.065, 90.0), Vec2::ZERO).bidirectional(),
+        ] {
+            let t = run(&case);
+            let k = t.steps.iter().position(|s| (s.omega.abs() - spin).abs() < 1e-6);
+            let bidir = case.motion.bidirectional;
+            assert!(k.is_some_and(|k| k < 120), "bidir={bidir}: no empieza a girar en 2 s ({k:?})");
+        }
+    }
+
+    #[test]
+    fn spin_kick_picks_a_reachable_contact_center_against_the_wall() {
+        // N8: con la pelota contra la pared, el centro más cercano al robot queda detrás de
+        // ella; se elige el otro, dentro del campo lógico.
+        let ball = Vec2::new(0.2, -0.6);
+        let tgt = Vec2::ZERO;
+        let s = SpinKickSkill::new(tgt);
+        let dir = (tgt - ball).normalize();
+        let (ccw, cw) = s.contact_centers(ball, dir);
+        let robot = Vec2::new(-0.2, -0.3);
+        assert!(!is_inside_logical_field(ccw) && is_inside_logical_field(cw));
+        assert!((ccw - robot).length() < (cw - robot).length(), "el inalcanzable es el más cercano");
+        let (chosen, sign) = s.choose_center(robot, ball, dir);
+        assert_eq!((chosen, sign), (cw, -1.0));
     }
 
     #[test]
