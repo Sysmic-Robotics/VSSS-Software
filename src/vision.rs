@@ -662,7 +662,7 @@ impl Vision {
         // Filtrar placeholders del fork vsss-vision-sysmic (mismo problema que en
         // process_robot): emite un ball entry siempre, con confidence=0 y pixel=(0,0)
         // cuando no hay pelota detectada. Sin filtro, queda una pelota fantasma en
-        // (0,0) que el UVF de motion::move_to trata como obstáculo permanente.
+        // (0,0) que el UVF de motion (`move_and_face`) trata como obstáculo permanente.
         if ball.confidence() <= 0.0
             || (ball.pixel_x() == 0.0 && ball.pixel_y() == 0.0)
         {

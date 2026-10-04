@@ -192,17 +192,27 @@ impl Default for SkillParams {
 }
 
 /// Navegación (`MotionConfig`). Las velocidades máximas se calibran con M2/M4.
+///
+/// `heading_gain`, `max_linear_accel` y `max_angular_speed` se calibraron en FIRASim con
+/// el proxy de ruido de cámara (90 ms de latencia, ~1.2 m/s² de aceleración física): hay
+/// que recalibrarlos con la sysid del robot real (latencia de la cámara y a_max con el
+/// firmware (v, ω)).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MotionParams {
     pub max_linear_speed: f64,
     pub min_linear_speed: f64,
     pub max_angular_speed: f64,
+    /// Distancia al destino bajo la cual el robot se considera llegado (m). Debe ser
+    /// menor que `skills.approach_pos_tol` (se valida al cargar).
     pub arrival_threshold: f32,
     pub brake_distance: f32,
-    pub coupling_floor: f32,
     pub uvf_influence_radius: f32,
     pub uvf_k_rep: f32,
+    /// Ganancia del seguimiento de heading hacia la dirección del UVF (rad/s por rad).
+    pub heading_gain: f64,
+    /// Límite de aceleración del avance comandado, sobre el comando anterior (m/s²).
+    pub max_linear_accel: f64,
     /// Robot de dos caras (heading módulo 180°). `VSSL_BIDIRECTIONAL` lo sobreescribe.
     pub bidirectional: bool,
 }
@@ -213,11 +223,12 @@ impl Default for MotionParams {
             max_linear_speed: 1.2,
             min_linear_speed: 0.06,
             max_angular_speed: 3.0,
-            arrival_threshold: 0.06,
+            arrival_threshold: 0.04,
             brake_distance: 0.50,
-            coupling_floor: 0.22,
             uvf_influence_radius: 0.20,
             uvf_k_rep: 1.5,
+            heading_gain: 3.0,
+            max_linear_accel: 1.0,
             bidirectional: false,
         }
     }
@@ -403,7 +414,22 @@ impl TeamParams {
     pub fn from_json(text: &str) -> Result<Self, String> {
         let p: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
         p.robot.validate()?;
+        p.validate_arrival()?;
         Ok(p)
+    }
+
+    /// Motion se detiene a `arrival_threshold` del destino: si eso queda por encima de
+    /// la tolerancia de `ApproachAligned`, la skill nunca alcanza su staging.
+    fn validate_arrival(&self) -> Result<(), String> {
+        if self.motion.arrival_threshold < self.skills.approach_pos_tol {
+            Ok(())
+        } else {
+            Err(format!(
+                "motion.arrival_threshold ({}) debe ser menor que skills.approach_pos_tol ({}): \
+                 si no, ApproachAligned nunca alcanza su staging",
+                self.motion.arrival_threshold, self.skills.approach_pos_tol
+            ))
+        }
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
@@ -545,6 +571,27 @@ mod tests {
         assert_eq!(p.sim.wheel_base_m, 0.085);
         // La visión real entrega el heading girado 180° (vsss-vision-sysmic).
         assert_eq!(p.vision.real_theta_offset_deg, 180.0);
+    }
+
+    #[test]
+    fn arrival_threshold_must_be_below_approach_tolerance() {
+        // Con 0.06 ≥ 0.05, motion se detiene antes de que ApproachAligned dé por
+        // alcanzado su staging: la carga lo rechaza nombrando ambas claves.
+        let err = TeamParams::from_json(
+            r#"{ "motion": { "arrival_threshold": 0.06 }, "skills": { "approach_pos_tol": 0.05 } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("arrival_threshold") && err.contains("approach_pos_tol"), "{err}");
+        // Los defaults y el JSON del repo cumplen la relación.
+        let d = TeamParams::default();
+        assert!(d.motion.arrival_threshold < d.skills.approach_pos_tol);
+    }
+
+    #[test]
+    fn coupling_floor_is_no_longer_accepted() {
+        // Se eliminó: un JSON local que todavía la tenga falla al cargar.
+        let err = TeamParams::from_json(r#"{ "motion": { "coupling_floor": 0.22 } }"#).unwrap_err();
+        assert!(err.contains("coupling_floor"), "{err}");
     }
 
     #[test]

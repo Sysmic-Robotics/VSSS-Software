@@ -400,7 +400,40 @@ pub fn serialize_to_firasim(
 // viejo L = 0.05 hacía girar al robot al 59 % de la ω comandada.
 /// Límites de entrada esperados para comandos cinemáticos.
 const MOTION_VEL_MAX: f64 = 2.0; // m/s
+/// Solo para el serializador SSL (`serialize_to_firasim`); el FIRA no recorta ω: lo
+/// limitan las ruedas.
 const MOTION_OMEGA_MAX: f64 = 10.0; // rad/s
+
+/// Velocidades de rueda (rad/s, izquierda y derecha) que se mandan a FIRASim para un
+/// comando en marco mundo `(vx, vy, omega)` con el heading `theta`.
+///
+/// Si alguna rueda supera `sim.max_wheel_rad_s`, escala **ambas** por el mismo factor:
+/// conserva la curva comandada, igual que el firmware con `MAX_WHEEL_MM_S` (§9.2: el
+/// mismo ejecutor en sim y en el robot real). No recorta `omega` antes de convertir. Si
+/// alguna entrada no es finita, las dos ruedas valen 0. El `bool` indica si hubo que
+/// escalar.
+pub(crate) fn fira_wheel_speeds(vx: f64, vy: f64, omega: f64, theta: f64) -> (f64, f64, bool) {
+    if ![vx, vy, omega, theta].iter().all(|v| v.is_finite()) {
+        return (0.0, 0.0, false);
+    }
+    let vx = vx.clamp(-MOTION_VEL_MAX, MOTION_VEL_MAX);
+    let vy = vy.clamp(-MOTION_VEL_MAX, MOTION_VEL_MAX);
+    // v = velocidad lineal en la dirección del robot (m/s)
+    let v = vx * theta.cos() + vy * theta.sin();
+    // drive diferencial: L = wheel base, r = wheel radius
+    let sim = &crate::params::params().sim;
+    let half_l_over_r = sim.wheel_base_m / (2.0 * sim.wheel_radius_m);
+    let mut left = v / sim.wheel_radius_m - omega * half_l_over_r;
+    let mut right = v / sim.wheel_radius_m + omega * half_l_over_r;
+    let peak = left.abs().max(right.abs());
+    let scaled = peak > sim.max_wheel_rad_s;
+    if scaled {
+        let k = sim.max_wheel_rad_s / peak;
+        left *= k;
+        right *= k;
+    }
+    (left, right, scaled)
+}
 
 /// Serializa comandos al protocolo FIRA (VSSS/FIRASim) para el puerto 20011.
 /// Convierte velocidades globales (vx, vy, omega) a wheel_left/wheel_right en rad/s.
@@ -436,35 +469,14 @@ pub fn serialize_to_fira_actuator(
             }
         }
 
-        let theta = if raw_theta.is_finite() {
-            raw_theta
-        } else {
-            0.0
-        };
-        let vx = sanitize_and_clamp(raw_vx, -MOTION_VEL_MAX, MOTION_VEL_MAX);
-        let vy = sanitize_and_clamp(raw_vy, -MOTION_VEL_MAX, MOTION_VEL_MAX);
-        let omega = sanitize_and_clamp(raw_omega, -MOTION_OMEGA_MAX, MOTION_OMEGA_MAX);
-
-        // v = velocidad lineal en la dirección del robot (m/s)
-        let v = vx * theta.cos() + vy * theta.sin();
-        // omega_left/right en rad/s (drive diferencial: L = wheel base, r = wheel radius)
-        let sim = &crate::params::params().sim;
-        let inv_r = 1.0 / sim.wheel_radius_m;
-        let half_l_over_r = sim.wheel_base_m / (2.0 * sim.wheel_radius_m);
-        let mut wheel_left = v * inv_r - omega * half_l_over_r;
-        let mut wheel_right = v * inv_r + omega * half_l_over_r;
-        let unclamped_left = wheel_left;
-        let unclamped_right = wheel_right;
-        wheel_left = wheel_left.clamp(-sim.max_wheel_rad_s, sim.max_wheel_rad_s);
-        wheel_right = wheel_right.clamp(-sim.max_wheel_rad_s, sim.max_wheel_rad_s);
-        if (unclamped_left - wheel_left).abs() > f64::EPSILON
-            || (unclamped_right - wheel_right).abs() > f64::EPSILON
-        {
+        let (wheel_left, wheel_right, scaled) =
+            fira_wheel_speeds(raw_vx, raw_vy, raw_omega, raw_theta);
+        if scaled {
             let n = CLIPPED_WHEEL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 5 || n.is_multiple_of(120) {
                 eprintln!(
-                    "[serialize_to_fira_actuator] saturación ruedas (#{}) robot={} left={:.3}->{:.3} right={:.3}->{:.3}",
-                    n, cmd.id, unclamped_left, wheel_left, unclamped_right, wheel_right
+                    "[serialize_to_fira_actuator] saturación de ruedas (#{}) robot={}: escaladas a left={:.3} right={:.3}",
+                    n, cmd.id, wheel_left, wheel_right
                 );
             }
         }
@@ -489,6 +501,44 @@ pub fn serialize_to_fira_actuator(
 mod firasim_tests {
     use super::*;
     use crate::motion::{KickerCommand, MotionCommand};
+
+    fn sim() -> &'static crate::params::SimRobotParams {
+        &crate::params::params().sim
+    }
+
+    #[test]
+    fn fira_wheels_keep_the_curve_when_saturating() {
+        // v = 1.2 m/s, ω = 3 rad/s: la rueda exterior pediría más que el máximo. Escalando
+        // las dos se conserva el radio v/ω = 0.40 m (recortando por separado daba 0.76 m).
+        let (l, r, scaled) = fira_wheel_speeds(1.2, 0.0, 3.0, 0.0);
+        assert!(scaled);
+        assert!(l.abs() <= sim().max_wheel_rad_s + 1e-9 && r.abs() <= sim().max_wheel_rad_s + 1e-9);
+        let v = (l + r) * 0.5 * sim().wheel_radius_m;
+        let w = (r - l) * sim().wheel_radius_m / sim().wheel_base_m;
+        assert!((v / w - 0.40).abs() < 0.004, "radio {:.3}", v / w);
+    }
+
+    #[test]
+    fn fira_wheels_do_not_clip_a_fast_spin() {
+        // Spin a 20 rad/s en el lugar: llega entero a las ruedas (antes se recortaba a 10).
+        let (l, r, scaled) = fira_wheel_speeds(0.0, 0.0, 20.0, 0.3);
+        let expected = 20.0 * sim().wheel_base_m / (2.0 * sim().wheel_radius_m);
+        assert!(!scaled);
+        assert!((r - expected).abs() < 1e-9 && (l + expected).abs() < 1e-9, "l={l} r={r}");
+    }
+
+    #[test]
+    fn fira_wheels_zero_on_non_finite_input() {
+        for (vx, vy, w, th) in [
+            (f64::NAN, 0.0, 1.0, 0.0),
+            (0.5, f64::INFINITY, 0.0, 0.0),
+            (0.5, 0.0, f64::NAN, 0.0),
+            (0.5, 0.0, 1.0, f64::NAN),
+        ] {
+            let (l, r, _) = fira_wheel_speeds(vx, vy, w, th);
+            assert_eq!((l, r), (0.0, 0.0));
+        }
+    }
 
     #[test]
     fn test_serialize_to_firasim() {

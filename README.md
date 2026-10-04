@@ -24,7 +24,8 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Equipo que controla el engine (coach, skills) y, en `basestation`, qué comandos van al frame serial. Permite dos engines en la misma máquina, uno por equipo. |
 | `VSSL_SIDE` | azul `left`, amarillo `right` | Arco que defendemos (`left` = atacamos hacia +X). Cambia en el segundo tiempo y según cómo esté puesto el simulador; el coach avisa al arrancar si los robots están en la mitad contraria. |
 | `VSSL_COACH` | `heuristic` | `heuristic` (equipo STP de dos caras), `rule_based` (baseline de roles fijos) o `none`. |
-| `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro. |
+| `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro y avanza de espaldas cuando conviene. |
+| `VSSL_BORDER_RECOVERY` | (on) | `0`: apaga la recuperación de atasco. Hay atasco si durante 30 ticks se le comanda avanzar (> 0.1 m/s a lo largo del heading) y su pose medida se desplaza menos de 0.03 m netos; entonces hace una maniobra de escape de 25 ticks. |
 | `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |
 | `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota). |
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
@@ -224,7 +225,7 @@ Fuente de visión (FIRASim 224.0.0.1:10002 | vsss-vision-sysmic 224.5.23.2:10015
 | `world/` | Estado canónico del juego: poses de robots, posición/velocidad del balón, flags de inactividad |
 | `coach/` | Coach trait + `RuleBasedCoach` baseline + contrato `Observation` (52 floats) para el modelo RL futuro |
 | `skills/` | Catálogo congelado RL: `SkillId::{GoTo, FacePoint, ChaseBall, Spin}` (`SkillCatalog::tick`). Skills out-of-catalog viven en `skills/mod.rs` para otros usos |
-| `motion/` | UVF para evasión de obstáculos, PID para heading y velocidad, braking profile |
+| `motion/` | UVF para evasión de obstáculos, seguimiento de heading para diferencial con rampa de aceleración, PID de orientación al llegar, recuperación de atasco |
 | `radio/` | Trait `RobotTransport` + 3 implementaciones (`FiraSimTransport`, `GrSimTransport`, `BaseStationTransport`). Selección por `VSSL_RADIO_TARGET`. `Radio::from_target` explícito |
 | `control_loop.rs` | **Loop 60 Hz único** que `main`, `scenario` y `skill_test` invocan. `TickDecider` (`CoachDecider`/`FixedSkillDecider`/etc) decide qué skill; el resto del lazo (visión → world → dispatch → transport) es el mismo |
 | `skill_log.rs` | `CsvLogger`, `CsvRow`, `SkillLogCtx::build_skill_row` — fuente única del formato CSV compartida por `scenario` y `skill_test` |
@@ -350,14 +351,24 @@ ticks en que un robot recibe comando de avance pero no se mueve (atascado).
 
 `main` arma un `CoachDecider` con esos parámetros y delega TODO el lazo en `run_control_loop`. Los demás binarios (`scenario`, `skill_test`) corren el mismo loop con un decisor distinto.
 
-### Parámetros de movimiento (`src/motion/mod.rs`)
+### Parámetros de movimiento (sección `motion` de `config/team_params.json`)
 
-| Constante | Valor | Descripción |
+`move_and_face` sigue el heading como un uniciclo: `ω = heading_gain · e` hacia la dirección del UVF y avance `v = v_perfil · max(cos e, 0)` a lo largo del heading (en bidireccional el error se pliega a ±90° y el avance va de espaldas). El `face_target` se usa recién al llegar. El comando sale paralelo al heading, así que el diferencial lo ejecuta sin pérdida.
+
+| Parámetro | Valor | Descripción |
 |-----------|-------|-------------|
-| `MAX_LINEAR_SPEED` | `1.2 m/s` | Velocidad máxima lineal |
-| `MAX_ANGULAR_SPEED` | `3.0 rad/s` | Velocidad angular máxima |
-| `BRAKE_DISTANCE` | `0.50 m` | Distancia al goal desde la que empieza frenado |
-| `ARRIVAL_THRESHOLD` | `0.06 m` | Radio de llegada al target |
+| `max_linear_speed` | `1.2 m/s` | Velocidad máxima lineal |
+| `max_angular_speed` | `3.0 rad/s` | Velocidad angular máxima |
+| `brake_distance` | `0.50 m` | Distancia al destino desde la que empieza el frenado |
+| `arrival_threshold` | `0.04 m` | Radio de llegada. Debe ser menor que `skills.approach_pos_tol`: la carga lo valida |
+| `heading_gain` | `3.0` | Ganancia del seguimiento de heading (rad/s por rad) |
+| `max_linear_accel` | `1.0 m/s²` | Rampa del avance: cambio máximo por tick sobre el comando anterior (no usa la velocidad medida) |
+
+`heading_gain`, `max_linear_accel` y `max_angular_speed` se calibraron en FIRASim con el proxy de ruido (90 ms de latencia, ~1.2 m/s² de aceleración física). **Hay que recalibrarlos con la sysid del robot real.**
+
+**`motion.coupling_floor` ya no existe.** Como los parámetros rechazan campos desconocidos, un JSON local que todavía tenga la clave **deja de cargar** con error: hay que borrarla.
+
+El estado de control de cada robot (PID de heading y rampa) se reinicia cuando el robot cambia de skill.
 
 ### Parámetros del Univector Field (`src/motion/uvf.rs`)
 
@@ -365,6 +376,8 @@ ticks en que un robot recibe comando de avance pero no se mueve (atascado).
 |-----------|-------|-------------|
 | `influence_radius` | `0.20 m` | Radio de influencia de obstáculos |
 | `k_rep` | `1.5` | Ganancia repulsiva tangencial |
+
+Solo desvían los obstáculos (robots y pelota) que están por delante respecto del destino. No hay paredes virtuales: el borde lo cubren el `ZoneGuard` (áreas) y la recuperación de atasco.
 
 ### Parámetros de skills de balón (`src/skills/mod.rs`)
 
@@ -513,16 +526,28 @@ Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales 
 
 ---
 
+## Aceptación de motion (`motion_bench`)
+
+`motion_bench` corre casos fijos (GoTo, FacePoint, ChaseBall, Mark, Intercept, ApproachAligned, BlockLine, entradas al área y casos de skills) contra FIRASim, por el mismo `run_control_loop` que `main`. Imprime una línea JSON por caso y un resumen de los 17 casos de navegación: llegadas, giro acumulado hasta llegar, ticks de escape y tiempo medio. `b2_blockline_open` se informa aparte (penetración del área y escapes), porque su punto de bloqueo cae en la zona prohibida. Se configura con las mismas variables que producción.
+
+```bash
+# FIRASim corriendo. Regla del equipo: nada se acepta en sim limpio, siempre con el proxy de ruido.
+VSSL_VISION_NOISE=1 cargo run --release --bin motion_bench -- all
+VSSL_VISION_NOISE=1 VSSL_BIDIRECTIONAL=1 cargo run --release --bin motion_bench -- all --csv-dir /tmp/mb --tag _bd1
+cargo run --release --bin motion_bench -- --list
+```
+
 ## Tests
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (132 tests)
+cargo test --lib                 # solo lib (307 tests)
+cargo test --bin motion_bench    # métricas del bench de aceptación (5 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
-cargo test --bin skill_test      # parser del CLI (15 tests)
+cargo test --bin skill_test      # parser del CLI (19 tests)
 ```
 
-**153 tests** cubriendo: UVF, motion, PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station), skills (catálogo congelado), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip), skill_log (CsvLogger + row-builder compartido).
+**337 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard, PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim), skills (catálogo congelado), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos), skill_log (CsvLogger + row-builder compartido).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

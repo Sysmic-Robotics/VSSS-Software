@@ -12,11 +12,12 @@ use crate::GUI;
 use crate::coach::{Coach, Observation, SkillChoice};
 use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig};
 use crate::radio::{RadioTarget, TransportError};
+use crate::skills::zones::ZoneGuard;
 use crate::skills::{SkillCatalog, SkillId};
 use crate::vision::{Vision, VisionEvent, VisionSource};
 use crate::world::{RobotState, World};
 use glam::Vec2;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -57,6 +58,9 @@ pub struct TickRecord<'a> {
     /// Choices que produjeron `commands` en este tick. Útil para que el log
     /// sepa qué `SkillId` corrió y qué `target` paramétrico se usó.
     pub choices: &'a [SkillChoice],
+    /// Paralelo a `commands`: `true` si en este tick la recuperación de atasco
+    /// reemplazó el comando por la maniobra de escape (lo cuenta `motion_bench`).
+    pub escaping: &'a [bool],
 }
 
 pub type OnTick = Box<dyn FnMut(&TickRecord<'_>) + Send>;
@@ -185,6 +189,27 @@ pub struct GuiChannels {
 
 /// Construye comandos de velocidad cero para todos los robots activos del equipo
 /// propio (usado por la parada de emergencia y como base del stop de cierre).
+/// Reflejos de bajo nivel sobre los comandos autónomos del equipo propio, en este
+/// orden: `ZoneGuard` → recuperación de atasco → `ZoneGuard`. La recuperación ve el
+/// comando ya filtrado (si el guardia frena al robot en el borde de un área, no es
+/// atasco) y la maniobra de escape vuelve a pasar por el guardia (no puede entrar a
+/// una zona prohibida). Los robots en `manual_keys` no se tocan.
+///
+/// Devuelve, paralelo a `cmds`, si la recuperación reemplazó cada comando por el escape.
+pub fn apply_reflexes(
+    cmds: &mut [MotionCommand],
+    world: &World,
+    recovery: &mut BorderRecovery,
+    zone_guard: &ZoneGuard,
+    manual_keys: &HashSet<(i32, i32)>,
+    own_team: i32,
+) -> Vec<bool> {
+    zone_guard.guard_commands(cmds, world, own_team, manual_keys);
+    let escaping = recovery.guard_commands(cmds, world, manual_keys, own_team);
+    zone_guard.guard_commands(cmds, world, own_team, manual_keys);
+    escaping
+}
+
 fn zero_commands_for_active_team(
     world: &World,
     own_team: i32,
@@ -586,7 +611,7 @@ pub async fn run_control_loop(
     let mut catalog = SkillCatalog::new(config.num_robots);
     // Reglamento §9.5 como restricción dura: solo el arquero en el área propia,
     // un solo atacante en el área rival (ver `skills::zones`).
-    let zone_guard = crate::skills::zones::ZoneGuard::new(
+    let zone_guard = ZoneGuard::new(
         crate::skills::zones::attack_sign_from_env(config.own_team),
         crate::params::params().coach.keeper_id,
     );
@@ -663,7 +688,7 @@ pub async fn run_control_loop(
         }
 
         let skill_warning: Option<String>;
-        let (commands, targets, applied_choices) = {
+        let (commands, targets, applied_choices, escaping) = {
             let world_guard = world.read().await;
             if !field_scale_warned {
                 field_scale_warned = warn_if_outside_vsss_field(&world_guard);
@@ -672,7 +697,8 @@ pub async fn run_control_loop(
             skill_warning = gui_skill_warning(&skill_state, &world_guard, config.own_team);
             if estop_engaged {
                 let (z_cmds, z_tgts) = zero_commands_for_active_team(&world_guard, config.own_team);
-                (z_cmds, z_tgts, Vec::new())
+                let z_esc = vec![false; z_cmds.len()];
+                (z_cmds, z_tgts, Vec::new(), z_esc)
             } else {
                 // Override en vivo de la velocidad de Spin desde la GUI (por robot).
                 for ((team, id), (cmd, _)) in &skill_state {
@@ -690,13 +716,18 @@ pub async fn run_control_loop(
                     config.own_team,
                 );
                 apply_manual_overrides(&mut cmds, &mut tgts, &manual_state, &world_guard);
-                // Recuperación de borde/atasco: reflejo de bajo nivel sobre los comandos
-                // autónomos del equipo propio (salta manual; el estop ya cortó arriba).
-                let manual_keys: std::collections::HashSet<(i32, i32)> =
-                    manual_state.keys().copied().collect();
-                recovery.guard_commands(&mut cmds, &world_guard, &manual_keys, config.own_team);
-                zone_guard.guard_commands(&mut cmds, &world_guard, config.own_team, &manual_keys);
-                (cmds, tgts, applied)
+                // Reflejos de bajo nivel (áreas y atasco) sobre los comandos autónomos
+                // del equipo propio (salta manual; el estop ya cortó arriba).
+                let manual_keys: HashSet<(i32, i32)> = manual_state.keys().copied().collect();
+                let esc = apply_reflexes(
+                    &mut cmds,
+                    &world_guard,
+                    &mut recovery,
+                    &zone_guard,
+                    &manual_keys,
+                    config.own_team,
+                );
+                (cmds, tgts, applied, esc)
             }
         };
         tick_counter = tick_counter.wrapping_add(1);
@@ -732,6 +763,7 @@ pub async fn run_control_loop(
                 commands: &commands,
                 targets: &targets,
                 choices: &applied_choices,
+                escaping: &escaping,
             };
             hook(&rec);
         }
@@ -830,6 +862,60 @@ mod tests {
             self.sent.lock().unwrap().push(commands.to_vec());
             Ok(())
         }
+    }
+
+    fn own_cmd(v_body: f64, theta: f64) -> MotionCommand {
+        MotionCommand {
+            id: 0,
+            team: 0,
+            vx: v_body * theta.cos(),
+            vy: v_body * theta.sin(),
+            omega: 0.0,
+            orientation: theta,
+        }
+    }
+
+    #[test]
+    fn reflexes_robot_held_by_the_guard_is_not_stuck() {
+        // Robot de campo frente al área propia, mirando al arco y queriendo entrar: el
+        // guardia anula la traslación y la recuperación ve ese comando → no es atasco.
+        let guard = ZoneGuard::new(1.0, 2);
+        let mut recovery = BorderRecovery::new(true);
+        let th = std::f64::consts::PI;
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, Vec2::new(-0.52, 0.10), th, Vec2::ZERO, 0.0);
+        for k in 0..60 {
+            let mut cmds = vec![own_cmd(0.5, th)];
+            let esc = apply_reflexes(&mut cmds, &world, &mut recovery, &guard, &HashSet::new(), 0);
+            assert!(!esc[0], "escape espurio en el tick {k}");
+            assert_eq!((cmds[0].vx, cmds[0].vy), (0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn reflexes_escape_cannot_enter_the_area() {
+        // Robot trabado junto a la esquina del área propia, con heading diagonal: la
+        // skill lo aleja (marcha atrás), pero no se mueve → a los 30 ticks escapa hacia el
+        // centro. Proyectado a su heading, ese escape lo metería al área: el segundo paso
+        // del guardia anula la traslación y deja el giro del escape.
+        let guard = ZoneGuard::new(1.0, 2);
+        let mut recovery = BorderRecovery::new(true);
+        let th = (-0.954f64).atan2(-0.3);
+        let p = Vec2::new(-0.555, 0.41);
+        assert!(!guard.own_area().touches(p));
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, p, th, Vec2::ZERO, 0.0);
+        let mut escaped = false;
+        for _ in 0..30 {
+            let mut cmds = vec![own_cmd(-0.3, th)];
+            let esc = apply_reflexes(&mut cmds, &world, &mut recovery, &guard, &HashSet::new(), 0);
+            if esc[0] {
+                escaped = true;
+                assert_eq!((cmds[0].vx, cmds[0].vy), (0.0, 0.0), "el escape no entra al área");
+                assert!(cmds[0].omega.abs() > 1.0, "conserva el giro del escape");
+            }
+        }
+        assert!(escaped, "la recuperación debía disparar");
     }
 
     #[test]

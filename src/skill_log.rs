@@ -462,6 +462,7 @@ mod tests {
             commands,
             targets,
             choices,
+            escaping: &[],
         }
     }
 

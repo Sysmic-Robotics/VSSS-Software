@@ -1,5 +1,5 @@
 /// Comando de movimiento para un robot
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MotionCommand {
     pub id: i32,
     pub team: i32,        // 0 = azul, 1 = amarillo

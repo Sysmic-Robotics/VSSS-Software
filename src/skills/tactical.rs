@@ -1003,14 +1003,25 @@ mod tests {
         let mut world = World::new(3, 3);
         world.update_ball(Vec2::ZERO, Vec2::ZERO);
         // Robot delante de la pelota respecto del arco (+x): el staging queda detrás.
-        let robot = robot_at(0.25, 0.0, 180.0);
-        let mut skill = ApproachAlignedSkill::new(Vec2::new(0.75, 0.0));
-        let cmd = skill.tick(&robot, &world, &motion);
-        assert!(cmd.vy.abs() > 0.15, "debe desviarse lateralmente: {cmd:?}");
-        // Clear en la misma geometría también rodea.
-        let mut clear = ClearSkill::new(Vec2::new(0.75, 0.0));
-        let cmd = clear.tick(&robot, &world, &motion);
-        assert!(cmd.vy.abs() > 0.15, "clear debe rodear: {cmd:?}");
+        // Con la planta diferencial: durante el primer segundo el robot no toca la pelota
+        // (rodea por el costado en vez de atravesarla). Contacto: medio robot + pelota.
+        use crate::motion::test_plant::{Case, run};
+        use crate::skills::SkillId;
+        for skill in [SkillId::ApproachAligned, SkillId::Clear] {
+            let mut case = Case::new(skill, Vec2::new(0.75, 0.0), (0.25, 0.0, 180.0), Vec2::ZERO)
+                .bidirectional();
+            case.ticks = 60;
+            let trace = run(&case);
+            let min_d = trace
+                .steps
+                .iter()
+                .map(|s| Vec2::new(s.x, s.y).length())
+                .fold(f32::MAX, f32::min);
+            assert!(min_d > 0.06, "{skill:?} pasó a {min_d:.3} m de la pelota");
+            let last = trace.last();
+            assert!(last.y.abs() > 0.03, "{skill:?} debe desviarse lateralmente: y={:.3}", last.y);
+        }
+        let _ = (&motion, &world);
     }
 
     #[test]
@@ -1030,7 +1041,12 @@ mod tests {
         let in_front = robot_at(0.12, 0.0, 0.0);
         let cmd = skill2.tick(&in_front, &world, &motion);
         assert!(!skill2.is_spinning());
-        assert!(cmd.vy.abs() > 0.03, "rodea lateralmente: {cmd:?}");
+        // El waypoint de rodeo queda al costado: el diferencial primero gira hacia él
+        // (a lo sumo max_angular_speed, no el giro de la patada).
+        assert!(
+            cmd.omega.abs() > 0.5 && cmd.omega.abs() <= motion.config.max_angular_speed + 1e-9,
+            "gira hacia el rodeo lateral: {cmd:?}"
+        );
     }
 
     #[test]
@@ -1040,7 +1056,11 @@ mod tests {
         world.update_ball(Vec2::new(0.2, 0.1), Vec2::ZERO);
         let robot = robot_at(-0.5, -0.3, 0.0);
         let mut skill = ApproachAlignedSkill::new(Vec2::new(0.75, 0.0));
-        let cmd = skill.tick(&robot, &world, &motion);
+        // El avance sube con la rampa de aceleración: a los 20 ticks ya es claro.
+        let mut cmd = skill.tick(&robot, &world, &motion);
+        for _ in 0..20 {
+            cmd = skill.tick(&robot, &world, &motion);
+        }
         assert!(cmd.vx.abs() + cmd.vy.abs() > 0.1);
         assert!(!skill.is_done(&robot, &world));
     }
@@ -1133,7 +1153,11 @@ mod tests {
         // Delante de la pelota (lado del despeje): no empuja, va al staging detrás.
         let front = robot_at(-0.35, 0.1, 0.0);
         assert!(!skill.is_pushing(&front, Vec2::new(-0.5, 0.0)));
-        let cmd = skill.tick(&front, &world, &motion);
+        // El avance sube con la rampa de aceleración: a los 20 ticks ya es claro.
+        let mut cmd = skill.tick(&front, &world, &motion);
+        for _ in 0..20 {
+            cmd = skill.tick(&front, &world, &motion);
+        }
         assert!(cmd.vx.abs() + cmd.vy.abs() > 0.1);
         // Detrás (lado del arco propio): empuja hacia el objetivo.
         let behind = robot_at(-0.58, -0.04, 0.0);
@@ -1170,7 +1194,11 @@ mod tests {
         let mut skill = SpinKickSkill::new(Vec2::new(0.75, 0.0));
         // Lejos: se mueve, no gira a tope.
         let far = robot_at(-0.4, 0.2, 0.0);
-        let cmd = skill.tick(&far, &world, &motion);
+        // El avance sube con la rampa de aceleración: a los 20 ticks ya es claro.
+        let mut cmd = skill.tick(&far, &world, &motion);
+        for _ in 0..20 {
+            cmd = skill.tick(&far, &world, &motion);
+        }
         assert!(cmd.vx.abs() + cmd.vy.abs() > 0.1);
         assert!(cmd.omega.abs() < skill.omega);
         assert!(!skill.is_spinning());

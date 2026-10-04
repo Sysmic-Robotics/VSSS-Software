@@ -3,6 +3,8 @@ mod commands;
 mod environment;
 mod pid;
 mod recovery;
+#[cfg(test)]
+pub(crate) mod test_plant;
 mod uvf;
 
 pub use benchmark::{MotionBenchmarkScenario, MotionKpi, summarize_commands};
@@ -20,8 +22,8 @@ use std::sync::Mutex;
 const CONTROL_DT: f64 = 0.016; // ~60 Hz
 
 /// Parámetros tunables del sistema de movimiento.
-/// Usar `MotionConfig::default()` para los valores calibrados base,
-/// o construir uno propio y pasarlo a `Motion::with_config()`.
+/// `MotionConfig::default()` toma los defaults de `params::MotionParams`;
+/// `MotionConfig::from_env()` usa el JSON vigente.
 #[derive(Debug, Clone)]
 pub struct MotionConfig {
     /// Velocidad lineal máxima (m/s)
@@ -34,35 +36,25 @@ pub struct MotionConfig {
     pub arrival_threshold: f32,
     /// Distancia desde la que empieza a frenar linealmente (m)
     pub brake_distance: f32,
-    /// Mínimo de coupling velocidad–heading (0..1).
-    /// 0 = para completamente si no mira hacia donde va; 1 = ignora heading.
-    pub coupling_floor: f32,
     /// Radio de influencia de obstáculos en UVF (m)
     pub uvf_influence_radius: f32,
     /// Ganancia repulsiva del UVF — más alto = deflexión más brusca
     pub uvf_k_rep: f32,
+    /// Ganancia del seguimiento de heading hacia la dirección del UVF (rad/s por rad).
+    pub heading_gain: f64,
+    /// Límite de aceleración del avance comandado, sobre el comando anterior (m/s²).
+    pub max_linear_accel: f64,
     /// Robot simétrico con dos caras de contacto (frente y espalda): la orientación
-    /// se trata módulo 180°. El PID de heading apunta a la cara más cercana a la
-    /// dirección deseada (nunca gira más de 90°) y el coupling velocidad-heading no
-    /// castiga avanzar "de espaldas". La conversión a ruedas ya soporta v<0 (proyecta
-    /// el comando global sobre el heading), así que no hace falta tocar el radio.
-    /// Activar con `VSSL_BIDIRECTIONAL=1` (ver `MotionConfig::from_env`).
+    /// se trata módulo 180°. El seguimiento de heading pliega el error a ±90° y avanza
+    /// de espaldas (v < 0) cuando la dirección deseada queda detrás; el PID de
+    /// `face_to` apunta a la cara más cercana. Activar con `VSSL_BIDIRECTIONAL=1`
+    /// (ver `MotionConfig::from_env`).
     pub bidirectional: bool,
 }
 
 impl Default for MotionConfig {
     fn default() -> Self {
-        Self {
-            max_linear_speed: 1.2,
-            min_linear_speed: 0.06,
-            max_angular_speed: 3.0,
-            arrival_threshold: 0.06,
-            brake_distance: 0.50,
-            coupling_floor: 0.22,
-            uvf_influence_radius: 0.20,
-            uvf_k_rep: 1.5,
-            bidirectional: false,
-        }
+        Self::from_params(&crate::params::MotionParams::default())
     }
 }
 
@@ -75,9 +67,10 @@ impl MotionConfig {
             max_angular_speed: p.max_angular_speed,
             arrival_threshold: p.arrival_threshold,
             brake_distance: p.brake_distance,
-            coupling_floor: p.coupling_floor,
             uvf_influence_radius: p.uvf_influence_radius,
             uvf_k_rep: p.uvf_k_rep,
+            heading_gain: p.heading_gain,
+            max_linear_accel: p.max_linear_accel,
             bidirectional: p.bidirectional,
         }
     }
@@ -100,6 +93,8 @@ pub struct Motion {
     pid_x_by_robot: Mutex<HashMap<(i32, i32), PIDController>>,
     pid_y_by_robot: Mutex<HashMap<(i32, i32), PIDController>>,
     pid_theta_by_robot: Mutex<HashMap<(i32, i32), PIDController>>,
+    /// Último avance comandado por `move_and_face` (m/s, con signo), para la rampa.
+    v_prev_by_robot: Mutex<HashMap<(i32, i32), f64>>,
 }
 
 impl Motion {
@@ -117,6 +112,7 @@ impl Motion {
             pid_x_by_robot: Mutex::new(HashMap::new()),
             pid_y_by_robot: Mutex::new(HashMap::new()),
             pid_theta_by_robot: Mutex::new(HashMap::new()),
+            v_prev_by_robot: Mutex::new(HashMap::new()),
         }
     }
 
@@ -149,107 +145,44 @@ impl Motion {
         }
     }
 
-    /// Movimiento hacia un objetivo usando Univector Field.
+    /// Dirección del Univector Field (rad) desde el robot hacia `target`, con los otros
+    /// robots y la pelota como obstáculos, **excepto** los que están sobre el destino.
+    /// Un obstáculo encima del destino haría que el UVF deflecte tangencialmente y nunca
+    /// llegue ("no me esquives del lugar al que voy"): p. ej. el staging detrás de la
+    /// pelota, o un fantasma de visión sentado en el target.
     ///
-    /// Calcula un ángulo de heading deseado combinando atracción al target y deflexión
-    /// tangencial alrededor de obstáculos (robots y pelota). La velocidad lineal incluye
-    /// coupling velocidad-steering: se reduce proporcionalmente cuando el heading está
-    /// desalineado con la dirección de movimiento.
-    pub fn move_to(&self, robot_state: &RobotState, target: Vec2, world: &World) -> MotionCommand {
-        let dist_to_goal = (target - robot_state.position).length();
-
-        if dist_to_goal < self.config.arrival_threshold {
-            return MotionCommand {
-                id: robot_state.id,
-                team: robot_state.team,
-                vx: 0.0,
-                vy: 0.0,
-                omega: 0.0,
-                orientation: robot_state.orientation,
-            };
-        }
-
+    /// No hay paredes virtuales: el robot va hacia su destino, que está dentro de la
+    /// cancha; el borde lo cubren el `ZoneGuard` (áreas) y la recuperación de atasco.
+    fn uvf_heading(&self, robot_state: &RobotState, target: Vec2, world: &World) -> f32 {
         let env = Environment::new(world, robot_state);
-
-        // Obstáculos: robots y pelota, EXCEPTO los que estén plantados sobre el target.
-        // Un obstáculo encima del destino haría que el UVF deflecte tangencialmente y nunca
-        // llegue (regla "no me esquives del lugar al que voy"). Esto cubre dos casos reales:
-        //   - staging_point detrás de la pelota → pelota cerca del target → no obstaculizar.
-        //   - fantasma de visión sentado en (0,0) cuando el target es (0,0) → ignorarlo.
         let near_target_threshold = self.config.uvf_influence_radius * 1.5;
         let ball_pos = env.get_ball_position();
-        let target_near_ball = (target - ball_pos).length() < near_target_threshold;
         let mut obstacles: Vec<Vec2> = env
             .get_robots()
             .iter()
             .copied()
             .filter(|&r| (target - r).length() >= near_target_threshold)
             .collect();
-        if !target_near_ball {
+        if (target - ball_pos).length() >= near_target_threshold {
             obstacles.push(ball_pos);
         }
-
-        // Wall avoidance: obstáculos virtuales en los límites del campo lógico.
-        // Cuando el robot se acerca a una pared, el UVF lo deflecta tangencialmente
-        // igual que con robots. Sin esto, los robots se quedan pegados a las paredes.
-        //
-        // Excepción de target (misma regla que robots/pelota): si el destino está de
-        // ese lado y cerca/más allá de la pared lógica (p. ej. una pelota pegada al
-        // borde físico, más allá de ±0.70), NO se agrega esa pared. Si no, la pared
-        // virtual quedaría entre el robot y el target y el UVF deflectaría para siempre
-        // sin cruzar (el robot se "congela" deslizando por el borde).
-        let rp = robot_state.position;
-        let wall_threshold = self.config.uvf_influence_radius * 1.5;
-        const WALL_X: f32 = 0.70;
-        const WALL_Y: f32 = 0.60;
-        let target_beyond_x_wall = target.x.signum() == rp.x.signum()
-            && target.x.abs() > WALL_X - near_target_threshold;
-        let target_beyond_y_wall = target.y.signum() == rp.y.signum()
-            && target.y.abs() > WALL_Y - near_target_threshold;
-        if (WALL_X - rp.x.abs()) < wall_threshold && !target_beyond_x_wall {
-            obstacles.push(Vec2::new(rp.x.signum() * WALL_X, rp.y));
-        }
-        if (WALL_Y - rp.y.abs()) < wall_threshold && !target_beyond_y_wall {
-            obstacles.push(Vec2::new(rp.x, rp.y.signum() * WALL_Y));
-        }
-
-        let theta_uvf = self.uvf.compute(robot_state.position, target, &obstacles);
-
-        // Coupling velocidad-steering: penaliza ir de lado, pero no anula del todo el avance
-        // (si no, con `move_and_face` + UVF≠mirada al balón, cos→0 y el robot solo rota).
-        let heading_error = UniVectorField::heading_error(theta_uvf, robot_state.orientation);
-        // Bidireccional: ir de espaldas alinea tan bien como de frente (|cos|).
-        let cos_align = if self.config.bidirectional {
-            (heading_error.cos() as f32).abs()
-        } else {
-            (heading_error.cos() as f32).max(0.0)
-        };
-        let coupling = self.config.coupling_floor + (1.0 - self.config.coupling_floor) * cos_align;
-
-        let normalized = (dist_to_goal / self.config.brake_distance).clamp(0.0, 1.0);
-        let v_max = (self.config.min_linear_speed as f32)
-            + normalized * ((self.config.max_linear_speed - self.config.min_linear_speed) as f32);
-        let speed = v_max * coupling;
-
-        MotionCommand {
-            id: robot_state.id,
-            team: robot_state.team,
-            vx: theta_uvf.cos() as f64 * speed as f64,
-            vy: theta_uvf.sin() as f64 * speed as f64,
-            omega: 0.0,
-            orientation: robot_state.orientation,
-        }
+        self.uvf.compute(robot_state.position, target, &obstacles)
     }
 
-    /// Movimiento + orientación en un solo comando con coupling velocidad-steering.
+    /// Navega hacia `move_target` con una ley de seguimiento de heading para robot
+    /// diferencial, y al llegar se orienta hacia `face_target`.
     ///
-    /// Reemplaza el patrón manual: `let mut cmd = move_to(...); cmd.omega = face_to(...).omega`
+    /// Lejos del destino:
+    /// - `e` = error entre el heading y la dirección del UVF (en bidireccional se pliega
+    ///   a ±90° y el avance va de espaldas);
+    /// - `omega = clamp(heading_gain · e, ±max_angular_speed)`;
+    /// - avance `v = v_perfil(d) · max(cos e, 0)` a lo largo del heading, limitado por la
+    ///   rampa de aceleración. El comando `(vx, vy)` es paralelo al heading: el
+    ///   diferencial lo ejecuta sin pérdida.
     ///
-    /// - `move_target`: destino de navegación (evita obstáculos via UVF)
-    /// - `face_target`: punto hacia el que debe mirar el robot (puede diferir de move_target,
-    ///   ej: durante pre-alineación el robot se mueve a staging pero mira a la pelota)
-    /// - El coupling velocidad-steering se calcula respecto a la dirección UVF de movimiento,
-    ///   no respecto a face_target — así el robot frena al girar hacia donde va, no hacia donde mira.
+    /// `face_target` no influye mientras navega (el diferencial avanza hacia donde mira:
+    /// mirar a otro lado le impedía llegar). A menos de `arrival_threshold` se anula la
+    /// traslación y se orienta hacia `face_target` con el PID de heading de la skill.
     #[allow(clippy::too_many_arguments)]
     pub fn move_and_face(
         &self,
@@ -261,10 +194,68 @@ impl Motion {
         ki: f64,
         kd: f64,
     ) -> MotionCommand {
-        let mut cmd = self.move_to(robot_state, move_target, world);
-        let face = self.face_to(robot_state, face_target, kp, ki, kd);
-        cmd.omega = face.omega;
-        cmd
+        let key = (robot_state.team, robot_state.id);
+        let dist = (move_target - robot_state.position).length();
+        if !dist.is_finite() || dist < self.config.arrival_threshold {
+            self.v_prev_by_robot
+                .lock()
+                .expect("v_prev lock poisoned")
+                .insert(key, 0.0);
+            return self.face_to(robot_state, face_target, kp, ki, kd);
+        }
+
+        let theta_d = self.uvf_heading(robot_state, move_target, world) as f64;
+        let raw = Self::normalize_angle(theta_d - robot_state.orientation);
+        let (err, dir) = if self.config.bidirectional && raw.abs() > std::f64::consts::FRAC_PI_2
+        {
+            (Self::fold_bidirectional(raw), -1.0)
+        } else {
+            (raw, 1.0)
+        };
+        let max_w = self.config.max_angular_speed;
+        let omega = (self.config.heading_gain * err).clamp(-max_w, max_w);
+
+        let normalized = (dist / self.config.brake_distance).clamp(0.0, 1.0) as f64;
+        let v_profile = self.config.min_linear_speed
+            + normalized * (self.config.max_linear_speed - self.config.min_linear_speed);
+        let v = self.ramp(key, dir * v_profile * err.cos().max(0.0));
+
+        let th = robot_state.orientation;
+        MotionCommand {
+            id: robot_state.id,
+            team: robot_state.team,
+            vx: v * th.cos(),
+            vy: v * th.sin(),
+            omega,
+            orientation: th,
+        }
+    }
+
+    /// Rampa del avance: cambia como máximo `max_linear_accel · dt` respecto del comando
+    /// anterior del mismo robot. No usa la velocidad medida (con ruido, frames perdidos
+    /// o el tracker apagado podría dejar el avance pegado abajo). Pedir más de lo que el
+    /// robot acelera satura ambas ruedas y se pierde el giro.
+    fn ramp(&self, key: (i32, i32), v_target: f64) -> f64 {
+        let mut prev_by_robot = self.v_prev_by_robot.lock().expect("v_prev lock poisoned");
+        let prev = prev_by_robot.get(&key).copied().unwrap_or(0.0);
+        let dv = self.config.max_linear_accel * CONTROL_DT;
+        let v = v_target.clamp(prev - dv, prev + dv);
+        prev_by_robot.insert(key, v);
+        v
+    }
+
+    /// Reinicia el estado de control de un robot (PID de heading y rampa del avance).
+    /// Lo llama el catálogo de skills cuando el robot cambia de skill.
+    pub fn reset_robot(&self, team: i32, id: i32) {
+        let key = (team, id);
+        self.pid_theta_by_robot
+            .lock()
+            .expect("pid_theta lock poisoned")
+            .remove(&key);
+        self.v_prev_by_robot
+            .lock()
+            .expect("v_prev lock poisoned")
+            .remove(&key);
     }
 
     /// Movimiento directo sin evasión de obstáculos
@@ -417,36 +408,6 @@ impl Motion {
             orientation: robot_state.orientation,
         }
     }
-
-    /// Movimiento con orientación simultáneos
-    #[allow(clippy::too_many_arguments)]
-    pub fn motion_with_orientation(
-        &self,
-        robot_state: &RobotState,
-        target: Vec2,
-        target_angle: f64,
-        world: &World,
-        _kp_x: f64,
-        _ki_x: f64,
-        _kp_y: f64,
-        _ki_y: f64,
-        kp_theta: f64,
-        ki_theta: f64,
-        kd_theta: f64,
-    ) -> MotionCommand {
-        // Combinar move_to y face_to_angle
-        let motion_cmd = self.move_to(robot_state, target, world);
-        let face_cmd = self.face_to_angle(robot_state, target_angle, kp_theta, ki_theta, kd_theta);
-
-        MotionCommand {
-            id: robot_state.id,
-            team: robot_state.team,
-            vx: motion_cmd.vx,
-            vy: motion_cmd.vy,
-            omega: face_cmd.omega,
-            orientation: robot_state.orientation,
-        }
-    }
 }
 
 impl Default for Motion {
@@ -457,7 +418,32 @@ impl Default for Motion {
 
 #[cfg(test)]
 mod tests {
+    use super::test_plant::{Case, Plant, run};
     use super::*;
+    use crate::skills::SkillId;
+
+    const FAR_BALL: Vec2 = Vec2::new(0.6, 0.5);
+
+    fn robot(x: f32, y: f32, theta: f64) -> RobotState {
+        let mut r = RobotState::new(0, 0);
+        r.position = Vec2::new(x, y);
+        r.orientation = theta;
+        r
+    }
+
+    fn v_body(cmd: &MotionCommand) -> f64 {
+        cmd.vx * cmd.orientation.cos() + cmd.vy * cmd.orientation.sin()
+    }
+
+    fn bidir() -> Motion {
+        let mut cfg = MotionConfig::default();
+        cfg.bidirectional = true;
+        Motion::with_config(cfg)
+    }
+
+    fn angle_diff(a: f64, b: f64) -> f64 {
+        Motion::normalize_angle(a - b).abs()
+    }
 
     #[test]
     fn test_normalize_angle() {
@@ -487,46 +473,327 @@ mod tests {
 
     #[test]
     fn bidirectional_face_uses_back_when_target_is_behind() {
-        let mut cfg = MotionConfig::default();
-        cfg.bidirectional = true;
-        let motion = Motion::with_config(cfg);
-        let mut robot = RobotState::new(0, 0);
-        robot.orientation = std::f64::consts::PI; // mira a -x
+        let motion = bidir();
+        let r = robot(0.0, 0.0, std::f64::consts::PI); // mira a -x
         // Target exactamente detrás (+x): con dos caras ya está alineado → omega ≈ 0.
-        let cmd = motion.face_to(&robot, Vec2::new(1.0, 0.0), 3.0, 0.0, 0.0);
+        let cmd = motion.face_to(&r, Vec2::new(1.0, 0.0), 3.0, 0.0, 0.0);
         assert!(cmd.omega.abs() < 1e-6, "omega={} debería ser ~0", cmd.omega);
 
         // Sin bidireccional, el mismo caso pide media vuelta completa.
         let motion_fwd = Motion::new();
-        let cmd_fwd = motion_fwd.face_to(&robot, Vec2::new(1.0, 0.0), 3.0, 0.0, 0.0);
+        let cmd_fwd = motion_fwd.face_to(&r, Vec2::new(1.0, 0.0), 3.0, 0.0, 0.0);
         assert!(cmd_fwd.omega.abs() > 1.0);
     }
 
-    #[test]
-    fn bidirectional_move_to_keeps_speed_when_driving_backwards() {
-        let mut cfg = MotionConfig::default();
-        cfg.bidirectional = true;
-        let motion = Motion::with_config(cfg);
-        let world = World::new(3, 3);
-        let mut robot = RobotState::new(0, 0);
-        robot.position = Vec2::new(-0.4, 0.0);
-        robot.orientation = std::f64::consts::PI; // de espaldas al target (+x)
-        let target = Vec2::new(0.4, 0.0);
+    // ── Ley de seguimiento de heading ──────────────────────────────────────
 
-        let cmd = motion.move_to(&robot, target, &world);
-        let speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
-        // Con coupling |cos| la velocidad global es plena aunque vaya de espaldas.
-        assert!(speed > 1.0, "speed={speed}");
-        // La proyección sobre el heading (lo que va a las ruedas) es negativa: retrocede.
-        let v_local = cmd.vx * robot.orientation.cos() + cmd.vy * robot.orientation.sin();
-        assert!(v_local < -0.9, "v_local={v_local}");
+    #[test]
+    fn command_follows_the_heading() {
+        // El comando es paralelo al heading en cualquier pose: el diferencial lo
+        // ejecuta sin descartar nada (antes salía en la dirección del UVF).
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.05, 0.02), Vec2::ZERO);
+        world.update_robot(1, 1, Vec2::new(-0.1, 0.12), 0.0, Vec2::ZERO, 0.0);
+        for motion in [Motion::new(), bidir()] {
+            for (x, y, th) in [(-0.4, 0.0, 0.0), (0.3, -0.2, 2.0), (0.0, 0.3, -1.2), (-0.2, -0.4, 3.0)] {
+                let r = robot(x, y, th);
+                for target in [Vec2::new(0.4, 0.1), Vec2::new(-0.5, -0.3), Vec2::new(0.0, 0.45)] {
+                    for _ in 0..20 {
+                        let c = motion.move_and_face(&r, target, target, &world, 3.0, 0.08, 0.2);
+                        let lateral = -c.vx * th.sin() + c.vy * th.cos();
+                        assert!(lateral.abs() < 1e-9, "componente lateral {lateral} en {r:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bidirectional_drives_backwards_to_a_target_behind() {
+        let motion = bidir();
+        let world = World::new(3, 3);
+        let r = robot(-0.4, 0.0, std::f64::consts::PI); // de espaldas al target (+x)
+        let target = Vec2::new(0.4, 0.0);
+        let mut cmd = motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0);
+        for _ in 0..100 {
+            cmd = motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0);
+        }
+        // Avanza de espaldas a velocidad plena (la rampa ya llegó) y sin girar.
+        assert!(v_body(&cmd) < -0.9, "v={}", v_body(&cmd));
+        assert!(cmd.omega.abs() < 1e-6, "omega={}", cmd.omega);
+    }
+
+    #[test]
+    fn frontal_turns_in_place_to_a_target_behind() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let r = robot(-0.4, 0.0, std::f64::consts::PI);
+        let cmd = motion.move_and_face(&r, Vec2::new(0.4, 0.0), Vec2::new(0.4, 0.0), &world, 3.0, 0.0, 0.0);
+        assert_eq!((cmd.vx, cmd.vy), (0.0, 0.0), "sin traslación hasta alinear");
+        assert!(cmd.omega.abs() > 1.0);
+    }
+
+    #[test]
+    fn obstacle_ahead_deflects_and_omega_follows_it() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(FAR_BALL, Vec2::ZERO);
+        world.update_robot(0, 1, Vec2::new(0.0, 0.03), 0.0, Vec2::ZERO, 0.0);
+        let r = robot(-0.15, 0.0, 0.0);
+        let target = Vec2::new(0.4, 0.0);
+        let h = motion.uvf_heading(&r, target, &world) as f64;
+        assert!(h.abs() > 0.05, "el UVF debe desviarse: {h:.3}");
+        let cmd = motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0);
+        assert!(cmd.omega * h > 0.0, "omega persigue la dirección desviada");
+    }
+
+    #[test]
+    fn obstacle_behind_does_not_deflect() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(FAR_BALL, Vec2::ZERO);
+        world.update_robot(0, 1, Vec2::new(-0.25, 0.0), 0.0, Vec2::ZERO, 0.0);
+        let h = motion.uvf_heading(&robot(-0.15, 0.0, 0.0), Vec2::new(0.4, 0.0), &world);
+        assert!(h.abs() < 0.01, "h={h:.3}");
+    }
+
+    /// Regresión: un robot obstáculo sentado encima del target no debe deflectar al UVF.
+    /// Caso real: vision-sysmic emite un fantasma sobre (0,0) y el robot intenta ir ahí.
+    #[test]
+    fn obstacle_on_the_target_is_ignored() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 1, Vec2::new(0.0, 0.0), 0.0, Vec2::ZERO, 0.0);
+        let h = motion.uvf_heading(&robot(-0.40, -0.30, 0.0), Vec2::ZERO, &world) as f64;
+        assert!(angle_diff(h, 0.3f64.atan2(0.4)) < 0.01, "h={h:.3}");
+    }
+
+    /// Regresión de la pelota de borde: con el target pegado al borde físico (~0.72),
+    /// la dirección apunta al target (no hay paredes virtuales que lo desvíen).
+    #[test]
+    fn ball_against_the_border_is_reachable() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.72, 0.0), Vec2::ZERO);
+        let h = motion.uvf_heading(&robot(0.66, 0.0, 0.0), Vec2::new(0.72, 0.0), &world);
+        assert!(h.abs() < 0.01, "h={h:.3}");
+    }
+
+    #[test]
+    fn no_virtual_walls_near_the_border() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(FAR_BALL, Vec2::ZERO);
+        // Pegado al borde +x con el destino del otro lado: recto al destino.
+        let h = motion.uvf_heading(&robot(0.69, 0.0, 0.0), Vec2::new(-0.5, 0.0), &world) as f64;
+        assert!(angle_diff(h, std::f64::consts::PI) < 0.01, "h={h:.3}");
+        // Pegado al borde −y mirando la pared, destino al centro: recto hacia +y.
+        let h = motion.uvf_heading(&robot(0.0, -0.58, -1.57), Vec2::ZERO, &world) as f64;
+        assert!(angle_diff(h, std::f64::consts::FRAC_PI_2) < 0.01, "h={h:.3}");
+    }
+
+    #[test]
+    fn clustered_obstacles_still_give_a_finite_command() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        for i in 0..3 {
+            let angle = (i as f32) * std::f32::consts::PI * 2.0 / 3.0;
+            world.update_robot(i + 1, 0, Vec2::new(0.05 * angle.cos(), 0.05 * angle.sin()), 0.0, Vec2::ZERO, 0.0);
+        }
+        world.update_ball(Vec2::new(0.0, -0.5), Vec2::ZERO);
+        let target = Vec2::new(0.5, 0.0);
+        let cmd = motion.move_and_face(&robot(0.0, 0.0, 0.0), target, target, &world, 3.0, 0.0, 0.0);
+        assert!(cmd.vx.is_finite() && cmd.vy.is_finite() && cmd.omega.is_finite());
+    }
+
+    #[test]
+    fn arrival_stops_translation_and_faces_the_face_target() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let r = robot(0.0, 0.0, 0.0);
+        let cmd = motion.move_and_face(&r, Vec2::new(0.02, 0.0), Vec2::new(0.0, 0.5), &world, 3.0, 0.0, 0.0);
+        assert_eq!((cmd.vx, cmd.vy), (0.0, 0.0));
+        assert!(cmd.omega > 0.0, "gira hacia face_target (+y)");
+    }
+
+    // ── Rampa de aceleración ───────────────────────────────────────────────
+
+    #[test]
+    fn ramp_limits_the_change_including_the_face_switch() {
+        let motion = bidir();
+        let world = World::new(3, 3);
+        let r = robot(0.0, 0.0, 0.0);
+        let dv = motion.config.max_linear_accel * CONTROL_DT;
+        let mut prev = 0.0;
+        let mut went_negative = false;
+        for k in 0..160 {
+            // Primero hacia adelante; después el destino pasa atrás (cambia la cara).
+            let target = if k < 60 { Vec2::new(0.6, 0.0) } else { Vec2::new(-0.6, 0.0) };
+            let v = v_body(&motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0));
+            assert!((v - prev).abs() <= dv + 1e-12, "salto de {} en el tick {k}", v - prev);
+            went_negative |= v < -0.1;
+            prev = v;
+        }
+        assert!(went_negative, "debe terminar avanzando de espaldas");
+    }
+
+    #[test]
+    fn ramp_does_not_use_the_measured_velocity() {
+        // `velocity` en cero (tracker apagado): la rampa sigue el comando anterior y
+        // llega al perfil (1.2 m/s, destino lejos y alineado) en 1.2 / (a·dt) ticks.
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let r = robot(-0.5, 0.0, 0.0);
+        assert_eq!(r.velocity, Vec2::ZERO);
+        let target = Vec2::new(0.6, 0.0);
+        let first = v_body(&motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0));
+        assert!((first - motion.config.max_linear_accel * CONTROL_DT).abs() < 1e-12);
+        let n = (motion.config.max_linear_speed / (motion.config.max_linear_accel * CONTROL_DT)).ceil() as usize;
+        let mut v = first;
+        for _ in 0..n {
+            v = v_body(&motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0));
+        }
+        assert!((v - motion.config.max_linear_speed).abs() < 1e-9, "v={v}");
+    }
+
+    #[test]
+    fn reset_robot_restarts_the_ramp() {
+        let motion = Motion::new();
+        let world = World::new(3, 3);
+        let r = robot(-0.5, 0.0, 0.0);
+        let target = Vec2::new(0.6, 0.0);
+        for _ in 0..50 {
+            motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0);
+        }
+        motion.reset_robot(0, 0);
+        let v = v_body(&motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0));
+        assert!(v <= motion.config.max_linear_accel * CONTROL_DT + 1e-12, "v={v}");
+    }
+
+    // ── Con la planta diferencial (repro de la investigación del 2026-10-03) ──
+
+    #[test]
+    fn mark_reaches_its_point_while_the_ball_is_elsewhere() {
+        // A1: mirando la pelota y con el destino a ~70°, el robot no avanzaba.
+        let ball = Vec2::new(0.3, 0.3);
+        let target = Vec2::new(-0.3, 0.0);
+        let to_ball = (0.6f64).atan2(0.1).to_degrees();
+        let trace = run(&Case::new(SkillId::Mark, target, (0.2, -0.3, to_ball), ball));
+        let k = trace.first_within(target, 0.05).expect("Mark no llegó");
+        assert!(k < 180, "tardó {:.2} s", k as f64 / 60.0);
+        let last = trace.last();
+        let desired = ((ball.y - last.y) as f64).atan2((ball.x - last.x) as f64);
+        assert!(angle_diff(desired, last.th) < 0.1, "al final mira la pelota");
+        assert!(trace.steps.iter().all(|s| !s.escaping), "sin escapes espurios");
+    }
+
+    #[test]
+    fn short_lateral_goto_does_not_orbit() {
+        let target = Vec2::new(0.0, 0.15);
+        for case in [
+            Case::new(SkillId::GoTo, target, (0.0, 0.0, 0.0), FAR_BALL),
+            Case::new(SkillId::GoTo, target, (0.0, 0.0, 0.0), FAR_BALL).bidirectional(),
+        ] {
+            let trace = run(&case);
+            let k = trace.first_within(target, 0.05).expect("no llegó");
+            assert!(k < 90, "tardó {:.2} s", k as f64 / 60.0);
+            assert!(trace.turn_deg(k) < 150.0, "giro {:.0}°", trace.turn_deg(k));
+            assert!(trace.steps.iter().all(|s| !s.escaping));
+        }
+    }
+
+    #[test]
+    fn approach_aligned_finishes() {
+        // N4: con arrival_threshold ≥ approach_pos_tol, el robot se detenía a 0.058 m
+        // del staging y la skill nunca terminaba.
+        let trace = run(&Case::new(
+            SkillId::ApproachAligned,
+            Vec2::new(0.75, 0.0),
+            (-0.1, -0.35, 90.0),
+            Vec2::ZERO,
+        ));
+        let k = trace.steps.iter().position(|s| s.done).expect("ApproachAligned no terminó");
+        assert!(k < 300, "tardó {:.2} s", k as f64 / 60.0);
+    }
+
+    #[test]
+    fn goto_from_facing_the_wall_does_not_oscillate() {
+        // Pegado al borde mirando la pared, destino al centro (frontal: media vuelta).
+        let target = Vec2::ZERO;
+        let trace = run(&Case::new(SkillId::GoTo, target, (0.0, -0.57, -90.0), FAR_BALL));
+        let k = trace.first_within(target, 0.05).expect("no llegó");
+        assert!(trace.turn_deg(k) < 360.0, "giro {:.0}°", trace.turn_deg(k));
+    }
+
+    #[test]
+    fn plant_approach_then_push_moves_the_ball() {
+        // Banco headless: aproximación detrás de la pelota con move_and_face y empuje con
+        // move_direct + face_to, sobre la planta diferencial y una física simple de pelota.
+        let goal_pos = Vec2::new(0.75_f32, 0.0_f32);
+        let ball_start = Vec2::new(0.1_f32, 0.2_f32);
+        let (kp, ki, kd) = (1.2_f64, 0.0_f64, 0.10_f64);
+        let staging_offset = 0.16_f32;
+        let staging_tol = 0.08_f32;
+        let contact_dist = 0.075_f32;
+        let ball_friction = 0.92_f32;
+
+        let motion = Motion::new();
+        let mut plant = Plant::new(-0.3, 0.15, 60.0);
+        let mut ball_pos = ball_start;
+        let mut ball_vel = Vec2::ZERO;
+        let mut in_capture = false;
+        let mut staged_tick: Option<usize> = None;
+        let mut contact_tick: Option<usize> = None;
+        let mut ball_moved_m = 0.0_f32;
+        for tick in 0..480 {
+            let ball_to_goal = (goal_pos - ball_pos).normalize_or_zero();
+            let staging = ball_pos - ball_to_goal * staging_offset;
+            let mut r = robot(plant.x, plant.y, plant.th);
+            r.velocity = plant.velocity();
+            let pos = r.position;
+            let dist_staging = (staging - pos).length();
+            let along = (pos - ball_pos).dot(goal_pos - ball_pos);
+            if along < 0.02 && dist_staging <= staging_tol {
+                in_capture = true;
+            } else if along > 0.05 {
+                in_capture = false;
+            }
+            if staged_tick.is_none() && in_capture {
+                staged_tick = Some(tick);
+            }
+            let mut world = World::new(3, 3);
+            world.update_ball(ball_pos, Vec2::ZERO);
+            let cmd = if in_capture {
+                let mut c = motion.move_direct(&r, ball_pos + ball_to_goal * 0.12);
+                c.omega = motion.face_to(&r, ball_pos, kp, ki, kd).omega;
+                c
+            } else {
+                let face = if dist_staging < staging_tol * 3.0 { ball_pos } else { staging };
+                motion.move_and_face(&r, staging, face, &world, kp, ki, kd)
+            };
+            plant.step(&cmd);
+            let robot_pos = Vec2::new(plant.x, plant.y);
+            if (ball_pos - robot_pos).length() < contact_dist {
+                contact_tick.get_or_insert(tick);
+                let forward = Vec2::new(plant.th.cos() as f32, plant.th.sin() as f32);
+                ball_vel += forward * (plant.v().max(0.0) as f32) * 0.6 * test_plant::DT as f32;
+            }
+            ball_vel *= ball_friction;
+            let prev = ball_pos;
+            ball_pos += ball_vel * test_plant::DT as f32;
+            ball_moved_m += (ball_pos - prev).length();
+        }
+        let staged = staged_tick.expect("nunca llegó al staging");
+        assert!(contact_tick.is_some(), "nunca tocó la pelota");
+        assert!(ball_moved_m > 0.01, "la pelota no se movió ({ball_moved_m:.4} m)");
+        assert!(staged < 240, "la aproximación tardó {:.2} s", staged as f64 / 60.0);
     }
 
     #[test]
     fn test_move_direct() {
         let motion = Motion::new();
-        let robot = RobotState::new(0, 0);
-        let cmd = motion.move_direct(&robot, Vec2::new(1.0, 0.0));
+        let r = RobotState::new(0, 0);
+        let cmd = motion.move_direct(&r, Vec2::new(1.0, 0.0));
 
         assert_eq!(cmd.id, 0);
         assert!(cmd.vx > 0.0);
@@ -536,340 +803,14 @@ mod tests {
     #[test]
     fn test_motion_pid_persists_state_between_ticks() {
         let motion = Motion::new();
-        let robot = RobotState::new(0, 0);
+        let r = RobotState::new(0, 0);
         let world = World::new(3, 3);
         let target = Vec2::new(1.0, 0.0);
 
-        let cmd_1 = motion.motion(&robot, target, &world, 1.0, 0.4, 1.0, 0.0);
-        let cmd_2 = motion.motion(&robot, target, &world, 1.0, 0.4, 1.0, 0.0);
+        let cmd_1 = motion.motion(&r, target, &world, 1.0, 0.4, 1.0, 0.0);
+        let cmd_2 = motion.motion(&r, target, &world, 1.0, 0.4, 1.0, 0.0);
 
         // Con componente integral no nula, el segundo tick debe acumular al menos el mismo esfuerzo.
         assert!(cmd_2.vx >= cmd_1.vx);
-    }
-
-    /// Verifica que move_to con UVF produce velocidad razonable en trayectoria larga con obstáculo.
-    /// Con dist_to_goal ≈ 0.80m >> BRAKE_DISTANCE, la velocidad base es MAX_LINEAR_SPEED.
-    /// El coupling puede reducirla si el robot debe desviarse, pero debe ser > 0.3 m/s.
-    ///
-    /// Nota: el obstáculo está al **medio** del camino (no pegado al target) para que la
-    /// regla "ignorar obstáculos sobre el destino" no lo filtre y haya deflexión real.
-    #[test]
-    fn test_move_to_speed_with_obstacle_detour() {
-        let motion = Motion::new();
-        let mut world = World::new(3, 3);
-        world.update_robot(1, 0, Vec2::new(0.0, 0.0), 0.0, Vec2::ZERO, 0.0);
-        world.update_ball(Vec2::new(0.0, 0.5), Vec2::ZERO);
-
-        let mut robot = RobotState::new(0, 0);
-        robot.position = Vec2::new(-0.40, 0.0);
-        let target = Vec2::new(0.40, 0.0);
-
-        let cmd = motion.move_to(&robot, target, &world);
-        let speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
-
-        // UVF deflecta alrededor del obstáculo: velocidad > 0 y con dirección desviada del eje X
-        assert!(speed > 0.3, "velocidad {:.3} m/s demasiado baja", speed);
-        // La dirección debe desviarse del eje directo al target (obstáculo en el camino)
-        // vx solo no puede ser la velocidad completa — debe haber componente vy de desviación
-        // (test estructural: si no hay deflexión, cmd.vy ≈ 0; con deflexión, |vy| > threshold)
-    }
-
-    /// Regresión: un robot obstáculo sentado encima del target no debe deflectar al UVF.
-    /// Caso real: vision-sysmic emite un fantasma sobre (0,0) y el robot intenta ir ahí.
-    /// Antes del fix, el UVF tomaba una tangente y mandaba al robot hacia algún arco.
-    /// Después, el obstáculo se filtra (regla simétrica con la pelota) y el comando apunta
-    /// directo al target.
-    #[test]
-    fn test_move_to_ignores_obstacle_on_target() {
-        let motion = Motion::new();
-        let mut world = World::new(3, 3);
-        // Fantasma enemigo plantado en (0,0) — exactamente nuestro target.
-        world.update_robot(0, 1, Vec2::new(0.0, 0.0), 0.0, Vec2::ZERO, 0.0);
-
-        let mut robot = RobotState::new(0, 0);
-        robot.position = Vec2::new(-0.40, -0.30);
-        let target = Vec2::new(0.0, 0.0);
-
-        let cmd = motion.move_to(&robot, target, &world);
-        // Dirección esperada hacia (0,0) desde (-0.40, -0.30): vx > 0 y vy > 0.
-        // Si el fantasma se contara como obstáculo, la tangente del UVF mandaría
-        // al menos una de las componentes al signo contrario.
-        assert!(
-            cmd.vx > 0.0 && cmd.vy > 0.0,
-            "comando hacia el target debe tener vx>0 vy>0, no ({:.3}, {:.3})",
-            cmd.vx,
-            cmd.vy
-        );
-    }
-
-    /// Regresión del bug de la pelota de borde: con el target (pelota) pegado al borde
-    /// físico (~0.72, más allá del campo lógico ±0.70), la pared virtual NO debe agregarse
-    /// del lado del target — si no, el UVF deflectaría tangencial y el robot deslizaría por
-    /// el borde sin cruzar. Con el fix, apunta directo al target.
-    #[test]
-    fn move_to_reaches_target_beyond_wall() {
-        let motion = Motion::new();
-        let mut world = World::new(3, 3);
-        world.update_ball(Vec2::new(0.72, 0.0), Vec2::ZERO); // pelota pegada al borde
-
-        let mut robot = RobotState::new(0, 0);
-        robot.position = Vec2::new(0.66, 0.0); // acercándose al borde +x
-        let target = Vec2::new(0.72, 0.0); // = la pelota
-
-        let cmd = motion.move_to(&robot, target, &world);
-        let angle = (cmd.vy).atan2(cmd.vx);
-        assert!(cmd.vx > 0.0, "debe avanzar hacia el target (+x), vx={:.3}", cmd.vx);
-        assert!(
-            angle.abs() < 0.3,
-            "no debe deslizar por el borde (heading ~0), angle={:.3}",
-            angle
-        );
-    }
-
-    /// La pared virtual sigue activa cuando el target NO está de ese lado: un robot
-    /// pegado a la pared +x con destino al lado opuesto debe deflectar (no ir recto),
-    /// evitando quedarse pegado al borde.
-    #[test]
-    fn move_to_keeps_wall_when_target_elsewhere() {
-        let motion = Motion::new();
-        let world = World::new(3, 3);
-
-        let mut robot = RobotState::new(0, 0);
-        robot.position = Vec2::new(0.69, 0.0); // pegado a la pared +x
-        let target = Vec2::new(-0.5, 0.0); // target del lado opuesto (no tras la pared +x)
-
-        let cmd = motion.move_to(&robot, target, &world);
-        // La pared +x sigue como obstáculo → deflexión tangencial (vy != 0).
-        assert!(
-            cmd.vy.abs() > 0.05,
-            "la pared debe seguir deflectando, vy={:.3}",
-            cmd.vy
-        );
-    }
-
-    /// Verifica que move_to con UVF produce un vector no-cero cuando hay obstáculos cercanos.
-    /// El UVF no tiene un estado "stuck" — siempre calcula una dirección de deflexión tangencial.
-    /// La recuperación de atascos la maneja la capa `motion::BorderRecovery` (wrapper del loop).
-    #[test]
-    fn test_move_to_stuck_recovery() {
-        let motion = Motion::new();
-        let mut world = World::new(3, 3);
-        for i in 0..3 {
-            let angle = (i as f32) * std::f32::consts::PI * 2.0 / 3.0;
-            world.update_robot(
-                i + 1,
-                0,
-                Vec2::new(0.05 * angle.cos(), 0.05 * angle.sin()),
-                0.0,
-                Vec2::ZERO,
-                0.0,
-            );
-        }
-        world.update_ball(Vec2::new(0.0, -0.5), Vec2::ZERO);
-
-        let mut robot = RobotState::new(0, 0);
-        robot.position = Vec2::new(0.0, 0.0);
-        let target = Vec2::new(0.5, 0.0);
-
-        let cmd = motion.move_to(&robot, target, &world);
-        // UVF siempre produce un vector no-cero (deflexión tangencial, no backtrack explícito)
-        let total = cmd.vx.abs() + cmd.vy.abs() + cmd.omega.abs();
-        assert!(
-            total > 0.0,
-            "UVF debe producir comando no-cero aunque haya obstáculos cercanos"
-        );
-    }
-
-    /// Simulación headless completa: approach + pivote + empuje de pelota.
-    /// Modela robot diferencial real (v = vx·cos θ + vy·sin θ) y física simple de pelota.
-    /// Ejecutar con: cargo test test_robot_motion_simulation -- --nocapture
-    #[test]
-    fn test_robot_motion_simulation() {
-        // ── Parámetros (idénticos a main.rs) ────────────────────────────────
-        let goal_pos = Vec2::new(0.75_f32, 0.0_f32);
-        let ball_start = Vec2::new(0.1_f32, 0.2_f32);
-        let start_pos = Vec2::new(-0.3_f32, 0.15_f32);
-        let start_orient = std::f64::consts::PI / 3.0; // 60°
-        let staging_offset = 0.16_f32;
-        let staging_tol = 0.08_f32;
-        // Parámetros idénticos a ApproachBallBehindSkill::new() en skills/mod.rs
-        let kp = 1.2_f64;
-        let ki = 0.0_f64;
-        let kd = 0.10_f64;
-        let n_ticks = 480_usize; // 8s a 60Hz
-
-        // Física de pelota (modelo simple): el robot empuja la pelota al contacto.
-        let contact_dist = 0.075_f32; // radio robot (~4cm) + radio pelota (~2.5cm) + margen
-        let ball_friction = 0.92_f32; // decaimiento de velocidad por tick (~1 - 0.08)
-
-        // ── Setup ────────────────────────────────────────────────────────────
-        let motion = Motion::new();
-        let mut pos = start_pos;
-        let mut orient = start_orient;
-        let mut ball_pos = ball_start;
-        let mut ball_vel = Vec2::ZERO;
-        let mut in_captura = false;
-        let mut staged_tick: Option<usize> = None;
-        let mut contact_tick: Option<usize> = None;
-        let mut ball_moved_m = 0.0_f32;
-
-        println!("\n=== SIMULACIÓN COMPLETA: APPROACH + PIVOTE + EMPUJE (8s @ 60Hz) ===");
-        println!(
-            "robot=({:.2},{:.2}) orient={:.0}°  ball=({:.2},{:.2})  goal=({:.2},{:.2})",
-            start_pos.x,
-            start_pos.y,
-            start_orient.to_degrees(),
-            ball_start.x,
-            ball_start.y,
-            goal_pos.x,
-            goal_pos.y
-        );
-        println!(
-            "{:>6}  {:>14}  {:>14}  {:>6}  {:>6}  {:>6}  {:>8}",
-            "t(s)", "robot(x,y)", "ball(x,y)", "v m/s", "ω r/s", "dstg", "fase"
-        );
-
-        for tick in 0..n_ticks {
-            // ── Recalcular staging en función de la posición actual de la pelota ──
-            let ball_to_goal = (goal_pos - ball_pos).normalize_or_zero();
-            let staging_point = ball_pos - ball_to_goal * staging_offset;
-
-            let mut robot = RobotState::new(0, 0);
-            robot.position = pos;
-            robot.orientation = orient;
-
-            let dist_staging = (staging_point - pos).length();
-            let dot_robot_ball = (pos - ball_pos).dot(goal_pos - ball_pos);
-            let behind_ball = dot_robot_ball < 0.02; // pequeño margen positivo
-            let in_front_of_ball = dot_robot_ball > 0.05; // 5cm delante → salir de CAPTURA
-
-            // ── Histéresis de fase ────────────────────────────────────────────
-            // Entrar: detrás de la pelota Y cerca del staging.
-            // Salir: SOLO cuando el robot está claramente por delante de la pelota.
-            // NO salir por dist_staging: el robot debe empujar todo lo que necesite.
-            if behind_ball && dist_staging <= staging_tol {
-                in_captura = true;
-            } else if in_front_of_ball {
-                in_captura = false;
-            }
-            if staged_tick.is_none() && in_captura {
-                staged_tick = Some(tick);
-            }
-
-            // ── Comandos: en CAPTURA siempre move_direct (el pivote) ─────────
-            // En APPROACH: move_to con path planning (pelota es obstáculo → rodea).
-            // En CAPTURA:  move_direct ignora obstáculos y empuja la pelota directo.
-            //
-            // face_to(ball_pos) en CAPTURA: staging está sobre la línea ball-goal,
-            // así que face_to(ball) ≈ face_to_angle(goal) desde staging.
-            // Además garantiza que el robot apunte a la pelota (v > 0)
-            // y siga al ball cuando se mueve (pivote real).
-            // World con la pelota en su posición real para que move_to la esquive
-            let mut world = World::new(3, 3);
-            world.update_ball(ball_pos, Vec2::ZERO);
-            // En CAPTURA apuntamos 12cm PASADO la pelota (hacia el goal)
-            // para que move_direct no se detenga antes de empujar.
-            let push_target = ball_pos + ball_to_goal * 0.12;
-            let mut cmd = if in_captura {
-                motion.move_direct(&robot, push_target)
-            } else {
-                motion.move_to(&robot, staging_point, &world)
-            };
-
-            // face_to con pre-alineación (idéntico a ApproachBallBehindSkill::tick):
-            // cuando el robot está cerca del staging, empieza a mirar hacia la pelota
-            // para llegar a CAPTURA ya apuntando en la dirección correcta.
-            let pre_align_radius = staging_tol * 3.0; // 0.24m
-            let face_target = if in_captura || dist_staging < pre_align_radius {
-                ball_pos
-            } else {
-                staging_point
-            };
-            let face_cmd = motion.face_to(&robot, face_target, kp, ki, kd);
-            cmd.omega = face_cmd.omega;
-
-            // ── Física del robot (diferencial) ───────────────────────────────
-            let v = cmd.vx * orient.cos() + cmd.vy * orient.sin();
-            pos.x += (v * orient.cos() * CONTROL_DT) as f32;
-            pos.y += (v * orient.sin() * CONTROL_DT) as f32;
-            orient = Motion::normalize_angle(orient + cmd.omega * CONTROL_DT);
-
-            // ── Física de la pelota ───────────────────────────────────────────
-            // Cuando el robot toca la pelota le transfiere impulso en su dirección forward.
-            let dist_ball = (ball_pos - pos).length();
-            if dist_ball < contact_dist {
-                if contact_tick.is_none() {
-                    contact_tick = Some(tick);
-                }
-                let forward = Vec2::new(orient.cos() as f32, orient.sin() as f32);
-                // Transferencia de momento proporcional a la velocidad del robot
-                let impulse = forward * (v.max(0.0) as f32) * 0.6;
-                ball_vel += impulse * CONTROL_DT as f32;
-            }
-            ball_vel *= ball_friction;
-            let prev_ball = ball_pos;
-            ball_pos += ball_vel * CONTROL_DT as f32;
-            ball_moved_m += (ball_pos - prev_ball).length();
-
-            // ── Log cada 30 ticks ────────────────────────────────────────────
-            let fase = if in_captura { "CAPTURA" } else { "APPROACH" };
-            if tick.is_multiple_of(30) {
-                println!(
-                    "{:>6.2}  ({:>5.3},{:>5.3})  ({:>5.3},{:>5.3})  {:>6.3}  {:>6.3}  {:>6.3}  {}",
-                    tick as f64 * CONTROL_DT,
-                    pos.x,
-                    pos.y,
-                    ball_pos.x,
-                    ball_pos.y,
-                    v,
-                    cmd.omega,
-                    dist_staging,
-                    fase
-                );
-            }
-        }
-
-        // ── Métricas finales ─────────────────────────────────────────────────
-        let ball_dist_to_goal = (ball_pos - goal_pos).length();
-        let ball_progress = {
-            let initial = (ball_start - goal_pos).length();
-            let final_d = ball_dist_to_goal;
-            ((initial - final_d) / initial * 100.0).max(0.0)
-        };
-        println!("\n── RESULTADOS ──────────────────────────────────────────────────────");
-        println!(
-            "  Staging alcanzado: {}",
-            staged_tick
-                .map(|t| format!("SÍ en t={:.2}s", t as f64 * CONTROL_DT))
-                .unwrap_or("NO".to_string())
-        );
-        println!(
-            "  Primer contacto:   {}",
-            contact_tick
-                .map(|t| format!("SÍ en t={:.2}s", t as f64 * CONTROL_DT))
-                .unwrap_or("NO".to_string())
-        );
-        println!("  Pelota se movió:   {:.3}m total", ball_moved_m);
-        println!(
-            "  Pelota final:      ({:.3},{:.3})  dist_goal={:.3}m",
-            ball_pos.x, ball_pos.y, ball_dist_to_goal
-        );
-        println!("  Progreso al goal:  {:.1}%", ball_progress);
-        println!(
-            "  Robot final:       ({:.3},{:.3}) orient={:.1}°\n",
-            pos.x,
-            pos.y,
-            orient.to_degrees()
-        );
-
-        assert!(staged_tick.is_some(), "Robot nunca llegó al staging point");
-        assert!(contact_tick.is_some(), "Robot nunca tocó la pelota");
-        assert!(
-            ball_moved_m > 0.01,
-            "Pelota no se movió (moved={:.4}m)",
-            ball_moved_m
-        );
-        let staged_s = staged_tick.unwrap() as f64 * CONTROL_DT;
-        assert!(staged_s < 4.0, "Approach tardó demasiado: {:.2}s", staged_s);
     }
 }

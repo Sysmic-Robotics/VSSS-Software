@@ -35,7 +35,9 @@ impl UniVectorField {
     ///
     /// # Algoritmo
     /// 1. Vector atractivo: dirección unitaria hacia target.
-    /// 2. Por cada obstáculo dentro de `influence_radius`:
+    /// 2. Por cada obstáculo dentro de `influence_radius` y **por delante** respecto del
+    ///    target (`f_att · (obstáculo − robot) > 0`; uno a la espalda no estorba, y
+    ///    desviar por él hace que la tangente cambie de lado con milímetros de movimiento):
     ///    - Calcular peso `w = ((r0 - d) / r0)²` — cae a 0 en el borde de influencia.
     ///    - Deflexión tangencial: rotar el vector radial ±90° eligiendo el lado que
     ///      más se alinea con el target (avance > retroceso).
@@ -59,6 +61,10 @@ impl UniVectorField {
             let d = to_robot.length();
 
             if d < f32::EPSILON || d >= self.influence_radius {
+                continue;
+            }
+            // Solo desvían los obstáculos que están por delante respecto del target.
+            if f_att.dot(-to_robot) <= 0.0 {
                 continue;
             }
 
@@ -138,6 +144,14 @@ mod tests {
             "debe deflectar alrededor del obstáculo, angle={:.3}",
             angle
         );
+    }
+
+    #[test]
+    fn test_uvf_ignores_obstacle_behind() {
+        // Obstáculo a 0.10 m detrás del robot respecto del target: dirección recta.
+        let uvf = UniVectorField::new();
+        let angle = uvf.compute(Vec2::ZERO, Vec2::new(1.0, 0.0), &[Vec2::new(-0.10, 0.02)]);
+        assert!(angle.abs() < 0.01, "un obstáculo a la espalda no desvía, angle={angle:.3}");
     }
 
     #[test]

@@ -151,6 +151,9 @@ pub struct SkillCatalog {
     spin_kick: Vec<SpinKickSkill>,
     mark: Vec<MarkSkill>,
     hold: Vec<StopSkill>,
+    /// Última skill despachada por robot: al cambiar, se reinicia el estado de control
+    /// de motion de ese robot (PID de heading, rampa del avance).
+    last_skill: Vec<Option<SkillId>>,
     config: SkillConfig,
 }
 
@@ -212,6 +215,7 @@ impl SkillCatalog {
             spin_kick,
             mark,
             hold,
+            last_skill: vec![None; num_robots],
             config,
         }
     }
@@ -338,6 +342,12 @@ impl SkillCatalog {
             robot_id,
             self.num_robots()
         );
+
+        if self.last_skill[robot_id] != Some(skill_id) {
+            // Cambio de skill: sin integral ni derivada heredadas, rampa desde cero.
+            motion.reset_robot(robot.team, robot.id);
+            self.last_skill[robot_id] = Some(skill_id);
+        }
 
         match skill_id {
             SkillId::GoTo => {
@@ -661,6 +671,44 @@ mod tests {
         // Los comandos pueden parecerse en magnitud pero el estado del PID es
         // distinto — verificamos al menos que ambos producen output válido.
         assert!(cmd_a_after.vx.abs() + cmd_a_after.omega.abs() > 0.0);
+    }
+
+    #[test]
+    fn skill_change_resets_heading_pid() {
+        // 300 ticks de FacePoint con error constante de 90° dejan integral y derivada
+        // cargadas. Al pasar a Mark ya en su punto, mirando la pelota de frente (error 0),
+        // el primer tick no debe heredar nada: ω = 0.
+        let mut catalog = SkillCatalog::new(3);
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::new(0.5, 0.0), Vec2::ZERO);
+        let motion = Motion::new();
+        let robot = make_robot(0, 0.0, 0.0, 0.0);
+        for _ in 0..300 {
+            catalog.tick(0, SkillId::FacePoint, Vec2::new(0.0, 0.5), &robot, &world, &motion);
+        }
+        let cmd = catalog.tick(0, SkillId::Mark, Vec2::ZERO, &robot, &world, &motion);
+        assert_eq!(cmd.omega, 0.0, "estado heredado de la skill anterior: ω={}", cmd.omega);
+    }
+
+    #[test]
+    fn skill_change_of_one_robot_keeps_the_others_state() {
+        // El robot 1 corre FacePoint en dos catálogos idénticos; en uno de ellos el
+        // robot 0 cambia de skill en el medio. El comando siguiente del robot 1 es el mismo.
+        let world = World::new(3, 3);
+        let r0 = make_robot(0, 0.0, 0.0, 0.0);
+        let r1 = make_robot(1, 0.3, 0.0, 0.0);
+        let face = Vec2::new(0.3, 0.5);
+        let (mut a, mut b) = (SkillCatalog::new(3), SkillCatalog::new(3));
+        let (ma, mb) = (Motion::new(), Motion::new());
+        for k in 0..60 {
+            a.tick(1, SkillId::FacePoint, face, &r1, &world, &ma);
+            b.tick(1, SkillId::FacePoint, face, &r1, &world, &mb);
+            let s0 = if k < 30 { SkillId::GoTo } else { SkillId::FacePoint };
+            a.tick(0, s0, Vec2::new(0.4, 0.2), &r0, &world, &ma);
+        }
+        let ca = a.tick(1, SkillId::FacePoint, face, &r1, &world, &ma);
+        let cb = b.tick(1, SkillId::FacePoint, face, &r1, &world, &mb);
+        assert_eq!(ca.omega, cb.omega);
     }
 
     #[test]

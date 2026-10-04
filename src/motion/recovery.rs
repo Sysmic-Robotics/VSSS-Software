@@ -1,15 +1,18 @@
 //! Capa de recuperación de atasco (wrapper del control loop).
 //!
 //! Envuelve la salida de las skills (`MotionCommand`) sin modificarlas: si el robot se
-//! atasca (comandado a moverse pero sin avanzar durante N ticks — p. ej. un empujón de
-//! rival), ejecuta una maniobra de escape wall-aware (reversa alejándose de la pared +
-//! giro hacia el interior). La evasión de pared en operación normal la hace la navegación
-//! (UVF), que conoce el target; esta capa es solo recuperación de último recurso.
+//! atasca (se le comanda avanzar pero su pose medida no avanza durante una ventana de
+//! ticks — p. ej. un empujón de rival o la pared física), ejecuta una maniobra de escape
+//! wall-aware (reversa alejándose de la pared + giro hacia el interior). Es solo
+//! recuperación de último recurso: la navegación ya va hacia el destino.
+//!
+//! Recibe el comando ya filtrado por el `ZoneGuard` y su salida vuelve a pasar por él
+//! (`control_loop::apply_reflexes`).
 //!
 //! Es un reflejo de bajo nivel común a coach clásico y RL; conmutable por
 //! `VSSL_BORDER_RECOVERY` (default on). No toca manual ni estop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use glam::Vec2;
 
@@ -23,30 +26,34 @@ const FIELD_HALF_Y: f32 = 0.65;
 /// Franja (m) desde la pared física dentro de la cual se considera "junto al borde".
 const BORDER_BAND: f32 = 0.10;
 
-/// Ticks moviéndose por debajo del umbral (mientras se le comanda avanzar) para
-/// declarar atasco (~0.5 s @ 60 Hz).
-const STUCK_TICKS: u32 = 30;
+/// Ventana de detección (ticks, ~0.5 s @ 60 Hz): en cada uno de estos ticks se le
+/// comandó avanzar y el desplazamiento neto de la pose medida en la ventana fue chico.
+const STUCK_TICKS: usize = 30;
 /// Duración de la maniobra de escape una vez disparada (ticks).
 const RECOVERY_TICKS: u32 = 25;
-/// Movimiento medido por tick por debajo del cual se cuenta como "no avanza" (m).
-const STUCK_MOVE_EPS: f32 = 0.006;
-/// Rapidez comandada mínima (m/s) para considerar que "se le pidió moverse".
-const CMD_MOVE_EPS: f64 = 0.05;
+/// Velocidad del cuerpo comandada (proyección del comando al heading, m/s) desde la que
+/// "se le pidió avanzar". Girar en el lugar no cuenta, aunque el comando tenga
+/// componente en mundo.
+const CMD_BODY_EPS: f64 = 0.10;
+/// Desplazamiento NETO máximo de la pose medida en la ventana (m) para declarar atasco:
+/// 0.03 m en 0.5 s = 0.06 m/s. Es la distancia entre la primera y la última pose de la
+/// ventana, no el largo del camino: el jitter del ruido de cámara no se acumula. Se
+/// mide sobre la pose y no sobre la velocidad del EKF, que con el tracker apagado
+/// (`VSSL_TRACKER=off`) vale cero.
+const STUCK_NET_DISP: f32 = 0.03;
 /// Rapidez (m/s) de la reversa de escape (world frame, alejándose de la pared).
 const ESCAPE_SPEED: f64 = 0.4;
 /// Velocidad angular (rad/s) del giro de escape hacia el interior.
 const ESCAPE_OMEGA: f64 = 6.0;
 
 /// Estado de recuperación por robot.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct RecoveryState {
-    stuck_ticks: u32,
+    /// Poses medidas de los últimos ticks consecutivos con avance comandado.
+    window: VecDeque<Vec2>,
     recovery_ticks: u32,
-    last_pos: Vec2,
     /// Dirección de escape fija durante la ventana de recuperación (unit, world).
     escape_dir: Vec2,
-    /// `last_pos` ya inicializado.
-    seen: bool,
 }
 
 /// Dirección unitaria de alejamiento de la pared más cercana. En esquina combina
@@ -104,70 +111,70 @@ impl BorderRecovery {
         Self::new(enabled)
     }
 
-    /// Aplica prevención + recuperación a un comando, dado el estado medido del robot.
-    /// Modifica `cmd` en el lugar. Función central, testeable sin el loop.
-    pub fn guard(&mut self, cmd: &mut MotionCommand, robot: &RobotState) {
+    /// Aplica detección + recuperación a un comando, dado el estado medido del robot.
+    /// Modifica `cmd` en el lugar y devuelve `true` si en este tick lo reemplazó por la
+    /// maniobra de escape. Función central, testeable sin el loop.
+    pub fn guard(&mut self, cmd: &mut MotionCommand, robot: &RobotState) -> bool {
         if !self.enabled {
-            return;
+            return false;
         }
         let pos = robot.position;
         let st = self.states.entry((robot.team, robot.id)).or_default();
-
-        // Primera observación: inicializa `last_pos` sin declarar atasco.
-        if !st.seen {
-            st.seen = true;
-            st.last_pos = pos;
-        }
 
         // Ventana de escape activa: forzar la maniobra, ignorar el comando de la skill.
         if st.recovery_ticks > 0 {
             st.recovery_ticks -= 1;
             apply_escape(cmd, st.escape_dir, robot);
-            st.last_pos = pos;
-            return;
+            return true;
         }
 
-        // Detección por resultado: se le pide moverse pero no avanza.
-        let cmd_speed = (cmd.vx * cmd.vx + cmd.vy * cmd.vy).sqrt();
-        let moved = (pos - st.last_pos).length();
-        st.last_pos = pos;
-        if cmd_speed > CMD_MOVE_EPS && moved < STUCK_MOVE_EPS {
-            st.stuck_ticks += 1;
-        } else {
-            st.stuck_ticks = 0;
+        // Detección por resultado: avance comandado en el heading, pose que no avanza.
+        let th = robot.orientation;
+        let v_body = (cmd.vx * th.cos() + cmd.vy * th.sin()).abs();
+        if !v_body.is_finite() || v_body <= CMD_BODY_EPS {
+            st.window.clear();
+            return false;
         }
-
-        if st.stuck_ticks >= STUCK_TICKS {
-            st.stuck_ticks = 0;
-            st.recovery_ticks = RECOVERY_TICKS;
-            st.escape_dir = outward_from_nearest_wall(pos);
-            apply_escape(cmd, st.escape_dir, robot);
+        st.window.push_back(pos);
+        if st.window.len() > STUCK_TICKS {
+            st.window.pop_front();
         }
-        // Sin atasco: pass-through. La evasión de pared es responsabilidad de la
-        // navegación (UVF), que conoce el target (p. ej. pelota pegada al borde); una
-        // prevención aquí sería target-ciega y bloquearía ese acercamiento.
+        let stuck = st.window.len() == STUCK_TICKS
+            && (pos - st.window[0]).length() < STUCK_NET_DISP;
+        if !stuck {
+            // Sin atasco: pass-through.
+            return false;
+        }
+        st.window.clear();
+        st.recovery_ticks = RECOVERY_TICKS;
+        st.escape_dir = outward_from_nearest_wall(pos);
+        apply_escape(cmd, st.escape_dir, robot);
+        true
     }
 
     /// Aplica `guard` a todos los comandos del equipo propio con comando autónomo,
     /// saltando los robots en control manual y los que no tienen estado de visión.
+    /// Devuelve, paralelo a `commands`, si cada uno quedó en maniobra de escape.
     pub fn guard_commands(
         &mut self,
         commands: &mut [MotionCommand],
         world: &crate::world::World,
         manual_keys: &std::collections::HashSet<(i32, i32)>,
         own_team: i32,
-    ) {
+    ) -> Vec<bool> {
+        let mut escaping = vec![false; commands.len()];
         if !self.enabled {
-            return;
+            return escaping;
         }
-        for cmd in commands.iter_mut() {
+        for (cmd, esc) in commands.iter_mut().zip(escaping.iter_mut()) {
             if cmd.team != own_team || manual_keys.contains(&(cmd.team, cmd.id)) {
                 continue;
             }
             if let Some(robot) = world.get_robot_state(cmd.id, cmd.team) {
-                self.guard(cmd, robot);
+                *esc = self.guard(cmd, robot);
             }
         }
+        escaping
     }
 }
 
@@ -213,18 +220,34 @@ mod tests {
         }
     }
 
+    /// Corre `ticks` ticks con el comando `(vx, vy)` y la pose que devuelve `pose(k)`;
+    /// devuelve el primer tick con escape, si hubo.
+    fn first_escape(
+        ticks: usize,
+        vx: f64,
+        vy: f64,
+        mut pose: impl FnMut(usize) -> Vec2,
+    ) -> Option<usize> {
+        let mut rec = BorderRecovery::new(true);
+        (0..ticks).find(|&k| {
+            let robot = robot_at(pose(k));
+            let mut cmd = cmd_at(vx, vy);
+            rec.guard(&mut cmd, &robot)
+        })
+    }
+
     // ── Sin prevención target-ciega ───────────────────────────────────────────
 
     #[test]
     fn near_border_not_stuck_is_passthrough() {
         // Junto al borde +x con velocidad hacia la pared, pero avanzando (no atascado):
-        // el comando pasa SIN recorte (la evasión de pared la hace el UVF, no esta capa).
+        // el comando pasa SIN recorte.
         let mut rec = BorderRecovery::new(true);
         let mut pos = Vec2::new(0.66, 0.0);
         for _ in 0..10 {
             let robot = robot_at(pos);
             let mut cmd = cmd_at(0.5, 0.2);
-            rec.guard(&mut cmd, &robot);
+            assert!(!rec.guard(&mut cmd, &robot));
             assert_eq!(cmd.vx, 0.5, "sin atasco no debe recortar la velocidad");
             assert_eq!(cmd.vy, 0.2);
             pos.x += 0.02; // avanza (no se atasca)
@@ -254,35 +277,97 @@ mod tests {
         }
         // Tras superar el umbral, el comando es de escape: reversa (vx<0, alejándose).
         let mut cmd = cmd_at(0.6, 0.0);
-        rec.guard(&mut cmd, &robot);
+        assert!(rec.guard(&mut cmd, &robot));
         assert!(cmd.vx < 0.0, "el escape debe alejar de la pared +x: {}", cmd.vx);
     }
 
     #[test]
+    fn blocked_robot_escapes_after_the_window() {
+        // Bloqueado con v del cuerpo 0.3 m/s: el escape llega en el tick 30 (índice 29).
+        let k = first_escape(60, 0.3, 0.0, |_| Vec2::new(-0.2, 0.1));
+        assert_eq!(k, Some(STUCK_TICKS - 1));
+    }
+
+    #[test]
     fn advancing_robot_is_passthrough() {
+        // Comando 0.3 m/s, la pose avanza a 0.2 m/s durante 60 ticks: sin escape.
+        assert_eq!(
+            first_escape(60, 0.3, 0.0, |k| Vec2::new(-0.2 + 0.2 * k as f32 / 60.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn turning_in_place_is_not_stuck() {
+        // Comando con componente en mundo (0.264 m/s, el coupling viejo) pero
+        // perpendicular al heading: no hay avance comandado, no hay atasco.
+        assert_eq!(first_escape(90, 0.0, 0.264, |_| Vec2::new(0.1, 0.1)), None);
+    }
+
+    #[test]
+    fn accelerating_from_rest_is_not_stuck() {
+        // Comando 1.2 m/s, la pose acelera a 1.2 m/s² (lo medido en FIRASim).
+        assert_eq!(
+            first_escape(60, 1.2, 0.0, |k| {
+                let t = k as f32 / 60.0;
+                Vec2::new(-0.5 + 0.5 * 1.2 * t * t, 0.0)
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn tracker_off_does_not_cause_escapes() {
+        // `velocity` del estado en cero (tracker apagado) pero la pose avanza a 0.3 m/s:
+        // el detector mira la pose, no la velocidad del EKF.
         let mut rec = BorderRecovery::new(true);
-        // Avanza pero se mantiene lejos del borde (x sube de -0.2 a 0.4 < franja).
-        let mut pos = Vec2::new(-0.2, 0.0);
-        for _ in 0..30 {
-            let robot = robot_at(pos);
-            let mut cmd = cmd_at(0.6, 0.0);
-            rec.guard(&mut cmd, &robot);
-            // Lejos del borde y avanzando: comando intacto, sin escape.
-            assert_eq!(cmd.vx, 0.6);
-            assert_eq!(cmd.omega, 0.0);
-            pos.x += 0.02;
+        for k in 0..90 {
+            let robot = robot_at(Vec2::new(-0.3 + 0.3 * k as f32 / 60.0, 0.0));
+            assert_eq!(robot.velocity, Vec2::ZERO);
+            let mut cmd = cmd_at(0.3, 0.0);
+            assert!(!rec.guard(&mut cmd, &robot), "escape espurio en el tick {k}");
         }
     }
 
     #[test]
+    fn camera_noise_does_not_hide_a_stuck_robot() {
+        // Pose fija + ruido gaussiano con el σ del proxy (1.85 mm por eje): el
+        // desplazamiento NETO de la ventana sigue chico y el atasco se detecta. Con el
+        // largo del camino, el jitter sumaría varios cm y lo taparía.
+        let sigma = crate::params::VisionParams::default().proxy_sigma_pos_m as f32;
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut gauss = move || {
+            // xorshift64* + Box-Muller (semilla fija → determinista).
+            let mut next = || {
+                rng ^= rng >> 12;
+                rng ^= rng << 25;
+                rng ^= rng >> 27;
+                ((rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64)
+                    .max(1e-12)
+            };
+            let (u1, u2) = (next(), next());
+            ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
+        };
+        let mut path = 0.0f32;
+        let mut prev = Vec2::new(-0.2, 0.1);
+        let k = first_escape(60, 0.3, 0.0, |_| {
+            let p = Vec2::new(-0.2 + sigma * gauss(), 0.1 + sigma * gauss());
+            path += (p - prev).length();
+            prev = p;
+            p
+        });
+        assert_eq!(k, Some(STUCK_TICKS - 1), "el ruido no debe tapar el atasco");
+        assert!(path > STUCK_NET_DISP, "el largo del camino ({path:.3} m) sí lo habría tapado");
+    }
+
+    #[test]
     fn zero_command_is_passthrough_even_at_wall() {
-        // Comando en cero (p. ej. estop): no hay "comandado a moverse" → sin escape,
-        // y la proyección no recorta nada (velocidad nula).
+        // Comando en cero (p. ej. estop): no hay "comandado a moverse" → sin escape.
         let mut rec = BorderRecovery::new(true);
         let robot = robot_at(Vec2::new(FIELD_HALF_X - 0.01, 0.0));
         for _ in 0..(STUCK_TICKS + 5) {
             let mut cmd = cmd_at(0.0, 0.0);
-            rec.guard(&mut cmd, &robot);
+            assert!(!rec.guard(&mut cmd, &robot));
             assert_eq!((cmd.vx, cmd.vy, cmd.omega), (0.0, 0.0, 0.0));
         }
     }
@@ -297,12 +382,12 @@ mod tests {
         world.update_robot(0, 0, Vec2::new(FIELD_HALF_X - 0.03, 0.0), 0.0, Vec2::ZERO, 0.0);
 
         let mut rec = BorderRecovery::new(true);
-        let manual: std::collections::HashSet<(i32, i32)> =
-            [(0, 0)].into_iter().collect();
+        let manual: std::collections::HashSet<(i32, i32)> = [(0, 0)].into_iter().collect();
         let mut cmds = vec![cmd_at(0.6, 0.0)];
-        rec.guard_commands(&mut cmds, &world, &manual, 0);
-        // Está en manual → no se toca (ni proyección ni escape), pese a estar al borde.
+        let esc = rec.guard_commands(&mut cmds, &world, &manual, 0);
+        // Está en manual → no se toca, pese a estar al borde.
         assert_eq!(cmds[0].vx, 0.6, "robot manual no debe modificarse");
+        assert_eq!(esc, vec![false]);
     }
 
     // ── Flag off ─────────────────────────────────────────────────────────────
@@ -314,7 +399,7 @@ mod tests {
         let robot = robot_at(pos);
         for _ in 0..(STUCK_TICKS + 5) {
             let mut cmd = cmd_at(0.6, 0.3);
-            rec.guard(&mut cmd, &robot);
+            assert!(!rec.guard(&mut cmd, &robot));
             assert_eq!(cmd.vx, 0.6, "deshabilitado no debe modificar el comando");
             assert_eq!(cmd.vy, 0.3);
         }
