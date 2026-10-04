@@ -19,7 +19,8 @@ use glam::Vec2;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-const CONTROL_DT: f64 = 0.016; // ~60 Hz
+/// Paso de control de motion (s, ~60 Hz): la rampa limita el avance a `max_linear_accel · CONTROL_DT` por tick.
+pub const CONTROL_DT: f64 = 0.016;
 
 /// Parámetros tunables del sistema de movimiento.
 /// `MotionConfig::default()` toma los defaults de `params::MotionParams`;

@@ -532,6 +532,7 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
         radio_target: args.transport,
         max_ticks,
         vision_timeout,
+        referee: None,
     };
 
     // Logger compartido (si --log presente).

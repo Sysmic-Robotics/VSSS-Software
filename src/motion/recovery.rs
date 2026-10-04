@@ -111,6 +111,13 @@ impl BorderRecovery {
         Self::new(enabled)
     }
 
+    /// Vacía el estado de todos los robots (ventanas de detección y maniobras de escape en
+    /// curso). El control loop la llama mientras el equipo está detenido (parada de
+    /// emergencia, HALT o STOP), para que al retomar no continúe un escape interrumpido.
+    pub fn reset(&mut self) {
+        self.states.clear();
+    }
+
     /// Aplica detección + recuperación a un comando, dado el estado medido del robot.
     /// Modifica `cmd` en el lugar y devuelve `true` si en este tick lo reemplazó por la
     /// maniobra de escape. Función central, testeable sin el loop.
@@ -279,6 +286,20 @@ mod tests {
         let mut cmd = cmd_at(0.6, 0.0);
         assert!(rec.guard(&mut cmd, &robot));
         assert!(cmd.vx < 0.0, "el escape debe alejar de la pared +x: {}", cmd.vx);
+    }
+
+    #[test]
+    fn reset_drops_an_escape_in_progress() {
+        let mut rec = BorderRecovery::new(true);
+        let robot = robot_at(Vec2::new(FIELD_HALF_X - 0.03, 0.0));
+        for _ in 0..(STUCK_TICKS + 1) {
+            rec.guard(&mut cmd_at(0.6, 0.0), &robot);
+        }
+        assert!(rec.guard(&mut cmd_at(0.6, 0.0), &robot), "en escape");
+        rec.reset();
+        let mut cmd = cmd_at(0.6, 0.0);
+        assert!(!rec.guard(&mut cmd, &robot), "tras reset no sigue el escape");
+        assert_eq!(cmd.vx, 0.6);
     }
 
     #[test]

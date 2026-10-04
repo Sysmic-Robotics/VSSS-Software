@@ -240,6 +240,7 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         radio_target,
         max_ticks: None,
         vision_timeout: None,
+        referee: Some(referee.clone()),
     };
 
     let gui = gui_channels.map(

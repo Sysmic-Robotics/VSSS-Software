@@ -229,6 +229,7 @@ async fn async_run(
         radio_target: transport,
         max_ticks,
         vision_timeout: None,
+        referee: None,
     };
 
     let mut csv: Option<CsvLogger> = match &log {

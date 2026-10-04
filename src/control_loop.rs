@@ -9,7 +9,7 @@
 //! comportarse idéntico al correrla bajo `main` con el mismo target.
 
 use crate::GUI;
-use crate::coach::{Coach, Observation, SkillChoice};
+use crate::coach::{Coach, Foul, Observation, SharedReferee, SkillChoice};
 use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig};
 use crate::radio::{RadioTarget, TransportError};
 use crate::skills::zones::ZoneGuard;
@@ -44,6 +44,33 @@ pub struct ControlLoopConfig {
     pub max_ticks: Option<u32>,
     /// Si está presente y no llegan paquetes de visión en esa ventana, abort con error.
     pub vision_timeout: Option<Duration>,
+    /// Estado del árbitro (listener de `coach::referee`). Con HALT el loop detiene al
+    /// equipo propio y con STOP solo deja corregir la orientación (ver `TickMode`).
+    /// `None` = sin árbitro: el loop no lo consulta.
+    pub referee: Option<SharedReferee>,
+}
+
+/// Qué hace el loop con el equipo propio en un tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickMode {
+    /// Juego: decider → skills → reflejos.
+    Play,
+    /// STOP del árbitro (§9.5, "mantener y solo corregir orientación"): decider y
+    /// skills, pero traslación cero, la `omega` de cada skill y sin reflejos.
+    Stop,
+    /// HALT del árbitro o parada de emergencia: cero a todos los ids propios, sin
+    /// decider, sin skills y sin reflejos.
+    Halt,
+}
+
+/// Modo que impone el árbitro según su último comando (`Play` sin árbitro o con el lock
+/// envenenado).
+pub fn referee_mode(referee: &Option<SharedReferee>) -> TickMode {
+    match referee.as_ref().and_then(|r| r.lock().ok().map(|s| s.command.foul)) {
+        Some(Foul::Halt) => TickMode::Halt,
+        Some(Foul::Stop) => TickMode::Stop,
+        _ => TickMode::Play,
+    }
 }
 
 /// Información disponible al hook `on_tick` para logging externo. El loop común
@@ -210,28 +237,110 @@ pub fn apply_reflexes(
     escaping
 }
 
-fn zero_commands_for_active_team(
+/// Modo del tick: la parada de emergencia toma el camino de HALT, prevalezca lo que
+/// diga el árbitro.
+pub fn tick_mode(estop_engaged: bool, ref_mode: TickMode) -> TickMode {
+    if estop_engaged { TickMode::Halt } else { ref_mode }
+}
+
+/// Comando cero para cada id del equipo propio en `0..num_robots`, lo vea o no la visión
+/// (la orientación, informativa, sale de la visión si el robot está). Así el camino de
+/// parada siempre emite un frame en cero: sin comandos el loop no envía nada y la base
+/// station repite el último comando (no tiene timeout de serial).
+fn zero_commands_for_team(
     world: &World,
     own_team: i32,
+    num_robots: usize,
 ) -> (Vec<MotionCommand>, Vec<Option<Vec2>>) {
-    let team_robots = if own_team == 0 {
-        world.get_blue_team_active()
-    } else {
-        world.get_yellow_team_active()
-    };
-    let cmds: Vec<MotionCommand> = team_robots
-        .iter()
-        .map(|r| MotionCommand {
-            id: r.id,
-            team: r.team,
+    let cmds: Vec<MotionCommand> = (0..num_robots as i32)
+        .map(|id| MotionCommand {
+            id,
+            team: own_team,
             vx: 0.0,
             vy: 0.0,
             omega: 0.0,
-            orientation: r.orientation,
+            orientation: world.get_robot_state(id, own_team).map_or(0.0, |r| r.orientation),
         })
         .collect();
     let tgts = vec![None; cmds.len()];
     (cmds, tgts)
+}
+
+/// STOP: traslación cero y la `omega` de cada comando propio; los ids sin comando reciben
+/// cero (ver `zero_commands_for_team`).
+fn stop_translation(
+    cmds: &mut Vec<MotionCommand>,
+    tgts: &mut Vec<Option<Vec2>>,
+    world: &World,
+    own_team: i32,
+    num_robots: usize,
+) {
+    for c in cmds.iter_mut().filter(|c| c.team == own_team) {
+        c.vx = 0.0;
+        c.vy = 0.0;
+    }
+    let (zeros, _) = zero_commands_for_team(world, own_team, num_robots);
+    for z in zeros {
+        if !cmds.iter().any(|c| c.team == z.team && c.id == z.id) {
+            cmds.push(z);
+            tgts.push(None);
+        }
+    }
+}
+
+/// Comandos de un tick: `(comandos, targets, choices aplicadas, en escape)`.
+///
+/// - `Play`: decider → overrides de GUI → skills → control manual → reflejos.
+/// - `Stop`: igual sin reflejos, con traslación cero (`stop_translation`).
+/// - `Halt`: cero a todos los ids propios, sin decider, skills ni reflejos.
+///
+/// En `Stop` y `Halt` vacía la recuperación de atasco y el catálogo olvida la última
+/// skill de cada robot: al volver a `Play` no queda un escape interrumpido, la rampa
+/// arranca de cero y cada skill se reinicia.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tick_commands(
+    mode: TickMode,
+    world: &World,
+    decider: &mut dyn TickDecider,
+    tick: u32,
+    catalog: &mut SkillCatalog,
+    motion: &Motion,
+    recovery: &mut BorderRecovery,
+    zone_guard: &ZoneGuard,
+    manual_state: &HashMap<(i32, i32), (ManualCommand, u32)>,
+    skill_state: &HashMap<(i32, i32), (GuiSkillCommand, u32)>,
+    own_team: i32,
+    num_robots: usize,
+) -> (Vec<MotionCommand>, Vec<Option<Vec2>>, Vec<SkillChoice>, Vec<bool>) {
+    if mode == TickMode::Halt {
+        recovery.reset();
+        catalog.forget_last_skills();
+        let (cmds, tgts) = zero_commands_for_team(world, own_team, num_robots);
+        let esc = vec![false; cmds.len()];
+        return (cmds, tgts, Vec::new(), esc);
+    }
+    // Override en vivo de la velocidad de Spin desde la GUI (por robot).
+    for ((team, id), (cmd, _)) in skill_state {
+        if *team == own_team && cmd.skill_id == SkillId::Spin {
+            catalog.set_spin_omega_for(*id as usize, cmd.spin_omega);
+        }
+    }
+    let mut choices = decider.decide(tick, world);
+    apply_gui_skill_overrides(&mut choices, skill_state, own_team);
+    let (mut cmds, mut tgts, applied) = dispatch_choices(&choices, catalog, world, motion, own_team);
+    apply_manual_overrides(&mut cmds, &mut tgts, manual_state, world);
+    if mode == TickMode::Stop {
+        recovery.reset();
+        catalog.forget_last_skills();
+        stop_translation(&mut cmds, &mut tgts, world, own_team, num_robots);
+        let esc = vec![false; cmds.len()];
+        return (cmds, tgts, applied, esc);
+    }
+    // Reflejos de bajo nivel (áreas y atasco) sobre los comandos autónomos del equipo
+    // propio (salta manual).
+    let manual_keys: HashSet<(i32, i32)> = manual_state.keys().copied().collect();
+    let esc = apply_reflexes(&mut cmds, world, recovery, zone_guard, &manual_keys, own_team);
+    (cmds, tgts, applied, esc)
 }
 
 /// Límites físicos de la cancha VSSS con margen (m). Fuera de esto la fuente de
@@ -616,6 +725,7 @@ pub async fn run_control_loop(
         crate::params::params().coach.keeper_id,
     );
     let mut field_scale_warned = false;
+    let mut halted_prev = false;
     let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
     let started = Instant::now();
@@ -677,12 +787,23 @@ pub async fn run_control_loop(
                 .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
         }
 
-        // Parada de emergencia: prevalece sobre coach/manual/skills.
+        // Parada de emergencia y HALT del árbitro: prevalecen sobre coach/manual/skills
+        // (mismo camino). STOP: solo corregir orientación (ver `TickMode`).
         let estop_engaged = estop
             .as_ref()
             .map(|e| e.load(Ordering::Relaxed))
             .unwrap_or(false);
-        if estop_engaged {
+        let ref_mode = referee_mode(&config.referee);
+        if (ref_mode == TickMode::Halt) != halted_prev {
+            halted_prev = ref_mode == TickMode::Halt;
+            if halted_prev {
+                eprintln!("[control_loop] HALT del árbitro: equipo propio detenido");
+            } else {
+                eprintln!("[control_loop] fin de HALT");
+            }
+        }
+        let mode = tick_mode(estop_engaged, ref_mode);
+        if mode == TickMode::Halt {
             manual_state.clear();
             skill_state.clear();
         }
@@ -695,40 +816,20 @@ pub async fn run_control_loop(
             }
             // Con la parada activa `skill_state` ya está vacío → sin aviso.
             skill_warning = gui_skill_warning(&skill_state, &world_guard, config.own_team);
-            if estop_engaged {
-                let (z_cmds, z_tgts) = zero_commands_for_active_team(&world_guard, config.own_team);
-                let z_esc = vec![false; z_cmds.len()];
-                (z_cmds, z_tgts, Vec::new(), z_esc)
-            } else {
-                // Override en vivo de la velocidad de Spin desde la GUI (por robot).
-                for ((team, id), (cmd, _)) in &skill_state {
-                    if *team == config.own_team && cmd.skill_id == SkillId::Spin {
-                        catalog.set_spin_omega_for(*id as usize, cmd.spin_omega);
-                    }
-                }
-                let mut choices = decider.decide(tick_counter, &world_guard);
-                apply_gui_skill_overrides(&mut choices, &skill_state, config.own_team);
-                let (mut cmds, mut tgts, applied) = dispatch_choices(
-                    &choices,
-                    &mut catalog,
-                    &world_guard,
-                    &motion,
-                    config.own_team,
-                );
-                apply_manual_overrides(&mut cmds, &mut tgts, &manual_state, &world_guard);
-                // Reflejos de bajo nivel (áreas y atasco) sobre los comandos autónomos
-                // del equipo propio (salta manual; el estop ya cortó arriba).
-                let manual_keys: HashSet<(i32, i32)> = manual_state.keys().copied().collect();
-                let esc = apply_reflexes(
-                    &mut cmds,
-                    &world_guard,
-                    &mut recovery,
-                    &zone_guard,
-                    &manual_keys,
-                    config.own_team,
-                );
-                (cmds, tgts, applied, esc)
-            }
+            tick_commands(
+                mode,
+                &world_guard,
+                decider.as_mut(),
+                tick_counter,
+                &mut catalog,
+                &motion,
+                &mut recovery,
+                &zone_guard,
+                &manual_state,
+                &skill_state,
+                config.own_team,
+                config.num_robots,
+            )
         };
         tick_counter = tick_counter.wrapping_add(1);
 
@@ -872,6 +973,324 @@ mod tests {
             vy: v_body * theta.sin(),
             omega: 0.0,
             orientation: theta,
+        }
+    }
+
+    // ── Árbitro: HALT y STOP sobre `tick_commands` ──────────────────────────
+
+    /// Estado mínimo del loop para correr `tick_commands` tick a tick, sin sockets.
+    struct Rig {
+        catalog: SkillCatalog,
+        motion: Motion,
+        recovery: BorderRecovery,
+        guard: ZoneGuard,
+        manual: HashMap<(i32, i32), (ManualCommand, u32)>,
+        gui: HashMap<(i32, i32), (GuiSkillCommand, u32)>,
+        tick: u32,
+    }
+
+    impl Rig {
+        fn new(recovery: bool) -> Self {
+            Self {
+                catalog: SkillCatalog::new(3),
+                motion: Motion::new(),
+                recovery: BorderRecovery::new(recovery),
+                guard: ZoneGuard::new(1.0, 2),
+                manual: HashMap::new(),
+                gui: HashMap::new(),
+                tick: 0,
+            }
+        }
+
+        fn step(&mut self, mode: TickMode, world: &World, decider: &mut dyn TickDecider) -> (Vec<MotionCommand>, Vec<bool>) {
+            let (cmds, _, _, esc) = tick_commands(
+                mode,
+                world,
+                decider,
+                self.tick,
+                &mut self.catalog,
+                &self.motion,
+                &mut self.recovery,
+                &self.guard,
+                &self.manual,
+                &self.gui,
+                0,
+                3,
+            );
+            self.tick += 1;
+            (cmds, esc)
+        }
+    }
+
+    /// Decider que cuenta sus llamadas.
+    struct CountingDecider {
+        inner: FixedSkillDecider,
+        calls: usize,
+    }
+
+    impl TickDecider for CountingDecider {
+        fn decide(&mut self, tick: u32, world: &World) -> Vec<SkillChoice> {
+            self.calls += 1;
+            self.inner.decide(tick, world)
+        }
+    }
+
+    fn robot0(cmds: &[MotionCommand]) -> MotionCommand {
+        cmds.iter().find(|c| c.id == 0 && c.team == 0).cloned().expect("comando del robot 0")
+    }
+
+    fn all_zero(cmds: &[MotionCommand]) -> bool {
+        cmds.iter().all(|c| c.vx == 0.0 && c.vy == 0.0 && c.omega == 0.0)
+    }
+
+    fn world_with_robot(x: f32, y: f32, th: f64) -> World {
+        let mut w = World::new(3, 3);
+        w.update_robot(0, 0, Vec2::new(x, y), th, Vec2::ZERO, 0.0);
+        w.update_ball(Vec2::new(0.6, 0.5), Vec2::ZERO);
+        w
+    }
+
+    /// Lleva al robot 0 (quieto en la visión, con GoTo hacia adelante) hasta la maniobra
+    /// de escape de la recuperación de atasco.
+    fn drive_into_escape(rig: &mut Rig, world: &World, decider: &mut dyn TickDecider) {
+        for _ in 0..120 {
+            let (_, esc) = rig.step(TickMode::Play, world, decider);
+            if esc.first().copied().unwrap_or(false) {
+                return;
+            }
+        }
+        panic!("no llegó a la maniobra de escape");
+    }
+
+    fn set_referee(shared: &SharedReferee, foul: Foul) {
+        crate::coach::referee::apply_command(
+            shared,
+            crate::coach::RefereeCommand { foul, ..crate::coach::RefereeCommand::GAME_ON },
+        );
+    }
+
+    #[test]
+    fn referee_mode_follows_the_last_command_and_estop_wins() {
+        assert_eq!(referee_mode(&None), TickMode::Play);
+        let shared = crate::coach::new_shared_referee();
+        let referee = Some(shared.clone());
+        assert_eq!(referee_mode(&referee), TickMode::Play, "arranca en GAME_ON");
+        set_referee(&shared, Foul::Stop);
+        assert_eq!(referee_mode(&referee), TickMode::Stop);
+        set_referee(&shared, Foul::Halt);
+        assert_eq!(referee_mode(&referee), TickMode::Halt);
+        set_referee(&shared, Foul::FreeKick);
+        assert_eq!(referee_mode(&referee), TickMode::Play);
+        // La parada de emergencia toma el camino de HALT diga lo que diga el árbitro.
+        for m in [TickMode::Play, TickMode::Stop, TickMode::Halt] {
+            assert_eq!(tick_mode(true, m), TickMode::Halt);
+            assert_eq!(tick_mode(false, m), m);
+        }
+    }
+
+    #[test]
+    fn halt_from_game_on_zeroes_at_once_and_skips_the_decider() {
+        let world = world_with_robot(-0.4, 0.0, 0.0);
+        let shared = crate::coach::new_shared_referee();
+        let referee = Some(shared.clone());
+        let mut rig = Rig::new(true);
+        let mut d = CountingDecider { inner: FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.4, 0.0)), calls: 0 };
+        let mut last = Vec::new();
+        for _ in 0..10 {
+            last = rig.step(referee_mode(&referee), &world, &mut d).0;
+        }
+        assert!(robot0(&last).vx > 0.05, "avanzaba: {:?}", robot0(&last));
+        set_referee(&shared, Foul::Halt);
+        for k in 0..20 {
+            let (cmds, esc) = rig.step(referee_mode(&referee), &world, &mut d);
+            assert!(all_zero(&cmds), "tick {k} de HALT: {cmds:?}");
+            assert!(esc.iter().all(|e| !e));
+        }
+        assert_eq!(d.calls, 10, "el decider no se consulta en HALT");
+    }
+
+    #[test]
+    fn halt_does_not_let_the_guard_move_a_field_robot_in_the_area() {
+        let world = world_with_robot(-0.66, 0.0, std::f64::consts::FRAC_PI_2);
+        let mut d = FixedSkillDecider::new(0, SkillId::Hold, Vec2::ZERO);
+        // En juego el guardia lo saca (gira en el lugar hacia "afuera").
+        let (play, _) = Rig::new(true).step(TickMode::Play, &world, &mut d);
+        assert!(!all_zero(&play), "sin HALT el guardia actúa: {play:?}");
+        let mut rig = Rig::new(true);
+        for _ in 0..30 {
+            assert!(all_zero(&rig.step(TickMode::Halt, &world, &mut d).0));
+        }
+    }
+
+    #[test]
+    fn halt_stops_an_escape_and_leaving_it_starts_clean() {
+        let world = world_with_robot(0.0, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.6, 0.0));
+        let mut rig = Rig::new(true);
+        drive_into_escape(&mut rig, &world, &mut d);
+        assert!(all_zero(&rig.step(TickMode::Halt, &world, &mut d).0), "cero desde el primer tick");
+        for _ in 0..10 {
+            rig.step(TickMode::Halt, &world, &mut d);
+        }
+        // Al salir: el comando es el de la skill (sin escape) y la rampa arranca de cero.
+        let (cmds, esc) = rig.step(TickMode::Play, &world, &mut d);
+        assert!(!esc[0], "el escape interrumpido no sigue");
+        let c = robot0(&cmds);
+        let v = c.vx.hypot(c.vy);
+        assert!(v <= rig.motion.config.max_linear_accel * crate::motion::CONTROL_DT + 1e-9, "rampa: v={v}");
+    }
+
+    #[test]
+    fn leaving_halt_restarts_spin_kick() {
+        let mut world = World::new(3, 3);
+        let ball = Vec2::new(0.2, -0.3);
+        world.update_ball(ball, Vec2::ZERO);
+        let tgt = Vec2::new(0.0, 0.3);
+        let probe = crate::skills::SpinKickSkill::new(tgt);
+        let (ccw, _) = probe.contact_centers(ball, (tgt - ball).normalize());
+        world.update_robot(0, 0, ccw, 0.0, Vec2::ZERO, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::SpinKick, tgt);
+        let mut rig = Rig::new(false);
+        let (cmds, _) = rig.step(TickMode::Play, &world, &mut d);
+        assert!((robot0(&cmds).omega.abs() - probe.omega).abs() < 1e-9, "girando");
+        rig.step(TickMode::Halt, &world, &mut d);
+        world.update_robot(0, 0, ball + Vec2::new(0.10, 0.12), 0.0, Vec2::ZERO, 0.0);
+        let (cmds, _) = rig.step(TickMode::Play, &world, &mut d);
+        let w = robot0(&cmds).omega;
+        assert!(w.abs() <= rig.motion.config.max_angular_speed + 1e-9, "sigue girando: ω={w}");
+    }
+
+    #[test]
+    fn halt_without_visible_robots_still_zeroes_every_own_id() {
+        let world = World::new(3, 3);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.4, 0.0));
+        let (cmds, _) = Rig::new(true).step(TickMode::Halt, &world, &mut d);
+        let mut ids: Vec<i32> = cmds.iter().map(|c| c.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert!(all_zero(&cmds) && cmds.iter().all(|c| c.team == 0));
+    }
+
+    #[test]
+    fn halt_works_with_a_decider_that_ignores_the_referee() {
+        // `FixedSkillDecider` no lee al árbitro: HALT vale igual (lo aplica el loop).
+        let world = world_with_robot(-0.4, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::ChaseBall, Vec2::ZERO);
+        let mut rig = Rig::new(true);
+        for _ in 0..5 {
+            rig.step(TickMode::Play, &world, &mut d);
+        }
+        assert!(all_zero(&rig.step(TickMode::Halt, &world, &mut d).0));
+    }
+
+    #[test]
+    fn base_station_frame_is_all_zero_while_stopped() {
+        use crate::radio::base_station::{TeamColor, build_frame};
+        use std::collections::BTreeMap;
+        let to_radio = |cmds: &[MotionCommand]| -> Vec<RobotCommand> {
+            cmds.iter()
+                .map(|c| RobotCommand {
+                    id: c.id,
+                    team: c.team,
+                    motion: c.clone(),
+                    kicker: KickerCommand { id: c.id, team: c.team, kick_x: false, kick_z: false, dribbler: 0.0 },
+                })
+                .collect()
+        };
+        // Mapa no vacío que deja las posiciones de radio 1 y 2 sin usar.
+        let slots: BTreeMap<u32, u32> = [(0, 3), (1, 0), (2, 4)].into_iter().collect();
+        let mut world = world_with_robot(-0.4, 0.0, 0.0);
+        world.update_robot(1, 0, Vec2::new(0.0, 0.3), 0.0, Vec2::ZERO, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.4, 0.0));
+        let mut rig = Rig::new(true);
+        let mut play = Vec::new();
+        for _ in 0..10 {
+            play = rig.step(TickMode::Play, &world, &mut d).0;
+        }
+        let zero = "0,0,0,0,0,0,0,0,0,0\n";
+        assert_ne!(build_frame(&to_radio(&play), TeamColor::Blue, &slots), zero, "en juego no es nulo");
+        let halt = rig.step(TickMode::Halt, &world, &mut d).0;
+        assert_eq!(build_frame(&to_radio(&halt), TeamColor::Blue, &slots), zero);
+        // Con la visión caída tampoco queda una posición con el comando anterior.
+        let blind = rig.step(TickMode::Halt, &World::new(3, 3), &mut d).0;
+        assert_eq!(build_frame(&to_radio(&blind), TeamColor::Blue, &slots), zero);
+    }
+
+    #[test]
+    fn stop_keeps_a_field_robot_in_the_area_still() {
+        let world = world_with_robot(-0.66, 0.0, std::f64::consts::FRAC_PI_2);
+        let mut d = FixedSkillDecider::new(0, SkillId::Hold, Vec2::ZERO);
+        let mut rig = Rig::new(true);
+        for _ in 0..30 {
+            let c = robot0(&rig.step(TickMode::Stop, &world, &mut d).0);
+            assert_eq!((c.vx, c.vy, c.omega), (0.0, 0.0, 0.0), "el guardia no lo mueve en STOP");
+        }
+    }
+
+    #[test]
+    fn stop_cuts_an_escape_and_game_on_does_not_resume_it() {
+        let world = world_with_robot(0.0, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.6, 0.0));
+        let mut rig = Rig::new(true);
+        drive_into_escape(&mut rig, &world, &mut d);
+        for _ in 0..10 {
+            let (cmds, esc) = rig.step(TickMode::Stop, &world, &mut d);
+            let c = robot0(&cmds);
+            assert_eq!((c.vx, c.vy), (0.0, 0.0));
+            assert!(!esc[0]);
+        }
+        let (_, esc) = rig.step(TickMode::Play, &world, &mut d);
+        assert!(!esc[0], "el escape no continúa al volver a GAME_ON");
+    }
+
+    #[test]
+    fn stop_keeps_the_skill_omega_without_translation() {
+        // FacePoint hacia un punto a 90°: en STOP sigue corrigiendo la orientación.
+        let world = world_with_robot(0.0, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::FacePoint, Vec2::new(0.0, 0.5));
+        let c = robot0(&Rig::new(true).step(TickMode::Stop, &world, &mut d).0);
+        assert_eq!((c.vx, c.vy), (0.0, 0.0));
+        assert!(c.omega > 0.1, "gira hacia el punto: ω={}", c.omega);
+    }
+
+    #[test]
+    fn stop_to_game_on_restarts_the_ramp() {
+        let world = world_with_robot(-0.4, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.6, 0.0));
+        let mut rig = Rig::new(false);
+        let mut c = robot0(&rig.step(TickMode::Play, &world, &mut d).0);
+        for _ in 0..60 {
+            c = robot0(&rig.step(TickMode::Play, &world, &mut d).0);
+        }
+        assert!(c.vx > 0.8, "avanzaba a {}", c.vx);
+        for _ in 0..5 {
+            rig.step(TickMode::Stop, &world, &mut d);
+        }
+        let c = robot0(&rig.step(TickMode::Play, &world, &mut d).0);
+        let v = c.vx.hypot(c.vy);
+        assert!(v <= rig.motion.config.max_linear_accel * crate::motion::CONTROL_DT + 1e-9, "rampa: v={v}");
+    }
+
+    #[test]
+    fn play_mode_matches_the_plain_pipeline() {
+        // Sin árbitro (o en GAME_ON) `tick_commands` es el camino de siempre: decider →
+        // skills → reflejos. Se compara contra la composición directa, tick a tick.
+        let world = world_with_robot(-0.52, 0.10, std::f64::consts::PI);
+        let target = Vec2::new(-0.7, 0.1);
+        let mut d1 = FixedSkillDecider::new(0, SkillId::GoTo, target);
+        let mut d2 = FixedSkillDecider::new(0, SkillId::GoTo, target);
+        let mut rig = Rig::new(true);
+        let (mut catalog, motion) = (SkillCatalog::new(3), Motion::new());
+        let mut recovery = BorderRecovery::new(true);
+        let guard = ZoneGuard::new(1.0, 2);
+        assert_eq!(referee_mode(&None), TickMode::Play);
+        for k in 0..80 {
+            let (a, ea) = rig.step(TickMode::Play, &world, &mut d1);
+            let choices = d2.decide(k, &world);
+            let (mut b, _, _) = dispatch_choices(&choices, &mut catalog, &world, &motion, 0);
+            let eb = apply_reflexes(&mut b, &world, &mut recovery, &guard, &HashSet::new(), 0);
+            assert_eq!(a, b, "tick {k}");
+            assert_eq!(ea, eb, "tick {k}");
         }
     }
 
@@ -1220,22 +1639,25 @@ mod tests {
         assert_eq!(gui_skill_warning(&HashMap::new(), &world, 0), None);
     }
 
-    /// 1.4 — La parada produce comando cero por cada robot activo del equipo propio.
+    /// La parada (y HALT) produce comando cero por cada id del equipo propio, lo vea o no
+    /// la visión; la orientación sale de la visión si el robot está.
     #[test]
-    fn estop_zeroes_active_team() {
+    fn estop_zeroes_every_own_id() {
         let mut world = World::new(3, 3);
         world.update_robot(0, 0, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
         world.update_robot(2, 0, Vec2::new(0.1, 0.1), 1.0, Vec2::ZERO, 0.0);
         // Robot del otro equipo no debe aparecer.
         world.update_robot(1, 1, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
 
-        let (cmds, tgts) = zero_commands_for_active_team(&world, 0);
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(tgts.len(), 2);
+        let (cmds, tgts) = zero_commands_for_team(&world, 0, 3);
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(tgts.len(), 3);
         for c in &cmds {
             assert_eq!((c.vx, c.vy, c.omega), (0.0, 0.0, 0.0));
             assert_eq!(c.team, 0);
         }
+        assert_eq!(cmds.iter().find(|c| c.id == 2).map(|c| c.orientation), Some(1.0));
+        assert_eq!(cmds.iter().find(|c| c.id == 1).map(|c| c.orientation), Some(0.0));
     }
 
     /// Smoke test: `run_control_loop` con `FixedSkillDecider` y `MockTransport`.
@@ -1260,6 +1682,7 @@ mod tests {
             radio_target: RadioTarget::FiraSim,
             max_ticks: Some(5),
             vision_timeout: None,
+            referee: None,
         };
         let _decider: Box<dyn TickDecider> =
             Box::new(FixedSkillDecider::new(0, SkillId::GoTo, Vec2::ZERO));

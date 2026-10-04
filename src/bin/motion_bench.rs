@@ -27,7 +27,8 @@
 //!   solo de las repeticiones que fallan.
 
 use glam::Vec2;
-use rustengine::coach::SkillChoice;
+use rustengine::coach::{RefereeCommand, SharedReferee, SkillChoice};
+use rustengine::coach::referee::{REFEREE_ADDR_DEFAULT, REFEREE_ADDR_ENV, apply_command};
 use rustengine::control_loop::{ControlLoopConfig, TickDecider, TickRecord, run_control_loop};
 use rustengine::motion::{Motion, MotionConfig};
 use rustengine::params::params;
@@ -62,6 +63,10 @@ enum Goal {
     NoSidePush,
     /// Arquero en su punto de defensa mirando a la pelota.
     Keeper,
+    /// Árbitro: en la ventana HALT/STOP la traslación comandada es cero (en HALT también
+    /// `omega`) y el robot no se desplaza después de frenar (desde 1.0 s); al salir, cumple el objetivo
+    /// de su skill (`arrived`) sin escapes en los primeros 0.5 s.
+    Referee,
     None,
 }
 
@@ -79,6 +84,9 @@ struct Case {
     goal: Goal,
     /// Fases que siguen a la principal (`skill`, `target`, `dur`).
     then: &'static [Phase],
+    /// Línea de tiempo del árbitro: (s desde el inicio del caso, comando de texto). Se
+    /// envía por UDP al listener real (`run_referee_listener`) que corre en el bench.
+    referee: &'static [(f64, &'static str)],
 }
 
 const FAR: (f32, f32) = (0.6, 0.5);
@@ -96,7 +104,7 @@ const KICK_SPIN: Goal = Goal::Kick { min_prog: 0.10, max_dir: 45.0 };
 
 #[allow(clippy::too_many_arguments)]
 const fn c(name: &'static str, skill: SkillId, target: (f32, f32), robot: (f32, f32, f32), ball: (f32, f32), dur: f64, tol: f32, goal: Goal) -> Case {
-    Case { name, skill, target, robot, ball, dur, tol, goal, then: &[] }
+    Case { name, skill, target, robot, ball, dur, tol, goal, then: &[], referee: &[] }
 }
 
 #[rustfmt::skip]
@@ -144,7 +152,24 @@ const CASES: &[Case] = &[
     c("a4_ball_wall", SkillId::GoTo, (0.3, -0.25), (-0.3, -0.5, 0.0), (0.0, -0.56), 6.0, 0.08, ARRIVE),
     c("spin_20", SkillId::Spin, (1.0, 0.0), (0.0, 0.0, 0.0), FAR, 2.0, 0.0, Goal::None),
     c("goalkeep_keeper", SkillId::GoalKeep, (-0.75, 0.0), (-0.4, 0.2, 0.0), (0.0, -0.15), 5.0, 0.0, Goal::Keeper),
+    // Árbitro por texto: HALT a velocidad de crucero; HALT y STOP con un jugador de campo
+    // dentro del área propia (sin el árbitro, el `ZoneGuard` lo sacaría).
+    Case {
+        referee: &[(0.8, "HALT"), (2.3, "GAME_ON")],
+        ..c("halt_game_on", SkillId::GoTo, (0.4, 0.0), (-0.4, 0.0, 0.0), FAR, 5.0, 0.08, Goal::Referee)
+    },
+    Case {
+        referee: &[(0.0, "HALT"), (1.5, "GAME_ON")],
+        ..c("halt_in_area", SkillId::Hold, (0.0, 0.0), (-0.66, 0.0, 90.0), FAR, 4.0, 0.0, Goal::Referee)
+    },
+    Case {
+        referee: &[(0.0, "STOP"), (1.5, "GAME_ON")],
+        ..c("stop_in_area", SkillId::Hold, (0.0, 0.0), (-0.66, 0.0, 90.0), FAR, 4.0, 0.0, Goal::Referee)
+    },
 ];
+
+/// Casos del árbitro (alias `referee` en la línea de comandos).
+const REFEREE_CASES: &[&str] = &["halt_game_on", "halt_in_area", "stop_in_area"];
 
 /// Casos de navegación del resumen. `b2_blockline_open` se informa aparte: es el caso del
 /// bug B2 de BlockLine (punto de bloqueo en la zona prohibida).
@@ -372,8 +397,38 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
             (spot - p).length() <= params().motion.arrival_threshold + 0.01
                 && heading_err(Vec2::new(last.bx, last.by) - p, last.th, bidirectional).to_degrees() <= 20.0
         }
+        Goal::Referee => referee_ok(case, rows, bidirectional),
         Goal::None => return None,
     })
+}
+
+/// Criterio `Goal::Referee` sobre la primera ventana HALT/STOP de la línea de tiempo.
+fn referee_ok(case: &Case, rows: &[Row], bidirectional: bool) -> bool {
+    let Some(k) = case.referee.iter().position(|(_, c)| *c != "GAME_ON") else { return false };
+    let (t_on, cmd) = case.referee[k];
+    let t_off = case.referee.get(k + 1).map_or(f64::INFINITY, |e| e.0);
+    let Some(t0) = rows.first().map(|r| r.t) else { return false };
+    let rel = |r: &Row| r.t - t0;
+    let window: Vec<&Row> = rows.iter().filter(|r| rel(r) >= t_on + 0.10 && rel(r) < t_off).collect();
+    let still_cmd = window.iter().all(|r| r.vx == 0.0 && r.vy == 0.0 && (cmd != "HALT" || r.w == 0.0));
+    // Quieto desde 1.0 s: con el comando ya en cero, frenando desde ~0.8 m/s en FIRASim la
+    // pose (EKF con la latencia del proxy) se pasa y vuelve hasta 4 cm durante ~0.8 s.
+    let braked: Vec<Vec2> = window.iter().filter(|r| rel(r) >= t_on + 1.0).map(|r| Vec2::new(r.x, r.y)).collect();
+    let still = braked.first().is_none_or(|p0| braked.iter().all(|p| (*p - *p0).length() <= 0.01));
+    let after: Vec<&Row> = rows.iter().filter(|r| rel(r) >= t_off).collect();
+    let no_escape = after.iter().filter(|r| rel(r) < t_off + 0.5).all(|r| !r.escaping);
+    let resumed = after.iter().any(|r| arrived(case, r, bidirectional));
+    !window.is_empty() && still_cmd && still && no_escape && resumed
+}
+
+/// Índice del próximo comando del árbitro a enviar cuando el caso lleva `rel` s, dados
+/// `sent` comandos ya enviados.
+fn referee_due(timeline: &[(f64, &str)], sent: usize, rel: f64) -> usize {
+    let mut k = sent;
+    while k < timeline.len() && timeline[k].0 <= rel {
+        k += 1;
+    }
+    k
 }
 
 fn is_valid(v: &Value) -> bool {
@@ -430,7 +485,7 @@ impl TickDecider for ScriptDecider {
     }
 }
 
-async fn run_case(case: &Case, pose: (f32, f32, f32)) -> Result<Vec<Row>, String> {
+async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedReferee>) -> Result<Vec<Row>, String> {
     let client = FIRASimClient::new("127.0.0.1", 20011).await.map_err(|e| e.to_string())?;
     let rid = robot_id(case);
     let mut items: Vec<TeleportItem> = (0u32..2)
@@ -453,8 +508,28 @@ async fn run_case(case: &Case, pose: (f32, f32, f32)) -> Result<Vec<Row>, String
     let rows = Arc::new(Mutex::new(Vec::<Row>::new()));
     let sink = rows.clone();
     let script = *case;
+    // Árbitro: el caso arranca en GAME_ON (no hereda el comando del anterior) y el hook
+    // envía cada comando de la línea de tiempo como texto al listener, por UDP.
+    if let Some(r) = &referee {
+        apply_command(r, RefereeCommand::GAME_ON);
+    }
+    let timeline = case.referee;
+    let sender = if timeline.is_empty() { None } else { Some(referee_sender()?) };
+    let (mut sent, mut t0) = (0usize, None::<f64>);
     let hook = Box::new(move |rec: &TickRecord<'_>| {
         let Some(r) = test_robot(rec.world, rid) else { return };
+        // El reloj de la línea de tiempo arranca en la primera fila (robot visible), el
+        // mismo origen que usa el criterio `Goal::Referee`.
+        if let Some((sock, addr)) = &sender {
+            let t = rec.t_ms as f64 / 1000.0;
+            let due = referee_due(timeline, sent, t - *t0.get_or_insert(t));
+            for (_, cmd) in &timeline[sent..due] {
+                if let Err(e) = sock.send_to(cmd.as_bytes(), addr) {
+                    eprintln!("[motion_bench] no pude enviar {cmd} al árbitro ({addr}): {e}");
+                }
+            }
+            sent = due;
+        }
         let b = rec.world.get_ball_state().position;
         let k = rec.commands.iter().position(|c| c.id == rid as i32 && c.team == 0);
         let (vx, vy, w) = k.map(|k| (rec.commands[k].vx, rec.commands[k].vy, rec.commands[k].omega)).unwrap_or_default();
@@ -481,6 +556,7 @@ async fn run_case(case: &Case, pose: (f32, f32, f32)) -> Result<Vec<Row>, String
         radio_target: RadioTarget::FiraSim,
         max_ticks: Some((total_dur(case) * 60.0).round() as u32),
         vision_timeout: Some(Duration::from_secs(3)),
+        referee,
     };
     let decider = Box::new(ScriptDecider { case: *case, robot_id: rid as i32 });
     run_control_loop(cfg, decider, Some(hook), None, Arc::new(AtomicBool::new(false)))
@@ -488,6 +564,16 @@ async fn run_case(case: &Case, pose: (f32, f32, f32)) -> Result<Vec<Row>, String
         .map_err(|e| format!("{e:?}"))?;
     let out = rows.lock().unwrap().clone();
     Ok(out)
+}
+
+/// Socket y dirección para mandar comandos de texto al listener del árbitro (la misma
+/// dirección que escucha: `VSSL_REFEREE_ADDR` o el grupo multicast por defecto).
+fn referee_sender() -> Result<(std::net::UdpSocket, std::net::SocketAddr), String> {
+    let text = std::env::var(REFEREE_ADDR_ENV).ok().filter(|s| !s.trim().is_empty());
+    let addr: std::net::SocketAddr = text.as_deref().unwrap_or(REFEREE_ADDR_DEFAULT).trim().parse().map_err(|e| format!("{REFEREE_ADDR_ENV}: {e}"))?;
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    sock.set_multicast_loop_v4(true).map_err(|e| e.to_string())?;
+    Ok((sock, addr))
 }
 
 fn write_csv(path: &str, rows: &[Row]) -> std::io::Result<()> {
@@ -544,9 +630,14 @@ async fn main() {
     let bidirectional = MotionConfig::from_env().bidirectional;
     let all = names.is_empty() || names.iter().any(|n| n == "all");
     let skills = names.iter().any(|n| n == "skills");
+    let referee_alias = names.iter().any(|n| n == "referee");
     let selected: Vec<&Case> = CASES
         .iter()
-        .filter(|c| all || names.iter().any(|n| n == c.name) || (skills && SKILL_CASES.contains(&c.name)))
+        .filter(|c| {
+            all || names.iter().any(|n| n == c.name)
+                || (skills && SKILL_CASES.contains(&c.name))
+                || (referee_alias && REFEREE_CASES.contains(&c.name))
+        })
         .collect();
     if selected.is_empty() {
         eprintln!("[motion_bench] ningún caso coincide; ver --list");
@@ -567,6 +658,16 @@ async fn main() {
         })
     });
 
+    // Listener real del árbitro, solo si algún caso lo usa (el resto corre sin árbitro).
+    let referee = selected.iter().any(|c| !c.referee.is_empty()).then(|| {
+        let shared = rustengine::coach::new_shared_referee();
+        tokio::spawn(rustengine::coach::run_referee_listener(shared.clone()));
+        shared
+    });
+    if referee.is_some() {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
     for case in &selected {
         for rep in 0..repeat {
             if done.contains(&(case.name.to_string(), rep as u64)) {
@@ -575,7 +676,8 @@ async fn main() {
             let pose = start_pose(case, rep);
             let mut attempt = 0;
             let line = loop {
-                let res = run_case(case, pose).await;
+                let shared = if case.referee.is_empty() { None } else { referee.clone() };
+                let res = run_case(case, pose, shared).await;
                 let reason = match &res {
                     Ok(rows) => infra_reason(rows).map(str::to_string),
                     Err(e) => Some(e.clone()),
@@ -849,13 +951,65 @@ mod tests {
         assert!(test_robot(&w, 0).is_none());
     }
 
+    /// Filas a 60 Hz: avanza hasta `t_on`, frena 0.2 s sin comando y queda quieto hasta
+    /// `t_off`; después avanza otra vez hacia +x. `cmd_in_window` es el comando en HALT/STOP.
+    fn referee_rows(t_on: f64, t_off: f64, cmd_in_window: (f64, f64, f64)) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let mut x = -0.4f32;
+        for k in 0..300 {
+            let t = k as f64 / 60.0;
+            let (vx, vy, w) = if t < t_on || t >= t_off { (0.5, 0.0, 0.0) } else { cmd_in_window };
+            if t < t_on + 0.2 || t >= t_off {
+                x += 0.5 / 60.0;
+            }
+            rows.push(Row { t, x, y: 0.0, th: 0.0, bx: 0.6, by: 0.5, vx, vy, w, ..Default::default() });
+        }
+        rows
+    }
+
+    #[test]
+    fn referee_criterion_needs_zero_command_stillness_and_resume() {
+        let c = case("halt_game_on"); // HALT 0.8 s → GAME_ON 2.3 s, GoTo a (0.4, 0)
+        let ok = referee_rows(0.8, 2.3, (0.0, 0.0, 0.0));
+        assert!(ok.iter().any(|r| r.x >= 0.33), "la fila de prueba llega al destino");
+        assert_eq!(success(&c, &ok, &metrics(&c, &ok, false), false), Some(true));
+        // Un tick con avance dentro de la ventana de HALT → falla.
+        let mut moved = ok.clone();
+        moved[100].vx = 0.3;
+        assert_eq!(success(&c, &moved, &metrics(&c, &moved, false), false), Some(false));
+        // En HALT tampoco vale girar.
+        let turning = referee_rows(0.8, 2.3, (0.0, 0.0, 1.0));
+        assert_eq!(success(&c, &turning, &metrics(&c, &turning, false), false), Some(false));
+        // En STOP sí: giro sin traslación cumple.
+        let stop = Case { referee: &[(0.8, "STOP"), (2.3, "GAME_ON")], ..c };
+        let rows = referee_rows(0.8, 2.3, (0.0, 0.0, 1.0));
+        assert_eq!(success(&stop, &rows, &metrics(&stop, &rows, false), false), Some(true));
+        // Desplazarse durante HALT ya asentado (aunque el comando sea cero) → falla.
+        let mut drift = ok.clone();
+        for r in drift.iter_mut().filter(|r| r.t > 1.8 && r.t < 2.3) {
+            r.x += (r.t - 1.8) as f32 * 0.1;
+        }
+        assert_eq!(success(&c, &drift, &metrics(&c, &drift, false), false), Some(false));
+    }
+
+    #[test]
+    fn referee_commands_are_sent_when_their_time_comes() {
+        let tl = [(0.0, "HALT"), (1.5, "GAME_ON")];
+        assert_eq!(referee_due(&tl, 0, 0.0), 1, "el HALT de t = 0 sale en el primer tick");
+        assert_eq!(referee_due(&tl, 1, 1.49), 1);
+        assert_eq!(referee_due(&tl, 1, 1.5), 2);
+        assert_eq!(referee_due(&tl, 2, 9.0), 2);
+        assert_eq!(referee_due(&[], 0, 1.0), 0);
+        assert!(REFEREE_CASES.iter().all(|n| !case(n).referee.is_empty() && case(n).goal == Goal::Referee));
+    }
+
     #[test]
     fn case_names_are_unique_and_lists_exist() {
         let mut names: Vec<&str> = CASES.iter().map(|c| c.name).collect();
         names.sort();
         names.dedup();
         assert_eq!(names.len(), CASES.len());
-        assert!(NAV.iter().chain(SKILL_CASES).all(|n| CASES.iter().any(|c| c.name == *n)));
+        assert!(NAV.iter().chain(SKILL_CASES).chain(REFEREE_CASES).all(|n| CASES.iter().any(|c| c.name == *n)));
         assert!(SKILL_CASES.iter().all(|n| case(n).goal != Goal::None));
     }
 }

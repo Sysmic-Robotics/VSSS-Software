@@ -75,9 +75,12 @@ real (ver `docs/bringup_robot_real.md`):
   velocidades de rueda comandadas **L/R (mm/s)** en el tiempo.
 
 **Parada de emergencia:** el botón rojo **STOP** (o la tecla **Espacio**) enclava una
-parada que comanda velocidad cero a todos los robots del equipo propio y prevalece sobre
-coach, control manual y skills. Se libera con el mismo botón. El watchdog del firmware
-(200 ms) queda como red final.
+parada que comanda velocidad cero a todos los ids del equipo propio, aunque la visión no
+los vea (así siempre sale un frame en cero), y prevalece sobre coach, control manual y
+skills. Mientras está activa no actúan el `ZoneGuard` ni la recuperación de atasco. Al
+liberarla con el mismo botón, cada robot retoma sin estado heredado: sin la maniobra de
+escape interrumpida, con la rampa desde cero y la skill reiniciada. Es el mismo camino que
+toma el loop en HALT del árbitro. El watchdog del firmware (200 ms) queda como red final.
 
 **Runner de skills (validador visual):** en la fila de control eliges una de las 4 skills
 (`GoTo`, `FacePoint`, `ChaseBall`, `Spin`) o **Ninguna**, y haces **click en la cancha**
@@ -315,9 +318,19 @@ RMS es la σ de la cámara (base de M1). Protocolo de torneo: 15 min de grabaci�
 El coach heurístico lee el estado de juego del árbitro y ejecuta las formaciones del reglamento
 LARC 2026 (§6.6 y §10) antes del silbato: kickoff, free ball (cruz del cuadrante, robot en el punto a
 20 cm del lado propio), penal, free kick (defensores tocando la línea del área, uno por cuadrante) y
-goal kick (lo saca el arquero). Con `GAME_ON` vuelve la táctica normal de inmediato; con `STOP`/`HALT`
-todos quedan quietos (`Hold`). El pateador queda colocado en el staging de `ShootPush`, así empuja
-en el primer tick tras el silbato.
+goal kick (lo saca el arquero). Con `GAME_ON` vuelve la táctica normal de inmediato. El pateador
+queda colocado en el staging de `ShootPush`, así empuja en el primer tick tras el silbato.
+
+`HALT` y `STOP` los aplica el **control loop** en el mismo tick, con cualquier coach (o sin coach),
+leyendo el estado del árbitro (`ControlLoopConfig.referee`):
+
+- **HALT:** el mismo camino que la parada de emergencia. Cero a todos los ids propios, sin
+  decider, skills, `ZoneGuard` ni recuperación de atasco.
+- **STOP** (§9.5, "mantener y solo corregir orientación"): las skills siguen corriendo, pero la
+  traslación es cero y se conserva su `omega`. No actúan el `ZoneGuard` ni la recuperación. Con el
+  coach heurístico, en STOP las skills son `Hold` y los robots quedan quietos del todo.
+- Al volver a `GAME_ON`, cada robot retoma sin estado heredado (sin escape interrumpido, rampa
+  desde cero, skill reiniciada). La terminal avisa al entrar y al salir de HALT.
 
 Fuentes, por el mismo puerto (`VSSL_REFEREE_ADDR`): **VSSReferee** (simulador, protobuf
 `VSSRef_Command`) o **texto del operador** para el árbitro humano de la cancha:
@@ -550,6 +563,7 @@ Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales 
 - `--out FILE`: agrega cada repetición a un JSONL y, al relanzar con el mismo archivo, salta las que ya tienen resultado (para reanudar si FIRASim se cae).
 - Una repetición con FIRASim caído, sin datos del robot o con la física explotada (salto de pose de más de 0.3 m entre ticks) es **falla de infraestructura**: no cuenta en la tasa, se reintenta hasta 2 veces y, si no se recupera, el binario sale con código 3. El resumen informa cuántas se perdieron.
 - `--csv-dir DIR` escribe un CSV por tick y por repetición (`<caso><tag>_r<N>.csv`); con `--csv-failures-only`, solo de las que fallan.
+- `referee` corre los casos del árbitro (`halt_game_on`, `halt_in_area`, `stop_in_area`). El bench lanza el listener real y le manda `HALT`, `STOP` y `GAME_ON` como texto por UDP a `VSSL_REFEREE_ADDR` (o al grupo multicast por defecto). Si en la máquina no funciona el loopback de multicast, usar `VSSL_REFEREE_ADDR=127.0.0.1:10003`.
 
 ```bash
 # FIRASim corriendo. Regla del equipo: nada se acepta en sim limpio, siempre con el proxy de ruido.
@@ -563,13 +577,13 @@ cargo run --release --bin motion_bench -- --list
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (324 tests)
-cargo test --bin motion_bench    # métricas, criterios y reanudación del bench de aceptación (14 tests)
+cargo test --lib                 # solo lib (339 tests)
+cargo test --bin motion_bench    # métricas, criterios y reanudación del bench de aceptación (16 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI (19 tests)
 ```
 
-**363 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos), skill_log (CsvLogger + row-builder compartido).
+**380 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

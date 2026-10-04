@@ -220,6 +220,13 @@ impl SkillCatalog {
         }
     }
 
+    /// Olvida la última skill de todos los robots: la próxima activación de cada uno se
+    /// trata como cambio de skill (reinicio de la skill y del estado de motion del robot).
+    /// El control loop la llama mientras el equipo está detenido (parada, HALT o STOP).
+    pub fn forget_last_skills(&mut self) {
+        self.last_skill.iter_mut().for_each(|s| *s = None);
+    }
+
     /// La instancia de `skill_id` del robot `robot_id`, como `dyn Skill` (para `reset`).
     fn skill_mut(&mut self, robot_id: usize, skill_id: SkillId) -> &mut dyn Skill {
         match skill_id {
@@ -740,6 +747,30 @@ mod tests {
         let c = catalog.tick(0, SkillId::SpinKick, tgt, &off, &world, &motion);
         assert!(c.omega.abs() <= motion.config.max_angular_speed + 1e-9, "relanzada gira en el lugar: ω={}", c.omega);
         assert!(!catalog.status(0, SkillId::SpinKick, tgt, &off, &world).done);
+    }
+
+    #[test]
+    fn forgetting_last_skills_restarts_skill_and_ramp() {
+        // SpinKick girando junto a la pelota; tras olvidar la última skill, la misma skill
+        // a 0.16 m de la pelota arranca de cero: se acerca (no gira) con la rampa desde 0.
+        let mut catalog = SkillCatalog::new(3);
+        let mut world = World::new(3, 3);
+        let ball = Vec2::new(0.2, -0.3);
+        world.update_ball(ball, Vec2::ZERO);
+        let motion = Motion::new();
+        let tgt = Vec2::new(0.0, 0.3);
+        let probe = SpinKickSkill::new(tgt);
+        let (ccw, _) = probe.contact_centers(ball, (tgt - ball).normalize());
+        let at = make_robot(0, ccw.x, ccw.y, 0.0);
+        for _ in 0..10 {
+            catalog.tick(0, SkillId::SpinKick, tgt, &at, &world, &motion);
+        }
+        catalog.forget_last_skills();
+        let off = make_robot(0, ball.x + 0.10, ball.y + 0.12, 0.0);
+        let c = catalog.tick(0, SkillId::SpinKick, tgt, &off, &world, &motion);
+        assert!(c.omega.abs() <= motion.config.max_angular_speed + 1e-9, "sigue girando: ω={}", c.omega);
+        let v = c.vx.hypot(c.vy);
+        assert!(v <= motion.config.max_linear_accel * crate::motion::CONTROL_DT + 1e-9, "rampa: v={v}");
     }
 
     #[test]
