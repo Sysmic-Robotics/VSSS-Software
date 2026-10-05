@@ -34,7 +34,7 @@ use rustengine::motion::{Motion, MotionConfig};
 use rustengine::params::params;
 use rustengine::radio::{FIRASimClient, RadioTarget, TeleportItem};
 use rustengine::skills::zones::AreaRect;
-use rustengine::skills::{ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, SkillId};
+use rustengine::skills::{ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, SkillConfig, SkillId};
 use rustengine::vision::VisionSource;
 use rustengine::world::World;
 use serde_json::{Value, json};
@@ -63,6 +63,15 @@ enum Goal {
     NoSidePush,
     /// Arquero en su punto de defensa mirando a la pelota.
     Keeper,
+    /// Spin: desde 1.0 s, velocidad angular medida con el signo de `target.x` y magnitud
+    /// ≥ 80 % de `SkillConfig::default().spin_omega`; traslación ≤ 0.03 m en todo el caso.
+    Spin,
+    /// Quieto: comando cero en todos los ticks y desplazamiento ≤ 0.01 m desde 0.3 s.
+    Still,
+    /// Llega y termina con la cara del modo a < 20° de la pelota (Mark).
+    ArriveFacingBall,
+    /// Llega sin mover la pelota más de 0.03 m (GoTo con la pelota en el camino: A4).
+    ArriveNoBallPush,
     /// Árbitro: en la ventana HALT/STOP la traslación comandada es cero (en HALT también
     /// `omega`) y el robot no se desplaza después de frenar (desde 1.0 s); al salir, cumple el objetivo
     /// de su skill (`arrived`) sin escapes en los primeros 0.5 s.
@@ -78,6 +87,8 @@ struct Case {
     /// x, y (m) y heading (grados).
     robot: (f32, f32, f32),
     ball: (f32, f32),
+    /// Velocidad inicial de la pelota en el teleport (m/s).
+    ball_vel: (f32, f32),
     dur: f64,
     /// Tolerancia de llegada (m); en FacePoint, grados.
     tol: f32,
@@ -104,7 +115,7 @@ const KICK_SPIN: Goal = Goal::Kick { min_prog: 0.10, max_dir: 45.0 };
 
 #[allow(clippy::too_many_arguments)]
 const fn c(name: &'static str, skill: SkillId, target: (f32, f32), robot: (f32, f32, f32), ball: (f32, f32), dur: f64, tol: f32, goal: Goal) -> Case {
-    Case { name, skill, target, robot, ball, dur, tol, goal, then: &[], referee: &[] }
+    Case { name, skill, target, robot, ball, ball_vel: (0.0, 0.0), dur, tol, goal, then: &[], referee: &[] }
 }
 
 #[rustfmt::skip]
@@ -113,7 +124,7 @@ const CASES: &[Case] = &[
     c("goto_side", SkillId::GoTo, (0.0, 0.3), (0.0, -0.3, 0.0), FAR, 6.0, 0.08, ARRIVE),
     c("goto_back", SkillId::GoTo, (-0.3, 0.0), (0.3, 0.0, 0.0), FAR, 6.0, 0.08, ARRIVE),
     c("goto_short_side", SkillId::GoTo, (0.0, 0.15), (0.0, 0.0, 0.0), FAR, 5.0, 0.08, ARRIVE),
-    c("goto_ball", SkillId::GoTo, (0.45, 0.0), (-0.45, 0.02, 0.0), (0.0, 0.0), 6.0, 0.08, ARRIVE),
+    c("goto_ball", SkillId::GoTo, (0.45, 0.0), (-0.45, 0.02, 0.0), (0.0, 0.0), 6.0, 0.08, Goal::ArriveNoBallPush),
     c("goto_wall_along", SkillId::GoTo, (0.4, -0.55), (-0.4, -0.55, 0.0), FAR, 6.0, 0.08, ARRIVE),
     c("goto_wall_out", SkillId::GoTo, (0.3, -0.2), (-0.3, -0.52, 0.0), FAR, 6.0, 0.08, ARRIVE),
     c("goto_wall_facing", SkillId::GoTo, (0.0, 0.0), (0.0, -0.57, -90.0), FAR, 6.0, 0.08, ARRIVE),
@@ -134,8 +145,13 @@ const CASES: &[Case] = &[
     c("b3_shoot_behind", SkillId::ShootPush, (0.75, 0.0), (-0.12, 0.0, 0.0), (0.0, 0.0), 3.0, 0.0, Goal::Kick { min_prog: 0.30, max_dir: 30.0 }),
     c("approach_front", SkillId::ApproachAligned, (0.75, 0.0), (0.3, 0.05, 180.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("approach_side", SkillId::ApproachAligned, (0.75, 0.0), (-0.1, -0.35, 90.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
-    c("mark_point", SkillId::Mark, (-0.3, 0.0), (0.2, -0.3, 0.0), (0.3, 0.3), 6.0, 0.08, ARRIVE),
+    c("mark_point", SkillId::Mark, (-0.3, 0.0), (0.2, -0.3, 0.0), (0.3, 0.3), 6.0, 0.08, Goal::ArriveFacingBall),
     c("intercept_static", SkillId::Intercept, (0.0, 0.0), (-0.4, -0.3, 0.0), (0.2, 0.2), 6.0, 0.09, ARRIVE),
+    // La pelota arranca rodando (teleport con velocidad) y cruza la cancha hacia abajo.
+    Case {
+        ball_vel: (-0.15, -0.7),
+        ..c("intercept_moving", SkillId::Intercept, (0.0, 0.0), (-0.3, -0.3, 0.0), (0.35, 0.45), 5.0, 0.09, ARRIVE)
+    },
     // Pelota en (−0.30, 0): más cerca del área, el staging de Clear o el rodeo de la pelota
     // caen en el arco, prohibido para un jugador de campo (motion no planifica alrededor).
     c("clear_own", SkillId::Clear, (0.2, 0.45), (-0.2, 0.3, 0.0), (-0.30, 0.0), 6.0, 0.0, KICK_PUSH),
@@ -148,9 +164,11 @@ const CASES: &[Case] = &[
         then: &[(SkillId::GoTo, (0.0, 0.16), 1.0), (SkillId::SpinKick, (0.75, 0.0), 4.0)],
         ..c("spinkick_interrupted", SkillId::SpinKick, (0.75, 0.0), (0.0, 0.074, 0.0), (0.0, 0.0), 0.07, 0.0, KICK_SPIN)
     },
-    c("a4_ball_behind_target", SkillId::GoTo, (0.33, 0.0), (-0.4, 0.0, 0.0), (0.0, 0.0), 6.0, 0.08, ARRIVE),
-    c("a4_ball_wall", SkillId::GoTo, (0.3, -0.25), (-0.3, -0.5, 0.0), (0.0, -0.56), 6.0, 0.08, ARRIVE),
-    c("spin_20", SkillId::Spin, (1.0, 0.0), (0.0, 0.0, 0.0), FAR, 2.0, 0.0, Goal::None),
+    c("a4_ball_behind_target", SkillId::GoTo, (0.33, 0.0), (-0.4, 0.0, 0.0), (0.0, 0.0), 6.0, 0.08, Goal::ArriveNoBallPush),
+    c("a4_ball_wall", SkillId::GoTo, (0.3, -0.25), (-0.3, -0.5, 0.0), (0.0, -0.56), 6.0, 0.08, Goal::ArriveNoBallPush),
+    c("spin_20", SkillId::Spin, (1.0, 0.0), (0.0, 0.0, 0.0), FAR, 3.0, 0.0, Goal::Spin),
+    c("spin_cw", SkillId::Spin, (-1.0, 0.0), (0.0, 0.0, 0.0), FAR, 3.0, 0.0, Goal::Spin),
+    c("hold_still", SkillId::Hold, (0.0, 0.0), (0.2, -0.2, 30.0), FAR, 3.0, 0.0, Goal::Still),
     c("goalkeep_keeper", SkillId::GoalKeep, (-0.75, 0.0), (-0.4, 0.2, 0.0), (0.0, -0.15), 5.0, 0.0, Goal::Keeper),
     // Árbitro por texto: HALT a velocidad de crucero; HALT y STOP con un jugador de campo
     // dentro del área propia (sin el árbitro, el `ZoneGuard` lo sacaría).
@@ -166,6 +184,24 @@ const CASES: &[Case] = &[
         referee: &[(0.0, "STOP"), (1.5, "GAME_ON")],
         ..c("stop_in_area", SkillId::Hold, (0.0, 0.0), (-0.66, 0.0, 90.0), FAR, 4.0, 0.0, Goal::Referee)
     },
+];
+
+/// Suite completa de regresión de las 13 skills (alias `suite`): para hitos.
+const SUITE: &[&str] = &[
+    "goto_side", "goto_back", "goto_short_side", "goto_wall_facing", "goto_ball",
+    "a4_ball_behind_target", "b1b_diag_into_area", "face_90", "face_180", "chase_fwd",
+    "chase_back", "spin_20", "spin_cw", "approach_front", "approach_side", "b3_shoot_side",
+    "b3_shoot_side25", "b3_shoot_behind", "intercept_static", "intercept_moving",
+    "b2_blockline_open", "b2_blockline_corner", "b2_blockline_center", "goalkeep_keeper",
+    "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
+    "mark_point", "hold_still", "b1a_hold_in_area",
+];
+
+/// Suite rápida, un caso por skill (alias `suite-rapida`): para cada change.
+const SUITE_QUICK: &[&str] = &[
+    "goto_side", "face_90", "chase_fwd", "spin_20", "approach_side", "b3_shoot_behind",
+    "intercept_moving", "b2_blockline_open", "goalkeep_keeper", "clear_lateral",
+    "spinkick_wall", "mark_point", "hold_still",
 ];
 
 /// Casos del árbitro (alias `referee` en la línea de comandos).
@@ -398,8 +434,49 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
                 && heading_err(Vec2::new(last.bx, last.by) - p, last.th, bidirectional).to_degrees() <= 20.0
         }
         Goal::Referee => referee_ok(case, rows, bidirectional),
+        Goal::Spin => spin_ok(case, rows),
+        Goal::Still => still_ok(rows),
+        Goal::ArriveFacingBall => {
+            let last = rows.last()?;
+            let p = Vec2::new(last.x, last.y);
+            m.arrived.is_some() && heading_err(Vec2::new(last.bx, last.by) - p, last.th, bidirectional).to_degrees() < 20.0
+        }
+        Goal::ArriveNoBallPush => {
+            let b0 = rows.first().map(|r| Vec2::new(r.bx, r.by))?;
+            let pushed = rows.iter().map(|r| (Vec2::new(r.bx, r.by) - b0).length()).fold(0.0f32, f32::max);
+            m.arrived.is_some() && pushed < 0.03
+        }
         Goal::None => return None,
     })
+}
+
+/// Criterio `Goal::Spin`: velocidad angular media medida desde 1.0 s (Δθ normalizado tick
+/// a tick: a 20 rad/s y 60 Hz son 0.33 rad por tick) con el signo de `target.x` y ≥ 80 %
+/// de `spin_omega`; el robot no se traslada más de 0.03 m.
+fn spin_ok(case: &Case, rows: &[Row]) -> bool {
+    let Some(first) = rows.first() else { return false };
+    let p0 = Vec2::new(first.x, first.y);
+    if rows.iter().any(|r| (Vec2::new(r.x, r.y) - p0).length() > 0.03) {
+        return false;
+    }
+    let win: Vec<&Row> = rows.iter().filter(|r| r.t - first.t >= 1.0).collect();
+    let (Some(a), Some(b)) = (win.first(), win.last()) else { return false };
+    if b.t <= a.t {
+        return false;
+    }
+    let turned: f64 = win.windows(2).map(|w| Motion::normalize_angle(w[1].th - w[0].th)).sum();
+    let omega = turned / (b.t - a.t);
+    let want = SkillConfig::default().spin_omega * case.target.0.signum() as f64;
+    omega * want > 0.0 && omega.abs() >= 0.8 * want.abs()
+}
+
+/// Criterio `Goal::Still`: comando cero en todos los ticks y desplazamiento ≤ 0.01 m desde
+/// 0.3 s (después de asentarse el teleport).
+fn still_ok(rows: &[Row]) -> bool {
+    let Some(t0) = rows.first().map(|r| r.t) else { return false };
+    let zero = rows.iter().all(|r| r.vx == 0.0 && r.vy == 0.0 && r.w == 0.0);
+    let settled: Vec<Vec2> = rows.iter().filter(|r| r.t - t0 >= 0.3).map(|r| Vec2::new(r.x, r.y)).collect();
+    zero && settled.first().is_some_and(|p0| settled.iter().all(|p| (*p - *p0).length() <= 0.01))
 }
 
 /// Criterio `Goal::Referee` sobre la primera ventana HALT/STOP de la línea de tiempo.
@@ -463,6 +540,21 @@ fn rate(results: &[Value], name: &str, repeat: u32) -> (usize, usize) {
     (judged.iter().filter(|v| v["success"] == json!(true)).count(), judged.len())
 }
 
+/// Éxitos y repeticiones válidas por skill, sumando sus casos, en el orden del catálogo.
+fn skill_rates(cases: &[&&Case], results: &[Value], repeat: u32) -> Vec<(SkillId, usize, usize)> {
+    (0..SkillId::COUNT as u8)
+        .filter_map(SkillId::from_u8)
+        .filter_map(|skill| {
+            let of: Vec<&&&Case> = cases.iter().filter(|c| c.skill == skill).collect();
+            if of.is_empty() {
+                return None;
+            }
+            let (k, n) = of.iter().map(|c| rate(results, c.name, repeat)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            Some((skill, k, n))
+        })
+        .collect()
+}
+
 /// Pares (caso, repetición) que ya tienen un resultado válido.
 fn done_set(results: &[Value]) -> HashSet<(String, u64)> {
     results
@@ -497,7 +589,8 @@ async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedRefe
     // El teleport lleva la orientación en grados (la unidad del replacement de FIRASim).
     let (x, y, deg) = pose;
     items.push(TeleportItem::Robot { team: 0, id: rid, x: x as f64, y: y as f64, theta: deg as f64 });
-    items.push(TeleportItem::Ball { x: case.ball.0 as f64, y: case.ball.1 as f64 });
+    let (bvx, bvy) = case.ball_vel;
+    items.push(TeleportItem::Ball { x: case.ball.0 as f64, y: case.ball.1 as f64, vx: bvx as f64, vy: bvy as f64 });
     // El replacement va por UDP y el robot puede traer inercia del caso anterior.
     for _ in 0..5 {
         client.teleport(&items).await.map_err(|e| e.to_string())?;
@@ -631,12 +724,16 @@ async fn main() {
     let all = names.is_empty() || names.iter().any(|n| n == "all");
     let skills = names.iter().any(|n| n == "skills");
     let referee_alias = names.iter().any(|n| n == "referee");
+    let suite = names.iter().any(|n| n == "suite");
+    let suite_quick = names.iter().any(|n| n == "suite-rapida");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
             all || names.iter().any(|n| n == c.name)
                 || (skills && SKILL_CASES.contains(&c.name))
                 || (referee_alias && REFEREE_CASES.contains(&c.name))
+                || (suite && SUITE.contains(&c.name))
+                || (suite_quick && SUITE_QUICK.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {
@@ -747,6 +844,13 @@ async fn main() {
             let (k, n) = rate(&results, c.name, repeat);
             let skill = if SKILL_CASES.contains(&c.name) { " [skill]" } else { "" };
             println!("  {:24} éxito {k}/{n}{skill}", c.name);
+        }
+    }
+    let by_skill = skill_rates(&judged, &results, repeat);
+    if by_skill.len() > 1 {
+        println!("\néxito por skill ({repeat} repeticiones, bidireccional={bidirectional}):");
+        for (skill, k, n) in by_skill {
+            println!("  {:16} éxito {k}/{n}", format!("{skill:?}"));
         }
     }
     let lost = results.iter().filter(|v| v["infra"] == json!(true)).count();
@@ -1003,13 +1107,93 @@ mod tests {
         assert!(REFEREE_CASES.iter().all(|n| !case(n).referee.is_empty() && case(n).goal == Goal::Referee));
     }
 
+    /// Filas a 60 Hz durante `dur` s girando a `w` rad/s en (x0, 0) con traslación `drift`
+    /// m/s en +x.
+    fn spin_rows(dur: f64, w: f64, drift: f32) -> Vec<Row> {
+        (0..(dur * 60.0) as usize)
+            .map(|k| {
+                let t = k as f64 / 60.0;
+                let th = Motion::normalize_angle(w * t);
+                Row { t, x: drift * t as f32, y: 0.0, th, bx: 0.6, by: 0.5, w, ..Default::default() }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spin_criterion_checks_direction_rate_and_translation() {
+        let ccw = case("spin_20");
+        let cw = case("spin_cw");
+        let ok = |c: &Case, rows: &[Row]| success(c, rows, &metrics(c, rows, false), false);
+        let fast_ccw = spin_rows(3.0, 18.0, 0.0);
+        assert_eq!(ok(&ccw, &fast_ccw), Some(true));
+        assert_eq!(ok(&cw, &fast_ccw), Some(false), "sentido contrario");
+        assert_eq!(ok(&cw, &spin_rows(3.0, -17.0, 0.0)), Some(true));
+        assert_eq!(ok(&ccw, &spin_rows(3.0, 10.0, 0.0)), Some(false), "demasiado lento");
+        assert_eq!(ok(&ccw, &spin_rows(3.0, 18.0, 0.02)), Some(false), "se traslada 6 cm");
+    }
+
+    #[test]
+    fn still_criterion_needs_zero_command_and_no_motion() {
+        let c = case("hold_still");
+        let ok = |rows: &[Row]| success(&c, rows, &metrics(&c, rows, false), false);
+        let still: Vec<Row> = (0..180).map(|k| row(k as f64 / 60.0, 0.2, -0.2, 0.5)).collect();
+        assert_eq!(ok(&still), Some(true));
+        let mut moved = still.clone();
+        for r in moved.iter_mut().skip(120) {
+            r.x += 0.03;
+        }
+        assert_eq!(ok(&moved), Some(false));
+        let mut cmd = still.clone();
+        cmd[50].vx = 0.05;
+        assert_eq!(ok(&cmd), Some(false));
+    }
+
+    #[test]
+    fn mark_must_end_facing_the_ball() {
+        let c = case("mark_point"); // punto (−0.3, 0), pelota (0.3, 0.3)
+        let at = |th: f64| vec![Row { t: 0.0, x: -0.3, y: 0.0, th, bx: 0.3, by: 0.3, ..Default::default() }];
+        let to_ball = 0.3f64.atan2(0.6);
+        let ok = |rows: &[Row], bidir: bool| success(&c, rows, &metrics(&c, rows, bidir), bidir);
+        assert_eq!(ok(&at(to_ball), false), Some(true));
+        assert_eq!(ok(&at(to_ball + std::f64::consts::PI), false), Some(false), "de espaldas en frontal");
+        assert_eq!(ok(&at(to_ball + std::f64::consts::PI), true), Some(true), "de espaldas vale con dos caras");
+    }
+
+    #[test]
+    fn goto_must_not_push_the_ball_in_its_way() {
+        let c = case("a4_ball_behind_target"); // destino (0.33, 0), pelota en (0, 0)
+        let mut rows = vec![
+            Row { t: 0.0, x: -0.4, y: 0.0, bx: 0.0, by: 0.0, ..Default::default() },
+            Row { t: 2.0, x: 0.33, y: 0.0, bx: 0.0, by: 0.0, ..Default::default() },
+        ];
+        let ok = |rows: &[Row]| success(&c, rows, &metrics(&c, rows, false), false);
+        assert_eq!(ok(&rows), Some(true));
+        rows[1].bx = 0.10;
+        assert_eq!(ok(&rows), Some(false), "llegó empujando la pelota");
+    }
+
+    #[test]
+    fn suites_cover_the_whole_catalog() {
+        let skills = |names: &[&str]| -> Vec<SkillId> { names.iter().map(|n| case(n).skill).collect() };
+        let all: Vec<SkillId> = (0..SkillId::COUNT as u8).filter_map(SkillId::from_u8).collect();
+        // Rápida: exactamente un caso por skill.
+        let quick = skills(SUITE_QUICK);
+        assert_eq!(quick.len(), SkillId::COUNT);
+        assert!(all.iter().all(|s| quick.iter().filter(|q| *q == s).count() == 1));
+        // Completa: todas las skills, todos los casos con criterio.
+        let full = skills(SUITE);
+        assert!(all.iter().all(|s| full.contains(s)), "falta alguna skill en la suite completa");
+        assert!(SUITE.iter().all(|n| case(n).goal != Goal::None));
+        assert!(SUITE_QUICK.iter().all(|n| SUITE.contains(n)));
+    }
+
     #[test]
     fn case_names_are_unique_and_lists_exist() {
         let mut names: Vec<&str> = CASES.iter().map(|c| c.name).collect();
         names.sort();
         names.dedup();
         assert_eq!(names.len(), CASES.len());
-        assert!(NAV.iter().chain(SKILL_CASES).chain(REFEREE_CASES).all(|n| CASES.iter().any(|c| c.name == *n)));
+        assert!(NAV.iter().chain(SKILL_CASES).chain(REFEREE_CASES).chain(SUITE).all(|n| CASES.iter().any(|c| c.name == *n)));
         assert!(SKILL_CASES.iter().all(|n| case(n).goal != Goal::None));
     }
 }

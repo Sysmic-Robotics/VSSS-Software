@@ -559,6 +559,7 @@ Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales 
 `motion_bench` corre casos fijos (GoTo, FacePoint, ChaseBall, Mark, Intercept, ApproachAligned, BlockLine, entradas al área y casos de skills) contra FIRASim, por el mismo `run_control_loop` que `main`. Cada caso es un guion de una o más fases (skill, target, duración) y tiene un criterio de éxito (llegar, no tocar el área, patear hacia el objetivo, no empujar de costado, arquero en su punto mirando la pelota). Imprime una línea JSON por repetición, un resumen de los 17 casos de navegación (llegadas, giro acumulado hasta llegar, ticks de escape y tiempo medio, sobre la repetición 0) y la tasa de éxito por caso. `b2_blockline_open` se informa aparte. En los casos de GoalKeep el robot de prueba es el arquero (`coach.keeper_id`). Se configura con las mismas variables que producción.
 
 - `skills` corre los 11 casos de los bugs de skills; `all`, todos.
+- `suite` corre la **suite de regresión de las 13 skills** (32 casos, al menos uno con criterio por skill) y `suite-rapida`, un caso por skill (13). Al final se imprime la tasa por caso y **por skill**. Criterios de las skills que no tenían uno: Spin (gira en el sentido pedido a ≥ 80 % de `spin_omega` sin trasladarse), Hold (comando cero y quieto), Mark (llega mirando a la pelota), Intercept con la pelota en movimiento (el teleport acepta velocidad de la pelota) y GoTo con la pelota en el camino (llega sin moverla: pendiente A4).
 - `--repeat N`: N repeticiones por caso; la 0 con la pose del caso y las demás con un jitter determinista (±0.02 m, ±10°).
 - `--out FILE`: agrega cada repetición a un JSONL y, al relanzar con el mismo archivo, salta las que ya tienen resultado (para reanudar si FIRASim se cae).
 - Una repetición con FIRASim caído, sin datos del robot o con la física explotada (salto de pose de más de 0.3 m entre ticks) es **falla de infraestructura**: no cuenta en la tasa, se reintenta hasta 2 veces y, si no se recupera, el binario sale con código 3. El resumen informa cuántas se perdieron.
@@ -573,17 +574,30 @@ VSSL_VISION_NOISE=1 cargo run --release --bin motion_bench -- skills --repeat 20
 cargo run --release --bin motion_bench -- --list
 ```
 
+### Suite de regresión de las 13 skills (`tools/suite_skills.sh`)
+
+Un solo comando corre la suite en los dos modos, con el proxy de ruido y 20 repeticiones por caso:
+
+```bash
+# FIRASim corriendo; sin la GUI ni otro engine (comandan los mismos robots).
+tools/suite_skills.sh rapida logs/suite                      # ~50 min, para cada change
+tools/suite_skills.sh completa logs/suite                    # ~2 h, para hitos (motion, torneo, sysid)
+REPEAT=10 FIRASIM_BIN=~/FIRASim/bin/FIRASim tools/suite_skills.sh rapida logs/suite
+```
+
+Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt` (tasa por caso y por skill) y el CSV por tick solo de las repeticiones que fallan. Si FIRASim se cae, reanuda desde la repetición pendiente (lo relanza si `FIRASIM_BIN` está definido). Se niega a correr si hay otro engine abierto.
+
 ## Tests
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (340 tests)
-cargo test --bin motion_bench    # métricas, criterios y reanudación del bench de aceptación (16 tests)
+cargo test --lib                 # solo lib (342 tests)
+cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (21 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI (19 tests)
 ```
 
-**381 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
+**388 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

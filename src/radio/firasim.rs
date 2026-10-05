@@ -181,10 +181,12 @@ impl FIRASimClient {
                     rr.turnon = true;
                     replacement.robots.push(rr);
                 }
-                TeleportItem::Ball { x, y } => {
+                TeleportItem::Ball { x, y, vx, vy } => {
                     let mut b = BallReplacement::new();
                     b.x = x;
                     b.y = y;
+                    b.vx = vx;
+                    b.vy = vy;
                     replacement.ball = protobuf::MessageField::some(b);
                 }
             }
@@ -389,5 +391,18 @@ mod tests {
         let n = sim.recv(&mut buf).await.unwrap();
         let pkt = Packet::parse_from_bytes(&buf[..n]).unwrap();
         assert_eq!(pkt.replace.robots[0].position.orientation, 90.0);
+    }
+
+    #[tokio::test]
+    async fn ball_teleport_carries_its_velocity() {
+        use crate::protos::fira_packet::Packet;
+        let sim = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sim.local_addr().unwrap().port();
+        let client = FIRASimClient::new("127.0.0.1", port).await.unwrap();
+        client.teleport(&[TeleportItem::Ball { x: 0.3, y: 0.4, vx: 0.0, vy: -0.7 }]).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = sim.recv(&mut buf).await.unwrap();
+        let b = Packet::parse_from_bytes(&buf[..n]).unwrap().replace.ball.clone().unwrap();
+        assert_eq!((b.x, b.y, b.vx, b.vy), (0.3, 0.4, 0.0, -0.7));
     }
 }

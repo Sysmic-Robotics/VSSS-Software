@@ -1202,7 +1202,7 @@ impl VisionGui {
                     (self.tp_ball_x.parse::<f64>(), self.tp_ball_y.parse::<f64>())
                     && let Some(tx) = &self.teleport_tx
                 {
-                    let _ = tx.try_send(vec![TeleportItem::Ball { x, y }]);
+                    let _ = tx.try_send(vec![TeleportItem::Ball { x, y, vx: 0.0, vy: 0.0 }]);
                 }
             }
             Message::RadioPortChanged(port) => {

@@ -15,9 +15,13 @@ pub enum TeleportItem {
         y: f64,
         theta: f64,
     },
+    /// Pelota en `(x, y)` con velocidad inicial `(vx, vy)` (m/s, marco mundo; cero para
+    /// dejarla quieta).
     Ball {
         x: f64,
         y: f64,
+        vx: f64,
+        vy: f64,
     },
 }
 
