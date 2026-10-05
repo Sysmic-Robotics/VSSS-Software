@@ -25,7 +25,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_SIDE` | azul `left`, amarillo `right` | Arco que defendemos (`left` = atacamos hacia +X). Cambia en el segundo tiempo y según cómo esté puesto el simulador; el coach avisa al arrancar si los robots están en la mitad contraria. |
 | `VSSL_COACH` | `heuristic` | `heuristic` (equipo STP de dos caras), `rule_based` (baseline de roles fijos) o `none`. |
 | `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro y avanza de espaldas cuando conviene. |
-| `VSSL_BORDER_RECOVERY` | (on) | `0`: apaga la recuperación de atasco. Hay atasco si durante 30 ticks se le comanda avanzar (> 0.1 m/s a lo largo del heading) y su pose medida se desplaza menos de 0.03 m netos; entonces hace una maniobra de escape de 25 ticks. |
+| `VSSL_BORDER_RECOVERY` | (on) | `0`: apaga la recuperación de atasco. Hay atasco si durante 30 ticks se le comanda avanzar (> 0.1 m/s a lo largo del heading) y todas sus poses medidas quedan a menos de 0.03 m de la primera de la ventana (un salto de la pose estimada, como el sobrepaso del estimador al chocar la pelota, cuenta como movimiento); entonces hace una maniobra de escape de 25 ticks. |
 | `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |
 | `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota). |
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
@@ -577,13 +577,13 @@ cargo run --release --bin motion_bench -- --list
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (339 tests)
+cargo test --lib                 # solo lib (340 tests)
 cargo test --bin motion_bench    # métricas, criterios y reanudación del bench de aceptación (16 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI (19 tests)
 ```
 
-**380 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
+**381 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

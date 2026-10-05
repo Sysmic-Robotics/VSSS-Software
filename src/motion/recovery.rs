@@ -27,7 +27,7 @@ const FIELD_HALF_Y: f32 = 0.65;
 const BORDER_BAND: f32 = 0.10;
 
 /// Ventana de detección (ticks, ~0.5 s @ 60 Hz): en cada uno de estos ticks se le
-/// comandó avanzar y el desplazamiento neto de la pose medida en la ventana fue chico.
+/// comandó avanzar y todas las poses medidas de la ventana quedaron cerca de la primera.
 const STUCK_TICKS: usize = 30;
 /// Duración de la maniobra de escape una vez disparada (ticks).
 const RECOVERY_TICKS: u32 = 25;
@@ -35,11 +35,13 @@ const RECOVERY_TICKS: u32 = 25;
 /// "se le pidió avanzar". Girar en el lugar no cuenta, aunque el comando tenga
 /// componente en mundo.
 const CMD_BODY_EPS: f64 = 0.10;
-/// Desplazamiento NETO máximo de la pose medida en la ventana (m) para declarar atasco:
-/// 0.03 m en 0.5 s = 0.06 m/s. Es la distancia entre la primera y la última pose de la
-/// ventana, no el largo del camino: el jitter del ruido de cámara no se acumula. Se
-/// mide sobre la pose y no sobre la velocidad del EKF, que con el tracker apagado
-/// (`VSSL_TRACKER=off`) vale cero.
+/// Radio (m) alrededor de la primera pose de la ventana: hay atasco si TODAS las poses
+/// medidas quedan dentro (distancia máxima desde el inicio < 0.03 m en 0.5 s). No es el
+/// largo del camino, así que el jitter del ruido de cámara no se acumula; tampoco es
+/// solo la última pose: un salto de la pose estimada (el estimador se adelanta y vuelve
+/// 8–10 cm al frenar en seco contra la pelota) cuenta como movimiento. Se mide sobre la
+/// pose y no sobre la velocidad del EKF, que con el tracker apagado
+/// (`VSSL_TRACKER=off`) vale cero. Revisar con el σ de la cámara real.
 const STUCK_NET_DISP: f32 = 0.03;
 /// Rapidez (m/s) de la reversa de escape (world frame, alejándose de la pared).
 const ESCAPE_SPEED: f64 = 0.4;
@@ -147,7 +149,7 @@ impl BorderRecovery {
             st.window.pop_front();
         }
         let stuck = st.window.len() == STUCK_TICKS
-            && (pos - st.window[0]).length() < STUCK_NET_DISP;
+            && st.window.iter().all(|p| (*p - st.window[0]).length() < STUCK_NET_DISP);
         if !stuck {
             // Sin atasco: pass-through.
             return false;
@@ -351,10 +353,30 @@ mod tests {
     }
 
     #[test]
+    fn estimator_snap_back_after_a_collision_is_not_stuck() {
+        // Al frenar en seco contra la pelota, la pose estimada se adelanta 8 cm y vuelve;
+        // después el robot avanza a ~0.16 m/s. Si la ventana arranca en la pose
+        // adelantada, la última queda a 0.02 m de la primera (el criterio neto declaraba
+        // atasco en el tick 29), pero hubo poses a 8 cm: no es atasco.
+        let x0 = -0.2;
+        let pose = |k: usize| {
+            let x = if k <= 6 {
+                x0 + 0.08 * (1.0 - k as f32 / 6.0)
+            } else {
+                x0 + 0.0026 * (k - 6) as f32
+            };
+            Vec2::new(x, 0.1)
+        };
+        let net = (pose(STUCK_TICKS - 1) - pose(0)).length();
+        assert!(net < STUCK_NET_DISP, "escenario del criterio neto: {net:.3}");
+        assert_eq!(first_escape(60, 0.3, 0.0, pose), None);
+    }
+
+    #[test]
     fn camera_noise_does_not_hide_a_stuck_robot() {
-        // Pose fija + ruido gaussiano con el σ del proxy (1.85 mm por eje): el
-        // desplazamiento NETO de la ventana sigue chico y el atasco se detecta. Con el
-        // largo del camino, el jitter sumaría varios cm y lo taparía.
+        // Pose fija + ruido gaussiano con el σ del proxy (1.85 mm por eje): todas las
+        // poses de la ventana siguen a menos de 0.03 m de la primera (~1 cm) y el atasco
+        // se detecta. Con el largo del camino, el jitter sumaría varios cm y lo taparía.
         let sigma = crate::params::VisionParams::default().proxy_sigma_pos_m as f32;
         let mut rng = 0x2545_F491_4F6C_DD1Du64;
         let mut gauss = move || {
