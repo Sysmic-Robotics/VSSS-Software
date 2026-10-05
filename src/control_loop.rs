@@ -1314,9 +1314,10 @@ mod tests {
     #[test]
     fn reflexes_escape_cannot_enter_the_area() {
         // Robot trabado junto a la esquina del área propia, con heading diagonal: la
-        // skill lo aleja (marcha atrás), pero no se mueve → a los 30 ticks escapa hacia el
-        // centro. Proyectado a su heading, ese escape lo metería al área: el segundo paso
-        // del guardia anula la traslación y deja el giro del escape.
+        // skill lo aleja (marcha atrás), pero no se mueve → tras la gracia de arranque
+        // desde el reposo y la ventana (60 ticks) escapa hacia el centro. Proyectado a su
+        // heading, ese escape lo metería al área: el segundo paso del guardia anula la
+        // traslación y deja el giro del escape.
         let guard = ZoneGuard::new(1.0, 2);
         let mut recovery = BorderRecovery::new(true);
         let th = (-0.954f64).atan2(-0.3);
@@ -1325,7 +1326,7 @@ mod tests {
         let mut world = World::new(3, 3);
         world.update_robot(0, 0, p, th, Vec2::ZERO, 0.0);
         let mut escaped = false;
-        for _ in 0..30 {
+        for _ in 0..60 {
             let mut cmds = vec![own_cmd(-0.3, th)];
             let esc = apply_reflexes(&mut cmds, &world, &mut recovery, &guard, &HashSet::new(), 0);
             if esc[0] {
