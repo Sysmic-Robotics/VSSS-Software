@@ -82,6 +82,12 @@ enum Stall {
 
 /// Segundos de empuje sin que la pelota se mueva antes de forzar `SpinKick`.
 const PUSH_STALL_S: f32 = 1.5;
+/// Arquero activo: sale a despejar una pelota conducida por un rival (a menos de esta
+/// distancia de ella y más lenta que este tope) dentro del área propia ampliada en
+/// este margen.
+const KEEPER_CHALLENGE_OPP_DIST: f32 = 0.20;
+const KEEPER_CHALLENGE_MAX_BALL_SPEED: f32 = 0.40;
+const KEEPER_CHALLENGE_MARGIN: f32 = 0.12;
 /// Tope del giro forzado si la pelota tampoco se suelta así (vuelve a empujar).
 const STALL_KICK_MAX_S: f32 = 3.0;
 
@@ -677,7 +683,14 @@ impl HeuristicCoach {
             .unwrap_or(0.0)
     }
 
-    fn keeper_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2) -> SkillChoice {
+    /// Pelota en el área propia ampliada en `KEEPER_CHALLENGE_MARGIN` (el borde desde
+    /// donde un rival la mete conduciendo).
+    fn near_own_area(&self, p: Vec2) -> bool {
+        let s = self.attack_sign();
+        (p.x * -s) >= GOAL_AREA_X - KEEPER_CHALLENGE_MARGIN && p.y.abs() <= GOAL_AREA_HALF_Y + KEEPER_CHALLENGE_MARGIN
+    }
+
+    fn keeper_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
         let in_area = self.in_own_area(ball);
         if in_area {
             if self.ball_in_area_since.is_none() {
@@ -686,11 +699,17 @@ impl HeuristicCoach {
         } else {
             self.ball_in_area_since = None;
         }
-        // Despejar si la pelota quedó parada en el área, o sí o sí antes del
-        // límite reglamentario de retención (10 s) aunque siga moviéndose.
-        let parked = in_area && ball_vel.length() <= self.p.gk_clear_max_ball_speed;
+        // Despejar si la pelota quedó parada en el área, sí o sí antes del límite
+        // reglamentario de retención (10 s) aunque siga moviéndose, o si un rival la
+        // lleva conduciendo (lenta, con él encima) por el área o su borde: esperarlo en
+        // la línea es dejar que la empuje hasta adentro.
+        let slow = ball_vel.length() <= self.p.gk_clear_max_ball_speed;
+        let carried = ball_vel.length() <= KEEPER_CHALLENGE_MAX_BALL_SPEED
+            && opp.iter().any(|o| o.active && (o.pos - ball).length() <= KEEPER_CHALLENGE_OPP_DIST);
+        let parked = in_area && slow;
         let overdue = in_area && self.ball_seconds_in_own_area() >= self.p.gk_force_clear_s;
-        if parked || overdue {
+        let challenge = carried && self.near_own_area(ball);
+        if parked || overdue || challenge {
             let target = self.clear_target(ball);
             let skill = self.commit(r.id, SkillId::Clear, |_| true);
             return SkillChoice::new(r.id, skill, target);
@@ -824,7 +843,7 @@ impl Coach for HeuristicCoach {
         let mut choices = Vec::with_capacity(3);
         for r in own.iter().filter(|r| r.active) {
             let choice = match self.role_of(r.id) {
-                Some(Role::Keeper) => self.keeper_choice(r, ball, ball_vel),
+                Some(Role::Keeper) => self.keeper_choice(r, ball, ball_vel, &opp),
                 Some(Role::Striker) if ball_in_own_area => {
                     let skill = self.commit(r.id, SkillId::BlockLine, |_| true);
                     SkillChoice::new(r.id, skill, self.own_goal)
@@ -1011,6 +1030,34 @@ mod tests {
         assert_eq!(gk.skill_id, SkillId::Clear);
         assert!(gk.target.x > -0.62, "despeje hacia adelante: {:?}", gk.target);
         assert!(gk.target.y > 0.0, "despeje al lado de la pelota");
+    }
+
+    #[test]
+    fn keeper_challenges_rival_carrying_ball_into_area() {
+        // Partido 3: el rival condujo la pelota 8 s por nuestra área a 0.1-0.2 m/s y el
+        // arquero esperó en la línea hasta el gol. Con un rival encima de una pelota
+        // lenta en el área o su borde, sale a despejar.
+        let mut c = coach();
+        let mut o = obs(
+            Vec2::new(-0.52, -0.25),
+            Vec2::new(-0.15, -0.05),
+            [Vec2::new(0.0, 0.3), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)],
+        );
+        o.opp_robots[0] = robot(Vec2::new(-0.44, -0.22), 180.0);
+        assert_eq!(choice_of(&c.decide(&o), 2).skill_id, SkillId::Clear);
+        // Misma pelota sin rival encima: sigue en la línea.
+        let mut c = coach();
+        o.opp_robots[0] = RobotObs::default();
+        assert_eq!(choice_of(&c.decide(&o), 2).skill_id, SkillId::GoalKeep);
+        // Rival encima pero lejos del área: no sale.
+        let mut c = coach();
+        let mut far = obs(
+            Vec2::new(-0.30, -0.25),
+            Vec2::new(-0.15, -0.05),
+            [Vec2::new(0.0, 0.3), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)],
+        );
+        far.opp_robots[0] = robot(Vec2::new(-0.22, -0.22), 180.0);
+        assert_eq!(choice_of(&c.decide(&far), 2).skill_id, SkillId::GoalKeep);
     }
 
     #[test]
