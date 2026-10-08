@@ -365,14 +365,15 @@ impl Skill for ShootPushSkill {
             return stop_cmd(robot);
         }
 
-        // Empuje directo (sin UVF: la pelota NO es obstáculo) apuntando más allá de
-        // la pelota para no frenar sobre ella; heading sobre la línea de empuje.
+        // Empuje con la ley del diferencial (como `Clear`), apuntando más allá de la
+        // pelota para no frenar sobre ella: si el heading no está sobre la recta de
+        // empuje primero gira (avance ∝ cos del error). Un vector en marco mundo
+        // proyectado sobre un heading cruzado movía al robot hacia atrás y fuera de la
+        // recta, la táctica volvía a `ApproachAligned` y el ciclo nunca tocaba la pelota.
+        // La pelota no desvía: queda a menos de 1.5 radios de influencia del punto de
+        // empuje.
         let push_point = ball + dir * self.push_overshoot;
-        let mut cmd = motion.move_direct(robot, push_point);
-        let desired = (dir.y as f64).atan2(dir.x as f64);
-        let face = motion.face_to_angle(robot, desired, self.kp, self.ki, self.kd);
-        cmd.omega = face.omega;
-        cmd
+        motion.move_and_face(robot, push_point, push_point, world, self.kp, self.ki, self.kd)
     }
 
     fn is_done(&self, robot: &RobotState, world: &World) -> bool {
@@ -1216,24 +1217,52 @@ mod tests {
         assert!(!skill.status(&robot, &world).feasible);
     }
 
+    /// Comando tras dejar subir la rampa de aceleración (motion nuevo por caso).
+    fn settled_cmd(skill: &mut ShootPushSkill, robot: &RobotState, world: &World) -> MotionCommand {
+        let motion = bidir_motion();
+        let mut cmd = skill.tick(robot, world, &motion);
+        for _ in 0..25 {
+            cmd = skill.tick(robot, world, &motion);
+        }
+        cmd
+    }
+
     #[test]
     fn shoot_push_pushes_through_ball_with_either_face() {
-        let motion = bidir_motion();
         let mut world = World::new(3, 3);
         world.update_ball(Vec2::new(0.0, 0.0), Vec2::ZERO);
         let mut skill = ShootPushSkill::new(Vec2::new(0.75, 0.0));
 
         let front = robot_at(-0.10, 0.0, 0.0);
-        let cmd_f = skill.tick(&front, &world, &motion);
+        let cmd_f = settled_cmd(&mut skill, &front, &world);
         assert!(cmd_f.vx > 0.3, "empuje frontal vx={}", cmd_f.vx);
         assert_eq!(skill.status(&front, &world).face, Face::Front);
 
         let back = robot_at(-0.10, 0.0, 180.0);
-        let cmd_b = skill.tick(&back, &world, &motion);
+        let cmd_b = settled_cmd(&mut skill, &back, &world);
         assert!(cmd_b.vx > 0.3, "empuje de espaldas vx={}", cmd_b.vx);
-        // Alineado con la espalda: el PID plegado no pide giro.
+        // Alineado con la espalda: el heading plegado no pide giro.
         assert!(cmd_b.omega.abs() < 1e-6, "omega={}", cmd_b.omega);
         assert_eq!(skill.status(&back, &world).face, Face::Back);
+    }
+
+    #[test]
+    fn shoot_push_turns_first_when_body_is_crossed() {
+        // Serie del 7-oct: factible por posición pero con el cuerpo cruzado respecto de la
+        // recta de empuje. El comando debe ser ejecutable por el diferencial (a lo largo
+        // del heading), girando hacia la recta y sin alejarse de la pelota.
+        let motion = bidir_motion();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let mut skill = ShootPushSkill::new(Vec2::new(0.75, 0.0));
+        let crossed = robot_at(-0.12, 0.02, -125.0);
+        assert!(skill.is_feasible(&crossed, Vec2::ZERO));
+        let cmd = skill.tick(&crossed, &world, &motion);
+        let th = crossed.orientation;
+        let across = cmd.vx * th.sin() - cmd.vy * th.cos();
+        assert!(across.abs() < 1e-6, "comando fuera del heading: {cmd:?}");
+        assert!(cmd.omega < -1.0, "debe girar hacia la recta: {cmd:?}");
+        assert!(cmd.vx >= 0.0, "no se aleja de la pelota: {cmd:?}");
     }
 
     #[test]
