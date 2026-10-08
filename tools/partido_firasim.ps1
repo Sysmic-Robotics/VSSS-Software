@@ -1,19 +1,26 @@
 # Lanza un partido de prueba en FIRASim (WSL) con cada componente en su propia ventana:
-#   1) FIRASim  2) engine azul (coach heuristico)  3) engine amarillo (rival)  4) arbitro de operador
+#   1) FIRASim  2) engine azul (coach heuristico)  3) engine amarillo (rival)
+#   4) director de partido (saque, goles, reposicion y marcador; corta por tiempo o goles)
 #
 # Uso (PowerShell, desde cualquier carpeta):
 #   powershell -ExecutionPolicy Bypass -File D:\Proyectos\VSSS-Software\tools\partido_firasim.ps1
+#   ... -Minutos 3 -Goles 3  (duracion y corte del director; defaults)
 #   ... -SinRuido        (sin proxy de ruido de camara)
 #   ... -SinAmarillo     (solo el equipo azul)
-#   ... -SinArbitro      (no abre la consola del arbitro)
+#   ... -ArbitroManual   (consola de arbitro de operador en vez del director)
+#   ... -SinArbitro      (ni director ni consola)
 #   ... -Rival heuristic (amarillo tambien con el coach nuevo; default rule_based)
 #
 # Cada ventana es un `wsl.exe bash -lc` independiente: cerrar una no cierra las demas.
-# Los CSV quedan en D:\Proyectos\VSSS-Software\logs\ (partido_azul.csv, partido_amarillo.csv).
+# Los CSV quedan en D:\Proyectos\VSSS-Software\logs\ (partido_azul.csv, partido_amarillo.csv)
+# y el resultado de cada partido se agrega a logs\partidos.jsonl.
 # (Archivo solo ASCII a proposito: PowerShell 5.1 lee los .ps1 sin BOM como ANSI.)
 param(
+    [double]$Minutos = 3,
+    [int]$Goles = 3,
     [switch]$SinRuido,
     [switch]$SinAmarillo,
+    [switch]$ArbitroManual,
     [switch]$SinArbitro,
     # Lado donde FIRASim puso al AZUL (mira la cancha: el arco que defiende el azul).
     # Con el lado al reves cada equipo ataca su propio arco y la fisica de FIRASim revienta.
@@ -48,9 +55,14 @@ if (-not $SinAmarillo) {
         "VSSL_VISION_NOISE=$ruido VSSL_MATCH_LOG=logs/partido_amarillo.csv cargo run --release")
 }
 
-if (-not $SinArbitro) {
+if ($ArbitroManual) {
     Write-Host "4/4 arbitro de operador (k b = kickoff azul, go = silbato, b 1 = free ball Q1, s = stop, h = halt, q = salir)"
     Start-WslWindow "ARBITRO" "cd $Repo && python3 tools/referee_cli.py"
+} elseif (-not $SinArbitro) {
+    # Espera a que los engines esten escuchando antes del primer silbato.
+    Write-Host "4/4 director de partido ($Minutos min, corte a $Goles goles; arranca en 15 s)"
+    Start-WslWindow "DIRECTOR" ("cd $Repo && sleep 15 && CARGO_TARGET_DIR=$target cargo run --release --bin match_director -- " +
+        "--minutes $Minutos --goals $Goles --out logs/partidos.jsonl")
 }
 
 Write-Host ""
