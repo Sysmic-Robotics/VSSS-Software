@@ -78,6 +78,24 @@ fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
 
+/// Puerta de giro del empuje (Clear y ShootPush): error de heading máximo (rad) respecto
+/// de la recta de empuje para empezar a empujar. Con la ley del diferencial (avance ∝ cos
+/// del error) el robot avanza mientras gira: entrando cruzado, se sale de la recta y manda
+/// la pelota en ángulo. Una vez empujando, el heading no corta el empuje.
+const PUSH_ENTRY_MAX_ERR: f64 = std::f64::consts::FRAC_PI_4;
+
+/// Error de heading (rad) de un robot con orientación `theta` respecto de la dirección
+/// `dir`, plegado a ±90° si es bidireccional (la cara más cercana).
+fn push_heading_error(theta: f64, dir: Vec2, bidirectional: bool) -> f64 {
+    let raw = Motion::normalize_angle((dir.y as f64).atan2(dir.x as f64) - theta);
+    if bidirectional { Motion::fold_bidirectional(raw) } else { raw }
+}
+
+/// `true` si el robot pasa la puerta de giro hacia `dir` (`PUSH_ENTRY_MAX_ERR`).
+fn passes_push_gate(theta: f64, dir: Vec2, bidirectional: bool) -> bool {
+    push_heading_error(theta, dir, bidirectional).abs() <= PUSH_ENTRY_MAX_ERR
+}
+
 /// Criterio geométrico de factibilidad de `ShootPush`, compartido con la capa
 /// táctica (el coach decide con la MISMA regla que la skill ejecuta):
 /// el robot está detrás de la pelota respecto de `target` (proyección sobre la
@@ -306,6 +324,8 @@ pub struct ShootPushSkill {
     pub kp: f64,
     pub ki: f64,
     pub kd: f64,
+    /// Fase de empuje: pasó la puerta de giro y sigue factible.
+    pushing: bool,
 }
 
 impl ShootPushSkill {
@@ -321,11 +341,17 @@ impl ShootPushSkill {
             kp: CONTROL_KP,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
+            pushing: false,
         }
     }
 
     pub fn set_target(&mut self, p: Vec2) {
         self.target = p;
+    }
+
+    /// `true` si en el último tick estaba empujando (pasó la puerta de giro).
+    pub fn is_pushing(&self) -> bool {
+        self.pushing
     }
 
     fn push_dir(&self, ball: Vec2) -> Option<Vec2> {
@@ -362,15 +388,24 @@ impl Skill for ShootPushSkill {
             return stop_cmd(robot);
         };
         if !self.is_feasible(robot, ball) {
+            self.pushing = false;
             return stop_cmd(robot);
         }
+        // Puerta de giro (como `Clear`): sin empujar y con más de 45° de error, gira en el
+        // lugar hacia la recta de empuje; con la ley del diferencial avanzaría mientras
+        // gira y mandaría la pelota en ángulo. Empujando, el heading no lo corta.
+        if !self.pushing {
+            if !passes_push_gate(robot.orientation, dir, motion.config.bidirectional) {
+                let desired = (dir.y as f64).atan2(dir.x as f64);
+                return motion.face_to_angle(robot, desired, self.kp, self.ki, self.kd);
+            }
+            self.pushing = true;
+        }
 
-        // Empuje con la ley del diferencial (como `Clear`), apuntando más allá de la
-        // pelota para no frenar sobre ella: si el heading no está sobre la recta de
-        // empuje primero gira (avance ∝ cos del error). Un vector en marco mundo
-        // proyectado sobre un heading cruzado movía al robot hacia atrás y fuera de la
-        // recta, la táctica volvía a `ApproachAligned` y el ciclo nunca tocaba la pelota.
-        // Es un movimiento de contacto: motion no rodea la pelota que va a empujar.
+        // Empuje con la ley del diferencial, apuntando más allá de la pelota para no
+        // frenar sobre ella. Un vector en marco mundo proyectado sobre un heading cruzado
+        // movía al robot hacia atrás y fuera de la recta. Es un movimiento de contacto:
+        // motion no rodea la pelota que va a empujar.
         let push_point = ball + dir * self.push_overshoot;
         motion.move_and_face_contact(robot, push_point, push_point, world, self.kp, self.ki, self.kd)
     }
@@ -381,6 +416,10 @@ impl Skill for ShootPushSkill {
             && (b.position - robot.position).length() > 0.12;
         let arrived = (b.position - self.target).length() < 0.05;
         released || arrived
+    }
+
+    fn reset(&mut self) {
+        self.pushing = false;
     }
 
     fn current_target(&self, world: &World) -> Option<Vec2> {
@@ -624,10 +663,6 @@ pub struct ClearSkill {
     pushing: bool,
 }
 
-/// Error de heading máximo (rad) respecto de la recta de despeje para entrar al empuje
-/// (plegado a ±90° en bidireccional). Entrando de costado, el robot gira mientras empuja,
-/// se sale de la recta y manda la pelota en ángulo.
-const CLEAR_ENTRY_MAX_ERR: f64 = std::f64::consts::FRAC_PI_4;
 /// Distancia lateral (m) a la recta de despeje desde la que un robot que ya empuja vuelve
 /// al staging (para entrar se exige `shoot_lateral_tol`, 0.05).
 const CLEAR_EXIT_LATERAL: f32 = 0.08;
@@ -716,8 +751,8 @@ impl ClearSkill {
 
     /// Siguiente fase dado si estaba empujando (`pushing`):
     /// - para **entrar** tiene que estar detrás de la pelota sobre la recta de despeje (la
-    ///   de la dirección efectiva; `shoot_push_feasible`) y con el error de heading a lo
-    ///   sumo `CLEAR_ENTRY_MAX_ERR` (plegado a ±90° si es bidireccional);
+    ///   de la dirección efectiva; `shoot_push_feasible`) y pasar la puerta de giro
+    ///   (`passes_push_gate`);
     /// - empujando, **sale** si se aparta de la recta más de `CLEAR_EXIT_LATERAL`, o si deja
     ///   de estar detrás de la pelota o la pierde (`lose_radius`).
     pub fn push_transition(&self, pushing: bool, robot: &RobotState, ball: Vec2, bidirectional: bool) -> bool {
@@ -730,11 +765,8 @@ impl ClearSkill {
                 && rel.dot(dir) <= self.behind_tol
                 && rel.length() <= self.lose_radius;
         }
-        let desired = (dir.y as f64).atan2(dir.x as f64);
-        let raw = Motion::normalize_angle(desired - robot.orientation);
-        let err = if bidirectional { Motion::fold_bidirectional(raw) } else { raw };
         shoot_push_feasible(robot.position, ball, ball + dir, self.behind_tol, self.lateral_tol, self.lose_radius)
-            && err.abs() <= CLEAR_ENTRY_MAX_ERR
+            && passes_push_gate(robot.orientation, dir, bidirectional)
     }
 }
 
@@ -1262,6 +1294,50 @@ mod tests {
         assert!(across.abs() < 1e-6, "comando fuera del heading: {cmd:?}");
         assert!(cmd.omega < -1.0, "debe girar hacia la recta: {cmd:?}");
         assert!(cmd.vx >= 0.0, "no se aleja de la pelota: {cmd:?}");
+    }
+
+    #[test]
+    fn shoot_push_turns_in_place_before_pushing_when_crossed() {
+        // Factible por posición pero con el cuerpo cruzado: gira en el lugar (sin
+        // traslación) hacia la recta de empuje (+x). 90° en ambos modos; −125° en frontal
+        // (en bidireccional se pliega a 55°, también fuera de la puerta).
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        for (deg, motion) in [(90.0, Motion::new()), (90.0, bidir_motion()), (-125.0, Motion::new()), (-125.0, bidir_motion())] {
+            let mut skill = ShootPushSkill::new(Vec2::new(0.75, 0.0));
+            let robot = robot_at(-0.12, 0.02, deg);
+            assert!(skill.is_feasible(&robot, Vec2::ZERO));
+            let cmd = skill.tick(&robot, &world, &motion);
+            assert_eq!((cmd.vx, cmd.vy), (0.0, 0.0), "{deg}° bidir={}: gira sin trasladar", motion.config.bidirectional);
+            assert!(cmd.omega.abs() > 0.5, "{deg}°: debe girar ({cmd:?})");
+            assert!(!skill.is_pushing());
+        }
+        // Alineado dentro de la puerta (30°): empuja hacia el objetivo.
+        let mut skill = ShootPushSkill::new(Vec2::new(0.75, 0.0));
+        let cmd = settled_cmd(&mut skill, &robot_at(-0.12, 0.02, 30.0), &world);
+        assert!(cmd.vx > 0.1, "empuja: {cmd:?}");
+        assert!(skill.is_pushing());
+    }
+
+    #[test]
+    fn shoot_push_does_not_stop_pushing_for_heading() {
+        // Ya empujando, el heading se cruza (60°) sin dejar de ser factible: sigue
+        // empujando (con la ley del diferencial). Al dejar de ser factible se detiene y la
+        // próxima entrada vuelve a pasar por la puerta.
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let mut skill = ShootPushSkill::new(Vec2::new(0.75, 0.0));
+        skill.tick(&robot_at(-0.12, 0.0, 0.0), &world, &motion);
+        assert!(skill.is_pushing());
+        let cmd = skill.tick(&robot_at(-0.12, 0.0, 60.0), &world, &motion);
+        assert!(skill.is_pushing(), "el heading no corta el empuje");
+        assert!(cmd.vx.abs() + cmd.vy.abs() > 0.0 || cmd.omega.abs() > 0.0);
+        let stop = skill.tick(&robot_at(0.0, 0.30, 0.0), &world, &motion);
+        assert!(!skill.is_pushing(), "no factible: se detiene");
+        assert_eq!((stop.vx, stop.vy, stop.omega), (0.0, 0.0, 0.0));
+        let turn = skill.tick(&robot_at(-0.12, 0.0, 90.0), &world, &motion);
+        assert_eq!((turn.vx, turn.vy), (0.0, 0.0), "vuelve a pasar por la puerta");
     }
 
     #[test]

@@ -149,6 +149,10 @@ const CASES: &[Case] = &[
     c("b3_shoot_side", SkillId::ShootPush, (0.75, 0.0), (0.0, 0.10, -90.0), (0.0, 0.0), 3.0, 0.0, Goal::NoSidePush),
     c("b3_shoot_side25", SkillId::ShootPush, (0.75, 0.0), (0.0, 0.25, -90.0), (0.0, 0.0), 3.0, 0.0, Goal::NoSidePush),
     c("b3_shoot_behind", SkillId::ShootPush, (0.75, 0.0), (-0.12, 0.0, 0.0), (0.0, 0.0), 3.0, 0.0, Goal::Kick { min_prog: 0.30, max_dir: 30.0 }),
+    // ShootPush factible por posición con el cuerpo cruzado: gira en el lugar antes de
+    // empujar (puerta de giro). −125° es 55° plegado en bidireccional.
+    c("b3_shoot_crossed90", SkillId::ShootPush, (0.75, 0.0), (-0.12, 0.02, 90.0), (0.0, 0.0), 3.0, 0.0, Goal::Kick { min_prog: 0.30, max_dir: 30.0 }),
+    c("b3_shoot_crossed125", SkillId::ShootPush, (0.75, 0.0), (-0.12, 0.02, -125.0), (0.0, 0.0), 3.0, 0.0, Goal::Kick { min_prog: 0.30, max_dir: 30.0 }),
     c("approach_front", SkillId::ApproachAligned, (0.75, 0.0), (0.3, 0.05, 180.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("approach_side", SkillId::ApproachAligned, (0.75, 0.0), (-0.1, -0.35, 90.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("mark_point", SkillId::Mark, (-0.3, 0.0), (0.2, -0.3, 0.0), (0.3, 0.3), 6.0, 0.08, Goal::ArriveFacingBall),
@@ -201,7 +205,8 @@ const SUITE: &[&str] = &[
     "goto_side", "goto_back", "goto_short_side", "goto_wall_facing", "goto_ball",
     "a4_ball_behind_target", "b1b_diag_into_area", "face_90", "face_180", "chase_fwd",
     "chase_back", "spin_20", "spin_cw", "approach_front", "approach_side", "b3_shoot_side",
-    "b3_shoot_side25", "b3_shoot_behind", "intercept_static", "intercept_moving",
+    "b3_shoot_side25", "b3_shoot_behind", "b3_shoot_crossed90", "b3_shoot_crossed125",
+    "intercept_static", "intercept_moving",
     "b2_blockline_open", "b2_blockline_corner", "b2_blockline_center", "goalkeep_keeper",
     "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
     "mark_point", "hold_still", "b1a_hold_in_area", "goto_around_area", "blockline_across_area",
@@ -230,7 +235,8 @@ const NAV: &[&str] = &[
 /// Casos de los bugs de skills (alias `skills` en la línea de comandos).
 const SKILL_CASES: &[&str] = &[
     "b2_blockline_open", "b2_blockline_corner", "b3_shoot_side", "b3_shoot_side25",
-    "b3_shoot_behind", "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side",
+    "b3_shoot_behind", "b3_shoot_crossed90", "b3_shoot_crossed125", "clear_own", "clear_lateral",
+    "spinkick_wall", "spinkick_side",
     "spinkick_interrupted", "goalkeep_keeper",
 ];
 
@@ -1238,6 +1244,24 @@ mod tests {
             .unwrap();
         let eff_deg = eff.y.atan2(eff.x).to_degrees();
         assert!((72.0..=82.0).contains(&eff_deg), "efectiva {eff_deg:.1}°");
+    }
+
+    #[test]
+    fn crossed_shoot_push_cases_are_in_the_full_suite() {
+        for n in ["b3_shoot_crossed90", "b3_shoot_crossed125"] {
+            assert!(SUITE.contains(&n) && SKILL_CASES.contains(&n), "{n}");
+        }
+        // Criterio: avance ≥ 0.30 m hacia el objetivo y desvío ≤ 30°.
+        let c = case("b3_shoot_crossed90");
+        let m = Metrics::default();
+        let shot = |deg: f32, dist: f32| {
+            let d = Vec2::from_angle(deg.to_radians());
+            let rows: Vec<Row> = (0..=10).map(|i| ball_row(i as f64 * 0.1, d.x * dist * i as f32 / 10.0, d.y * dist * i as f32 / 10.0)).collect();
+            success(&c, &rows, &m, false)
+        };
+        assert_eq!(shot(25.0, 0.40), Some(true));
+        assert_eq!(shot(35.0, 0.40), Some(false));
+        assert_eq!(shot(10.0, 0.20), Some(false));
     }
 
     #[test]
