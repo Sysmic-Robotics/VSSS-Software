@@ -4,6 +4,10 @@ use crate::coach::skill_choice::SkillChoice;
 use crate::skills::SkillId;
 use glam::Vec2;
 
+/// Área de arco (LARC 2026: 0.70 × 0.15 m): línea frontal en |x| = 0.60, mitad del ancho.
+const OWN_AREA_X: f32 = 0.60;
+const OWN_AREA_HALF_Y: f32 = 0.35;
+
 /// **Baseline clásico contra el cual comparar el modelo RL** (A/B obligatorio).
 ///
 /// Reescrito en Fase 3 del plan RL contra la nueva firma `Coach<SkillChoice>`.
@@ -61,11 +65,24 @@ impl RuleBasedCoach {
         Vec2::new(r.x * FIELD_HALF_X, r.y * FIELD_HALF_Y)
     }
 
+    /// Saca un punto del área propia (solo el portero puede estar ahí: el `ZoneGuard`
+    /// frena a un jugador de campo que vaya hacia adentro y el equipo queda congelado
+    /// con la pelota cerca del área). Lo deja sobre la línea frontal del área.
+    fn outside_own_area(&self, p: Vec2) -> Vec2 {
+        let sign = if self.own_goal.x < 0.0 { 1.0_f32 } else { -1.0 };
+        let inside = p.x * -sign >= OWN_AREA_X - 0.05 && p.y.abs() <= OWN_AREA_HALF_Y + 0.05;
+        if inside {
+            Vec2::new(-sign * (OWN_AREA_X - 0.06), p.y)
+        } else {
+            p
+        }
+    }
+
     fn attacker_choice(&self, obs: &Observation) -> SkillChoice {
         let ball = Self::ball_pos(obs);
         let robot = Self::own_robot_pos(obs, 0);
         let ball_to_goal = (self.attack_goal - ball).normalize_or_zero();
-        let staging = ball - ball_to_goal * self.attacker_staging_offset;
+        let staging = self.outside_own_area(ball - ball_to_goal * self.attacker_staging_offset);
 
         if (robot - staging).length() < self.attacker_chase_radius {
             // Cerca del staging → empujar la pelota persiguiéndola.
@@ -82,7 +99,7 @@ impl RuleBasedCoach {
         let lateral = Vec2::new(-to_own.y, to_own.x) * 0.20;
         let raw = ball + to_own * 0.25 + lateral;
         let pos = Vec2::new(raw.x.clamp(-0.60, 0.60), raw.y.clamp(-0.55, 0.55));
-        SkillChoice::goto(1, pos)
+        SkillChoice::goto(1, self.outside_own_area(pos))
     }
 
     fn goalkeeper_choice(&self, obs: &Observation) -> SkillChoice {
@@ -192,6 +209,25 @@ mod tests {
         // Pelota en centro, own_goal a la izquierda → support va detrás (x<0)
         // y con offset lateral.
         assert!(support.target.x < 0.0);
+    }
+
+    #[test]
+    fn field_players_never_target_their_own_area() {
+        let mut coach = RuleBasedCoach::new(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0));
+        // Pelota pegada al área propia: el staging detrás de ella caería adentro.
+        let obs = make_obs_with_robot(Vec2::new(-0.58, -0.2), 0, Vec2::new(0.3, 0.3));
+        let choices = coach.decide(&obs);
+        for c in &choices[..2] {
+            assert_eq!(c.skill_id, SkillId::GoTo);
+            assert!(c.target.x > -0.60, "fuera del área propia: {:?}", c.target);
+        }
+        // Mismo caso para el amarillo (arco propio en +x).
+        let mut coach = RuleBasedCoach::new(Vec2::new(-0.75, 0.0), Vec2::new(0.75, 0.0));
+        let obs = make_obs_with_robot(Vec2::new(0.58, 0.2), 0, Vec2::new(-0.3, 0.3));
+        let choices = coach.decide(&obs);
+        for c in &choices[..2] {
+            assert!(c.target.x < 0.60, "fuera del área propia: {:?}", c.target);
+        }
     }
 
     #[test]

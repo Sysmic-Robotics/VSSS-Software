@@ -101,6 +101,11 @@ fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
 
+/// Fracción del score base de `ApproachAligned` que conserva cuando `ShootPush` ya es
+/// factible: por debajo de cualquier tiro factible (mínimo 0.6 × tapado 0.6 × carril
+/// 0.7 ≈ 0.25) incluso sumando la histéresis.
+const APPROACH_WHEN_SHOT_FEASIBLE: f32 = 0.2;
+
 /// Opciones que compiten por el striker (orden fijo de `last_scores`).
 pub const STRIKER_OPTIONS: [SkillId; 5] = [
     SkillId::ShootPush,
@@ -467,9 +472,13 @@ impl HeuristicCoach {
         let intercept = speed_term * coming;
 
         // ApproachAligned: fallback con score base (las demás deben superarlo); algo
-        // menos atractivo si el staging está lejos (la pelota "se va").
+        // menos atractivo si el staging está lejos (la pelota "se va"). Con el empuje ya
+        // factible queda casi en cero: su único fin es hacerlo factible y, una vez en el
+        // staging, se queda quieto (un tiro tapado vale más que no tirar). No es cero
+        // para que el compromiso mínimo siga evitando el ping-pong approach↔shoot.
         let staging_far = clamp01(dist_ball / (2.0 * sp.approach_staging_offset + 0.6));
-        let approach = p.score_approach_base * (1.0 - 0.3 * staging_far);
+        let approach = p.score_approach_base
+            * if shoot > 0.0 { APPROACH_WHEN_SHOT_FEASIBLE } else { 1.0 - 0.3 * staging_far };
 
         [
             (SkillId::ShootPush, clamp01(shoot)),
@@ -1324,6 +1333,39 @@ mod tests {
         assert_eq!(choice_of(&ch, 0).skill_id, SkillId::Clear);
         // danger 0.875 × (0.6 + 0.4·presión 0.63) ≈ 0.75
         assert!(score_of(&c, SkillId::Clear) > 0.6, "{}", score_of(&c, SkillId::Clear));
+    }
+
+    #[test]
+    fn feasible_shot_beats_idle_approach_even_when_blocked() {
+        // Partido del 7-oct: striker alineado 14 cm detrás de la pelota libre y el
+        // arquero rival tapando el palo lejano; con el approach ya "terminado" el robot
+        // se quedó 50 s quieto porque un tiro tapado puntuaba menos que approach + histéresis.
+        let p = CoachParams {
+            keeper_id: 2,
+            score_shot_blocked_factor: 0.4,
+            ..CoachParams::default()
+        };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        let mut o = obs(
+            Vec2::new(0.59, 0.39),
+            Vec2::ZERO,
+            [Vec2::new(0.51, 0.51), Vec2::new(-0.3, 0.0), Vec2::new(-0.63, 0.0)],
+        );
+        o.opp_robots[0] = robot(Vec2::new(0.63, 0.18), 180.0);
+        // Primero llega desde adelante (approach vigente)...
+        let mut before = o.clone();
+        before.own_robots[0] = robot(Vec2::new(0.70, 0.45), 0.0);
+        assert_eq!(choice_of(&c.decide(&before), 0).skill_id, SkillId::ApproachAligned);
+        // ...y ya detrás y alineado: pasado el compromiso mínimo, el tiro tapado vale
+        // más que seguir "aproximando".
+        let mut last = SkillId::ApproachAligned;
+        for _ in 0..CoachParams::default().skill_min_hold {
+            last = choice_of(&c.decide(&o), 0).skill_id;
+        }
+        assert_eq!(last, SkillId::ShootPush);
+        let shoot = score_of(&c, SkillId::ShootPush);
+        assert!(shoot < 0.5, "tiro tapado: {shoot}");
+        assert!(score_of(&c, SkillId::ApproachAligned) + c.p.score_hysteresis < shoot);
     }
 
     #[test]
