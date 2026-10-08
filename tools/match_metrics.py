@@ -72,11 +72,28 @@ def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def infer_attack_sign(ticks, own_team):
+    """Lado de ataque: el arquero propio (skill `goalkeep`) está en nuestro arco, así que
+    atacamos hacia el lado contrario. Sin arquero visible, convención por color
+    (azul ataca +x). El simulador puede poner a cada color en cualquier lado (VSSL_SIDE)."""
+    xs = [
+        r["pos"][0]
+        for e in ticks[: min(len(ticks), 600)]
+        for r in e["robots"]
+        if r["own"] and r["skill"] == "goalkeep" and r["pos"][0] is not None
+    ]
+    if xs:
+        mean_x = sum(xs) / len(xs)
+        if abs(mean_x) > 0.2:
+            return -1.0 if mean_x > 0 else 1.0
+    return 1.0 if own_team == 0 else -1.0
+
+
 def analyze(path: str) -> dict:
     ticks, own_team = load(path)
     if not ticks or own_team is None:
         return {"archivo": path, "error": "sin filas propias"}
-    attack_sign = 1.0 if own_team == 0 else -1.0
+    attack_sign = infer_attack_sign(ticks, own_team)
     duration_s = (ticks[-1]["t"] - ticks[0]["t"]) / 1000.0
     n = len(ticks)
 
