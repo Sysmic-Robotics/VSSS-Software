@@ -370,10 +370,9 @@ impl Skill for ShootPushSkill {
         // empuje primero gira (avance ∝ cos del error). Un vector en marco mundo
         // proyectado sobre un heading cruzado movía al robot hacia atrás y fuera de la
         // recta, la táctica volvía a `ApproachAligned` y el ciclo nunca tocaba la pelota.
-        // La pelota no desvía: queda a menos de 1.5 radios de influencia del punto de
-        // empuje.
+        // Es un movimiento de contacto: motion no rodea la pelota que va a empujar.
         let push_point = ball + dir * self.push_overshoot;
-        motion.move_and_face(robot, push_point, push_point, world, self.kp, self.ki, self.kd)
+        motion.move_and_face_contact(robot, push_point, push_point, world, self.kp, self.ki, self.kd)
     }
 
     fn is_done(&self, robot: &RobotState, world: &World) -> bool {
