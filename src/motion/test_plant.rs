@@ -11,7 +11,8 @@
 //! - paredes físicas: el centro no sale de ±(0.75 − 0.04) × ±(0.65 − 0.04).
 //!
 //! `run` arma el `World` con la pose y la velocidad de la planta, despacha con el mismo
-//! `SkillCatalog` que el loop y aplica `control_loop::apply_reflexes`.
+//! `SkillCatalog` que el loop (con motion rodeando las áreas, como en el loop) y aplica
+//! `control_loop::apply_reflexes`.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -152,6 +153,8 @@ pub(crate) struct Case {
     pub ticks: usize,
     pub motion: MotionConfig,
     pub keeper_id: i32,
+    /// Ticks de latencia comando → ruedas de la planta.
+    pub latency: usize,
 }
 
 impl Case {
@@ -164,6 +167,7 @@ impl Case {
             ticks: 360,
             motion: MotionConfig::default(),
             keeper_id: 2,
+            latency: 5,
         }
     }
 
@@ -174,12 +178,13 @@ impl Case {
 }
 
 pub(crate) fn run(case: &Case) -> Trace {
-    let motion = Motion::with_config(case.motion.clone());
+    let motion = Motion::with_config(case.motion.clone()).with_areas(1.0, case.keeper_id);
     let mut catalog = SkillCatalog::new(3);
     let mut recovery = BorderRecovery::new(true);
     let guard = ZoneGuard::new(1.0, case.keeper_id);
     let manual = HashSet::new();
     let mut plant = Plant::new(case.pose.0, case.pose.1, case.pose.2);
+    plant.latency = case.latency;
     let mut steps = Vec::with_capacity(case.ticks);
     for _ in 0..case.ticks {
         let mut world = World::new(3, 3);

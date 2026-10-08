@@ -716,14 +716,14 @@ pub async fn run_control_loop(
     if motion_cfg.bidirectional {
         eprintln!("[control_loop] VSSL_BIDIRECTIONAL=1 → motion de dos caras (heading mod 180°)");
     }
-    let motion = Motion::with_config(motion_cfg);
     let mut catalog = SkillCatalog::new(config.num_robots);
     // Reglamento §9.5 como restricción dura: solo el arquero en el área propia,
-    // un solo atacante en el área rival (ver `skills::zones`).
-    let zone_guard = ZoneGuard::new(
-        crate::skills::zones::attack_sign_from_env(config.own_team),
-        crate::params::params().coach.keeper_id,
-    );
+    // un solo atacante en el área rival (ver `skills::zones`). Motion rodea las mismas
+    // áreas por la tangente, con las mismas reglas.
+    let attack_sign = crate::skills::zones::attack_sign_from_env(config.own_team);
+    let keeper_id = crate::params::params().coach.keeper_id;
+    let motion = Motion::with_config(motion_cfg).with_areas(attack_sign, keeper_id);
+    let zone_guard = ZoneGuard::new(attack_sign, keeper_id);
     let mut field_scale_warned = false;
     let mut halted_prev = false;
     let mut tick_counter: u32 = 0;

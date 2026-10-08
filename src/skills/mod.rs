@@ -7,7 +7,8 @@ pub use catalog::{SkillCatalog, SkillId};
 pub use config::SkillConfig;
 pub use tactical::{
     ApproachAlignedSkill, BlockLineSkill, ClearSkill, Face, InterceptSkill, MarkSkill,
-    ShootPushSkill, SkillStatus, SpinKickSkill, shoot_push_feasible, shoot_push_feasible_now,
+    ShootPushSkill, SkillStatus, SpinKickSkill, clear_direction, shoot_push_feasible,
+    shoot_push_feasible_now,
 };
 
 use crate::motion::{Motion, MotionCommand};
@@ -261,7 +262,7 @@ impl Default for ChaseBallSkill {
 impl Skill for ChaseBallSkill {
     fn tick(&mut self, robot: &RobotState, world: &World, motion: &Motion) -> MotionCommand {
         let ball = world.get_ball_state().position;
-        motion.move_and_face(robot, ball, ball, world, self.kp, self.ki, self.kd)
+        motion.move_and_face_contact(robot, ball, ball, world, self.kp, self.ki, self.kd)
     }
 
     fn current_target(&self, world: &World) -> Option<Vec2> {
@@ -453,7 +454,7 @@ impl Skill for DefendGoalLineSkill {
             move_target
         };
 
-        motion.move_and_face(
+        motion.move_and_face_contact(
             robot,
             move_target,
             face_target,

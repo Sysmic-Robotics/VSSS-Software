@@ -1,3 +1,4 @@
+pub mod avoid;
 mod benchmark;
 mod commands;
 mod environment;
@@ -14,6 +15,7 @@ pub use pid::PIDController;
 pub use recovery::BorderRecovery;
 pub use uvf::UniVectorField;
 
+use crate::skills::zones::AreaRect;
 use crate::world::{RobotState, World};
 use glam::Vec2;
 use std::collections::HashMap;
@@ -87,6 +89,13 @@ impl MotionConfig {
     }
 }
 
+/// Reglas de áreas del `ZoneGuard`, para que motion rodee lo mismo que el guardia frena.
+#[derive(Debug, Clone, Copy)]
+struct AreaRules {
+    attack_sign: f32,
+    keeper_id: i32,
+}
+
 /// Módulo principal de control de movimiento
 pub struct Motion {
     uvf: UniVectorField,
@@ -96,6 +105,10 @@ pub struct Motion {
     pid_theta_by_robot: Mutex<HashMap<(i32, i32), PIDController>>,
     /// Último avance comandado por `move_and_face` (m/s, con signo), para la rampa.
     v_prev_by_robot: Mutex<HashMap<(i32, i32), f64>>,
+    /// Áreas que rodea la regla de la tangente; `None` = ninguna (tests unitarios).
+    areas: Option<AreaRules>,
+    /// Lado de rodeo elegido por robot (histéresis de `avoid::aim_point`).
+    side_by_robot: Mutex<HashMap<(i32, i32), avoid::Memo>>,
 }
 
 impl Motion {
@@ -114,7 +127,44 @@ impl Motion {
             pid_y_by_robot: Mutex::new(HashMap::new()),
             pid_theta_by_robot: Mutex::new(HashMap::new()),
             v_prev_by_robot: Mutex::new(HashMap::new()),
+            areas: None,
+            side_by_robot: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Activa el rodeo de las áreas con las mismas reglas que el `ZoneGuard` (el control
+    /// loop la llama con los mismos valores que `ZoneGuard::new`).
+    pub fn with_areas(mut self, attack_sign: f32, keeper_id: i32) -> Self {
+        self.areas = Some(AreaRules { attack_sign, keeper_id });
+        self
+    }
+
+    /// Dirección hacia el arco rival (`with_areas`); `None` sin reglas de áreas.
+    pub fn attack_dir(&self) -> Option<Vec2> {
+        self.areas.map(|r| Vec2::new(r.attack_sign, 0.0))
+    }
+
+    /// Áreas prohibidas para `robot`, con la regla del `ZoneGuard`: la propia para todos
+    /// menos el arquero, y la rival cuando otro robot propio ya la toca (un atacante
+    /// adentro es legal; el segundo es falta). Vacío sin `with_areas`.
+    pub fn forbidden_areas(&self, robot: &RobotState, world: &World) -> Vec<AreaRect> {
+        let Some(rules) = self.areas else {
+            return Vec::new();
+        };
+        let mut areas = Vec::new();
+        if robot.id != rules.keeper_id {
+            areas.push(AreaRect::own(rules.attack_sign));
+        }
+        let opp = AreaRect::opp(rules.attack_sign);
+        let mates = if robot.team == 0 {
+            world.get_blue_team_active()
+        } else {
+            world.get_yellow_team_active()
+        };
+        if mates.iter().any(|m| m.id != robot.id && opp.touches(m.position)) {
+            areas.push(opp);
+        }
+        areas
     }
 
     /// Normaliza un ángulo al rango [-π, π]
@@ -147,27 +197,47 @@ impl Motion {
     }
 
     /// Dirección del Univector Field (rad) desde el robot hacia `target`, con los otros
-    /// robots y la pelota como obstáculos, **excepto** los que están sobre el destino.
+    /// robots como obstáculos, **excepto** los que están sobre el destino.
     /// Un obstáculo encima del destino haría que el UVF deflecte tangencialmente y nunca
-    /// llegue ("no me esquives del lugar al que voy"): p. ej. el staging detrás de la
-    /// pelota, o un fantasma de visión sentado en el target.
+    /// llegue ("no me esquives del lugar al que voy"): p. ej. un fantasma de visión
+    /// sentado en el target. La pelota y las áreas no son obstáculos del UVF: las rodea la
+    /// regla de la tangente (`avoid`).
     ///
     /// No hay paredes virtuales: el robot va hacia su destino, que está dentro de la
     /// cancha; el borde lo cubren el `ZoneGuard` (áreas) y la recuperación de atasco.
+    #[cfg(test)]
     fn uvf_heading(&self, robot_state: &RobotState, target: Vec2, world: &World) -> f32 {
+        self.uvf_toward(robot_state, target, target, world)
+    }
+
+    /// Como `uvf_heading`, pero el UVF apunta a `aim` (el punto de mira de la regla de la
+    /// tangente) y la excepción de destino se mide a `target`.
+    fn uvf_toward(&self, robot_state: &RobotState, aim: Vec2, target: Vec2, world: &World) -> f32 {
         let env = Environment::new(world, robot_state);
         let near_target_threshold = self.config.uvf_influence_radius * 1.5;
-        let ball_pos = env.get_ball_position();
-        let mut obstacles: Vec<Vec2> = env
+        let obstacles: Vec<Vec2> = env
             .get_robots()
             .iter()
             .copied()
             .filter(|&r| (target - r).length() >= near_target_threshold)
             .collect();
-        if (target - ball_pos).length() >= near_target_threshold {
-            obstacles.push(ball_pos);
+        self.uvf.compute(robot_state.position, aim, &obstacles)
+    }
+
+    /// Punto de mira hacia `target`: el destino, o la tangente de la pelota (si
+    /// `avoid_ball`) o de un área prohibida que esté en el camino (`avoid::aim_point`).
+    fn aim_point(&self, robot_state: &RobotState, target: Vec2, world: &World, avoid_ball: bool) -> Vec2 {
+        let mut obstacles: Vec<avoid::Obstacle> = self
+            .forbidden_areas(robot_state, world)
+            .into_iter()
+            .map(avoid::Obstacle::Area)
+            .collect();
+        if avoid_ball {
+            obstacles.push(avoid::Obstacle::Ball(world.get_ball_state().position));
         }
-        self.uvf.compute(robot_state.position, target, &obstacles)
+        let mut memos = self.side_by_robot.lock().expect("side lock poisoned");
+        let memo = memos.entry((robot_state.team, robot_state.id)).or_default();
+        avoid::aim_point(robot_state.position, target, &obstacles, memo)
     }
 
     /// Navega hacia `move_target` con una ley de seguimiento de heading para robot
@@ -184,6 +254,10 @@ impl Motion {
     /// `face_target` no influye mientras navega (el diferencial avanza hacia donde mira:
     /// mirar a otro lado le impedía llegar). A menos de `arrival_threshold` se anula la
     /// traslación y se orienta hacia `face_target` con el PID de heading de la skill.
+    ///
+    /// Es un movimiento de **posición**: rodea la pelota y las áreas prohibidas por la
+    /// tangente (`avoid`). Las skills que van a tocar o bloquear la pelota usan
+    /// `move_and_face_contact`.
     #[allow(clippy::too_many_arguments)]
     pub fn move_and_face(
         &self,
@@ -195,6 +269,34 @@ impl Motion {
         ki: f64,
         kd: f64,
     ) -> MotionCommand {
+        self.navigate(robot_state, move_target, face_target, world, (kp, ki, kd), true)
+    }
+
+    /// `move_and_face` para un movimiento de **contacto** (ChaseBall, Intercept, el empuje
+    /// de Clear, GoalKeep): rodea las áreas prohibidas pero no la pelota.
+    #[allow(clippy::too_many_arguments)]
+    pub fn move_and_face_contact(
+        &self,
+        robot_state: &RobotState,
+        move_target: Vec2,
+        face_target: Vec2,
+        world: &World,
+        kp: f64,
+        ki: f64,
+        kd: f64,
+    ) -> MotionCommand {
+        self.navigate(robot_state, move_target, face_target, world, (kp, ki, kd), false)
+    }
+
+    fn navigate(
+        &self,
+        robot_state: &RobotState,
+        move_target: Vec2,
+        face_target: Vec2,
+        world: &World,
+        (kp, ki, kd): (f64, f64, f64),
+        avoid_ball: bool,
+    ) -> MotionCommand {
         let key = (robot_state.team, robot_state.id);
         let dist = (move_target - robot_state.position).length();
         if !dist.is_finite() || dist < self.config.arrival_threshold {
@@ -205,7 +307,8 @@ impl Motion {
             return self.face_to(robot_state, face_target, kp, ki, kd);
         }
 
-        let theta_d = self.uvf_heading(robot_state, move_target, world) as f64;
+        let aim = self.aim_point(robot_state, move_target, world, avoid_ball);
+        let theta_d = self.uvf_toward(robot_state, aim, move_target, world) as f64;
         let raw = Self::normalize_angle(theta_d - robot_state.orientation);
         let (err, dir) = if self.config.bidirectional && raw.abs() > std::f64::consts::FRAC_PI_2
         {
@@ -216,7 +319,10 @@ impl Motion {
         let max_w = self.config.max_angular_speed;
         let omega = (self.config.heading_gain * err).clamp(-max_w, max_w);
 
-        let normalized = (dist / self.config.brake_distance).clamp(0.0, 1.0) as f64;
+        // Mientras rodea, el perfil usa la distancia al punto de tangencia si es menor: llega
+        // a la esquina (o al costado de la pelota) a una velocidad con la que puede doblar.
+        let d_profile = dist.min((aim - robot_state.position).length());
+        let normalized = (d_profile / self.config.brake_distance).clamp(0.0, 1.0) as f64;
         let v_profile = self.config.min_linear_speed
             + normalized * (self.config.max_linear_speed - self.config.min_linear_speed);
         let v = self.ramp(key, dir * v_profile * err.cos().max(0.0));
@@ -245,7 +351,8 @@ impl Motion {
         v
     }
 
-    /// Reinicia el estado de control de un robot (PID de heading y rampa del avance).
+    /// Reinicia el estado de control de un robot (PID de heading, rampa del avance y lado
+    /// de rodeo de la regla de la tangente).
     /// Lo llama el catálogo de skills cuando el robot cambia de skill.
     pub fn reset_robot(&self, team: i32, id: i32) {
         let key = (team, id);
@@ -256,6 +363,10 @@ impl Motion {
         self.v_prev_by_robot
             .lock()
             .expect("v_prev lock poisoned")
+            .remove(&key);
+        self.side_by_robot
+            .lock()
+            .expect("side lock poisoned")
             .remove(&key);
     }
 
@@ -442,6 +553,14 @@ mod tests {
         Motion::with_config(cfg)
     }
 
+    /// Mundo con la pelota lejos (la de `World::new` está en el origen, en el camino de
+    /// muchos casos, y motion la rodea).
+    fn world_far_ball() -> World {
+        let mut w = World::new(3, 3);
+        w.update_ball(FAR_BALL, Vec2::ZERO);
+        w
+    }
+
     fn angle_diff(a: f64, b: f64) -> f64 {
         Motion::normalize_angle(a - b).abs()
     }
@@ -512,7 +631,7 @@ mod tests {
     #[test]
     fn bidirectional_drives_backwards_to_a_target_behind() {
         let motion = bidir();
-        let world = World::new(3, 3);
+        let world = world_far_ball();
         let r = robot(-0.4, 0.0, std::f64::consts::PI); // de espaldas al target (+x)
         let target = Vec2::new(0.4, 0.0);
         let mut cmd = motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0);
@@ -622,7 +741,7 @@ mod tests {
     #[test]
     fn ramp_limits_the_change_including_the_face_switch() {
         let motion = bidir();
-        let world = World::new(3, 3);
+        let world = world_far_ball();
         let r = robot(0.0, 0.0, 0.0);
         let dv = motion.config.max_linear_accel * CONTROL_DT;
         let mut prev = 0.0;
@@ -643,7 +762,7 @@ mod tests {
         // `velocity` en cero (tracker apagado): la rampa sigue el comando anterior y
         // llega al perfil (1.2 m/s, destino lejos y alineado) en 1.2 / (a·dt) ticks.
         let motion = Motion::new();
-        let world = World::new(3, 3);
+        let world = world_far_ball();
         let r = robot(-0.5, 0.0, 0.0);
         assert_eq!(r.velocity, Vec2::ZERO);
         let target = Vec2::new(0.6, 0.0);
@@ -813,5 +932,139 @@ mod tests {
 
         // Con componente integral no nula, el segundo tick debe acumular al menos el mismo esfuerzo.
         assert!(cmd_2.vx >= cmd_1.vx);
+    }
+
+    // ── Rodeo de la pelota y de las áreas por la tangente ─────────────────────
+
+    fn robot_id(id: i32, x: f32, y: f32, theta: f64) -> RobotState {
+        let mut r = RobotState::new(id, 0);
+        r.position = Vec2::new(x, y);
+        r.orientation = theta;
+        r
+    }
+
+    #[test]
+    fn the_keeper_does_not_avoid_its_own_area() {
+        // Keeper 2 y jugador de campo 0 en la misma pose, con el destino del otro lado del
+        // área propia: el arquero la cruza (su área no le está prohibida); el de campo la rodea.
+        let motion = Motion::new().with_areas(1.0, 2);
+        let mut world = World::new(3, 3);
+        world.update_ball(FAR_BALL, Vec2::ZERO);
+        let target = Vec2::new(-0.66, 0.45);
+        let keeper = robot_id(2, -0.66, -0.45, 1.57);
+        let field = robot_id(0, -0.66, -0.45, 1.57);
+        assert!(motion.forbidden_areas(&keeper, &world).is_empty());
+        assert_eq!(motion.aim_point(&keeper, target, &world, true), target);
+        assert_eq!(motion.forbidden_areas(&field, &world).len(), 1);
+        let aim = motion.aim_point(&field, target, &world, true);
+        assert!(aim.x > -0.66, "el jugador de campo rodea por el frente: {aim:?}");
+    }
+
+    #[test]
+    fn the_rival_area_is_avoided_only_with_a_teammate_inside() {
+        // Un atacante adentro es legal; el segundo no: con el robot 1 en el área rival, el
+        // robot 0 la rodea; sin nadie adentro, la cruza.
+        let motion = Motion::new().with_areas(1.0, 2);
+        let (r0, target) = (robot_id(0, 0.66, -0.45, 1.57), Vec2::new(0.66, 0.45));
+        let mut world = World::new(3, 3);
+        world.update_ball(FAR_BALL, Vec2::ZERO);
+        world.update_robot(1, 0, Vec2::new(0.68, 0.0), 0.0, Vec2::ZERO, 0.0);
+        assert!(motion.forbidden_areas(&r0, &world).iter().any(|a| a.side > 0.0));
+        let aim = motion.aim_point(&r0, target, &world, true);
+        assert!(aim.x < 0.66, "rodea el área rival por el frente: {aim:?}");
+        world.update_robot(1, 0, Vec2::new(0.0, 0.3), 0.0, Vec2::ZERO, 0.0);
+        assert_eq!(motion.aim_point(&r0, target, &world, true), target);
+    }
+
+    #[test]
+    fn a_contact_move_does_not_avoid_the_ball() {
+        let motion = Motion::new();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let r = robot(-0.45, 0.02, 0.0);
+        let target = Vec2::new(0.45, 0.0);
+        let contact = motion.move_and_face_contact(&r, target, target, &world, 3.0, 0.0, 0.0);
+        assert!(contact.omega.abs() < 0.1, "derecho al destino: ω={:.3}", contact.omega);
+        let position = motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0);
+        assert!(position.omega > 0.3, "rodea la pelota por arriba: ω={:.3}", position.omega);
+    }
+
+    #[test]
+    fn goto_rounds_the_ball_without_touching_it() {
+        // Planta diferencial, ambos modos: llega y el centro nunca pasa a menos de 0.075 m
+        // del centro de la pelota (contacto ≈ 0.074).
+        let (ball, target) = (Vec2::ZERO, Vec2::new(0.45, 0.0));
+        for bidirectional in [false, true] {
+            let mut case = Case::new(SkillId::GoTo, target, (-0.45, 0.02, 0.0), ball);
+            if bidirectional {
+                case = case.bidirectional();
+            }
+            let trace = run(&case);
+            let arrival = MotionConfig::default().arrival_threshold + 0.01;
+            assert!(trace.first_within(target, arrival).is_some(), "bidir={bidirectional}: no llegó");
+            let min = trace.steps.iter().map(|s| (Vec2::new(s.x, s.y) - ball).length()).fold(f32::MAX, f32::min);
+            assert!(min >= 0.075, "bidir={bidirectional}: pasó a {min:.3} m de la pelota");
+        }
+    }
+
+    #[test]
+    fn goto_rounds_the_own_area_by_the_front() {
+        // Jugador de campo al costado del área propia, mirándola, con el destino del otro
+        // lado: llega en menos de 4 s, sin tocar el área y pasando por delante del arco.
+        let area = AreaRect::own(1.0);
+        let target = Vec2::new(-0.66, 0.45);
+        for bidirectional in [false, true] {
+            let mut case = Case::new(SkillId::GoTo, target, (-0.66, -0.45, 90.0), FAR_BALL);
+            if bidirectional {
+                case = case.bidirectional();
+            }
+            let trace = run(&case);
+            let arrival = MotionConfig::default().arrival_threshold + 0.01;
+            let k = trace.first_within(target, arrival);
+            assert!(k.is_some_and(|k| k <= 240), "bidir={bidirectional}: llegó en {k:?} ticks");
+            assert!(
+                trace.steps.iter().all(|s| !area.touches(Vec2::new(s.x, s.y))),
+                "bidir={bidirectional}: tocó el área"
+            );
+            // Pasa por delante del arco (el rodeo nunca va por detrás del área).
+            assert!(
+                trace.steps.iter().filter(|s| s.y.abs() < 0.1).all(|s| s.x > -0.53),
+                "bidir={bidirectional}: no pasó por delante del arco"
+            );
+        }
+    }
+
+    #[test]
+    fn blockline_across_the_area_arrives_without_touching_it() {
+        // El punto de bloqueo queda del otro lado del área, junto a su esquina, con la pelota
+        // cerca: rodea el arco y llega sin tocar el área. En FIRASim, con la holgura del
+        // propose, volvía en diagonal rozando el arco y la latencia lo metía en el contacto
+        // del guardia.
+        let area = AreaRect::own(1.0);
+        let ball = Vec2::new(-0.45, 0.40);
+        // 8 ticks (≈ 130 ms, el orden de FIRASim con el proxy): con la holgura del propose
+        // (medio robot + 0.03) el modo frontal tocaba el área 31 ticks.
+        const LAT: usize = 8;
+        for bidirectional in [false, true] {
+            let mut case = Case::new(SkillId::BlockLine, Vec2::new(-0.75, 0.0), (-0.66, -0.45, 90.0), ball);
+            if bidirectional {
+                case = case.bidirectional();
+            }
+            case.ticks = 480;
+            case.latency = LAT;
+            let trace = run(&case);
+            let target = crate::skills::BlockLineSkill::new(Vec2::new(-0.75, 0.0)).block_point(ball).unwrap();
+            let arrival = MotionConfig::default().arrival_threshold + 0.01;
+            assert!(trace.first_within(target, arrival).is_some(), "bidir={bidirectional}: no llegó a {target:?}");
+            let touching = trace.steps.iter().filter(|s| area.touches(Vec2::new(s.x, s.y))).count();
+            assert_eq!(touching, 0, "bidir={bidirectional}: tocó el área {touching} ticks");
+        }
+    }
+
+    #[test]
+    fn chase_ball_still_reaches_the_ball() {
+        let ball = Vec2::new(0.2, 0.2);
+        let trace = run(&Case::new(SkillId::ChaseBall, ball, (-0.4, -0.3, 0.0), ball));
+        assert!(trace.first_within(ball, 0.075).is_some(), "ChaseBall no llegó a la pelota");
     }
 }

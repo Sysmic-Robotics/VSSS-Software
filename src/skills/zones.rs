@@ -27,6 +27,14 @@ pub const AREA_HALF_Y: f32 = 0.35;
 /// Medio lado del robot: el centro debe quedar a esta distancia del borde para
 /// que el cuerpo no toque la zona.
 pub const ROBOT_HALF: f32 = 0.04;
+/// Margen extra sobre el contacto del guardia para navegar junto a un área (m): motion la
+/// rodea a `AREA_CLEARANCE` y BlockLine/Clear eligen sus puntos fuera de esa holgura. Con
+/// 0.03, en FIRASim con ruido un robot que volvía en diagonal hacia un punto junto al área
+/// derivaba ~3 cm hacia adentro por la latencia y entraba al contacto del guardia; con 0.06,
+/// en la planta de test no toca hasta 200 ms de latencia. Revisar con la latencia real (sysid).
+pub const AREA_NAV_MARGIN: f32 = 0.06;
+/// Holgura de navegación al área: medio robot + `AREA_NAV_MARGIN`.
+pub const AREA_CLEARANCE: f32 = ROBOT_HALF + AREA_NAV_MARGIN;
 /// Arco del reglamento sobre el frente del área: cuerda de 20 cm centrada en el frente
 /// y flecha de 5 cm hacia la cancha (vértice en |x| = 0.55). Es un segmento del círculo
 /// de radio `(0.10² + 0.05²) / (2·0.05) = 0.125` m con centro en
@@ -84,6 +92,17 @@ impl AreaRect {
     /// medio robot).
     pub fn touches(&self, p: Vec2) -> bool {
         self.touches_with(p, ROBOT_HALF)
+    }
+
+    /// Distancia euclídea (m) de `p` al área: el rectángulo, extendido hacia atrás de la
+    /// línea de fondo, unido con el arco. Cero adentro. `clearance(p) ≤ m` implica
+    /// `touches_with(p, m)`: el margen de `touches_with` es cuadrado (más conservador en
+    /// las esquinas).
+    pub fn clearance(&self, p: Vec2) -> f32 {
+        let dx = (AREA_X - p.x * self.side).max(0.0);
+        let dy = (p.y.abs() - AREA_HALF_Y).max(0.0);
+        let arc = (p - Vec2::new(self.side * ARC_CENTER_X, 0.0)).length() - ARC_RADIUS;
+        dx.hypot(dy).min(arc.max(0.0))
     }
 
     /// `true` si `p` está a `margin` o menos del área (rectángulo o arco).

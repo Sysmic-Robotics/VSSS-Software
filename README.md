@@ -229,7 +229,7 @@ Fuente de visión (FIRASim 224.0.0.1:10002 | vsss-vision-sysmic 224.5.23.2:10015
 | `world/` | Estado canónico del juego: poses de robots, posición/velocidad del balón, flags de inactividad |
 | `coach/` | Coach trait + `RuleBasedCoach` baseline + contrato `Observation` (52 floats) para el modelo RL futuro |
 | `skills/` | Catálogo congelado RL: `SkillId::{GoTo, FacePoint, ChaseBall, Spin}` (`SkillCatalog::tick`). Skills out-of-catalog viven en `skills/mod.rs` para otros usos |
-| `motion/` | UVF para evasión de obstáculos, seguimiento de heading para diferencial con rampa de aceleración, PID de orientación al llegar, recuperación de atasco |
+| `motion/` | UVF para evasión de robots, rodeo de la pelota y de las áreas por la tangente, seguimiento de heading para diferencial con rampa de aceleración, PID de orientación al llegar, recuperación de atasco |
 | `radio/` | Trait `RobotTransport` + 3 implementaciones (`FiraSimTransport`, `GrSimTransport`, `BaseStationTransport`). Selección por `VSSL_RADIO_TARGET`. `Radio::from_target` explícito |
 | `control_loop.rs` | **Loop 60 Hz único** que `main`, `scenario` y `skill_test` invocan. `TickDecider` (`CoachDecider`/`FixedSkillDecider`/etc) decide qué skill; el resto del lazo (visión → world → dispatch → transport) es el mismo |
 | `skill_log.rs` | `CsvLogger`, `CsvRow`, `SkillLogCtx::build_skill_row` — fuente única del formato CSV compartida por `scenario` y `skill_test` |
@@ -391,7 +391,14 @@ El estado de control de cada robot (PID de heading y rampa) se reinicia cuando e
 | `influence_radius` | `0.20 m` | Radio de influencia de obstáculos |
 | `k_rep` | `1.5` | Ganancia repulsiva tangencial |
 
-Solo desvían los obstáculos (robots y pelota) que están por delante respecto del destino. No hay paredes virtuales: el borde lo cubren el `ZoneGuard` (áreas) y la recuperación de atasco.
+El UVF solo desvía por los **robots** que están por delante respecto del destino. No hay paredes virtuales: el borde lo cubren el `ZoneGuard` (áreas) y la recuperación de atasco.
+
+**Pelota y áreas: rodeo por la tangente (`src/motion/avoid.rs`).** Si el segmento robot → destino toca la pelota inflada (0.09 m) o un área prohibida para ese robot (rectángulo + arco, con medio robot + 0.06 m, la misma holgura con que BlockLine y Clear eligen sus puntos), el robot apunta a la tangente del obstáculo del lado más cercano al destino:
+- no vale un lado cuya tangencia sale de la cancha o cuyo camino toca otro obstáculo (la pelota pegada al arco se rodea por fuera; un área nunca se rodea por detrás);
+- el lado elegido se mantiene mientras siga valiendo;
+- no se rodea la pelota si el destino está a su holgura (contacto), ni un área si el destino la toca (ilegal: lo frena el guardia); un destino legal más cerca del área que la holgura se rodea a su propia distancia.
+
+Las áreas son las mismas que frena el guardia: la propia para todos menos el arquero, y la rival cuando otro robot propio ya la toca. El guardia no cambia y sigue como restricción dura. `move_and_face` (movimiento de posición) rodea la pelota; `move_and_face_contact` (ChaseBall, Intercept, el empuje de Clear, GoalKeep) no. Clear gira su dirección de despeje lo mínimo para que el staging quede fuera de las áreas prohibidas (el arquero no gira). Las holguras se revisan con la latencia real (sysid).
 
 El `ZoneGuard` cuenta como área el rectángulo de 70 × 15 cm **más el arco del reglamento** sobre su frente (cuerda de 20 cm, flecha de 5 cm), con margen de medio robot. Es más conservador que VSSReferee, que cuenta solo el rectángulo y por el centro del robot; el auditor de faltas sigue con el criterio de VSSReferee.
 
@@ -591,13 +598,13 @@ Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt`
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (345 tests)
-cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (21 tests)
+cargo test --lib                 # solo lib (369 tests)
+cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (23 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI (19 tests)
 ```
 
-**391 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
+**417 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

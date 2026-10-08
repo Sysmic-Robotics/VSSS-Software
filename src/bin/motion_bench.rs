@@ -34,7 +34,9 @@ use rustengine::motion::{Motion, MotionConfig};
 use rustengine::params::params;
 use rustengine::radio::{FIRASimClient, RadioTarget, TeleportItem};
 use rustengine::skills::zones::AreaRect;
-use rustengine::skills::{ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, SkillConfig, SkillId};
+use rustengine::skills::{
+    ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, SkillConfig, SkillId, clear_direction,
+};
 use rustengine::vision::VisionSource;
 use rustengine::world::World;
 use serde_json::{Value, json};
@@ -59,6 +61,10 @@ enum Goal {
     /// La pelota se acerca al objetivo al menos `min_prog` m y su desplazamiento forma a lo
     /// sumo `max_dir` grados con la dirección pelota → objetivo (última fase del guion).
     Kick { min_prog: f32, max_dir: f32 },
+    /// Como `Kick`, pero el desvío se mide contra la **dirección efectiva** de Clear (la
+    /// legal, `clear_direction` con el área propia): con la pelota frente al arco, la
+    /// dirección al objetivo deja el staging dentro del área.
+    ClearKick { min_prog: f32, max_dir: f32 },
     /// No empuja la pelota de costado: se mueve menos de 0.03 m o sale bien hacia el objetivo.
     NoSidePush,
     /// Arquero en su punto de defensa mirando a la pelota.
@@ -152,8 +158,7 @@ const CASES: &[Case] = &[
         ball_vel: (-0.15, -0.7),
         ..c("intercept_moving", SkillId::Intercept, (0.0, 0.0), (-0.3, -0.3, 0.0), (0.35, 0.45), 5.0, 0.09, ARRIVE)
     },
-    // Pelota en (−0.30, 0): más cerca del área, el staging de Clear o el rodeo de la pelota
-    // caen en el arco, prohibido para un jugador de campo (motion no planifica alrededor).
+    // Pelota en (−0.30, 0). Con la pelota frente al arco, ver `clear_own_arc`.
     c("clear_own", SkillId::Clear, (0.2, 0.45), (-0.2, 0.3, 0.0), (-0.30, 0.0), 6.0, 0.0, KICK_PUSH),
     c("clear_lateral", SkillId::Clear, (0.3, -0.2), (-0.4, 0.0, 0.0), (-0.4, -0.2), 6.0, 0.0, KICK_PUSH),
     c("spinkick_wall", SkillId::SpinKick, (0.0, 0.0), (-0.2, -0.3, 0.0), (0.2, -0.6), 6.0, 0.0, KICK_SPIN),
@@ -166,6 +171,11 @@ const CASES: &[Case] = &[
     },
     c("a4_ball_behind_target", SkillId::GoTo, (0.33, 0.0), (-0.4, 0.0, 0.0), (0.0, 0.0), 6.0, 0.08, Goal::ArriveNoBallPush),
     c("a4_ball_wall", SkillId::GoTo, (0.3, -0.25), (-0.3, -0.5, 0.0), (0.0, -0.56), 6.0, 0.08, Goal::ArriveNoBallPush),
+    // Navegación con obstáculos: el camino recto cruza el área propia (GoTo, BlockLine) y la
+    // pelota frente al arco deja el staging de Clear dentro del área con la dirección pedida.
+    c("goto_around_area", SkillId::GoTo, (-0.66, 0.45), (-0.66, -0.45, 90.0), FAR, 8.0, 0.08, Goal::ArriveNoArea),
+    c("blockline_across_area", SkillId::BlockLine, (-0.75, 0.0), (-0.66, -0.45, 90.0), (-0.45, 0.40), 8.0, 0.05, Goal::ArriveNoArea),
+    c("clear_own_arc", SkillId::Clear, (0.2, 0.45), (-0.2, 0.3, 0.0), (-0.45, 0.0), 6.0, 0.0, Goal::ClearKick { min_prog: 0.10, max_dir: 30.0 }),
     c("spin_20", SkillId::Spin, (1.0, 0.0), (0.0, 0.0, 0.0), FAR, 3.0, 0.0, Goal::Spin),
     c("spin_cw", SkillId::Spin, (-1.0, 0.0), (0.0, 0.0, 0.0), FAR, 3.0, 0.0, Goal::Spin),
     c("hold_still", SkillId::Hold, (0.0, 0.0), (0.2, -0.2, 30.0), FAR, 3.0, 0.0, Goal::Still),
@@ -194,7 +204,8 @@ const SUITE: &[&str] = &[
     "b3_shoot_side25", "b3_shoot_behind", "intercept_static", "intercept_moving",
     "b2_blockline_open", "b2_blockline_corner", "b2_blockline_center", "goalkeep_keeper",
     "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
-    "mark_point", "hold_still", "b1a_hold_in_area",
+    "mark_point", "hold_still", "b1a_hold_in_area", "goto_around_area", "blockline_across_area",
+    "clear_own_arc",
 ];
 
 /// Suite rápida, un caso por skill (alias `suite-rapida`): para cada change.
@@ -388,6 +399,21 @@ fn metrics(case: &Case, rows: &[Row], bidirectional: bool) -> Metrics {
 /// desvío (°) de su desplazamiento en ese instante respecto de la dirección pelota →
 /// objetivo, desplazamiento máximo (m)). El desvío es `None` si la pelota casi no se movió.
 fn kick(case: &Case, rows: &[Row]) -> (f32, Option<f32>, f32) {
+    let (b0, target) = kick_start(case, rows);
+    kick_against(case, rows, b0.map(|b| target - b).unwrap_or(Vec2::ZERO))
+}
+
+/// Pelota al inicio de la última fase del guion (si hay filas) y objetivo de esa fase.
+fn kick_start(case: &Case, rows: &[Row]) -> (Option<Vec2>, Vec2) {
+    let p = phases(case);
+    let last = p.len() - 1;
+    let target = Vec2::new(p[last].1.0, p[last].1.1);
+    let b0 = rows.iter().find(|r| r.phase == last).map(|r| Vec2::new(r.bx, r.by));
+    (b0, target)
+}
+
+/// `kick` con el desvío medido contra `want` (una dirección) en vez de pelota → objetivo.
+fn kick_against(case: &Case, rows: &[Row], want: Vec2) -> (f32, Option<f32>, f32) {
     let p = phases(case);
     let last = p.len() - 1;
     let target = Vec2::new(p[last].1.0, p[last].1.1);
@@ -403,7 +429,7 @@ fn kick(case: &Case, rows: &[Row]) -> (f32, Option<f32>, f32) {
             at = b;
         }
     }
-    let (moved, want) = (at - b0, target - b0);
+    let moved = at - b0;
     let dir = (moved.length() > 0.02 && want.length() > 1e-4)
         .then(|| (moved.dot(want) / (moved.length() * want.length())).clamp(-1.0, 1.0).acos().to_degrees());
     (d0 - best, dir, disp)
@@ -424,6 +450,13 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
         }
         Goal::NoArea => m.area_ticks == 0,
         Goal::Kick { min_prog, max_dir } => kick_ok(min_prog, max_dir),
+        Goal::ClearKick { min_prog, max_dir } => {
+            let (b0, target) = kick_start(case, rows);
+            let offset = params().skills.clear_staging_offset;
+            let eff = b0.and_then(|b| clear_direction(b, target, offset, &[AreaRect::own(1.0)], Some(Vec2::X)));
+            let (prog, dir, _) = kick_against(case, rows, eff.unwrap_or(Vec2::ZERO));
+            prog >= min_prog && dir.is_some_and(|d| d <= max_dir)
+        }
         Goal::NoSidePush => kick(case, rows).2 < 0.03 || kick_ok(0.05, 20.0),
         Goal::Keeper => {
             let last = rows.last()?;
@@ -1170,6 +1203,41 @@ mod tests {
         assert_eq!(ok(&rows), Some(true));
         rows[1].bx = 0.10;
         assert_eq!(ok(&rows), Some(false), "llegó empujando la pelota");
+    }
+
+    #[test]
+    fn obstacle_navigation_cases_are_in_the_full_suite() {
+        for n in ["goto_around_area", "blockline_across_area", "clear_own_arc"] {
+            assert!(SUITE.contains(&n), "{n} falta en la suite completa");
+        }
+        assert_eq!(case("goto_ball").goal, Goal::ArriveNoBallPush);
+        assert_eq!(case("a4_ball_behind_target").goal, Goal::ArriveNoBallPush);
+    }
+
+    #[test]
+    fn clear_own_arc_is_measured_against_the_effective_direction() {
+        // La pelota sale a 80°: a 45° de la dirección al objetivo (34.7°) y a ~2° de la
+        // efectiva (la legal, ~78°), y avanza más de 0.10 m hacia el objetivo → éxito. A 35°
+        // (justo hacia el objetivo) queda a 43° de la efectiva → falla; a 100° casi no avanza
+        // hacia el objetivo → falla.
+        let c = case("clear_own_arc");
+        let m = Metrics::default();
+        let shot = |deg: f32| {
+            let d = Vec2::from_angle(deg.to_radians());
+            let rows: Vec<Row> = (0..=10)
+                .map(|i| ball_row(i as f64 * 0.1, -0.45 + d.x * 0.03 * i as f32, d.y * 0.03 * i as f32))
+                .collect();
+            success(&c, &rows, &m, false)
+        };
+        assert_eq!(shot(80.0), Some(true));
+        assert_eq!(shot(65.0), Some(true));
+        assert_eq!(shot(35.0), Some(false));
+        assert_eq!(shot(100.0), Some(false));
+        let (b0, target) = (Vec2::new(-0.45, 0.0), Vec2::new(0.2, 0.45));
+        let eff = clear_direction(b0, target, params().skills.clear_staging_offset, &[AreaRect::own(1.0)], Some(Vec2::X))
+            .unwrap();
+        let eff_deg = eff.y.atan2(eff.x).to_degrees();
+        assert!((72.0..=82.0).contains(&eff_deg), "efectiva {eff_deg:.1}°");
     }
 
     #[test]
