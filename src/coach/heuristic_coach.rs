@@ -69,6 +69,22 @@ struct Committed {
     held: u32,
 }
 
+/// Empuje trabado del striker: la pelota pegada al robot sin moverse (contra la pared,
+/// con un rival encima). Tras `PUSH_STALL_S` se la saca con el giro.
+#[derive(Debug, Clone, Copy)]
+enum Stall {
+    None,
+    /// Decisión en la que empezó a empujar sin que la pelota se mueva.
+    Counting(u64),
+    /// Decisión en la que se forzó `SpinKick`.
+    Kicking(u64),
+}
+
+/// Segundos de empuje sin que la pelota se mueva antes de forzar `SpinKick`.
+const PUSH_STALL_S: f32 = 1.5;
+/// Tope del giro forzado si la pelota tampoco se suelta así (vuelve a empujar).
+const STALL_KICK_MAX_S: f32 = 3.0;
+
 pub struct HeuristicCoach {
     pub attack_goal: Vec2,
     pub own_goal: Vec2,
@@ -95,6 +111,7 @@ pub struct HeuristicCoach {
     pub adaptation: Adaptation,
     /// Ya se comparó el lado configurado con la posición inicial del equipo.
     side_checked: bool,
+    push_stall: Stall,
 }
 
 fn clamp01(x: f32) -> f32 {
@@ -158,6 +175,7 @@ impl HeuristicCoach {
             ],
             adaptation: Adaptation::new(p.adapt_enabled, p.adapt_alpha),
             side_checked: false,
+            push_stall: Stall::None,
             p,
         }
     }
@@ -354,9 +372,10 @@ impl HeuristicCoach {
             };
         }
         if self.ball_on_side_wall(ball) {
-            // Banda: conducir a lo largo de la banda con un ángulo suave hacia
-            // adentro, para que la pelota se despegue de la pared camino al arco.
-            return Vec2::new(ball.x + s * 0.35, side * 0.42);
+            // Banda: conducir a lo largo de la banda con un ángulo suave hacia adentro
+            // (~13°), para que la pelota se despegue de la pared camino al arco. Más
+            // ángulo deja el staging detrás de la pelota dentro de la pared.
+            return Vec2::new(ball.x + s * 0.35, side * (ball.y.abs() - 0.08));
         }
         if self.in_own_half(ball) && (ball.x * -s) > 0.35 {
             return self.clear_target(ball);
@@ -509,11 +528,56 @@ impl HeuristicCoach {
         best
     }
 
-    fn striker_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
-        let target = self.striker_target(ball, opp);
-        let scores = self.striker_scores(r, ball, ball_vel, opp, target);
-        self.last_scores = scores;
+    /// Actualiza el estado de empuje trabado. Devuelve `true` mientras corresponde sacar
+    /// la pelota con el giro: tras `PUSH_STALL_S` empujando con la pelota pegada y quieta,
+    /// hasta que se suelte (se mueve o se aleja) o pasen `STALL_KICK_MAX_S`.
+    fn update_push_stall(&mut self, current: Option<SkillId>, pos: Vec2, ball: Vec2, ball_vel: Vec2) -> bool {
+        let hz = self.p.decision_hz.max(1e-3);
+        let now = self.decision_count;
+        let elapsed = |since: u64| now.saturating_sub(since) as f32 / hz;
+        let dist = (ball - pos).length();
+        let pinned = dist < 0.15 && ball_vel.length() < 0.05;
+        let pushing = matches!(current, Some(SkillId::ShootPush | SkillId::Clear));
+        self.push_stall = match self.push_stall {
+            Stall::None if pushing && pinned => Stall::Counting(now),
+            Stall::Counting(_) if !(pushing && pinned) => Stall::None,
+            Stall::Counting(since) if elapsed(since) >= PUSH_STALL_S => Stall::Kicking(now),
+            Stall::Kicking(since)
+                if elapsed(since) >= STALL_KICK_MAX_S || ball_vel.length() > 0.15 || dist > 0.25 =>
+            {
+                Stall::None
+            }
+            same => same,
+        };
+        matches!(self.push_stall, Stall::Kicking(_))
+    }
+
+    /// `support`: posición del compañero de campo, destino del pase cuando el empuje
+    /// se traba.
+    fn striker_choice(
+        &mut self,
+        r: &RobotView,
+        ball: Vec2,
+        ball_vel: Vec2,
+        opp: &[RobotView],
+        support: Option<Vec2>,
+    ) -> SkillChoice {
+        let mut target = self.striker_target(ball, opp);
+        let mut scores = self.striker_scores(r, ball, ball_vel, opp, target);
         let current = self.committed[r.id as usize].map(|c| c.skill);
+        if self.update_push_stall(current, r.pos, ball, ball_vel) {
+            // Empuje trabado: sacarla con el giro aunque los scores digan seguir
+            // empujando, como pase al compañero si lo hay a distancia útil.
+            for (skill, score) in scores.iter_mut() {
+                if *skill == SkillId::SpinKick {
+                    *score = 1.0;
+                }
+            }
+            if let Some(mate) = support.filter(|p| (*p - ball).length() > 0.25) {
+                target = mate;
+            }
+        }
+        self.last_scores = scores;
         let wanted = self.pick_with_hysteresis(&scores, current);
         // Compromiso mínimo: la opción vigente se mantiene mientras siga viable (score > 0).
         let skill = self.commit(r.id, wanted, |prev| {
@@ -722,6 +786,7 @@ impl Coach for HeuristicCoach {
         let play = self.read_play();
         if play != self.current_play {
             self.committed = [None; 3];
+            self.push_stall = Stall::None;
             self.current_play = play;
         }
         match play {
@@ -747,6 +812,10 @@ impl Coach for HeuristicCoach {
 
         self.assign_roles(&own, ball);
         let striker = self.striker_id.and_then(|id| own.iter().find(|r| r.id == id).copied());
+        let support = own
+            .iter()
+            .find(|r| r.active && r.id != self.keeper_id && Some(r.id) != self.striker_id)
+            .map(|r| r.pos);
         // Pelota dentro del área propia con arquero activo: la despeja él (§9.5,
         // solo un robot en el área); los de campo cubren la línea desde afuera.
         let keeper_active = own.iter().any(|r| r.active && r.id == self.keeper_id);
@@ -760,7 +829,7 @@ impl Coach for HeuristicCoach {
                     let skill = self.commit(r.id, SkillId::BlockLine, |_| true);
                     SkillChoice::new(r.id, skill, self.own_goal)
                 }
-                Some(Role::Striker) => self.striker_choice(r, ball, ball_vel, &opp),
+                Some(Role::Striker) => self.striker_choice(r, ball, ball_vel, &opp, support),
                 _ => self.support_choice(r, ball, striker.as_ref(), &opp),
             };
             choices.push(choice);
@@ -1366,6 +1435,41 @@ mod tests {
         let shoot = score_of(&c, SkillId::ShootPush);
         assert!(shoot < 0.5, "tiro tapado: {shoot}");
         assert!(score_of(&c, SkillId::ApproachAligned) + c.p.score_hysteresis < shoot);
+    }
+
+    #[test]
+    fn pinned_push_turns_into_spin_kick_after_stall() {
+        // Pelota quieta en nuestra banda con un rival encima y el striker detrás sobre la
+        // recta de empuje: empuja (Clear/ShootPush), la pelota no se mueve, y pasado el
+        // plazo la saca con el giro.
+        let mut c = coach();
+        let ball = Vec2::new(-0.50, 0.58);
+        let mut o = obs(
+            ball,
+            Vec2::ZERO,
+            [Vec2::new(-0.60, 0.60), Vec2::new(0.2, -0.2), Vec2::new(-0.63, 0.0)],
+        );
+        o.opp_robots[0] = robot(Vec2::new(-0.42, 0.56), 180.0);
+        let first = choice_of(&c.decide(&o), 0).skill_id;
+        assert!(matches!(first, SkillId::Clear | SkillId::ShootPush), "{first:?}");
+        // El plazo corre desde la primera decisión ya empujando (la segunda).
+        let decisions = (PUSH_STALL_S * CoachParams::default().decision_hz) as usize + 2;
+        let mut last = choice_of(&c.decide(&o), 0);
+        for _ in 0..decisions {
+            last = choice_of(&c.decide(&o), 0);
+        }
+        assert_eq!(last.skill_id, SkillId::SpinKick);
+        assert!(matches!(c.push_stall, Stall::Kicking(_)));
+        // El giro es un pase: apunta al compañero de campo (robot 1).
+        assert!((last.target - Vec2::new(0.2, -0.2)).length() < 1e-3, "{:?}", last.target);
+        // La pelota se soltó (se aleja rodando): se vuelve a decidir por scores.
+        let freed = obs(
+            Vec2::new(-0.20, 0.50),
+            Vec2::new(0.6, -0.1),
+            [Vec2::new(-0.60, 0.60), Vec2::new(0.2, -0.2), Vec2::new(-0.63, 0.0)],
+        );
+        c.decide(&freed);
+        assert!(matches!(c.push_stall, Stall::None));
     }
 
     #[test]

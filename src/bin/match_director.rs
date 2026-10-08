@@ -3,8 +3,9 @@
 //! FIRASim no repone la pelota tras un gol ni lleva el marcador. Este binario escucha la
 //! visión del simulador, detecta los goles, repone pelota y robots con el replacement
 //! FIRA y pita a los dos engines por el canal del árbitro (texto a `VSSL_REFEREE_ADDR`):
-//! `STOP` → reposición → `KICKOFF <equipo>` → `GAME_ON`. Termina por tiempo de juego o
-//! por diferencia de goles y deja el resultado en la salida (y en `--out`, una línea JSON).
+//! `STOP` → reposición → `KICKOFF <equipo>` → `GAME_ON`. Pelota trabada 10 s → `FREE_BALL`
+//! en la cruz del cuadrante (un robot por equipo a 0.20 m del lado propio). Termina por
+//! tiempo de juego o por goles y deja el resultado en la salida (y en `--out`, JSON).
 //!
 //!   match_director [--minutes 3] [--goals 3] [--kickoff blue|yellow] [--out partidos.jsonl]
 //!                  [--vision-port 10002] [--cmd-port 20011]
@@ -13,6 +14,7 @@
 //! igual con FIRASim acelerado. Los lados se leen de la primera detección: cada equipo
 //! defiende la mitad en la que está respecto del otro.
 
+use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::time::Duration;
 
@@ -29,6 +31,13 @@ const GOAL_HALF_Y: f64 = 0.20;
 const BALL_RADIUS: f64 = 0.021;
 /// Frames de visión por segundo de simulación.
 const FRAMES_PER_S: f64 = 60.0;
+/// Pelota trabada: no se movió más de `STUCK_DIST` en `STUCK_S` segundos de juego.
+const STUCK_S: f64 = 10.0;
+const STUCK_DIST: f64 = 0.05;
+/// Cruces de free ball (|x|, |y|) y distancia del robot colocado a la cruz.
+const MARK_X: f64 = 0.375;
+const MARK_Y: f64 = 0.40;
+const MARK_OFFSET: f64 = 0.20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Team {
@@ -151,9 +160,19 @@ impl Whistle {
     }
 }
 
-/// Instantánea de un frame de visión: pelota y x medio de cada equipo.
+/// Robot visto: equipo, id y posición (m).
+#[derive(Clone, Copy)]
+struct Seen {
+    team: Team,
+    id: u32,
+    x: f64,
+    y: f64,
+}
+
+/// Instantánea de un frame de visión: pelota, robots y x medio de cada equipo.
 struct Frame {
     ball: Option<(f64, f64)>,
+    robots: Vec<Seen>,
     blue_mean_x: Option<f64>,
     yellow_mean_x: Option<f64>,
 }
@@ -165,11 +184,48 @@ fn mean_x(robots: &[rustengine::protos::fira_common::Robot]) -> Option<f64> {
 fn parse_frame(data: &[u8]) -> Option<Frame> {
     let env = Environment::parse_from_bytes(data).ok()?;
     let frame = env.frame.as_ref()?;
+    let mut robots = Vec::with_capacity(6);
+    robots.extend(frame.robots_blue.iter().map(|r| Seen { team: Team::Blue, id: r.robot_id, x: r.x, y: r.y }));
+    robots.extend(frame.robots_yellow.iter().map(|r| Seen { team: Team::Yellow, id: r.robot_id, x: r.x, y: r.y }));
     Some(Frame {
         ball: frame.ball.as_ref().map(|b| (b.x, b.y)),
+        robots,
         blue_mean_x: mean_x(&frame.robots_blue),
         yellow_mean_x: mean_x(&frame.robots_yellow),
     })
+}
+
+/// Free ball por pelota trabada en `ball`: cruz del cuadrante y colocación. El robot de
+/// campo de cada equipo más cercano a la cruz va al punto a `MARK_OFFSET` del lado propio;
+/// cualquier otro jugador de campo a menos de 0.35 m de la cruz se corre hacia su arco
+/// (el arquero, id 2, se queda en su área).
+fn free_ball_placement(ball: (f64, f64), robots: &[Seen], attack_sign: impl Fn(Team) -> f64) -> (u8, Vec<TeleportItem>) {
+    let (qx, qy) = (ball.0.signum(), ball.1.signum());
+    let quadrant = match (qx > 0.0, qy > 0.0) {
+        (true, true) => 1,
+        (false, true) => 2,
+        (false, false) => 3,
+        (true, false) => 4,
+    };
+    let mark = (qx * MARK_X, qy * MARK_Y);
+    let mut items = vec![TeleportItem::Ball { x: mark.0, y: mark.1, vx: 0.0, vy: 0.0 }];
+    for team in [Team::Blue, Team::Yellow] {
+        let s = attack_sign(team);
+        let theta = if s > 0.0 { 0.0 } else { 180.0 };
+        let dist = |r: &Seen| ((r.x - mark.0).powi(2) + (r.y - mark.1).powi(2)).sqrt();
+        let mut own: Vec<Seen> = robots.iter().copied().filter(|r| r.team == team).collect();
+        // Arquero (id 2) al final: que coloque a un jugador de campo si lo hay.
+        own.sort_by(|a, b| (a.id == 2, dist(a)).partial_cmp(&(b.id == 2, dist(b))).unwrap());
+        for (i, r) in own.iter().enumerate() {
+            if i == 0 {
+                items.push(TeleportItem::Robot { team: team.fira_id(), id: r.id, x: mark.0 - s * MARK_OFFSET, y: mark.1, theta });
+            } else if r.id != 2 && dist(r) < 0.35 {
+                let x = (r.x - s * 0.35).clamp(-0.70, 0.70);
+                items.push(TeleportItem::Robot { team: team.fira_id(), id: r.id, x, y: r.y, theta });
+            }
+        }
+    }
+    (quadrant, items)
 }
 
 /// Formación de saque inicial de un equipo que ataca hacia `s` (+1 → +x): arquero en
@@ -192,6 +248,9 @@ struct Match {
     score: [u32; 2],
     frames: u64,
     goals: Vec<(f64, Team)>,
+    free_balls: u32,
+    /// Posiciones de la pelota de los últimos `STUCK_S` segundos de juego.
+    ball_trail: VecDeque<(f64, f64)>,
 }
 
 impl Match {
@@ -225,6 +284,18 @@ impl Match {
             Team::Yellow => -self.blue_attack_sign,
         }
     }
+
+    /// Registra la pelota de este frame; `true` si lleva `STUCK_S` s sin moverse.
+    fn ball_stuck(&mut self, ball: (f64, f64)) -> bool {
+        let window = (STUCK_S * FRAMES_PER_S) as usize;
+        self.ball_trail.push_back(ball);
+        if self.ball_trail.len() <= window {
+            return false;
+        }
+        self.ball_trail.pop_front();
+        let oldest = self.ball_trail[0];
+        ((ball.0 - oldest.0).powi(2) + (ball.1 - oldest.1).powi(2)).sqrt() < STUCK_DIST
+    }
 }
 
 /// Descarta los frames que llegaron durante una pausa: son anteriores a la reposición
@@ -233,22 +304,35 @@ fn drain(vision: &UdpSocket, buf: &mut [u8]) {
     while vision.try_recv(buf).is_ok() {}
 }
 
-async fn kickoff(m: &Match, kicker: Team, whistle: &Whistle, sim: &mut FiraSimTransport, vision: &UdpSocket) {
+/// Parada con reposición: `STOP` → replacement → comando de la play → `GAME_ON`.
+async fn set_piece(m: &mut Match, command: &str, items: &[TeleportItem], whistle: &Whistle, sim: &mut FiraSimTransport, vision: &UdpSocket) {
     whistle.send("STOP");
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let mut items = vec![TeleportItem::Ball { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0 }];
-    items.extend(kickoff_positions(kicker, m.attack_sign(kicker), true));
-    items.extend(kickoff_positions(kicker.other(), m.attack_sign(kicker.other()), false));
-    if let Err(e) = sim.teleport(&items).await {
+    if let Err(e) = sim.teleport(items).await {
         eprintln!("[director] replacement falló: {e}");
     }
     tokio::time::sleep(Duration::from_millis(1000)).await;
-    whistle.send(&format!("KICKOFF {}", kicker.name()));
+    whistle.send(command);
     tokio::time::sleep(Duration::from_millis(1200)).await;
     let mut buf = [0u8; 65536];
     drain(vision, &mut buf);
+    m.ball_trail.clear();
     whistle.send("GAME_ON");
+}
+
+async fn kickoff(m: &mut Match, kicker: Team, whistle: &Whistle, sim: &mut FiraSimTransport, vision: &UdpSocket) {
+    let mut items = vec![TeleportItem::Ball { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0 }];
+    items.extend(kickoff_positions(kicker, m.attack_sign(kicker), true));
+    items.extend(kickoff_positions(kicker.other(), m.attack_sign(kicker.other()), false));
+    set_piece(m, &format!("KICKOFF {}", kicker.name()), &items, whistle, sim, vision).await;
     eprintln!("[director] {} saque {} — {}", m.clock(), kicker.spanish(), m.scoreline());
+}
+
+async fn free_ball(m: &mut Match, ball: (f64, f64), robots: &[Seen], whistle: &Whistle, sim: &mut FiraSimTransport, vision: &UdpSocket) {
+    let (quadrant, items) = free_ball_placement(ball, robots, |t| m.attack_sign(t));
+    m.free_balls += 1;
+    eprintln!("[director] {} pelota trabada en ({:.2}, {:.2}) → free ball Q{quadrant}", m.clock(), ball.0, ball.1);
+    set_piece(m, &format!("FREE_BALL Q{quadrant}"), &items, whistle, sim, vision).await;
 }
 
 #[tokio::main]
@@ -288,13 +372,20 @@ async fn main() {
             break if blue > yellow { -1.0 } else { 1.0 };
         }
     };
-    let mut m = Match { blue_attack_sign, score: [0, 0], frames: 0, goals: Vec::new() };
+    let mut m = Match {
+        blue_attack_sign,
+        score: [0, 0],
+        frames: 0,
+        goals: Vec::new(),
+        free_balls: 0,
+        ball_trail: VecDeque::new(),
+    };
     eprintln!(
         "[director] azul ataca hacia {:+}X · {} min · corte a {} goles · árbitro {}",
         blue_attack_sign as i32, opt.minutes, opt.goals, whistle.addr
     );
 
-    kickoff(&m, opt.kickoff, &whistle, &mut sim, &vision).await;
+    kickoff(&mut m, opt.kickoff, &whistle, &mut sim, &vision).await;
     let limit_frames = (opt.minutes * 60.0 * FRAMES_PER_S) as u64;
     let mut next_report = 30.0;
     let ended = loop {
@@ -326,12 +417,20 @@ async fn main() {
             if m.score[scorer.fira_id() as usize] >= opt.goals {
                 break "goals";
             }
-            kickoff(&m, scorer.other(), &whistle, &mut sim, &vision).await;
+            kickoff(&mut m, scorer.other(), &whistle, &mut sim, &vision).await;
+        } else if m.ball_stuck(ball) {
+            free_ball(&mut m, ball, &f.robots, &whistle, &mut sim, &vision).await;
         }
     };
 
     whistle.send("HALT");
-    println!("RESULTADO {} · {} de juego · fin por {}", m.scoreline(), m.clock(), ended);
+    println!(
+        "RESULTADO {} · {} de juego · {} free balls · fin por {}",
+        m.scoreline(),
+        m.clock(),
+        m.free_balls,
+        ended
+    );
     if let Some(path) = opt.out {
         let goals: Vec<String> = m
             .goals
@@ -339,10 +438,11 @@ async fn main() {
             .map(|(t, team)| format!("{{\"t\":{t:.1},\"team\":\"{}\"}}", team.spanish()))
             .collect();
         let line = format!(
-            "{{\"blue\":{},\"yellow\":{},\"seconds\":{:.1},\"ended\":\"{ended}\",\"goals\":[{}]}}",
+            "{{\"blue\":{},\"yellow\":{},\"seconds\":{:.1},\"ended\":\"{ended}\",\"free_balls\":{},\"goals\":[{}]}}",
             m.score[0],
             m.score[1],
             m.seconds(),
+            m.free_balls,
             goals.join(",")
         );
         use std::io::Write;
@@ -360,7 +460,65 @@ mod tests {
     use super::*;
 
     fn m(blue_attack_sign: f64) -> Match {
-        Match { blue_attack_sign, score: [0, 0], frames: 0, goals: Vec::new() }
+        Match {
+            blue_attack_sign,
+            score: [0, 0],
+            frames: 0,
+            goals: Vec::new(),
+            free_balls: 0,
+            ball_trail: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn stuck_ball_needs_ten_still_seconds() {
+        let mut game = m(1.0);
+        let still = (0.61, 0.63);
+        for _ in 0..600 {
+            assert!(!game.ball_stuck(still));
+        }
+        assert!(game.ball_stuck((0.62, 0.64)));
+        // Se movió más de 5 cm en la ventana: no está trabada.
+        let mut rolling = m(1.0);
+        for i in 0..601 {
+            let moved = rolling.ball_stuck((0.61 + 0.0002 * i as f64, 0.63));
+            assert!(!moved, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn free_ball_puts_one_field_robot_per_team_on_its_side() {
+        // Pelota trabada en la esquina (+,+): cruz Q1 en (0.375, 0.40).
+        let robots = [
+            Seen { team: Team::Blue, id: 1, x: 0.66, y: 0.59 },
+            Seen { team: Team::Blue, id: 0, x: 0.65, y: 0.43 },
+            Seen { team: Team::Blue, id: 2, x: 0.60, y: 0.18 },
+            Seen { team: Team::Yellow, id: 0, x: 0.54, y: 0.58 },
+            Seen { team: Team::Yellow, id: 1, x: 0.47, y: 0.33 },
+            Seen { team: Team::Yellow, id: 2, x: -0.65, y: 0.19 },
+        ];
+        // Azul ataca hacia -x (defiende +x), amarillo hacia +x.
+        let (q, items) = free_ball_placement((0.61, 0.63), &robots, |t| if t == Team::Blue { -1.0 } else { 1.0 });
+        assert_eq!(q, 1);
+        let placed: Vec<(u32, u32, f64, f64)> = items
+            .iter()
+            .filter_map(|i| match *i {
+                TeleportItem::Robot { team, id, x, y, .. } => Some((team, id, x, y)),
+                _ => None,
+            })
+            .collect();
+        let at = |team: u32, id: u32, x: f64, y: f64| {
+            placed.iter().any(|&(t, i, px, py)| t == team && i == id && (px - x).abs() < 1e-6 && (py - y).abs() < 1e-6)
+        };
+        // El de campo más cercano a la cruz: azul 0 a 0.20 m hacia +x, amarillo 1 hacia -x.
+        assert!(at(0, 0, 0.575, 0.40), "{placed:?}");
+        assert!(at(1, 1, 0.175, 0.40), "{placed:?}");
+        // Los otros de campo estaban a < 0.35 m: se corren hacia su arco (azul topa con el borde).
+        assert!(at(0, 1, 0.70, 0.59), "{placed:?}");
+        assert!(at(1, 0, 0.19, 0.58), "{placed:?}");
+        // Los arqueros no se tocan aunque estén cerca de la cruz.
+        assert!(!placed.iter().any(|&(_, id, _, _)| id == 2), "{placed:?}");
+        assert!(matches!(items[0], TeleportItem::Ball { x, y, .. } if x == 0.375 && y == 0.40));
     }
 
     #[test]
