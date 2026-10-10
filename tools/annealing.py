@@ -242,9 +242,9 @@ class Evaluation:
     def fitness(self) -> float:
         return sum(m.fitness() for m in self.matches)
 
-    def mean_fitness(self) -> float:
-        """Aptitud por tanda de tres partidos (el titular acumula tandas al reevaluarse)."""
-        return self.fitness * 3.0 / max(len(self.matches), 1)
+    def mean_fitness(self, per_round: int = 3) -> float:
+        """Aptitud por tanda (el titular acumula tandas al reevaluarse)."""
+        return self.fitness * per_round / max(len(self.matches), 1)
 
     def as_dict(self) -> dict:
         return {
@@ -263,6 +263,8 @@ class Annealer:
     t0: float
     cooling: float
     reevaluate: bool
+    # Veces que se repite la tanda de tres rivales por evaluación (con otras semillas).
+    rounds: int = 1
     history: list[Evaluation] = field(default_factory=list)
     incumbent: Evaluation | None = None
     best: Evaluation | None = None
@@ -314,7 +316,8 @@ class Annealer:
     def evaluate(self, index: int, params: dict[str, float], temperature: float, note: str) -> Evaluation:
         candidate_file = write_params_file(self.out / "candidato.json", params)
         matches = []
-        for k, rival in enumerate(self.rivals()):
+        rivals = self.rivals() * self.rounds
+        for k, rival in enumerate(rivals):
             kickoff = "blue" if (index + k) % 2 == 0 else "yellow"
             seed = index * 10 + k
             result = self.runner.play(candidate_file, rival, seed, kickoff, tag=f"e{index}_{k}")
@@ -336,22 +339,22 @@ class Annealer:
             index = len(self.history)
             temperature = self.t0 * self.cooling ** index
             candidate = self.evaluate(index, neighbor(self.incumbent.params, self.ranges, self.rng), temperature, "")
-            delta = candidate.fitness - self.incumbent.mean_fitness()
+            delta = candidate.fitness - self.incumbent.mean_fitness(3 * self.rounds)
             if delta > 0 and self.reevaluate:
                 # El titular se defiende con partidos nuevos: no cede el puesto por suerte.
                 self.record(candidate)
                 fresh = self.evaluate(len(self.history), self.incumbent.params, temperature, "reevaluación del titular")
                 self.record(fresh)
                 self.incumbent.matches.extend(fresh.matches)
-                delta = candidate.fitness - self.incumbent.mean_fitness()
-                candidate.note = f"titular reevaluado: media {self.incumbent.mean_fitness():+.2f}"
+                delta = candidate.fitness - self.incumbent.mean_fitness(3 * self.rounds)
+                candidate.note = f"titular reevaluado: media {self.incumbent.mean_fitness(3 * self.rounds):+.2f}"
                 candidate.accepted = delta > 0
                 self.rewrite_history()
             else:
                 candidate.accepted = delta > 0 or self.rng.random() < math.exp(delta / max(temperature, 1e-9))
                 self.record(candidate)
             print(f"[annealing] eval {index}: aptitud {candidate.fitness:+.2f} vs titular "
-                  f"{self.incumbent.mean_fitness():+.2f} (Δ {delta:+.2f}, T {temperature:.3f}) → "
+                  f"{self.incumbent.mean_fitness(3 * self.rounds):+.2f} (Δ {delta:+.2f}, T {temperature:.3f}) → "
                   f"{'ACEPTADO' if candidate.accepted else 'rechazado'}")
             if candidate.accepted:
                 self.incumbent = candidate
@@ -380,6 +383,30 @@ class Annealer:
 #  CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+def report(out: Path) -> int:
+    """Tabla del historial: una fila por evaluación, con los parámetros que cambió."""
+    path = out / "history.jsonl"
+    if not path.exists():
+        print(f"[annealing] no hay historial en {path}", file=sys.stderr)
+        return 1
+    rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    ranges = load_ranges()
+    defaults = load_defaults(ranges)
+    incumbent = None
+    print(f"{'eval':>4} {'aptitud':>8} {'T':>6} {'estado':>10}  partidos (gf-gc vs rival)  cambios respecto del titular")
+    for r in rows:
+        base = incumbent["params"] if incumbent else defaults
+        changes = ", ".join(f"{k} {base[k]:.3g}→{r['params'][k]:.3g}" for k in sorted(ranges) if abs(r["params"][k] - base[k]) > 1e-9)
+        matches = " ".join(f"{m['goals_for']}-{m['goals_against']}@{m['rival'][:8]}" for m in r["matches"])
+        state = "titular" if r["accepted"] else ("reeval" if "reevaluación" in r.get("note", "") else "rechazado")
+        print(f"{r['eval']:>4} {r['fitness']:>+8.2f} {r['temperature']:>6.3f} {state:>10}  {matches:<32} {changes or '-'}")
+        if r["accepted"]:
+            incumbent = r
+    best = max(rows, key=lambda r: r["fitness"])
+    print(f"\nmejor: eval {best['eval']} con aptitud {best['fitness']:+.2f}; titular final: eval {incumbent['eval'] if incumbent else '-'}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="simulated annealing de los parámetros de estilo")
     ap.add_argument("--evals", type=int, default=20, help="evaluaciones totales (incluye las ya hechas)")
@@ -391,11 +418,15 @@ def main() -> int:
     ap.add_argument("--t0", type=float, default=1.0 / math.log(2.0), help="temperatura inicial (Δ=1 gol → p=0.5)")
     ap.add_argument("--cooling", type=float, default=0.95)
     ap.add_argument("--no-reevaluate", action="store_true", help="no reevaluar al titular cuando lo superan")
+    ap.add_argument("--rounds", type=int, default=1, help="tandas de tres rivales por evaluación (menos ruido, más partidos)")
     ap.add_argument("--vision-port", type=int, default=10002)
     ap.add_argument("--cmd-port", type=int, default=20011)
     ap.add_argument("--referee-port", type=int, default=10003)
+    ap.add_argument("--report", action="store_true", help="solo imprimir el historial de --out y salir")
     args = ap.parse_args()
 
+    if args.report:
+        return report(args.out)
     for exe in (ENGINE, DIRECTOR, FIRASIM):
         if not exe.exists():
             print(f"[annealing] falta {exe}", file=sys.stderr)
@@ -406,7 +437,7 @@ def main() -> int:
     sim = Simulator(args.fps, args.vision_port, args.cmd_port, args.out / "firasim.log")
     runner = MatchRunner(sim, args.minutes, args.goals, args.referee_port)
     annealer = Annealer(ranges, runner, args.out, random.Random(args.seed), args.t0, args.cooling,
-                        not args.no_reevaluate)
+                        not args.no_reevaluate, rounds=max(1, args.rounds))
     annealer.resume()
 
     def stop(_sig, _frame):

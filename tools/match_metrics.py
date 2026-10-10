@@ -205,6 +205,7 @@ def analyze(path: str) -> dict:
 AREA_X = 0.60
 AREA_HALF_Y = 0.35
 RETENTION_TICKS = 600  # 10 s a 60 Hz
+EPISODE_GAP_TICKS = 120  # 2 s sin nadie en el área antes de contar otro episodio
 
 
 def in_area(p, side):
@@ -229,9 +230,11 @@ def audit_rules(ticks, own_team, attack_sign) -> dict:
         "opp_area_ticks": 0, "opp_area_episodes": 0,
         "opp_double_ticks": 0, "opp_retention_episodes": 0,
     }
-    prev = {"own_area": False, "opp_area": False}
+    # Un episodio de área nuevo exige EPISODE_GAP_TICKS sin nadie adentro: un robot que
+    # oscila sobre la línea del área cuenta una vez, como lo cobraría el árbitro.
+    last_in = {"own_area": -EPISODE_GAP_TICKS, "opp_area": -EPISODE_GAP_TICKS}
     ball_in_own = ball_in_opp = 0
-    for e in ticks:
+    for i, e in enumerate(ticks):
         own = [r for r in e["robots"] if r["own"] and r["pos"][0] is not None]
         opp = [r for r in e["robots"] if not r["own"] and r["pos"][0] is not None]
         if not own or not opp:
@@ -245,9 +248,9 @@ def audit_rules(ticks, own_team, attack_sign) -> dict:
         for key, cond in (("own_area", bool(own_field_in)), ("opp_area", bool(opp_field_in))):
             if cond:
                 stats[key + "_ticks"] += 1
-                if not prev[key]:
+                if i - last_in[key] > EPISODE_GAP_TICKS:
                     stats[key + "_episodes"] += 1
-            prev[key] = cond
+                last_in[key] = i
         if len(own_attackers_in) >= 2:
             stats["own_double_ticks"] += 1
         if len(opp_attackers_in) >= 2:
