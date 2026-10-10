@@ -1,6 +1,7 @@
 //! Logging CSV estructurado compartido entre `skill_test` y `scenario`.
 //!
-//! - `CsvLogger`: writer mínimo sobre `File`. Header en la primera línea.
+//! - `CsvLogger`: writer mínimo sobre `File`. Header en la primera línea. CSV estándar: el
+//!   `frame_str` de la base (con comas) va entre comillas (`csv_field`).
 //! - `CsvRow<'a>`: forma de una fila, con labels como `&'static str` para evitar arrastrar lifetimes.
 //! - `SkillLogCtx`: contexto fijo de una corrida (transport, vision, robot, team, skill).
 //! - `SkillLogCtx::build_skill_row(rec)`: única fuente de verdad para armar la fila a partir de un
@@ -54,7 +55,7 @@ impl CsvLogger {
             opt(row.cmd_omega),
             opt(row.v_mm_s),
             opt(row.w_deg_s),
-            row.frame_str,
+            csv_field(&row.frame_str),
             opt(row.err_dist),
             opt(row.err_heading),
             opt(row.ball_x),
@@ -62,6 +63,17 @@ impl CsvLogger {
             opt(row.ball_vx),
             opt(row.ball_vy),
         )
+    }
+}
+
+/// Campo de texto en CSV estándar: tal cual, o entre comillas dobles (con las internas
+/// duplicadas) si tiene coma, comillas o salto de línea. El frame de la base
+/// (`V1,W1,…`) tiene comas: sin comillas correría las columnas siguientes.
+pub fn csv_field(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\"")).into()
+    } else {
+        s.into()
     }
 }
 
@@ -688,5 +700,89 @@ mod tests {
         assert!(s.contains("tick=90"));
         assert!(s.contains("pose=(0.12"));
         assert!(s.contains("vw=(400,-90)"));
+    }
+
+    /// Separa una línea CSV estándar (comillas dobles, `""` = comilla).
+    fn split_csv(line: &str) -> Vec<String> {
+        let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match (c, quoted) {
+                ('"', true) if chars.peek() == Some(&'"') => {
+                    cur.push('"');
+                    chars.next();
+                }
+                ('"', _) => quoted = !quoted,
+                (',', false) => out.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+        }
+        out.push(cur);
+        out
+    }
+
+    fn written_line(frame: &str) -> String {
+        let path = std::env::temp_dir().join(format!("skill_log_{}_{}.csv", std::process::id(), frame.len()));
+        let mut log = CsvLogger::new(&path).unwrap();
+        let row = CsvRow {
+            t_ms: 50,
+            tick: 3,
+            mode: "vw",
+            transport: "base-station",
+            vision: "",
+            robot: 1,
+            team: "blue",
+            skill: "",
+            pose_x: None,
+            pose_y: None,
+            pose_theta: None,
+            target_x: None,
+            target_y: None,
+            cmd_vx: None,
+            cmd_vy: None,
+            cmd_omega: None,
+            v_mm_s: Some(300),
+            w_deg_s: Some(-45),
+            frame_str: frame.to_string(),
+            err_dist: Some(0.25),
+            err_heading: None,
+            ball_x: Some(0.1),
+            ball_y: Some(-0.2),
+            ball_vx: None,
+            ball_vy: None,
+        };
+        log.write_row(&row).unwrap();
+        drop(log);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        text.lines().nth(1).unwrap().to_string()
+    }
+
+    #[test]
+    fn base_station_frame_is_quoted_and_reads_as_one_column() {
+        let line = written_line("0,0,300,-45,0,0,0,0,0,0");
+        assert!(line.contains(r#","0,0,300,-45,0,0,0,0,0,0","#), "{line}");
+        let header: Vec<&str> = CSV_HEADER.trim_end().split(',').collect();
+        let fields = split_csv(&line);
+        assert_eq!(fields.len(), 25, "{fields:?}");
+        let col = |name: &str| fields[header.iter().position(|h| *h == name).unwrap()].as_str();
+        assert_eq!(col("frame_str"), "0,0,300,-45,0,0,0,0,0,0");
+        assert_eq!((col("v_mm_s"), col("w_deg_s")), ("300", "-45"));
+        assert_eq!((col("err_dist"), col("ball_x"), col("ball_y")), ("0.25", "0.1", "-0.2"));
+    }
+
+    #[test]
+    fn row_without_frame_is_unchanged() {
+        assert_eq!(written_line(""), "50,3,vw,base-station,,1,blue,,,,,,,,,,300,-45,,0.25,,0.1,-0.2,,");
+    }
+
+    #[test]
+    fn csv_field_escapes_only_what_needs_it() {
+        assert_eq!(csv_field("goto"), "goto");
+        assert_eq!(csv_field(""), "");
+        assert_eq!(csv_field("1,2"), "\"1,2\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+        assert_eq!(split_csv(&format!("x,{},y", csv_field("p,\"q\""))), ["x", "p,\"q\"", "y"]);
     }
 }

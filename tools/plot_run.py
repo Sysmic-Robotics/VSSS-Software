@@ -18,7 +18,8 @@ Requiere matplotlib (`pip install matplotlib`). El resumen de texto funciona sin
 Columnas esperadas (header de skill_log): t_ms, pose_x, pose_y, pose_theta,
 target_x, target_y, cmd_vx, cmd_vy, cmd_omega, v_mm_s, w_deg_s,
 err_dist, err_heading, skill, robot, transport. Un CSV viejo (wheel_L/R_mm_s, protocolo
-L,R) se abre igual, pero el panel 3 queda vacío.
+L,R) se abre igual, pero el panel 3 queda vacío. Un CSV con la base de antes de que
+`frame_str` fuera entre comillas se repara al cargarlo.
 """
 import argparse
 import csv
@@ -44,8 +45,20 @@ def fnum(s):
 
 
 def load(path):
+    """Filas del CSV como dicts. Los CSV de antes de las comillas en `frame_str` (con la
+    base, el frame `V1,W1,...` corría las columnas siguientes) se reparan: los campos de
+    más se juntan en `frame_str`, el único campo que puede tener comas."""
     with open(path, newline="") as f:
-        return list(csv.DictReader(f))
+        reader = csv.reader(f)
+        header = next(reader, [])
+        i = header.index("frame_str") if "frame_str" in header else None
+        rows = []
+        for row in reader:
+            extra = len(row) - len(header)
+            if extra > 0 and i is not None:
+                row = row[:i] + [",".join(row[i : i + extra + 1])] + row[i + extra + 1 :]
+            rows.append(dict(zip(header, row)))
+        return rows
 
 
 def col(rows, name):

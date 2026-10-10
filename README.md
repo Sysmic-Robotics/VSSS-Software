@@ -620,15 +620,15 @@ Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt`
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (396 tests)
+cargo test --lib                 # solo lib (400 tests)
 cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (24 tests)
 cargo test --bin match_director  # director de partido de FIRASim (5 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI, perfiles y corte de seguridad (27 tests)
-python3 -m unittest discover -s tools -p 'test_sysid.py'   # ajuste y validación de la sysid (15 tests)
+python3 -m unittest discover -s tools -p 'test_*.py'   # sysid y lectura de los CSV (17 tests)
 ```
 
-**458 tests de Rust** (más 15 de Python para la sysid) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración).
+**462 tests de Rust** (más 17 de Python: sysid y lectura de los CSV) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración).
 
 ### Plotting de runs (`tools/plot_run.py`)
 
@@ -640,7 +640,7 @@ python tools/plot_run.py logs/run.csv --save run.png                # guarda PNG
 python tools/plot_run.py logs/run.csv --save run.png --no-show      # solo guarda (headless / WSL)
 ```
 
-Requiere `matplotlib` (`pip install matplotlib`). Sin `matplotlib` funciona el resumen de texto que imprime stats por columna.
+Requiere `matplotlib` (`pip install matplotlib`). Sin `matplotlib` funciona el resumen de texto que imprime stats por columna. El `frame_str` de la base va entre comillas (CSV estándar); los CSV grabados antes, con el frame suelto, se reparan al cargarlos.
 
 ### Troubleshooting
 
