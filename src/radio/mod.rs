@@ -44,6 +44,16 @@ impl RadioTarget {
     }
 }
 
+/// Puerto de comandos del simulador por instancia (simuladores en paralelo). Vacío = 20011.
+pub const SIM_CMD_PORT_ENV: &str = "VSSL_CMD_PORT";
+
+pub fn sim_cmd_port() -> u16 {
+    std::env::var(SIM_CMD_PORT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(20011)
+}
+
 pub struct Radio {
     transport: Box<dyn RobotTransport>,
     command_map: HashMap<(i32, i32), RobotCommand>,
@@ -72,8 +82,8 @@ impl Radio {
     pub async fn from_target(target: RadioTarget) -> Result<Self, TransportError> {
         eprintln!("[Radio] target = {target:?}");
         let transport: Box<dyn RobotTransport> = match target {
-            RadioTarget::FiraSim => Box::new(FiraSimTransport::new("127.0.0.1", 20011).await?),
-            RadioTarget::GrSim => Box::new(GrSimTransport::new("127.0.0.1", 20011).await?),
+            RadioTarget::FiraSim => Box::new(FiraSimTransport::new("127.0.0.1", sim_cmd_port()).await?),
+            RadioTarget::GrSim => Box::new(GrSimTransport::new("127.0.0.1", sim_cmd_port()).await?),
             RadioTarget::BaseStation => {
                 let team = TeamColor::from_env();
                 Box::new(BaseStationTransport::from_env(team)?)

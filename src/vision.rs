@@ -48,6 +48,8 @@ const VISION_LOG_PACKET_STATS_EVERY_N: u64 = 3000;
 const VISION_MULTICAST_INTERFACE_ENV: &str = "VSSL_MULTICAST_IFACE";
 /// Selecciona la fuente de visión (`firasim` | `sslvision`). Default: `firasim`.
 const VISION_SOURCE_ENV: &str = "VSSL_VISION_SOURCE";
+/// Puerto de visión por instancia (simuladores en paralelo). Vacío = el de la fuente.
+pub const VISION_PORT_ENV: &str = "VSSL_VISION_PORT";
 
 /// Fuente de paquetes de visión.
 ///
@@ -69,7 +71,12 @@ impl VisionSource {
         }
     }
 
+    /// Puerto de visión: `VSSL_VISION_PORT` si está definido (varios simuladores en
+    /// paralelo, cada uno con sus puertos); si no, el de fábrica de la fuente.
     pub fn port(&self) -> u16 {
+        if let Some(port) = std::env::var(VISION_PORT_ENV).ok().and_then(|v| v.trim().parse().ok()) {
+            return port;
+        }
         match self {
             VisionSource::FiraSim => 10002,
             VisionSource::SslVision => 10015,
