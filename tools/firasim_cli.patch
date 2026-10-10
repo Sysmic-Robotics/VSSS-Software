@@ -38,10 +38,21 @@ index 18f6689..0cd25a8 100644
      return QApplication::exec();
  }
 diff --git a/src/mainwindow.cpp b/src/mainwindow.cpp
-index 1d38839..e65a7c0 100644
+index 1d38839..19519fe 100644
 --- a/src/mainwindow.cpp
 +++ b/src/mainwindow.cpp
-@@ -540,3 +540,21 @@ void MainWindow::fullSpeed(bool value)
+@@ -503,6 +503,10 @@ void MainWindow::reconnectCommandSocket()
+     if (commandSocket->bind(QHostAddress::Any,configwidget->CommandListenPort()))
+         logStatus(QString("Command listen port binded on: %1").arg(configwidget->CommandListenPort()),QColor("green"));
+     QObject::connect(commandSocket,SIGNAL(readyRead()),this,SLOT(recvActions()));
++    // El mundo guarda su propio puntero al socket: tras recrearlo hay que actualizarlo,
++    // si no recvActions() lee de un socket ya borrado (segfault al primer comando).
++    if (glwidget != nullptr && glwidget->ssl != nullptr)
++        glwidget->ssl->commandSocket = commandSocket;
+ }
+ 
+ void MainWindow::reconnectVisionSocket()
+@@ -540,3 +544,21 @@ void MainWindow::fullSpeed(bool value)
  {
      glwidget->ssl->fullSpeed = value;
  }

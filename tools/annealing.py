@@ -25,12 +25,17 @@ import argparse
 import json
 import math
 import os
+import queue
 import random
+import re
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -109,6 +114,7 @@ class MatchResult:
     free_balls: int
     seconds: float
     wall_seconds: float
+    frames_lost_pct: float = 0.0   # peor de los dos engines: frames de visión sin tick
 
     def fitness(self) -> float:
         return (
@@ -122,6 +128,62 @@ class MatchResult:
         return dict(self.__dict__, fitness=round(self.fitness(), 3))
 
 
+def _pb_varint(n: int) -> bytes:
+    out = b""
+    while True:
+        b, n = n & 0x7F, n >> 7
+        if not n:
+            return out + bytes([b])
+        out += bytes([b | 0x80])
+
+
+def _pb_parse(buf: bytes) -> list[tuple[int, int, object]]:
+    """Campos (número, tipo de alambre, valor) de un mensaje protobuf, sin esquema."""
+    i, out = 0, []
+
+    def read_varint() -> int:
+        nonlocal i
+        v = shift = 0
+        while True:
+            b = buf[i]; i += 1
+            v |= (b & 0x7F) << shift; shift += 7
+            if not b & 0x80:
+                return v
+
+    while i < len(buf):
+        tag = read_varint()
+        field, wt = tag >> 3, tag & 7
+        if wt == 0:
+            out.append((field, wt, read_varint()))
+        elif wt == 1:
+            out.append((field, wt, struct.unpack("<d", buf[i:i + 8])[0])); i += 8
+        elif wt == 2:
+            n = read_varint(); out.append((field, wt, buf[i:i + n])); i += n
+        elif wt == 5:
+            out.append((field, wt, buf[i:i + 4])); i += 4
+        else:
+            raise ValueError(f"wire type {wt}")
+    return out
+
+
+def vision_ball(env: bytes) -> tuple[float, float] | None:
+    """Posición de la pelota en un paquete Environment de FIRASim (frame=2 → ball=1 → x=1, y=2)."""
+    for f, wt, v in _pb_parse(env):
+        if f == 2 and wt == 2:
+            for f2, wt2, v2 in _pb_parse(v):
+                if f2 == 1 and wt2 == 2:
+                    d = {f3: v3 for f3, _, v3 in _pb_parse(v2)}
+                    return float(d.get(1, 0.0)), float(d.get(2, 0.0))
+    return None
+
+
+def ball_replacement(x: float, y: float) -> bytes:
+    """Packet{replace=2: Replacement{ball=1: BallReplacement{x=1, y=2}}}."""
+    ball = b"\x09" + struct.pack("<d", x) + b"\x11" + struct.pack("<d", y)
+    replacement = b"\x0a" + _pb_varint(len(ball)) + ball
+    return b"\x12" + _pb_varint(len(replacement)) + replacement
+
+
 class Simulator:
     """FIRASim headless acelerado, con puertos propios, vivo durante toda la corrida."""
 
@@ -131,17 +193,59 @@ class Simulator:
         self.cmd_port = cmd_port
         self.log = open(log, "a", encoding="utf-8")
         self.proc: subprocess.Popen | None = None
+        self.restarts = 0
 
     def start(self) -> None:
-        # Los puertos solo se pasan si no son los de fábrica: reabrir el socket sobre el
-        # mismo puerto deja a FIRASim sin emitir visión.
+        # Los puertos solo se pasan si no son los de fábrica. (El parche de FIRASim en
+        # tools/firasim_cli.patch corrige el segfault al recrear el socket de comandos.)
         args = [str(FIRASIM), "--headless", "--fps", str(self.fps)]
         if self.vision_port != 10002:
             args += ["--vision-port", str(self.vision_port)]
         if self.cmd_port != 20011:
             args += ["--cmd-port", str(self.cmd_port)]
-        self.proc = subprocess.Popen(args, stdout=self.log, stderr=subprocess.STDOUT, cwd=REPO)
-        time.sleep(6.0)
+        for intento in range(3):
+            self.proc = subprocess.Popen(args, stdout=self.log, stderr=subprocess.STDOUT, cwd=REPO)
+            time.sleep(6.0)
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"FIRASim (visión {self.vision_port}, comandos {self.cmd_port}) terminó al arrancar")
+            if self.probe():
+                return
+            # Instancia 'congelada' (emite visión pero ignora los teleports): se relanza.
+            print(f"[annealing] FIRASim en {self.vision_port}/{self.cmd_port} arrancó congelado; se relanza "
+                  f"({intento + 1}/3)", flush=True)
+            self.stop()
+            self.restarts += 1
+        raise RuntimeError(f"FIRASim (visión {self.vision_port}, comandos {self.cmd_port}) arranca congelado")
+
+    def probe(self, x: float = 0.31, y: float = 0.22) -> bool:
+        """Teleporta la pelota y comprueba que la visión lo refleje."""
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            rx.bind(("", self.vision_port))
+            rx.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                          struct.pack("4s4s", socket.inet_aton("224.0.0.1"), socket.inet_aton("0.0.0.0")))
+            rx.settimeout(0.5)
+
+            def last_ball(seconds: float) -> tuple[float, float] | None:
+                ball, t_end = None, time.monotonic() + seconds
+                while time.monotonic() < t_end:
+                    try:
+                        ball = vision_ball(rx.recv(65536)) or ball
+                    except socket.timeout:
+                        break
+                return ball
+
+            if last_ball(0.3) is None:
+                return False
+            tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            tx.sendto(ball_replacement(x, y), ("127.0.0.1", self.cmd_port))
+            tx.close()
+            time.sleep(0.2)
+            ball = last_ball(0.3)
+            return ball is not None and abs(ball[0] - x) < 0.05 and abs(ball[1] - y) < 0.05
+        finally:
+            rx.close()
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -150,6 +254,16 @@ class Simulator:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+
+    def restart(self) -> None:
+        """Se ha visto a FIRASim quedarse 'congelado' (emite visión pero ignora comandos y
+        teleports) de forma intermitente; ante un partido inválido se relanza la instancia."""
+        self.stop()
+        self.restarts += 1
+        self.start()
+
+    def close(self) -> None:
+        self.stop()
         self.log.close()
 
 
@@ -160,12 +274,32 @@ class Rival:
     params_file: Path | None   # VSSL_PARAMS del amarillo (solo heuristic)
 
 
+FRAME_CLOCK_LINE = re.compile(r"reloj por frames: frames (\d+), ticks (\d+)")
+
+
+def frames_lost_pct(log: Path) -> float:
+    """Frames de visión que el engine no alcanzó a procesar, según su último resumen periódico."""
+    last = None
+    try:
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = FRAME_CLOCK_LINE.search(line)
+            if m:
+                last = m
+    except OSError:
+        return 0.0
+    if last is None:
+        return 0.0
+    frames, ticks = int(last.group(1)), int(last.group(2))
+    return 100.0 * max(frames - ticks, 0) / max(frames, 1)
+
+
 class MatchRunner:
-    def __init__(self, sim: Simulator, minutes: float, goals: int, referee_port: int):
+    def __init__(self, sim: Simulator, minutes: float, goals: int, referee_port: int, keep_work: bool = False):
         self.sim = sim
         self.minutes = minutes
         self.goals = goals
         self.referee_addr = f"224.5.23.2:{referee_port}"
+        self.keep_work = keep_work
 
     def _engine(self, color: str, side: str, coach: str, params_file: Path | None, seed: int,
                 log: Path, csv: Path) -> subprocess.Popen:
@@ -183,8 +317,10 @@ class MatchRunner:
             env.pop("VSSL_PARAMS", None)
         return subprocess.Popen([str(ENGINE)], env=env, cwd=REPO, stdout=open(log, "w"), stderr=subprocess.STDOUT)
 
-    def play(self, candidate_file: Path, rival: Rival, seed: int, kickoff: str, tag: str) -> MatchResult:
+    def play(self, candidate_file: Path, rival: Rival, seed: int, kickoff: str, tag: str,
+             attempt: int = 0) -> MatchResult:
         work = WORK / tag
+        shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True, exist_ok=True)
         blue_csv, yellow_csv = work / "azul.csv", work / "amarillo.csv"
         t0 = time.monotonic()
@@ -212,6 +348,25 @@ class MatchRunner:
             raise RuntimeError(f"el director falló en {tag} (código {director.returncode})")
         score = json.loads(out.read_text(encoding="utf-8").strip().splitlines()[-1])
         metrics = analyze(str(blue_csv))
+        covered = float(metrics.get("duracion_s", 0.0))
+        touches = int(metrics.get("toques_propios", 0)) + int(metrics.get("toques_rival", 0))
+        problem = None
+        if covered < 0.7 * float(score["seconds"]):
+            problem = f"el registro azul cubre {covered:.0f} s de {score['seconds']:.0f} s"
+        elif touches == 0 and float(metrics.get("pelota_libre_pct", 0.0)) > 99.0:
+            problem = "nadie tocó la pelota en todo el partido (simulador congelado)"
+        if problem is not None:
+            # Partido inválido: el directorio queda para inspección, se relanza el FIRASim de este
+            # carril y el partido se repite una vez.
+            failed = WORK / f"{tag}_fallido{attempt}"
+            shutil.rmtree(failed, ignore_errors=True)
+            shutil.move(work, failed)
+            print(f"[annealing]   {tag}: {problem} (guardado en {failed})"
+                  f"{'; se relanza el simulador y se repite' if attempt < 1 else ''}")
+            if attempt < 1:
+                self.sim.restart()
+                return self.play(candidate_file, rival, seed, kickoff, tag, attempt + 1)
+            raise RuntimeError(f"partido {tag} inválido dos veces seguidas")
         result = MatchResult(
             rival=rival.name,
             goals_for=int(score["blue"]), goals_against=int(score["yellow"]),
@@ -220,8 +375,10 @@ class MatchRunner:
             retentions=int(metrics.get("retencion_10s_episodios", 0)),
             free_balls=int(score.get("free_balls", 0)),
             seconds=float(score["seconds"]), wall_seconds=time.monotonic() - t0,
+            frames_lost_pct=max(frames_lost_pct(work / "azul.log"), frames_lost_pct(work / "amarillo.log")),
         )
-        shutil.rmtree(work, ignore_errors=True)
+        if not self.keep_work:
+            shutil.rmtree(work, ignore_errors=True)
         return result
 
 
@@ -257,7 +414,8 @@ class Evaluation:
 @dataclass
 class Annealer:
     ranges: dict[str, tuple[float, float]]
-    runner: MatchRunner
+    runners: "queue.Queue[MatchRunner]"
+    pool: ThreadPoolExecutor
     out: Path
     rng: random.Random
     t0: float
@@ -314,17 +472,25 @@ class Annealer:
         return rivals
 
     def evaluate(self, index: int, params: dict[str, float], temperature: float, note: str) -> Evaluation:
-        candidate_file = write_params_file(self.out / "candidato.json", params)
-        matches = []
+        candidate_file = write_params_file(self.out / f"candidato_{index}.json", params)
         rivals = self.rivals() * self.rounds
-        for k, rival in enumerate(rivals):
+
+        def play(k: int, rival: Rival) -> MatchResult:
             kickoff = "blue" if (index + k) % 2 == 0 else "yellow"
-            seed = index * 10 + k
-            result = self.runner.play(candidate_file, rival, seed, kickoff, tag=f"e{index}_{k}")
-            matches.append(result)
+            runner = self.runners.get()
+            try:
+                return runner.play(candidate_file, rival, index * 10 + k, kickoff, tag=f"e{index}_{k}")
+            finally:
+                self.runners.put(runner)
+
+        # Los partidos de una evaluación se reparten entre los simuladores disponibles.
+        matches = list(self.pool.map(lambda kr: play(*kr), enumerate(rivals)))
+        for rival, result in zip(rivals, matches):
             print(f"[annealing]   eval {index} vs {rival.name:>12}: {result.goals_for}-{result.goals_against}, "
                   f"posesión {result.possession_pct:.0f} %, faltas {result.area_fouls}, "
-                  f"aptitud {result.fitness():+.2f} ({result.wall_seconds:.0f} s)")
+                  f"aptitud {result.fitness():+.2f} ({result.wall_seconds:.0f} s, "
+                  f"frames perdidos {result.frames_lost_pct:.1f} %)")
+        candidate_file.unlink(missing_ok=True)
         return Evaluation(index=index, params=params, matches=matches, temperature=temperature, note=note)
 
     # ── Bucle principal ─────────────────────────────────────────────────────
@@ -419,9 +585,11 @@ def main() -> int:
     ap.add_argument("--cooling", type=float, default=0.95)
     ap.add_argument("--no-reevaluate", action="store_true", help="no reevaluar al titular cuando lo superan")
     ap.add_argument("--rounds", type=int, default=1, help="tandas de tres rivales por evaluación (menos ruido, más partidos)")
-    ap.add_argument("--vision-port", type=int, default=10002)
-    ap.add_argument("--cmd-port", type=int, default=20011)
-    ap.add_argument("--referee-port", type=int, default=10003)
+    ap.add_argument("--sims", type=int, default=1, help="simuladores en paralelo (cada uno con sus puertos)")
+    ap.add_argument("--vision-port", type=int, default=10002, help="puerto de visión del primer simulador")
+    ap.add_argument("--cmd-port", type=int, default=20011, help="puerto de comandos del primer simulador")
+    ap.add_argument("--referee-port", type=int, default=10003, help="puerto del árbitro del primer simulador")
+    ap.add_argument("--keep-work", action="store_true", help="conservar CSV y logs de cada partido en WORK (depuración)")
     ap.add_argument("--report", action="store_true", help="solo imprimir el historial de --out y salir")
     args = ap.parse_args()
 
@@ -434,25 +602,42 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     WORK.mkdir(parents=True, exist_ok=True)
     ranges = load_ranges()
-    sim = Simulator(args.fps, args.vision_port, args.cmd_port, args.out / "firasim.log")
-    runner = MatchRunner(sim, args.minutes, args.goals, args.referee_port)
-    annealer = Annealer(ranges, runner, args.out, random.Random(args.seed), args.t0, args.cooling,
+    # Un simulador por "carril", con puertos separados de a 10 (visión, comandos y árbitro).
+    sims = [Simulator(args.fps, args.vision_port + 10 * k, args.cmd_port + 10 * k, args.out / f"firasim_{k}.log")
+            for k in range(max(1, args.sims))]
+    runners: "queue.Queue[MatchRunner]" = queue.Queue()
+    for k, sim in enumerate(sims):
+        runners.put(MatchRunner(sim, args.minutes, args.goals, args.referee_port + k, keep_work=args.keep_work))
+    pool = ThreadPoolExecutor(max_workers=len(sims))
+    annealer = Annealer(ranges, runners, pool, args.out, random.Random(args.seed), args.t0, args.cooling,
                         not args.no_reevaluate, rounds=max(1, args.rounds))
     annealer.resume()
 
+    def stop_all() -> None:
+        for sim in sims:
+            sim.close()
+        restarts = sum(sim.restarts for sim in sims)
+        if restarts:
+            print(f"[annealing] simuladores relanzados por partidos inválidos: {restarts}")
+
     def stop(_sig, _frame):
         print("[annealing] interrumpido; el historial queda y se reanuda con la misma --out")
-        sim.stop()
+        stop_all()
         sys.exit(130)
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    sim.start()
+    # La instancia con puertos de fábrica va al final: las demás enlazan 20011 un instante al
+    # construirse y eso dejaba 'congelada' a una instancia de fábrica ya en marcha.
+    for sim in reversed(sims):
+        sim.start()
+    print(f"[annealing] {len(sims)} simulador(es) a {args.fps} fps, {3 * max(1, args.rounds)} partidos por evaluación")
     started = time.monotonic()
     try:
         annealer.run(args.evals, load_defaults(ranges))
     finally:
-        sim.stop()
+        stop_all()
+        pool.shutdown(wait=False)
     print(f"[annealing] {time.monotonic() - started:.0f} s de pared en total")
     return 0
 
