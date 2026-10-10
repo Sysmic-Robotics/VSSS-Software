@@ -177,6 +177,9 @@ pub struct Vision {
     theta_offset_deg: f64,
     /// Reloj por frames (`VSSL_FRAME_CLOCK`): dt fijo y latencia en frames.
     frame_clock: bool,
+    /// Paquetes de detección recibidos del socket (antes del proxy), para que el lazo
+    /// mida cuánto se atrasa respecto de la visión.
+    pub packets_received: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Contadores del receptor (para los logs periódicos).
@@ -229,6 +232,7 @@ impl Vision {
             dropped: 0,
             theta_offset_deg,
             frame_clock,
+            packets_received: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -539,6 +543,7 @@ impl Vision {
                     match result {
                         Ok((len, addr)) => {
                             stats.packet_count += 1;
+                            self.packets_received.fetch_add(1, Ordering::Relaxed);
                             last_packet_time = Instant::now();
                             let data = &buf[..len];
 

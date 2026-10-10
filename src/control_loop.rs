@@ -621,6 +621,9 @@ pub async fn run_control_loop(
     // Aviso "la skill no corre": último log a terminal y último envío a la GUI.
     let mut skill_warning_logged_at: Option<Instant> = None;
     let mut skill_warning_sent: Option<(Option<String>, Instant)> = None;
+    // Paquetes leídos del socket por la visión: con el reloj por frames, su diferencia
+    // con los frames vistos por el lazo es la cola que el lazo todavía no procesó (atraso).
+    let packets_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Vision
     {
@@ -633,8 +636,10 @@ pub async fn run_control_loop(
             source.port()
         );
         let status_tx_vis = status_tx.clone();
+        let packets_received = packets_received.clone();
         tokio::spawn(async move {
             let mut vis = Vision::new(source, tracker_enabled);
+            vis.packets_received = packets_received;
             let (dummy_tx, _) = mpsc::channel(1);
             let tx = status_tx_vis.unwrap_or(dummy_tx);
             if let Err(err) = vis.run(vision_tx, tx).await {
@@ -752,6 +757,15 @@ pub async fn run_control_loop(
                     let n = *frame_rx.borrow_and_update();
                     frames_skipped += n.saturating_sub(last_frame + 1);
                     last_frame = n;
+                    if n.is_multiple_of(600) {
+                        let seen = packets_received.load(Ordering::Relaxed);
+                        eprintln!(
+                            "[control_loop] reloj por frames: frames {n}, ticks {tick_counter}, paquetes leídos {seen}, \
+                             atraso {} frames, {:.1} s de pared",
+                            seen.saturating_sub(n),
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
                 }
                 Ok(Err(_)) => break,
                 Err(_) => {
