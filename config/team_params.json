@@ -22,7 +22,17 @@
     "clear_zone_start_x": 0.2,
     "clear_zone_full_x": 0.6,
     "adapt_enabled": true,
-    "adapt_alpha": 0.3
+    "adapt_alpha": 0.3,
+    "score_approach_when_feasible": 0.2,
+    "push_stall_s": 1.5,
+    "stall_kick_max_s": 3.0,
+    "spin_ban_s": 2.0,
+    "standoff_from_ball": 0.3,
+    "support_depth": 0.3,
+    "press_distance": 0.6,
+    "gk_engage_margin": 0.05,
+    "gk_engage_opp_dist": 0.2,
+    "gk_engage_max_ball_speed": 0.4
   },
   "skills": {
     "approach_staging_offset": 0.14,

@@ -70,8 +70,8 @@ struct Committed {
 }
 
 /// Pelota trabada junto al striker (pegada al robot sin moverse: contra la pared, con un
-/// rival encima). Empujando, tras `PUSH_STALL_S` se la saca con el giro; si el giro
-/// tampoco la suelta en `STALL_KICK_MAX_S`, se lo prohíbe `SPIN_BAN_S` para que pruebe
+/// rival encima). Empujando, tras `push_stall_s` se la saca con el giro; si el giro
+/// tampoco la suelta en `stall_kick_max_s`, se lo prohíbe `spin_ban_s` para que pruebe
 /// otra opción en vez de quedarse quieto con el giro agotado.
 #[derive(Debug, Clone, Copy)]
 enum Stall {
@@ -92,23 +92,9 @@ enum StallAction {
     BanSpin,
 }
 
-/// Segundos de empuje sin que la pelota se mueva antes de forzar `SpinKick`.
-const PUSH_STALL_S: f32 = 1.5;
-/// Segundos sin giro tras un giro que no soltó la pelota.
-const SPIN_BAN_S: f32 = 2.0;
-/// Distancia (m) a la que se aparta un robot de campo de una pelota que ya juega el
-/// arquero, y mínima del punto de apoyo a la pelota.
-const STANDOFF_FROM_BALL: f32 = 0.30;
-/// Arquero activo: sale a despejar una pelota conducida por un rival (a menos de esta
-/// distancia de ella y más lenta que este tope) dentro del área propia ampliada en
-/// este margen.
-const KEEPER_CHALLENGE_OPP_DIST: f32 = 0.20;
-const KEEPER_CHALLENGE_MAX_BALL_SPEED: f32 = 0.40;
-/// Margen chico: más lejos deja el arco vacío y se suma a la disputa junto a la línea
-/// de fondo, donde el rival no puede marcar.
-const KEEPER_CHALLENGE_MARGIN: f32 = 0.05;
-/// Tope del giro forzado si la pelota tampoco se suelta así (vuelve a empujar).
-const STALL_KICK_MAX_S: f32 = 3.0;
+// Los tiempos del empuje trabado, las distancias de apoyo y presión y los umbrales
+// del arquero activo son parámetros de estilo de juego: `CoachParams`
+// (`config/team_params.json`, rangos en `config/style_ranges.json`).
 
 pub struct HeuristicCoach {
     pub attack_goal: Vec2,
@@ -142,11 +128,6 @@ pub struct HeuristicCoach {
 fn clamp01(x: f32) -> f32 {
     x.clamp(0.0, 1.0)
 }
-
-/// Fracción del score base de `ApproachAligned` que conserva cuando `ShootPush` ya es
-/// factible: por debajo de cualquier tiro factible (mínimo 0.6 × tapado 0.6 × carril
-/// 0.7 ≈ 0.25) incluso sumando la histéresis.
-const APPROACH_WHEN_SHOT_FEASIBLE: f32 = 0.2;
 
 /// Opciones que compiten por el striker (orden fijo de `last_scores`).
 pub const STRIKER_OPTIONS: [SkillId; 5] = [
@@ -522,7 +503,7 @@ impl HeuristicCoach {
         // para que el compromiso mínimo siga evitando el ping-pong approach↔shoot.
         let staging_far = clamp01(dist_ball / (2.0 * sp.approach_staging_offset + 0.6));
         let approach = p.score_approach_base
-            * if shoot > 0.0 { APPROACH_WHEN_SHOT_FEASIBLE } else { 1.0 - 0.3 * staging_far };
+            * if shoot > 0.0 { p.score_approach_when_feasible } else { 1.0 - 0.3 * staging_far };
 
         [
             (SkillId::ShootPush, clamp01(shoot)),
@@ -554,12 +535,13 @@ impl HeuristicCoach {
     }
 
     /// Actualiza el estado de pelota trabada y devuelve qué imponer sobre los scores:
-    /// - empujando con la pelota pegada y quieta `PUSH_STALL_S` → `ForceSpin` hasta que se
-    ///   suelte (se mueve o se aleja) o pasen `STALL_KICK_MAX_S`;
-    /// - un giro (forzado o elegido) que no la suelta en `STALL_KICK_MAX_S` → `BanSpin`
-    ///   durante `SPIN_BAN_S` (el giro agotado deja al robot quieto; que pruebe otra cosa).
+    /// - empujando con la pelota pegada y quieta `push_stall_s` → `ForceSpin` hasta que se
+    ///   suelte (se mueve o se aleja) o pasen `stall_kick_max_s`;
+    /// - un giro (forzado o elegido) que no la suelta en `stall_kick_max_s` → `BanSpin`
+    ///   durante `spin_ban_s` (el giro agotado deja al robot quieto; que pruebe otra cosa).
     fn update_push_stall(&mut self, current: Option<SkillId>, pos: Vec2, ball: Vec2, ball_vel: Vec2) -> StallAction {
-        let hz = self.p.decision_hz.max(1e-3);
+        let p = &self.p;
+        let hz = p.decision_hz.max(1e-3);
         let now = self.decision_count;
         let elapsed = |since: u64| now.saturating_sub(since) as f32 / hz;
         let dist = (ball - pos).length();
@@ -571,10 +553,10 @@ impl HeuristicCoach {
             Stall::None if pushing && pinned => Stall::Counting(now),
             Stall::None if spinning && pinned => Stall::Kicking(now),
             Stall::Counting(_) if !(pushing && pinned) => Stall::None,
-            Stall::Counting(since) if elapsed(since) >= PUSH_STALL_S => Stall::Kicking(now),
+            Stall::Counting(since) if elapsed(since) >= p.push_stall_s => Stall::Kicking(now),
             Stall::Kicking(_) if freed => Stall::None,
-            Stall::Kicking(since) if elapsed(since) >= STALL_KICK_MAX_S => Stall::SpinBanned(now),
-            Stall::SpinBanned(since) if freed || elapsed(since) >= SPIN_BAN_S => Stall::None,
+            Stall::Kicking(since) if elapsed(since) >= p.stall_kick_max_s => Stall::SpinBanned(now),
+            Stall::SpinBanned(since) if freed || elapsed(since) >= p.spin_ban_s => Stall::None,
             same => same,
         };
         match self.push_stall {
@@ -584,27 +566,48 @@ impl HeuristicCoach {
         }
     }
 
-    /// Punto a `STANDOFF_FROM_BALL` de la pelota hacia el centro de la cancha (fuera del
+    /// Punto a `standoff_from_ball` de la pelota hacia el centro de la cancha (fuera del
     /// área propia): donde espera un robot de campo mientras el arquero juega la pelota.
     fn standoff_point(&self, ball: Vec2) -> Vec2 {
         let away = (Vec2::ZERO - ball).normalize_or_zero();
-        let mut pos = self.clamp_field_robot(ball + away * STANDOFF_FROM_BALL);
+        let mut pos = self.clamp_field_robot(ball + away * self.p.standoff_from_ball);
         if self.in_own_area(pos) {
             pos.x = self.attack_sign() * -(GOAL_AREA_X - 0.08);
         }
         pos
     }
 
-    /// `pos` alejado de la pelota hasta `STANDOFF_FROM_BALL` si estaba más cerca (contra
+    /// `pos` alejado de la pelota hasta `standoff_from_ball` si estaba más cerca (contra
     /// la pared el clamp del campo deja el punto de apoyo encima de la pelota y el
     /// support se suma a la disputa).
     fn away_from_ball(&self, pos: Vec2, ball: Vec2) -> Vec2 {
+        let standoff = self.p.standoff_from_ball;
         let rel = pos - ball;
-        if rel.length() >= STANDOFF_FROM_BALL {
+        if rel.length() >= standoff {
             return pos;
         }
         let dir = if rel.length() > 1e-3 { rel.normalize() } else { (Vec2::ZERO - ball).normalize_or_zero() };
-        self.clamp_field_robot(ball + dir * STANDOFF_FROM_BALL)
+        self.clamp_field_robot(ball + dir * standoff)
+    }
+
+    /// Presión: `true` si un rival está encima de la pelota y el striker, más lejos que
+    /// `press_distance`, debe esperarla sobre la línea pelota–arco propio en vez de ir.
+    fn holds_press_line(&self, r: &RobotView, ball: Vec2, opp: &[RobotView]) -> bool {
+        let rival_on_ball = opp
+            .iter()
+            .any(|o| o.active && (o.pos - ball).length() <= self.p.spin_when_opponent_within);
+        rival_on_ball && (ball - r.pos).length() > self.p.press_distance
+    }
+
+    /// Punto de espera de la presión: sobre la línea pelota–arco propio, a
+    /// `press_distance` de la pelota, fuera del área propia.
+    fn press_point(&self, ball: Vec2) -> Vec2 {
+        let to_own = (self.own_goal - ball).normalize_or_zero();
+        let mut pos = self.clamp_field_robot(ball + to_own * self.p.press_distance);
+        if self.in_own_area(pos) {
+            pos.x = self.attack_sign() * -(GOAL_AREA_X - 0.08);
+        }
+        pos
     }
 
     /// `support`: posición del compañero de campo, destino del pase cuando el empuje
@@ -725,7 +728,7 @@ impl HeuristicCoach {
             None => -ball.y.signum(),
         };
         let side = if side == 0.0 { 1.0 } else { side };
-        let raw = ball + to_own * 0.30 + lateral_dir * (0.25 * side);
+        let raw = ball + to_own * self.p.support_depth + lateral_dir * (0.25 * side);
         let mut pos = self.away_from_ball(self.clamp_field_robot(raw), ball);
         if self.in_own_area(pos) {
             pos.x = self.attack_sign() * -(GOAL_AREA_X - 0.08);
@@ -742,11 +745,12 @@ impl HeuristicCoach {
             .unwrap_or(0.0)
     }
 
-    /// Pelota en el área propia ampliada en `KEEPER_CHALLENGE_MARGIN` (el borde desde
-    /// donde un rival la mete conduciendo).
+    /// Pelota en el área propia ampliada en `gk_engage_margin` (el borde desde donde un
+    /// rival la mete conduciendo).
     fn near_own_area(&self, p: Vec2) -> bool {
         let s = self.attack_sign();
-        (p.x * -s) >= GOAL_AREA_X - KEEPER_CHALLENGE_MARGIN && p.y.abs() <= GOAL_AREA_HALF_Y + KEEPER_CHALLENGE_MARGIN
+        let margin = self.p.gk_engage_margin;
+        (p.x * -s) >= GOAL_AREA_X - margin && p.y.abs() <= GOAL_AREA_HALF_Y + margin
     }
 
     fn keeper_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
@@ -763,8 +767,8 @@ impl HeuristicCoach {
         // lleva conduciendo (lenta, con él encima) por el área o su borde: esperarlo en
         // la línea es dejar que la empuje hasta adentro.
         let slow = ball_vel.length() <= self.p.gk_clear_max_ball_speed;
-        let carried = ball_vel.length() <= KEEPER_CHALLENGE_MAX_BALL_SPEED
-            && opp.iter().any(|o| o.active && (o.pos - ball).length() <= KEEPER_CHALLENGE_OPP_DIST);
+        let carried = ball_vel.length() <= self.p.gk_engage_max_ball_speed
+            && opp.iter().any(|o| o.active && (o.pos - ball).length() <= self.p.gk_engage_opp_dist);
         let parked = in_area && slow;
         let overdue = in_area && self.ball_seconds_in_own_area() >= self.p.gk_force_clear_s;
         let challenge = carried && self.near_own_area(ball);
@@ -917,6 +921,10 @@ impl Coach for HeuristicCoach {
                 Some(Role::Striker) if keeper_clearing => {
                     let skill = self.commit(r.id, SkillId::Mark, |_| true);
                     SkillChoice::new(r.id, skill, self.standoff_point(ball))
+                }
+                Some(Role::Striker) if self.holds_press_line(r, ball, &opp) => {
+                    let skill = self.commit(r.id, SkillId::Mark, |_| true);
+                    SkillChoice::new(r.id, skill, self.press_point(ball))
                 }
                 Some(Role::Striker) => self.striker_choice(r, ball, ball_vel, &opp, support),
                 _ => self.support_choice(r, ball, striker.as_ref(), &opp),
@@ -1120,7 +1128,7 @@ mod tests {
         // la distancia de apoyo hacia el centro, mirando la pelota.
         let striker = choice_of(&ch, 0);
         assert_eq!(striker.skill_id, SkillId::Mark);
-        assert!((striker.target - Vec2::new(-0.57, -0.25)).length() >= STANDOFF_FROM_BALL - 1e-3);
+        assert!((striker.target - Vec2::new(-0.57, -0.25)).length() >= c.p.standoff_from_ball - 1e-3);
         assert!(!c.in_own_area(striker.target));
         // Misma pelota sin rival encima: sigue en la línea.
         let mut c = coach();
@@ -1142,7 +1150,7 @@ mod tests {
     fn exhausted_spin_is_banned_so_the_striker_tries_something_else() {
         // Serie espejo: el atacante quedaba 8 s quieto en SpinKick agotado contra la línea
         // de fondo porque el coach lo volvía a elegir. Girando con la pelota quieta más de
-        // STALL_KICK_MAX_S, el giro queda prohibido un rato.
+        // stall_kick_max_s, el giro queda prohibido un rato.
         let mut c = coach();
         // Esquina rival, pelota quieta, rival encima: SpinKick por scores.
         let mut o = obs(
@@ -1154,13 +1162,13 @@ mod tests {
         assert_eq!(choice_of(&c.decide(&o), 0).skill_id, SkillId::SpinKick);
         let hz = CoachParams::default().decision_hz;
         let mut last = SkillId::SpinKick;
-        for _ in 0..((STALL_KICK_MAX_S * hz) as usize + 2) {
+        for _ in 0..((CoachParams::default().stall_kick_max_s * hz) as usize + 2) {
             last = choice_of(&c.decide(&o), 0).skill_id;
         }
         assert_ne!(last, SkillId::SpinKick, "{last:?}");
         assert!(matches!(c.push_stall, Stall::SpinBanned(_)));
         // Pasada la prohibición vuelve a poder girar.
-        for _ in 0..((SPIN_BAN_S * hz) as usize + 2) {
+        for _ in 0..((CoachParams::default().spin_ban_s * hz) as usize + 2) {
             last = choice_of(&c.decide(&o), 0).skill_id;
         }
         assert!(matches!(c.push_stall, Stall::None | Stall::Kicking(_)), "{:?}", c.push_stall);
@@ -1181,7 +1189,36 @@ mod tests {
         assert_eq!(c.role_of(0), Some(Role::Striker));
         let sup = choice_of(&ch, 1);
         assert_eq!(sup.skill_id, SkillId::Mark);
-        assert!((sup.target - ball).length() >= STANDOFF_FROM_BALL - 1e-3, "{:?}", sup.target);
+        assert!((sup.target - ball).length() >= c.p.standoff_from_ball - 1e-3, "{:?}", sup.target);
+    }
+
+    #[test]
+    fn striker_holds_the_press_line_when_far_from_a_rival_with_the_ball() {
+        // Rival encima de la pelota en su mitad, striker a 0.9 m: con press_distance
+        // 0.6 espera sobre la línea pelota–arco propio a esa distancia, mirando la
+        // pelota; con presión total (press_distance grande) va a disputarla.
+        let ball = Vec2::new(0.30, 0.20);
+        let mut o = obs(
+            ball,
+            Vec2::ZERO,
+            [Vec2::new(-0.45, -0.10), Vec2::new(-0.60, 0.50), Vec2::new(-0.63, 0.0)],
+        );
+        o.opp_robots[0] = robot(Vec2::new(0.37, 0.22), 180.0);
+        let mut c = coach();
+        let ch = c.decide(&o);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        let striker = choice_of(&ch, 0);
+        assert_eq!(striker.skill_id, SkillId::Mark);
+        let to_own = (OWN - ball).normalize();
+        let expected = ball + to_own * c.p.press_distance;
+        assert!((striker.target - expected).length() < 1e-3, "{:?} vs {:?}", striker.target, expected);
+
+        let p = CoachParams {
+            press_distance: 2.0,
+            ..CoachParams::default()
+        };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        assert_ne!(choice_of(&c.decide(&o), 0).skill_id, SkillId::Mark);
     }
 
     #[test]
@@ -1625,7 +1662,8 @@ mod tests {
         let first = choice_of(&c.decide(&o), 0).skill_id;
         assert!(matches!(first, SkillId::Clear | SkillId::ShootPush), "{first:?}");
         // El plazo corre desde la primera decisión ya empujando (la segunda).
-        let decisions = (PUSH_STALL_S * CoachParams::default().decision_hz) as usize + 2;
+        let d = CoachParams::default();
+        let decisions = (d.push_stall_s * d.decision_hz) as usize + 2;
         let mut last = choice_of(&c.decide(&o), 0);
         for _ in 0..decisions {
             last = choice_of(&c.decide(&o), 0);

@@ -1,0 +1,22 @@
+{
+  "role_switch_gain": [0.5, 1.0],
+  "role_min_hold": [0, 10],
+  "skill_min_hold": [0, 6],
+  "score_hysteresis": [0.0, 0.4],
+  "score_approach_base": [0.1, 0.5],
+  "score_approach_when_feasible": [0.0, 0.5],
+  "score_shot_blocked_factor": [0.2, 1.0],
+  "clear_zone_start_x": [0.0, 0.5],
+  "clear_zone_full_x": [0.3, 0.75],
+  "spin_engage_radius": [0.1, 0.4],
+  "spin_when_opponent_within": [0.05, 0.25],
+  "intercept_min_ball_speed": [0.15, 0.6],
+  "push_stall_s": [0.5, 3.0],
+  "spin_ban_s": [1.0, 4.0],
+  "standoff_from_ball": [0.2, 0.4],
+  "support_depth": [0.1, 0.5],
+  "press_distance": [0.15, 0.6],
+  "mark_distance": [0.1, 0.3],
+  "gk_engage_margin": [0.0, 0.25],
+  "gk_clear_max_ball_speed": [0.05, 0.3]
+}

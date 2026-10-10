@@ -74,6 +74,33 @@ pub struct CoachParams {
     pub adapt_enabled: bool,
     /// Peso de cada observación nueva en las tasas adaptativas (0..1).
     pub adapt_alpha: f32,
+    /// Fracción de `score_approach_base` que conserva `ApproachAligned` cuando el
+    /// empuje ya es factible: casi nada (un tiro tapado vale más que no tirar), pero
+    /// no cero, para que el compromiso mínimo siga evitando el ping-pong.
+    pub score_approach_when_feasible: f32,
+    /// Segundos de empuje con la pelota pegada y quieta antes de sacarla con el giro.
+    pub push_stall_s: f32,
+    /// Tope del giro (forzado o elegido) si la pelota tampoco se suelta así (s).
+    pub stall_kick_max_s: f32,
+    /// Segundos sin giro tras un giro que no soltó la pelota: que pruebe otra opción.
+    pub spin_ban_s: f32,
+    /// Distancia (m) a la que se aparta un jugador de campo de una pelota que juega
+    /// el arquero, y mínima del punto de apoyo a la pelota.
+    pub standoff_from_ball: f32,
+    /// Cuánto se ubica el apoyo detrás de la pelota (hacia nuestro arco) cuando el
+    /// equipo ataca (m): chico = ofensivo, grande = conservador.
+    pub support_depth: f32,
+    /// Presión: con un rival encima de la pelota, el striker va a disputarla solo si
+    /// está a menos de esto de ella (m); más lejos espera sobre la línea pelota–arco
+    /// propio a esta distancia de la pelota. Grande = presiona siempre.
+    pub press_distance: f32,
+    /// Arquero activo: sale a despejar una pelota conducida por un rival dentro del
+    /// área propia ampliada en este margen (m). Más lejos deja el arco vacío.
+    pub gk_engage_margin: f32,
+    /// Arquero activo: rival a menos de esto de la pelota cuenta como conduciéndola (m).
+    pub gk_engage_opp_dist: f32,
+    /// Arquero activo: solo sale a una pelota más lenta que esto (m/s).
+    pub gk_engage_max_ball_speed: f32,
 }
 
 impl Default for CoachParams {
@@ -102,7 +129,59 @@ impl Default for CoachParams {
             clear_zone_full_x: 0.60,
             adapt_enabled: true,
             adapt_alpha: 0.3,
+            score_approach_when_feasible: 0.2,
+            push_stall_s: 1.5,
+            stall_kick_max_s: 3.0,
+            spin_ban_s: 2.0,
+            standoff_from_ball: 0.30,
+            support_depth: 0.30,
+            press_distance: 0.60,
+            gk_engage_margin: 0.05,
+            gk_engage_opp_dist: 0.20,
+            gk_engage_max_ball_speed: 0.40,
         }
+    }
+}
+
+/// Rangos admisibles de los parámetros de ESTILO de juego (`config/style_ranges.json`):
+/// los que mueve el optimizador (`tools/annealing.py`). Solo claves de `coach`; los
+/// parámetros físicos y las tolerancias de las skills se calibran con el robot y no
+/// entran. Cada rango es `[mín, máx]`; el default del código debe caer adentro.
+pub type StyleRanges = BTreeMap<String, [f64; 2]>;
+
+impl CoachParams {
+    pub const STYLE_RANGES_PATH: &'static str = "config/style_ranges.json";
+
+    /// Valores vigentes como mapa `clave → número`, para cruzarlos con los rangos.
+    pub fn as_numbers(&self) -> BTreeMap<String, f64> {
+        let value = serde_json::to_value(self).expect("CoachParams serializa");
+        value
+            .as_object()
+            .expect("CoachParams es un objeto")
+            .iter()
+            .filter_map(|(k, v)| v.as_f64().map(|x| (k.clone(), x)))
+            .collect()
+    }
+
+    /// Lee los rangos y verifica que cada clave exista en `CoachParams` y que el valor
+    /// vigente esté dentro del rango. Devuelve el primer problema como texto.
+    pub fn check_style_ranges(&self, text: &str) -> Result<StyleRanges, String> {
+        let ranges: StyleRanges = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let values = self.as_numbers();
+        for (key, [lo, hi]) in &ranges {
+            let Some(v) = values.get(key) else {
+                return Err(format!("style_ranges: `{key}` no es un parámetro numérico de coach"));
+            };
+            if lo > hi {
+                return Err(format!("style_ranges: `{key}` tiene mín {lo} > máx {hi}"));
+            }
+            // Tolerancia por la conversión f32 → f64 (0.6_f32 = 0.6000000238…).
+            let eps = 1e-6 * hi.abs().max(1.0);
+            if *v < lo - eps || *v > hi + eps {
+                return Err(format!("style_ranges: `{key}` = {v} fuera de [{lo}, {hi}]"));
+            }
+        }
+        Ok(ranges)
     }
 }
 
@@ -593,6 +672,30 @@ mod tests {
         assert_eq!(p.sim.wheel_base_m, 0.085);
         // La visión real entrega el heading girado 180° (vsss-vision-sysmic).
         assert_eq!(p.vision.real_theta_offset_deg, 180.0);
+    }
+
+    #[test]
+    fn style_ranges_file_matches_coach_defaults() {
+        // Cada clave de config/style_ranges.json es un parámetro numérico del coach y
+        // el default del código cae dentro de su rango (son los 20 de estilo del TDP).
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(CoachParams::STYLE_RANGES_PATH);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+        let ranges = CoachParams::default().check_style_ranges(&text).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ranges.len(), 20, "la lista blanca de estilo tiene 20 parámetros");
+        assert!(ranges.contains_key("press_distance") && ranges.contains_key("support_depth"));
+        // Y también lo cumple el JSON del repo.
+        let repo = TeamParams::from_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH)).unwrap();
+        repo.coach.check_style_ranges(&text).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn style_ranges_reject_unknown_keys_and_values_outside() {
+        let p = CoachParams::default();
+        let err = p.check_style_ranges(r#"{ "no_existe": [0.0, 1.0] }"#).unwrap_err();
+        assert!(err.contains("no_existe"), "{err}");
+        let err = p.check_style_ranges(r#"{ "score_hysteresis": [0.5, 0.9] }"#).unwrap_err();
+        assert!(err.contains("score_hysteresis") && err.contains("fuera"), "{err}");
+        assert!(p.check_style_ranges(r#"{ "role_min_hold": [0, 10] }"#).is_ok());
     }
 
     #[test]
