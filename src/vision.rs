@@ -133,6 +133,22 @@ pub struct RobotData {
 pub enum VisionEvent {
     Ball(BallData),
     Robot(RobotData),
+    /// Fin de un frame de detección (ya se emitieron su pelota y sus robots). Con el
+    /// reloj por frames, el lazo de control da un tick por cada uno.
+    Frame,
+}
+
+/// `VSSL_FRAME_CLOCK=1`: el tiempo lo marca la visión, no el reloj de pared. Cada
+/// paquete de detección es un frame de 1/60 s: el EKF integra con ese dt fijo, la
+/// latencia del proxy se cuenta en frames y el lazo de control da un tick por frame.
+/// Así un simulador acelerado (FIRASim `--fps 600`) produce el mismo partido, más
+/// rápido, y con `VSSL_NOISE_SEED` el partido es reproducible.
+pub const FRAME_CLOCK_ENV: &str = "VSSL_FRAME_CLOCK";
+
+pub fn frame_clock_from_env() -> bool {
+    std::env::var(FRAME_CLOCK_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
 }
 
 // Tracker is now imported from crate::tracker module
@@ -152,10 +168,15 @@ pub struct Vision {
     recorder: Option<VisionRecorder>,
     /// Paquetes retenidos por la latencia del proxy: (instante de liberación, bytes).
     delayed: VecDeque<(Instant, Vec<u8>)>,
+    /// Con el reloj por frames: paquetes retenidos, que salen cuando llegan
+    /// `latency_frames` más nuevos.
+    delayed_frames: VecDeque<Vec<u8>>,
     /// Paquetes descartados por el proxy (pérdida de frames simulada).
     dropped: u64,
     /// `vision.real_theta_offset_deg` (solo se aplica con `SslVision`).
     theta_offset_deg: f64,
+    /// Reloj por frames (`VSSL_FRAME_CLOCK`): dt fijo y latencia en frames.
+    frame_clock: bool,
 }
 
 /// Contadores del receptor (para los logs periódicos).
@@ -190,6 +211,12 @@ impl Vision {
                 std::env::var(crate::vision_tools::VISION_RECORD_ENV).unwrap_or_default()
             );
         }
+        let frame_clock = frame_clock_from_env();
+        if frame_clock {
+            eprintln!(
+                "[Vision] reloj por frames ({FRAME_CLOCK_ENV}): dt fijo de 1/60 s y latencia del proxy en frames"
+            );
+        }
         Self {
             source,
             tracker: Tracker::new(),
@@ -198,9 +225,18 @@ impl Vision {
             noise,
             recorder,
             delayed: VecDeque::new(),
+            delayed_frames: VecDeque::new(),
             dropped: 0,
             theta_offset_deg,
+            frame_clock,
         }
+    }
+
+    /// Reloj por frames: retiene el paquete y devuelve el que ya cumplió la latencia
+    /// (tiene `latency_frames` paquetes más nuevos encima), si lo hay.
+    fn queue_frame(&mut self, data: &[u8], latency_frames: usize) -> Option<Vec<u8>> {
+        self.delayed_frames.push_back(data.to_vec());
+        (self.delayed_frames.len() > latency_frames).then(|| self.delayed_frames.pop_front().expect("cola no vacía"))
     }
 
     /// Posición con el ruido del proxy (identidad si el proxy está apagado).
@@ -265,6 +301,7 @@ impl Vision {
             for robot in frame.robots_blue.iter() {
                 let _ = self.process_robot_fira(sender, status_tx, robot, 0).await;
             }
+            let _ = sender.send(VisionEvent::Frame).await;
             handled = true;
         }
 
@@ -306,6 +343,7 @@ impl Vision {
                         for robot in detection.robots_blue.iter() {
                             let _ = self.process_robot(sender, status_tx, robot, 0).await;
                         }
+                        let _ = sender.send(VisionEvent::Frame).await;
                     } else {
                         stats.geometry_only_count += 1;
                     }
@@ -325,6 +363,9 @@ impl Vision {
     /// separados ~16 ms; con dt ≈ 5 ms el filtro triplicaba la velocidad
     /// estimada, el gate rechazaba todo y la pose se extrapolaba al infinito.
     fn compute_dt(&mut self, key: (i32, i32)) -> f32 {
+        if self.frame_clock {
+            return crate::vision_tools::FRAME_PERIOD_S as f32;
+        }
         let now = Instant::now();
         let dt = self
             .last_seen
@@ -517,14 +558,21 @@ impl Vision {
                                 self.recorder = None;
                             }
 
-                            match self.noise.as_mut() {
-                                Some(noise) => {
-                                    if noise.drop_packet() {
-                                        self.dropped += 1;
-                                    } else {
-                                        let release = Instant::now() + noise.latency;
-                                        self.delayed.push_back((release, data.to_vec()));
+                            let proxy = self
+                                .noise
+                                .as_mut()
+                                .map(|n| (n.drop_packet(), n.latency, n.latency_frames()));
+                            match proxy {
+                                Some((true, _, _)) => self.dropped += 1,
+                                // Reloj por frames: la latencia son N paquetes más nuevos.
+                                Some((false, _, frames)) if self.frame_clock => {
+                                    if let Some(pkt) = self.queue_frame(data, frames) {
+                                        self.handle_packet(&pkt, &sender, &status_tx, &mut stats).await;
                                     }
+                                }
+                                Some((false, latency, _)) => {
+                                    let release = Instant::now() + latency;
+                                    self.delayed.push_back((release, data.to_vec()));
                                 }
                                 None => self.handle_packet(data, &sender, &status_tx, &mut stats).await,
                             }
@@ -910,5 +958,31 @@ mod tests {
 
             std::env::remove_var(VISION_SOURCE_ENV);
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_clock_tests {
+    use super::*;
+
+    #[test]
+    fn frame_queue_releases_a_packet_after_latency_frames_newer_ones() {
+        let mut v = Vision::new(VisionSource::FiraSim, Arc::new(AtomicBool::new(true)));
+        assert!(v.queue_frame(b"f1", 2).is_none());
+        assert!(v.queue_frame(b"f2", 2).is_none());
+        assert_eq!(v.queue_frame(b"f3", 2).as_deref(), Some(&b"f1"[..]));
+        assert_eq!(v.queue_frame(b"f4", 2).as_deref(), Some(&b"f2"[..]));
+        // Sin latencia, cada paquete sale de inmediato.
+        let mut direct = Vision::new(VisionSource::FiraSim, Arc::new(AtomicBool::new(true)));
+        assert_eq!(direct.queue_frame(b"g1", 0).as_deref(), Some(&b"g1"[..]));
+    }
+
+    #[test]
+    fn frame_clock_uses_a_fixed_dt() {
+        let mut v = Vision::new(VisionSource::FiraSim, Arc::new(AtomicBool::new(true)));
+        v.frame_clock = true;
+        let dt = v.compute_dt((0, 0));
+        assert!((dt - 1.0 / 60.0).abs() < 1e-6, "{dt}");
+        assert!((v.compute_dt((0, 0)) - dt).abs() < 1e-9);
     }
 }

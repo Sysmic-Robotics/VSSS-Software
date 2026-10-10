@@ -643,17 +643,25 @@ pub async fn run_control_loop(
         });
     }
 
+    // Reloj por frames (`VSSL_FRAME_CLOCK`): el lazo da un tick por frame de visión en
+    // vez de por reloj de pared; `frame_rx` cuenta los frames completos recibidos.
+    let frame_clock = crate::vision::frame_clock_from_env();
+    let (frame_tx, mut frame_rx) = tokio::sync::watch::channel(0u64);
+
     // World updater desde visión + contador de paquetes para el watchdog
     {
         let world = world.clone();
         let vision_pkt_count = vision_pkt_count.clone();
         tokio::spawn(async move {
             while let Some(event) = vision_rx.recv().await {
-                vision_pkt_count.fetch_add(1, Ordering::Relaxed);
-                let mut w = world.write().await;
                 match event {
+                    VisionEvent::Frame => {
+                        frame_tx.send_modify(|n| *n += 1);
+                        continue;
+                    }
                     VisionEvent::Robot(r) => {
-                        w.update_robot(
+                        vision_pkt_count.fetch_add(1, Ordering::Relaxed);
+                        world.write().await.update_robot(
                             r.id as i32,
                             r.team as i32,
                             r.position,
@@ -663,7 +671,8 @@ pub async fn run_control_loop(
                         );
                     }
                     VisionEvent::Ball(b) => {
-                        w.update_ball(b.position, b.velocity);
+                        vision_pkt_count.fetch_add(1, Ordering::Relaxed);
+                        world.write().await.update_ball(b.position, b.velocity);
                     }
                 }
             }
@@ -729,9 +738,36 @@ pub async fn run_control_loop(
     let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
     let started = Instant::now();
+    if frame_clock {
+        eprintln!("[control_loop] reloj por frames ({}): un tick por frame de visión", crate::vision::FRAME_CLOCK_ENV);
+    }
+    let mut last_frame: u64 = 0;
+    let mut frames_skipped: u64 = 0;
+    let mut frame_wait_warned = false;
 
     loop {
-        interval.tick().await;
+        if frame_clock {
+            match tokio::time::timeout(Duration::from_secs(3), frame_rx.changed()).await {
+                Ok(Ok(())) => {
+                    let n = *frame_rx.borrow_and_update();
+                    frames_skipped += n.saturating_sub(last_frame + 1);
+                    last_frame = n;
+                }
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if !frame_wait_warned {
+                        eprintln!("[control_loop] reloj por frames: sin frames de visión en 3 s, esperando");
+                        frame_wait_warned = true;
+                    }
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            interval.tick().await;
+        }
 
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -857,9 +893,15 @@ pub async fn run_control_loop(
         // Hook de logging — recibe snapshot del mundo + comandos + choices que se aplicaron.
         if let Some(ref mut hook) = on_tick {
             let world_guard = world.read().await;
+            // Con el reloj por frames el tiempo es el del simulador: 1/60 s por tick.
+            let t_ms = if frame_clock {
+                (tick_counter as f64 * 1000.0 * crate::vision_tools::FRAME_PERIOD_S) as u64
+            } else {
+                started.elapsed().as_millis() as u64
+            };
             let rec = TickRecord {
                 tick: tick_counter,
-                t_ms: started.elapsed().as_millis() as u64,
+                t_ms,
                 world: &world_guard,
                 commands: &commands,
                 targets: &targets,
@@ -914,6 +956,14 @@ pub async fn run_control_loop(
                 let _ = tx.try_send(GUI::StatusUpdate::TransportStatus(ok));
             }
         }
+    }
+
+    if frame_clock {
+        eprintln!(
+            "[control_loop] reloj por frames: {tick_counter} ticks, {frames_skipped} frames sin tick \
+             (el lazo no alcanzó a seguir la visión), {:.1} s de pared",
+            started.elapsed().as_secs_f64()
+        );
     }
 
     // Stop sequence: enviar comando con velocidades en cero por cada robot del equipo

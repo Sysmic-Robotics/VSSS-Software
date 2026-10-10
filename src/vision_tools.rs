@@ -71,6 +71,26 @@ impl XorShift64 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub const VISION_NOISE_ENV: &str = "VSSL_VISION_NOISE";
+/// Semilla del proxy (`VSSL_NOISE_SEED=<entero>`): partidos reproducibles. Sin ella,
+/// la semilla sale del reloj.
+pub const NOISE_SEED_ENV: &str = "VSSL_NOISE_SEED";
+/// Período de un frame de visión a 60 Hz (s): unidad del reloj por frames.
+pub const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
+/// Semilla desde `VSSL_NOISE_SEED` si está definida y es un entero; si no, el reloj.
+pub fn seed_from_env() -> u64 {
+    seed_from(std::env::var(NOISE_SEED_ENV).ok().as_deref())
+}
+
+fn seed_from(text: Option<&str>) -> u64 {
+    match text.and_then(|t| t.trim().parse::<u64>().ok()) {
+        Some(seed) => seed,
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1),
+    }
+}
 
 /// Ruido de percepción inyectado ANTES del tracker, con el mismo pipeline que en
 /// cancha: σ gaussiana en posición y orientación, latencia (retención de paquetes)
@@ -100,13 +120,12 @@ impl NoiseProxy {
         let on = std::env::var(VISION_NOISE_ENV)
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
             .unwrap_or(false);
-        on.then(|| {
-            let seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(1);
-            Self::from_params(p, seed)
-        })
+        on.then(|| Self::from_params(p, seed_from_env()))
+    }
+
+    /// Latencia en frames de visión (60 Hz), para el reloj por frames.
+    pub fn latency_frames(&self) -> usize {
+        (self.latency.as_secs_f64() / FRAME_PERIOD_S).round() as usize
     }
 
     pub fn describe(&self) -> String {
@@ -378,6 +397,9 @@ mod tests {
     #[test]
     fn gauss_has_unit_variance() {
         let mut rng = XorShift64::new(42);
+        assert_eq!(seed_from(Some(" 42 ")), 42);
+        assert!(seed_from(Some("abc")) > 1_000_000, "sin entero válido, la semilla sale del reloj");
+        assert!(seed_from(None) > 1_000_000);
         let n = 20_000;
         let (mut sum, mut sum2) = (0.0, 0.0);
         for _ in 0..n {
@@ -402,6 +424,12 @@ mod tests {
         };
         let mut n = NoiseProxy::from_params(&p, 7);
         assert_eq!(n.latency, Duration::from_millis(90));
+        // 90 ms son 5.4 frames → 5; 25 ms son 1.5 → 2; sin latencia, 0.
+        assert_eq!(n.latency_frames(), 5);
+        let short = NoiseProxy::from_params(&VisionParams { proxy_latency_ms: 25.0, ..VisionParams::default() }, 1);
+        assert_eq!(short.latency_frames(), 2);
+        let none = NoiseProxy::from_params(&VisionParams { proxy_latency_ms: 0.0, ..VisionParams::default() }, 1);
+        assert_eq!(none.latency_frames(), 0);
         let dropped = (0..2000).filter(|_| n.drop_packet()).count();
         assert!((800..1200).contains(&dropped), "dropped={dropped}");
         let mut acc = 0.0;

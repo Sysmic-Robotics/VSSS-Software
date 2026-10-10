@@ -8,7 +8,7 @@
 //! tiempo de juego o por goles y deja el resultado en la salida (y en `--out`, JSON).
 //!
 //!   match_director [--minutes 3] [--goals 3] [--kickoff blue|yellow] [--out partidos.jsonl]
-//!                  [--vision-port 10002] [--cmd-port 20011]
+//!                  [--vision-port 10002] [--cmd-port 20011] [--speed 8]
 //!
 //! El tiempo de juego se cuenta en frames de visión (60 por segundo simulado), así vale
 //! igual con FIRASim acelerado. Los lados se leen de la primera detección: cada equipo
@@ -79,6 +79,9 @@ struct Options {
     out: Option<String>,
     vision_port: u16,
     cmd_port: u16,
+    /// Factor de aceleración del simulador: divide las pausas de pared de las paradas
+    /// (con FIRASim a 8× una pausa de 1 s son 8 s de partido).
+    speed: f64,
 }
 
 fn parse_args() -> Options {
@@ -89,6 +92,7 @@ fn parse_args() -> Options {
         out: None,
         vision_port: 10002,
         cmd_port: 20011,
+        speed: 1.0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -114,6 +118,7 @@ fn parse_args() -> Options {
             "--out" => o.out = Some(value(&mut args)),
             "--vision-port" => o.vision_port = value(&mut args).parse().expect("--vision-port: entero"),
             "--cmd-port" => o.cmd_port = value(&mut args).parse().expect("--cmd-port: entero"),
+            "--speed" => o.speed = value(&mut args).parse::<f64>().expect("--speed: número").max(1.0),
             other => {
                 eprintln!("[director] opción desconocida: {other}");
                 std::process::exit(2);
@@ -251,6 +256,8 @@ struct Match {
     free_balls: u32,
     /// Posiciones de la pelota de los últimos `STUCK_S` segundos de juego.
     ball_trail: VecDeque<(f64, f64)>,
+    /// Divisor de las pausas de pared en las paradas (`--speed`).
+    pause_scale: f64,
 }
 
 impl Match {
@@ -306,14 +313,15 @@ fn drain(vision: &UdpSocket, buf: &mut [u8]) {
 
 /// Parada con reposición: `STOP` → replacement → comando de la play → `GAME_ON`.
 async fn set_piece(m: &mut Match, command: &str, items: &[TeleportItem], whistle: &Whistle, sim: &mut FiraSimTransport, vision: &UdpSocket) {
+    let pause = |ms: f64| Duration::from_millis((ms / m.pause_scale).max(100.0) as u64);
     whistle.send("STOP");
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(pause(800.0)).await;
     if let Err(e) = sim.teleport(items).await {
         eprintln!("[director] replacement falló: {e}");
     }
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(pause(1000.0)).await;
     whistle.send(command);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    tokio::time::sleep(pause(1200.0)).await;
     let mut buf = [0u8; 65536];
     drain(vision, &mut buf);
     m.ball_trail.clear();
@@ -379,6 +387,7 @@ async fn main() {
         goals: Vec::new(),
         free_balls: 0,
         ball_trail: VecDeque::new(),
+        pause_scale: opt.speed,
     };
     eprintln!(
         "[director] azul ataca hacia {:+}X · {} min · corte a {} goles · árbitro {}",
@@ -467,6 +476,7 @@ mod tests {
             goals: Vec::new(),
             free_balls: 0,
             ball_trail: VecDeque::new(),
+            pause_scale: 1.0,
         }
     }
 
