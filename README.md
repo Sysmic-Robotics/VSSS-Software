@@ -53,71 +53,102 @@ cargo fmt                            # formato
 
 ### GUI de debug (`VSSL_DEBUG_GUI=1`)
 
-Layout: **barra superior** (botón STOP + estado de conexión), **sidebar izquierdo con
-secciones colapsables** (Control, Skills, Inspector, Tuning, Teleport, Radio, Visión, Telemetría),
-**cancha central**, y
-**barra de estado** inferior (robot/equipo, θ, PPS, ESTOP). Cada sección se expande/colapsa
-con su encabezado.
+La interfaz se ve como la mesa de la salita: es neutra, y el único color es el del juego.
 
-La sección **Control** permite **manejar un robot a mano**, útil para el bring-up del robot
-real (ver `docs/bringup_robot_real.md`):
+- **Barra de estado** (arriba): frases con el modo (simulación o robots reales, frontal o
+  bidireccional, ruido de cámara), el coach, el árbitro y la salud del sistema: cuadros/s y
+  latencia de visión, pérdidas, frecuencia y jitter del lazo, envíos de radio y la velocidad
+  real de FIRASim. Lo anormal va en color alerta. A la derecha, **Detener todo** (o Espacio).
+- **Nuestros robots** (izquierda): una fila por robot propio con su parche, rol, skill y
+  progreso, cara, v y ω **pedidos** (lo que va en el frame, `command_to_vw`) y **medidos**
+  (visión), y avisos: tope del frame, skill que no corre, no visto, escape de atasco. Un
+  click en la fila elige el robot. Debajo, los rivales que ve la visión.
+- **Cancha** (centro): medidas del reglamento, tomadas de las mismas constantes que usan el
+  guardia de zonas y los plays; paredes, triángulos, regla en cm, robots de 7.5 cm con sus
+  caras cóncavas y marcas de identificación, y pelota a escala.
+- **Pestañas** (derecha): **Herramientas** (control manual, skill para el robot elegido y
+  teleport), **Inspector** (robot elegido, salud en detalle, visión, radio y mapeo visión →
+  radio, error de la skill) y **Parámetros** (vista, escalas y rampa del manual, Spin ω, PID
+  de heading, presets).
+- **Gráficos** (abajo): velocidad y giro del robot elegido, pedido (azul) y medido (negro),
+  cada uno escalado a su tope (una consigna saturada toca el borde). Se pueden congelar y
+  elegir la ventana (5, 15 o 30 s).
+- Con la ventana de menos de 1100 px de ancho, todo va en una columna con la cancha primero.
 
-- **Manual: ON/OFF** activa el control manual del robot/equipo seleccionados.
-- Selector de **Robot** (`-`/`+`) y de **Equipo** (Azul/Amarillo).
-- **Marco de referencia** (toggle Mundo/Robot):
-  - **Robot** (default, arcade drive): **W/S** = adelante/atrás según hacia dónde mira el
-    robot, **A/D** = giro. Usa la orientación de visión del robot seleccionado.
-  - **Mundo**: **W/S** = ±Y de la cancha, **A/D** = ±X, **Q/E** = giro CCW/CW.
-- **Escalas ajustables** en la GUI: velocidad lineal máx (m/s) y angular máx (rad/s).
-- **Rampa de aceleración**: el comando arranca y frena suave (no salta de 0 a máximo),
-  evitando tirones/patinaje. Al soltar las teclas decae a cero por la misma rampa.
-- El comando pasa por la MISMA cinemática inversa y el mismo `RobotTransport` que el coach
-  (no hay ruta paralela): lo que ves en el chart L/R es lo que se envía.
-- El robot seleccionado se resalta con un halo naranjo, y el chart inferior grafica sus
-  velocidades de rueda comandadas **L/R (mm/s)** en el tiempo.
+Opciones de la vista (en Parámetros, y al arrancar por variable de entorno):
 
-**Parada de emergencia:** el botón rojo **STOP** (o la tecla **Espacio**) enclava una
-parada que comanda velocidad cero a todos los ids del equipo propio, aunque la visión no
-los vea (así siempre sale un frame en cero), y prevalece sobre coach, control manual y
-skills. Mientras está activa no actúan el `ZoneGuard` ni la recuperación de atasco. Al
-liberarla con el mismo botón, cada robot retoma sin estado heredado: sin la maniobra de
-escape interrumpida, con la rampa desde cero y la skill reiniciada. Es el mismo camino que
+| Variable | Valores | Para qué |
+|---|---|---|
+| `VSSL_GUI_VISTA` | `normal` (default), `girada180`, `espejo-h`, `espejo-v` | que la cancha se vea como la mesa y la cámara (se dibuja en las coordenadas del mundo del software) |
+| `VSSL_GUI_MARCAS` | `anexo1` (default), `equipo` | marcas de identificación: parches del Anexo 1 del reglamento IEEE VSSS, o solo el parche de equipo |
+
+La fuente de visión, el filtro de Kalman (`VSSL_TRACKER`), el ruido simulado
+(`VSSL_VISION_NOISE`) y el puerto y baud de la base se fijan al arrancar: la GUI los muestra
+en el Inspector, pero no los cambia.
+
+**Control manual** (para el bring-up): solo funciona dentro del **modo manual**, al que se
+entra con el botón **Entrar al modo manual** de Herramientas; se sale con el mismo botón o
+con **Esc**.
+
+- Marco **robot** (default, arcade drive): **W/S** = adelante/atrás según hacia dónde mira el
+  robot, **A/D** = giro. Usa la orientación de visión del robot elegido.
+- Marco **mundo**: **W/S** = ±y de la cancha, **A/D** = ±x, **Q/E** = giro antihorario/horario.
+- Fuera del modo manual, las letras son de las capas de la cancha (N, C, R, T, V y S, que se
+  dibujan desde la fase 2) y ninguna mueve un robot. Escribir en un campo de texto tampoco.
+- Escalas y **rampa de aceleración** en Parámetros: el comando arranca y frena suave, y al
+  soltar las teclas decae a cero por la misma rampa.
+- El comando pasa por la misma conversión (`command_to_vw`) y el mismo `RobotTransport` que
+  el coach: no hay ruta paralela.
+
+**Parada de emergencia:** **Detener todo** (o la tecla **Espacio**, en cualquier modo)
+enclava una parada que comanda velocidad cero a todos los ids del equipo propio, aunque la
+visión no los vea (así siempre sale un frame en cero), y prevalece sobre coach, control
+manual y skills. Mientras está activa no actúan el `ZoneGuard` ni la recuperación de atasco.
+Se libera con **Soltar la parada**, y cada robot retoma sin estado heredado: sin la maniobra
+de escape interrumpida, con la rampa desde cero y la skill reiniciada. Es el mismo camino que
 toma el loop en HALT del árbitro. El watchdog del firmware (200 ms) queda como red final.
 
-**Runner de skills (validador visual):** en la fila de control eliges una de las 4 skills
-(`GoTo`, `FacePoint`, `ChaseBall`, `Spin`) o **Ninguna**, y haces **click en la cancha**
-para fijar el target (marcador verde). La skill se inyecta como `SkillChoice` al mismo
-`SkillCatalog::tick` que el coach — reemplaza la decisión del coach solo para ese robot.
-Precedencia: control manual (velocidad cruda) > skill de GUI > coach. Con "Ninguna" el robot
-vuelve al coach.
+**Skill para el robot elegido** (validador visual, en Herramientas): se elige una skill del
+catálogo o **ninguna (coach)**, y un click en la cancha fija el target (marcador blanco). La
+skill se inyecta como `SkillChoice` al mismo `SkillCatalog::tick` que el coach y reemplaza su
+decisión solo para ese robot. Precedencia: control manual > skill de la GUI > coach.
 
 El número de robot que se elige en la GUI es el **id de visión** (el del parche de colores).
 Una skill solo corre si ese robot es del equipo propio y está activo en el `World` (lo ve la
-visión). Si no, la sección Skills muestra `⚠ la skill no corre: el robot azul #1 no está en la
-visión. La visión ve: azul #0, amarillo #2`, y la terminal imprime lo mismo, como máximo una
-vez por segundo. Si el robot aparece con otro número o color, hay que corregir la selección o
-el mapa `robot.radio_slot_by_vision_id`. El control manual no tiene esta restricción: manda
+visión). Si no, la sección de la skill y la fila del robot muestran `la skill no corre: el
+robot azul #1 no está en la visión. La visión ve: azul #0, amarillo #2`, y la terminal imprime
+lo mismo, como máximo una vez por segundo. El control manual no tiene esta restricción: manda
 aunque la visión no vea al robot.
 
-La sección **Inspector** muestra los datos de visión del robot seleccionado: posición, θ,
-rapidez (m/s), ω (rad/s), estado activo/inactivo y antigüedad del último dato. En la cancha,
-overlays de diagnóstico: **vector de velocidad medida** (naranja, distinto de la flecha blanca
-de velocidad comandada), **número de robot** y **traza** del recorrido reciente del seleccionado (activable/desactivable en Inspector).
+**Teleport (simulación):** reposiciona el robot elegido a `(x, y, θ)` y la pelota a `(x, y)`
+en FIRASim o grSim. `x, y` van en metros y **θ en grados** (la unidad del replacement de los
+dos simuladores). Con la base station no hace nada.
 
-La sección **Tuning** ajusta en vivo (sin recompilar): escalas de velocidad, rampa, **Spin ω**
-y el **PID de heading** (`kp/ki/kd`, que gobierna el giro de GoTo/FacePoint/ChaseBall — afecta
-también al coach). Además guarda/carga **presets** de todo el tuning en un archivo JSON.
+**La GUI no frena el lazo.** Con GUI, el lazo publica una foto inmutable de cada tick
+(`src/snapshot.rs`: el `World` del tick, los comandos, la skill y su estado, el rol, la
+temporización del lazo y los contadores de visión y radio) por un canal de "último valor"
+(`tokio::sync::watch`): publicar nunca espera, y si la GUI se atrasa, se salta fotos. La GUI
+dibuja a 30 cuadros/s como máximo (`GUI_MAX_FPS`). Sin GUI no se arma ninguna foto. Para medir
+la frecuencia del lazo con la GUI abierta, con el registro de partido:
 
-La sección **Teleport (sim)** reposiciona el robot seleccionado a `(x, y, θ)` y la pelota a
-`(x, y)` en el simulador (FIRASim/grSim) — útil para armar situaciones reproducibles de test.
-`x, y` van en metros y **θ en grados** (la unidad del replacement de los dos simuladores).
-En base station (robots reales) es no-op.
+```bash
+# FIRASim corriendo, 120 s con la GUI abierta (ventana visible).
+VSSL_DEBUG_GUI=1 VSSL_VISION_NOISE=1 VSSL_MATCH_LOG=logs/lazo_gui.csv timeout 120 ./target/release/rustengine
+python3 tools/medir_lazo.py logs/lazo_gui.csv
+# Contra una condición base (por ejemplo, el binario anterior), con el criterio de aceptación:
+python3 tools/medir_lazo.py --base logs/lazo_antes.csv logs/lazo_gui.csv
+```
 
-La sección **Radio** muestra el transporte activo, puerto/baud (base station), equipo propio,
-estado de conexión, PPS y, con base station, el **mapeo visión → radio** vigente (por ejemplo
-`visión #1 → radio pos 0 (MI_ROBOT_ID 1)`). Editar puerto/baud requiere reiniciar el proceso (se aplican por
-`VSSL_BASESTATION_DEVICE` / `VSSL_BASESTATION_BAUD`). En headless nada de esto aplica: la
-config sigue viniendo del entorno y los bytes enviados son idénticos.
+**En WSL (WSLg, sin GPU):** iced dibuja con wgpu sobre lavapipe, un Vulkan por CPU que por
+defecto usa todos los núcleos y le quita tiempo al lazo y a FIRASim. Lanzar la GUI con
+`LP_NUM_THREADS=4` (2026-10-10, 8 núcleos: p99 del intervalo del lazo de 18 ms, como sin GUI,
+contra 21 ms con los 8 hilos). Si el compositor de WSLg se cae, la ventana no abre por
+Wayland: `env -u WAYLAND_DISPLAY` la abre por X11, y `wsl --shutdown` (desde Windows) lo
+reinicia.
+
+**Fuentes:** Barlow y Barlow Semi Condensed, dentro del binario, con las cifras tabulares
+fijadas en el archivo (iced 0.13 no aplica el rasgo `tnum`). Origen, cambios y cómo
+regenerarlas en `assets/fonts/LEEME.txt`; licencia OFL en `assets/fonts/OFL.txt`.
 
 **3 binarios:**
 - `rustengine` (default): producción headless o con `VSSL_DEBUG_GUI=1`. Coach decide qué skill correr.
@@ -164,7 +195,7 @@ Al arrancar, confirmar en la terminal:
 - `[Vision] orientación de la visión real corregida en +180°`;
 - el mapeo `[BaseStation] visión #N → radio pos …`.
 
-En la GUI, el robot se elige por su **id de visión**. Si una skill no mueve al robot, la sección Skills dice por qué: el robot no está en la visión, o es de otro equipo, y muestra qué robots sí ve la visión.
+En la GUI, el robot se elige por su **id de visión**. Si una skill no mueve al robot, la fila del robot y la sección de la skill dicen por qué: el robot no está en la visión, o es de otro equipo, y muestran qué robots sí ve la visión. La barra de estado avisa si la radio no envía.
 
 Variantes:
 
@@ -266,7 +297,7 @@ src/
 │   ├── firasim.rs         # FIRASimClient: UDP → 127.0.0.1:20011
 │   ├── grsim.rs           # GrSimClient: UDP protobuf
 │   └── commands.rs        # Serialización MotionCommand → protobuf
-├── GUI/                   # App Iced (campo 2D + paneles de visión / robots)
+├── GUI/                   # App Iced: cancha, planilla de robots, barra de estado, pestañas y gráficos
 └── protos/                # Bindings auto-generados — NO editar
 ```
 
@@ -469,7 +500,7 @@ Reglas, validadas al cargar los params (si no se cumplen, el proceso no arranca 
 - toda posición está en `0..4`;
 - dos ids de visión nunca caen en la misma posición, **contando los ids sin entrada**. Por eso `{"1": 0}` solo no vale: el #0 seguiría yendo a la posición 0. Hay que mapear también el #0 a una posición libre.
 
-El mapa solo afecta a la base station; FIRASim y grSim usan el id directo. Al abrir la base, la terminal imprime el mapeo vigente (`[BaseStation] visión #1 → radio pos 0 (MI_ROBOT_ID 1)`), y la sección Radio de la GUI lo muestra. `skill_test --mode vw --robot N` **no** pasa por el mapa: ahí N es la posición de radio cruda (bring-up sin visión).
+El mapa solo afecta a la base station; FIRASim y grSim usan el id directo. Al abrir la base, la terminal imprime el mapeo vigente (`[BaseStation] visión #1 → radio pos 0 (MI_ROBOT_ID 1)`), y la sección Radio del Inspector de la GUI lo muestra. `skill_test --mode vw --robot N` **no** pasa por el mapa: ahí N es la posición de radio cruda (bring-up sin visión).
 
 **Conversión** (en `command_to_vw`, única fuente de verdad del frame, el CSV y la GUI):
 ```
@@ -579,7 +610,7 @@ Tokio runtime (un solo loop común para main, scenario y skill_test):
   └─ control_loop       (16 ms, 60 Hz) TickDecider → SkillCatalog::tick → Radio → transport
 ```
 
-Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales `mpsc`.
+Estado compartido: `Arc<TokioRwLock<World>>`. Comunicación inter-task: canales `mpsc`. Con GUI, el lazo le publica una foto por tick por un `tokio::sync::watch` (último valor; nunca espera a la GUI).
 
 ---
 
@@ -620,15 +651,15 @@ Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt`
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (400 tests)
+cargo test --lib                 # solo lib (491 tests)
 cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (24 tests)
 cargo test --bin match_director  # director de partido de FIRASim (5 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI, perfiles y corte de seguridad (27 tests)
-python3 -m unittest discover -s tools -p 'test_*.py'   # sysid y lectura de los CSV (17 tests)
+python3 -m unittest discover -s tools -p 'test_*.py'   # sysid, lectura de los CSV y medición del lazo (22 tests)
 ```
 
-**462 tests de Rust** (más 17 de Python: sysid y lectura de los CSV) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración).
+**553 tests de Rust** (más 22 de Python: sysid, lectura de los CSV y medición del lazo) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración), foto del lazo para la GUI (publicar nunca espera, temporización, fuente de cada comando, consultar el estado de la skill no cambia los comandos, contadores de visión) y GUI (vista y orientación, regla y área del reglamento, parches del Anexo 1, frases de la barra de estado y de las filas, teclado del modo manual, contraste AA, fuentes tabulares, y la cancha dibujada con tiny-skia con datos no finitos).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

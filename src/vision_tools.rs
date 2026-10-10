@@ -72,6 +72,14 @@ impl XorShift64 {
 
 pub const VISION_NOISE_ENV: &str = "VSSL_VISION_NOISE";
 
+/// Si el proxy de ruido está pedido (`VSSL_VISION_NOISE=1|true|on`). Lo leen la visión
+/// y la GUI (barra de estado).
+pub fn vision_noise_enabled() -> bool {
+    std::env::var(VISION_NOISE_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+        .unwrap_or(false)
+}
+
 /// Ruido de percepción inyectado ANTES del tracker, con el mismo pipeline que en
 /// cancha: σ gaussiana en posición y orientación, latencia (retención de paquetes)
 /// y pérdida de frames. Los valores vienen de `VisionParams::proxy_*` (defaults de
@@ -97,10 +105,7 @@ impl NoiseProxy {
 
     /// `VSSL_VISION_NOISE=1|true|on` → proxy activo con los parámetros vigentes.
     pub fn from_env(p: &VisionParams) -> Option<Self> {
-        let on = std::env::var(VISION_NOISE_ENV)
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
-            .unwrap_or(false);
-        on.then(|| {
+        vision_noise_enabled().then(|| {
             let seed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)

@@ -829,6 +829,10 @@ impl HeuristicCoach {
 }
 
 impl Coach for HeuristicCoach {
+    fn role(&self, robot_id: i32) -> Option<Role> {
+        self.role_of(robot_id)
+    }
+
     fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice> {
         self.decision_count += 1;
         let ball = Self::ball_pos(obs);

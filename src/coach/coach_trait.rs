@@ -1,3 +1,4 @@
+use crate::coach::heuristic_coach::Role;
 use crate::coach::observation::Observation;
 use crate::coach::skill_choice::SkillChoice;
 
@@ -30,4 +31,10 @@ use crate::coach::skill_choice::SkillChoice;
 ///   los internals del engine (motion, radio, etc.).
 pub trait Coach: Send + Sync {
     fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice>;
+
+    /// Rol vigente del robot propio `robot_id`, para la GUI. `None` si el coach no
+    /// reparte roles. Solo lectura: no altera ninguna decisión.
+    fn role(&self, _robot_id: i32) -> Option<Role> {
+        None
+    }
 }

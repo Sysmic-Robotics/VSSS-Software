@@ -15,6 +15,7 @@ pub mod protos;
 pub mod radio;
 pub mod skill_log;
 pub mod skills;
+pub mod snapshot;
 pub mod sysid;
 pub mod tracker;
 pub mod vision;

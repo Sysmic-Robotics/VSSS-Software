@@ -24,5 +24,8 @@ async-trait = "0.1"           # Permite dyn-dispatch sobre traits con métodos a
 tokio-serial = "5"            # Wrapper async de `serialport` para el BaseStation USB↔ESP32
 socket2 = { version = "0.6", features = ["all"] } # SO_REUSEADDR/REUSEPORT: varios engines en un mismo multicast de visión
 
+[dev-dependencies]
+iced_tiny_skia = "0.13" # tests: la GUI con el renderer por CPU de iced (el respaldo sin GPU)
+
 [build-dependencies]
 protobuf-codegen = "3" # Tool to generate Rust code from .proto files

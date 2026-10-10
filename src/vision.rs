@@ -4,7 +4,7 @@ use std::error::Error;
 use std::net::Ipv4Addr;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -16,6 +16,7 @@ use crate::protos::fira_common::{Ball as FiraBall, Robot as FiraRobot};
 use crate::protos::fira_packet::Environment as FiraEnvironment;
 use crate::protos::ssl_vision_detection::{SSL_DetectionBall, SSL_DetectionRobot};
 use crate::protos::ssl_vision_wrapper::SSL_WrapperPacket;
+use crate::snapshot::VisionCounters;
 use crate::tracker::Tracker;
 use crate::vision_tools::{NoiseProxy, VisionRecorder};
 use protobuf::Message;
@@ -30,12 +31,74 @@ pub enum StatusUpdate {
     RobotsDetected(usize),
     RobotPosition(u32, u32, Vec2, f32, Vec2, f32), // id, team, position, orientation, velocity, angular_velocity
     BallPosition(Vec2),
-    /// Estado de conexión del transporte de radio (lo emite el control loop, no
-    /// la visión). `true` = último envío OK, `false` = último envío falló.
-    TransportStatus(bool),
-    /// Aviso de skill de GUI que no corre (lo emite el control loop contra
-    /// `World`). `None` = sin aviso. Ver `control_loop::gui_skill_warning`.
-    SkillWarning(Option<String>),
+}
+
+/// FIRASim publica un cuadro cada 16 ms simulados (`DeltaTime`).
+pub const FIRASIM_FRAME_MS: u64 = 16;
+
+/// Valor de "sin dato" en los atómicos de `VisionStats`.
+const NO_DATA: u64 = u64::MAX;
+
+/// Contadores de la visión para la salud del sistema en la GUI. Los incrementa la
+/// tarea de visión y los lee el control loop al armar la foto del tick
+/// (`snapshot::VisionCounters`). No cambian ningún comando.
+#[derive(Debug)]
+pub struct VisionStats {
+    frames: AtomicU64,
+    lost: AtomicU64,
+    proxy_dropped: AtomicU64,
+    sim_time_ms: AtomicU64,
+    latency_us: AtomicU64,
+}
+
+impl Default for VisionStats {
+    fn default() -> Self {
+        Self {
+            frames: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            proxy_dropped: AtomicU64::new(0),
+            sim_time_ms: AtomicU64::new(NO_DATA),
+            latency_us: AtomicU64::new(NO_DATA),
+        }
+    }
+}
+
+impl VisionStats {
+    /// Copia de los contadores, para la foto.
+    pub fn counters(&self) -> VisionCounters {
+        let opt = |a: &AtomicU64| Some(a.load(Ordering::Relaxed)).filter(|v| *v != NO_DATA);
+        VisionCounters {
+            frames: self.frames.load(Ordering::Relaxed),
+            lost: self.lost.load(Ordering::Relaxed),
+            proxy_dropped: self.proxy_dropped.load(Ordering::Relaxed),
+            sim_time_ms: opt(&self.sim_time_ms),
+            latency_ms: opt(&self.latency_us).map(|us| us as f32 / 1000.0),
+        }
+    }
+}
+
+/// Cuadros perdidos entre dos `step` consecutivos de FIRASim. El `step` es el tiempo
+/// simulado en ms (`steps · DeltaTime · 1000`, truncado: oscila entre 15 y 17 ms por
+/// cuadro), así que un salto cuenta como pérdida solo si supera 1.5 cuadros. Un
+/// `step` que no avanza (reinicio del simulador) no cuenta.
+pub fn fira_lost_frames(prev_ms: u64, step_ms: u64) -> u64 {
+    if step_ms <= prev_ms {
+        return 0;
+    }
+    let d = step_ms - prev_ms;
+    if 2 * d <= 3 * FIRASIM_FRAME_MS {
+        return 0;
+    }
+    ((d as f64 / FIRASIM_FRAME_MS as f64).round() as u64).saturating_sub(1)
+}
+
+/// Cuadros perdidos entre dos `frame_number` SSL consecutivos de una misma cámara.
+pub fn ssl_lost_frames(prev: u32, frame: u32) -> u64 {
+    if frame > prev {
+        u64::from(frame - prev - 1)
+    } else {
+        0
+    }
 }
 
 /// Log por cada robot azul enviado a la GUI (SSL). Desactivado por defecto; usar `[FieldAudit]` en main.
@@ -156,6 +219,12 @@ pub struct Vision {
     dropped: u64,
     /// `vision.real_theta_offset_deg` (solo se aplica con `SslVision`).
     theta_offset_deg: f64,
+    /// Contadores para la GUI (`with_stats`). `None` = no se cuenta nada.
+    stats: Option<Arc<VisionStats>>,
+    /// Último `step` de FIRASim (ms simulados), para contar saltos.
+    last_fira_ms: Option<u64>,
+    /// Último `frame_number` SSL por cámara, para contar saltos.
+    last_ssl_frame: HashMap<u32, u32>,
 }
 
 /// Contadores del receptor (para los logs periódicos).
@@ -200,7 +269,64 @@ impl Vision {
             delayed: VecDeque::new(),
             dropped: 0,
             theta_offset_deg,
+            stats: None,
+            last_fira_ms: None,
+            last_ssl_frame: HashMap::new(),
         }
+    }
+
+    /// Cuenta cuadros, pérdidas, `step` de FIRASim y latencia en `stats` (salud del
+    /// sistema en la GUI). Sin esto, la visión se comporta igual y no cuenta nada.
+    pub fn with_stats(mut self, stats: Arc<VisionStats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Latencia que agrega el proxy de ruido (µs), si está activo.
+    fn proxy_latency_us(&self) -> Option<u64> {
+        self.noise.as_ref().map(|n| n.latency.as_micros() as u64)
+    }
+
+    /// Un cuadro FIRA: cuenta el cuadro, los saltos de `step` y la latencia del proxy.
+    fn note_fira_frame(&mut self, step_ms: u32) {
+        let Some(stats) = self.stats.clone() else {
+            return;
+        };
+        stats.frames.fetch_add(1, Ordering::Relaxed);
+        if step_ms > 0 {
+            let step = u64::from(step_ms);
+            if let Some(prev) = self.last_fira_ms {
+                stats.lost.fetch_add(fira_lost_frames(prev, step), Ordering::Relaxed);
+            }
+            self.last_fira_ms = Some(step);
+            stats.sim_time_ms.store(step, Ordering::Relaxed);
+        }
+        stats
+            .latency_us
+            .store(self.proxy_latency_us().unwrap_or(NO_DATA), Ordering::Relaxed);
+    }
+
+    /// Un cuadro SSL: cuenta el cuadro, los saltos de `frame_number` de su cámara y la
+    /// latencia `t_sent − t_capture` (más la del proxy). Sin tiempos válidos (cero o
+    /// invertidos), solo la del proxy.
+    fn note_ssl_frame(&mut self, camera_id: u32, frame_number: u32, t_capture: f64, t_sent: f64) {
+        let Some(stats) = self.stats.clone() else {
+            return;
+        };
+        stats.frames.fetch_add(1, Ordering::Relaxed);
+        if let Some(prev) = self.last_ssl_frame.insert(camera_id, frame_number) {
+            stats
+                .lost
+                .fetch_add(ssl_lost_frames(prev, frame_number), Ordering::Relaxed);
+        }
+        let processing = t_sent - t_capture;
+        let processing_us = (t_capture > 0.0 && processing.is_finite() && (0.0..1.0).contains(&processing))
+            .then(|| (processing * 1e6).round() as u64);
+        let total = match (processing_us, self.proxy_latency_us()) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        stats.latency_us.store(total.unwrap_or(NO_DATA), Ordering::Relaxed);
     }
 
     /// Posición con el ruido del proxy (identidad si el proxy está apagado).
@@ -241,6 +367,7 @@ impl Vision {
             && let Some(frame) = env.frame.as_ref()
         {
             stats.detection_count += 1;
+            self.note_fira_frame(env.step);
             let robot_count = frame.robots_yellow.len() + frame.robots_blue.len();
             let ball_count = if frame.ball.is_some() { 1 } else { 0 };
 
@@ -275,6 +402,12 @@ impl Vision {
                 Ok(packet) => {
                     if let Some(detection) = packet.detection.as_ref() {
                         stats.detection_count += 1;
+                        self.note_ssl_frame(
+                            detection.camera_id(),
+                            detection.frame_number(),
+                            detection.t_capture(),
+                            detection.t_sent(),
+                        );
                         let robot_count =
                             detection.robots_yellow.len() + detection.robots_blue.len();
                         let ball_count = detection.balls.len();
@@ -521,6 +654,9 @@ impl Vision {
                                 Some(noise) => {
                                     if noise.drop_packet() {
                                         self.dropped += 1;
+                                        if let Some(stats) = &self.stats {
+                                            stats.proxy_dropped.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     } else {
                                         let release = Instant::now() + noise.latency;
                                         self.delayed.push_back((release, data.to_vec()));
@@ -813,6 +949,86 @@ mod tests {
             Ok(StatusUpdate::PacketReceived)
         ));
         assert!(status_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fira_lost_frames_by_simulated_time() {
+        // Cuadros seguidos (con la oscilación de 15–17 ms del truncado): sin pérdidas.
+        assert_eq!(fira_lost_frames(16, 32), 0);
+        assert_eq!(fira_lost_frames(32, 47), 0);
+        assert_eq!(fira_lost_frames(47, 64), 0);
+        // Un cuadro perdido (32 ms) y dos (48 ms).
+        assert_eq!(fira_lost_frames(32, 64), 1);
+        assert_eq!(fira_lost_frames(64, 112), 2);
+        // El simulador se reinició: no cuenta.
+        assert_eq!(fira_lost_frames(5000, 16), 0);
+    }
+
+    #[test]
+    fn ssl_lost_frames_by_frame_number() {
+        assert_eq!(ssl_lost_frames(10, 11), 0);
+        assert_eq!(ssl_lost_frames(10, 13), 2);
+        assert_eq!(ssl_lost_frames(13, 1), 0);
+    }
+
+    fn vision_with_stats(source: VisionSource) -> (Vision, Arc<VisionStats>) {
+        let stats = Arc::new(VisionStats::default());
+        let mut vis = Vision::new(source, Arc::new(AtomicBool::new(false))).with_stats(stats.clone());
+        vis.noise = None;
+        (vis, stats)
+    }
+
+    #[test]
+    fn fira_counters_frames_losses_and_time() {
+        let (mut vis, stats) = vision_with_stats(VisionSource::FiraSim);
+        assert_eq!(stats.counters(), VisionCounters::default());
+        for step in [16, 32, 64, 80] {
+            vis.note_fira_frame(step);
+        }
+        let c = stats.counters();
+        assert_eq!(c.frames, 4);
+        assert_eq!(c.lost, 1);
+        assert_eq!(c.sim_time_ms, Some(80));
+        assert_eq!(c.latency_ms, None, "FIRASim sin proxy no tiene dato de latencia");
+    }
+
+    #[test]
+    fn fira_step_zero_counts_the_frame_only() {
+        let (mut vis, stats) = vision_with_stats(VisionSource::FiraSim);
+        vis.note_fira_frame(0);
+        vis.note_fira_frame(0);
+        let c = stats.counters();
+        assert_eq!((c.frames, c.lost, c.sim_time_ms), (2, 0, None));
+    }
+
+    #[test]
+    fn ssl_counters_losses_and_latency() {
+        let (mut vis, stats) = vision_with_stats(VisionSource::SslVision);
+        vis.note_ssl_frame(0, 10, 100.0, 100.004);
+        vis.note_ssl_frame(0, 13, 100.05, 100.054);
+        vis.note_ssl_frame(1, 7, 100.06, 100.064);
+        let c = stats.counters();
+        assert_eq!(c.frames, 3);
+        assert_eq!(c.lost, 2, "solo los saltos de la misma cámara");
+        let lat = c.latency_ms.expect("latencia SSL");
+        assert!((lat - 4.0).abs() < 0.01, "{lat}");
+        assert_eq!(c.sim_time_ms, None);
+    }
+
+    #[test]
+    fn ssl_without_timestamps_has_no_latency() {
+        let (mut vis, stats) = vision_with_stats(VisionSource::SslVision);
+        vis.note_ssl_frame(0, 1, 0.0, 0.0);
+        assert_eq!(stats.counters().latency_ms, None);
+    }
+
+    #[test]
+    fn without_stats_nothing_is_counted() {
+        let mut vis = Vision::new(VisionSource::FiraSim, Arc::new(AtomicBool::new(false)));
+        vis.note_fira_frame(16);
+        vis.note_ssl_frame(0, 1, 1.0, 1.001);
+        assert!(vis.stats.is_none());
+        assert_eq!(vis.last_fira_ms, None);
     }
 
     #[test]

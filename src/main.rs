@@ -105,9 +105,8 @@ fn main() {
 //  Modo debug: GUI en el hilo principal, tokio en background
 // ─────────────────────────────────────────────────────────────────────────────
 fn run_with_gui() {
-    let (status_tx, status_rx) = mpsc::channel(100);
-    let (motion_tx, motion_rx) = mpsc::channel::<Vec<GUI::RobotMotionDebug>>(32);
-    let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
+    // Foto de cada tick, lazo → GUI (canal de "último valor": nunca frena el lazo).
+    let (snapshot_tx, snapshot_rx) = rustengine::snapshot::snapshot_channel();
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
     let (skill_tx, skill_rx) = mpsc::channel::<GuiSkillCommand>(32);
     let (pid_tx, pid_rx) = mpsc::channel::<HeadingPid>(16);
@@ -115,40 +114,31 @@ fn run_with_gui() {
         mpsc::channel::<Vec<rustengine::radio::TeleportItem>>(16);
     let estop = Arc::new(AtomicBool::new(false));
 
-    let source = VisionSource::from_env();
-    let ip = source.multicast_ip().to_string();
-    let port = source.port();
-
-    // Config de radio para el panel (etiqueta + defaults de base station).
-    let radio_target_label = format!("{:?}", RadioTarget::from_env());
-    let radio_port =
-        std::env::var("VSSL_BASESTATION_DEVICE").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
-    let radio_baud = std::env::var("VSSL_BASESTATION_BAUD").unwrap_or_else(|_| "115200".to_string());
+    // Configuración de la corrida para la barra de estado y el Inspector (solo lectura).
+    let run = GUI::RunInfo::from_env(
+        RadioTarget::from_env(),
+        VisionSource::from_env(),
+        own_team_from_env(),
+        NUM_ROBOTS,
+        GUI::CoachKind::from_env(),
+    );
 
     let estop_loop = estop.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(Some((
-            status_tx, motion_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx,
+            snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx,
         ))));
     });
 
     let setup = GUI::GuiSetup {
-        ip,
-        port,
-        config_tx,
-        status_rx,
-        motion_rx,
+        snapshot_rx,
         manual_tx: Some(manual_tx),
         skill_tx: Some(skill_tx),
         pid_tx: Some(pid_tx),
         teleport_tx: Some(teleport_tx),
         estop,
-        num_robots: NUM_ROBOTS,
-        own_team: own_team_from_env() as u32,
-        radio_target_label,
-        radio_port,
-        radio_baud,
+        run,
     };
     GUI::run_gui(setup).expect("GUI terminó con error");
 }
@@ -160,15 +150,14 @@ fn run_with_gui() {
 //    - Lee env (VSSL_COACH, VSSL_VISION_SOURCE, VSSL_RADIO_TARGET) una sola vez.
 //    - Arma un CoachDecider con frame-skip COACH_DECISION_PERIOD=6.
 //    - Delega en run_control_loop (60 Hz, dispatcher idéntico al pre-refactor).
-//    - GUI recibe los mismos RobotMotionDebug por canal.
+//    - Con GUI, el lazo publica una foto por tick (`rustengine::snapshot`).
 //
 //  Si necesitas cambiar el lazo de control, edita src/control_loop.rs — esta
 //  función solo arma la configuración.
 // ─────────────────────────────────────────────────────────────────────────────
 /// Canales GUI→loop / loop→GUI que `run_with_gui` pasa a `async_main`.
 type GuiChannelBundle = (
-    mpsc::Sender<GUI::StatusUpdate>,
-    mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
+    rustengine::snapshot::SnapshotSender,
     mpsc::Receiver<ManualCommand>,
     mpsc::Receiver<GuiSkillCommand>,
     Arc<AtomicBool>,
@@ -244,9 +233,8 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
     };
 
     let gui = gui_channels.map(
-        |(status_tx, motion_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)| GuiChannels {
-            status_tx,
-            motion_tx,
+        |(snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)| GuiChannels {
+            snapshot_tx,
             manual_rx: Some(manual_rx),
             skill_rx: Some(skill_rx),
             estop: Some(estop),

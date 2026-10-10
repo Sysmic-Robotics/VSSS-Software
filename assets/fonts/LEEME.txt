@@ -1,0 +1,34 @@
+# Fuentes de la GUI
+
+La GUI de depuración usa **Barlow** (texto) y **Barlow Semi Condensed** (títulos, números de robot, rótulos sobre la cancha y pestañas). Van dentro del binario con `include_bytes!` (`src/GUI/fonts.rs`), así que no hace falta instalarlas.
+
+## Origen
+
+- Proyecto: The Barlow Project Authors, <https://github.com/jpt/barlow>.
+- Archivos: `google/fonts`, carpetas `ofl/barlow` y `ofl/barlowsemicondensed`, commit `89f5431ff0db41bd2fe3f7ba21a723a01622428b` (versión 1.408). Es el último commit que toca estos archivos.
+- Licencia: SIL Open Font License 1.1, en `OFL.txt` (la misma para las dos familias). No declara Reserved Font Name.
+
+| Archivo de aquí | Original | sha256 del original |
+|---|---|---|
+| `BarlowTabular-Regular.ttf` | `Barlow-Regular.ttf` | `95aa02c7c43096e0dd44d787ba6216864a67157e402adab59b35572e0c1577ea` |
+| `BarlowTabular-SemiBold.ttf` | `Barlow-SemiBold.ttf` | `86577cb32f8abe3673db53ca0f4221e6856751a4f6730c867e00f720f8bb1fc5` |
+| `BarlowSemiCondensedTabular-Medium.ttf` | `BarlowSemiCondensed-Medium.ttf` | `4998b693a190b76f2b11315844345a8546c1e2e6a320905507a9eed04edf8b48` |
+| `BarlowSemiCondensedTabular-SemiBold.ttf` | `BarlowSemiCondensed-SemiBold.ttf` | `bd299f4bc5b44d30be8d42e9bad3a5df7d66af1cd55d0ed72a8b8916360a1424` |
+
+## Qué se modificó
+
+Son versiones modificadas (la OFL lo permite, con esta licencia junto a los archivos):
+
+- **Cifras tabulares por defecto.** iced 0.13 (cosmic-text 0.12) no aplica rasgos OpenType, y las cifras por defecto de Barlow son proporcionales. Se apuntó el `cmap` de `0`–`9` a los glifos del rasgo `tnum` (`zero.tf`, ...), que tienen todos el mismo avance.
+- **Familia renombrada** a "Barlow Tabular" y "Barlow Semi Condensed Tabular" (también el nombre PostScript), para que no se mezclen con una Barlow instalada en el sistema.
+
+Nada más: los glifos, las métricas y el resto de las tablas son los originales.
+
+## Cómo regenerarlas
+
+```
+pip install fonttools
+python3 tools/fuentes_tabulares.py <carpeta con los 4 TTF originales> assets/fonts
+```
+
+El script falla si los dígitos no quedan con el mismo avance, y no toca los timestamps: con los mismos originales produce los mismos archivos.

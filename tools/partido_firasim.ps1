@@ -47,7 +47,7 @@ Start-Sleep -Seconds 4
 
 Write-Host "2/4 engine azul (heuristic, lado $ladoAzul, ruido=$ruido, GUI, log)"
 Start-WslWindow "AZUL" ("cd $Repo && CARGO_TARGET_DIR=$target VSSL_TEAM_COLOR=blue VSSL_SIDE=$ladoAzul VSSL_BIDIRECTIONAL=1 " +
-    "VSSL_VISION_NOISE=$ruido VSSL_DEBUG_GUI=1 VSSL_MATCH_LOG=logs/partido_azul.csv cargo run --release")
+    "VSSL_VISION_NOISE=$ruido VSSL_DEBUG_GUI=1 LP_NUM_THREADS=4 VSSL_MATCH_LOG=logs/partido_azul.csv cargo run --release")
 
 if (-not $SinAmarillo) {
     Write-Host "3/4 engine amarillo ($Rival, lado $ladoAmarillo, log)"

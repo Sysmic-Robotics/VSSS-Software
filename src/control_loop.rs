@@ -8,13 +8,16 @@
 //! Principio de fidelidad: si una skill pasa la prueba en `skill_test`, debe
 //! comportarse idéntico al correrla bajo `main` con el mismo target.
 
-use crate::GUI;
-use crate::coach::{Coach, Foul, Observation, SharedReferee, SkillChoice};
+use crate::coach::{Coach, Foul, Observation, Role, SharedReferee, SkillChoice};
 use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig};
 use crate::radio::{RadioTarget, TransportError};
 use crate::skills::zones::ZoneGuard;
-use crate::skills::{SkillCatalog, SkillId};
-use crate::vision::{Vision, VisionEvent, VisionSource};
+use crate::skills::{SkillCatalog, SkillId, SkillStatus};
+use crate::snapshot::{
+    LoopSnapshot, LoopTiming, OwnTick, RadioCounters, SnapshotSender, ball_view, publish,
+    referee_view, robot_views,
+};
+use crate::vision::{Vision, VisionEvent, VisionSource, VisionStats};
 use crate::world::{RobotState, World};
 use glam::Vec2;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +33,12 @@ use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 pub trait TickDecider: Send {
     /// Devuelve las `SkillChoice` vigentes para `tick`. Puede reusar las anteriores.
     fn decide(&mut self, tick: u32, world: &World) -> Vec<SkillChoice>;
+
+    /// Rol del robot propio `robot_id` según el decisor, para la GUI. `None` si el
+    /// decisor no reparte roles. No altera ninguna decisión.
+    fn role(&self, _robot_id: i32) -> Option<Role> {
+        None
+    }
 }
 
 /// Configuración del loop. `vision_source` y `radio_target` se pasan EXPLÍCITOS
@@ -124,6 +133,10 @@ impl TickDecider for CoachDecider {
         }
         self.last_choices.clone()
     }
+
+    fn role(&self, robot_id: i32) -> Option<Role> {
+        self.coach.role(robot_id)
+    }
 }
 
 /// Decisor del probador: emite la misma `SkillChoice` cada tick.
@@ -196,10 +209,11 @@ const MANUAL_STALE_TICKS: u32 = 15;
 /// terminal, y reenvío a la GUI con la misma cadencia (por si se perdió uno).
 const SKILL_WARNING_PERIOD: Duration = Duration::from_secs(1);
 
-/// Canales opcionales para alimentar el GUI (mismo shape que el código pre-refactor).
+/// Canales de la GUI. Lazo → GUI: la foto del tick (`snapshot`, canal de "último
+/// valor": publicar nunca espera a la GUI). GUI → lazo: comandos explícitos.
 pub struct GuiChannels {
-    pub status_tx: mpsc::Sender<GUI::StatusUpdate>,
-    pub motion_tx: mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
+    /// Foto de cada tick (ver `crate::snapshot`). Con GUI, el lazo la arma y la publica.
+    pub snapshot_tx: SnapshotSender,
     /// Canal opcional de comandos manuales GUI→loop. `None` = sin control manual
     /// (comportamiento idéntico al headless). Ver `ManualCommand`.
     pub manual_rx: Option<mpsc::Receiver<ManualCommand>>,
@@ -235,6 +249,29 @@ pub fn apply_reflexes(
     let escaping = recovery.guard_commands(cmds, world, manual_keys, own_team);
     zone_guard.guard_commands(cmds, world, own_team, manual_keys);
     escaping
+}
+
+/// `SkillStatus` de cada choice aplicada, con el mismo target que recibió
+/// `SkillCatalog::tick` en este tick (solo para la foto de la GUI). `status` no muta
+/// estado de control: solo vuelve a fijar el target que `tick` ya fijó.
+pub(crate) fn skill_statuses(
+    catalog: &mut SkillCatalog,
+    applied: &[SkillChoice],
+    world: &World,
+    own_team: i32,
+) -> Vec<(i32, SkillStatus)> {
+    applied
+        .iter()
+        .filter_map(|c| {
+            let idx = usize::try_from(c.robot_id)
+                .ok()
+                .filter(|&i| i < catalog.num_robots())?;
+            let robot = world
+                .get_robot_state(c.robot_id, own_team)
+                .filter(|r| r.active)?;
+            Some((c.robot_id, catalog.status(idx, c.skill_id, c.target, robot, world)))
+        })
+        .collect()
 }
 
 /// Modo del tick: la parada de emergencia toma el camino de HALT, prevalezca lo que
@@ -568,6 +605,14 @@ fn apply_manual_overrides(
     }
 }
 
+/// `VSSL_TRACKER=off|0|false` desactiva el EKF desde el arranque (mediciones de ruido
+/// crudo de cámara). Por defecto el tracker está encendido. Lo leen el lazo y la GUI.
+pub fn tracker_on_from_env() -> bool {
+    std::env::var("VSSL_TRACKER")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
+        .unwrap_or(true)
+}
+
 /// Ejecuta el loop de control con el decisor entregado. Una sola fuente de
 /// verdad: tanto `main` como `skill_test` (modo skill) llaman aquí.
 pub async fn run_control_loop(
@@ -582,30 +627,30 @@ pub async fn run_control_loop(
         config.num_robots,
         config.num_robots,
     )));
-    // VSSL_TRACKER=off|0 desactiva el EKF desde el arranque (mediciones de ruido
-    // crudo de cámara). Por defecto el tracker está encendido.
-    let tracker_on_at_start = std::env::var("VSSL_TRACKER")
-        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
-        .unwrap_or(true);
+    let tracker_on_at_start = tracker_on_from_env();
     if !tracker_on_at_start {
         eprintln!("[control_loop] VSSL_TRACKER=off → EKF desactivado (poses crudas de visión)");
     }
     let tracker_enabled = Arc::new(AtomicBool::new(tracker_on_at_start));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (status_tx, motion_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx) =
+    let (snapshot_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx) =
         match gui {
             Some(g) => (
-                Some(g.status_tx),
-                Some(g.motion_tx),
+                Some(g.snapshot_tx),
                 g.manual_rx,
                 g.skill_rx,
                 g.estop,
                 g.pid_rx,
                 g.teleport_rx,
             ),
-            None => (None, None, None, None, None, None, None),
+            None => (None, None, None, None, None, None),
         };
+    // Contadores de la visión (atómicos; no cambian ningún comando).
+    let vision_stats = Arc::new(VisionStats::default());
+    // Solo con GUI: período del lazo y contadores de radio para la foto.
+    let mut timing = snapshot_tx.as_ref().map(|_| LoopTiming::default());
+    let mut radio_counters = RadioCounters::default();
 
     // Estado de comandos manuales vigentes por (team, id) con el tick de último
     // refresco, para expirar comandos rancios (ver `MANUAL_STALE_TICKS`).
@@ -615,12 +660,8 @@ pub async fn run_control_loop(
     let mut manual_state: HashMap<(i32, i32), (ManualCommand, u32)> = HashMap::new();
     // Estado de skills de GUI vigentes por (team, id), misma mecánica de expiry.
     let mut skill_state: HashMap<(i32, i32), (GuiSkillCommand, u32)> = HashMap::new();
-    // Última señal de conexión del transporte reportada a la GUI (para emitir
-    // solo en transiciones y no inundar el canal de estado).
-    let mut last_transport_ok: Option<bool> = None;
-    // Aviso "la skill no corre": último log a terminal y último envío a la GUI.
+    // Aviso "la skill no corre": último log a terminal (la GUI lo recibe en cada foto).
     let mut skill_warning_logged_at: Option<Instant> = None;
-    let mut skill_warning_sent: Option<(Option<String>, Instant)> = None;
 
     // Vision
     {
@@ -632,12 +673,12 @@ pub async fn run_control_loop(
             source.multicast_ip(),
             source.port()
         );
-        let status_tx_vis = status_tx.clone();
+        let vision_stats = vision_stats.clone();
         tokio::spawn(async move {
-            let mut vis = Vision::new(source, tracker_enabled);
+            let mut vis = Vision::new(source, tracker_enabled).with_stats(vision_stats);
+            // La GUI ya no lee `StatusUpdate`: la visión manda a un canal cerrado.
             let (dummy_tx, _) = mpsc::channel(1);
-            let tx = status_tx_vis.unwrap_or(dummy_tx);
-            if let Err(err) = vis.run(vision_tx, tx).await {
+            if let Err(err) = vis.run(vision_tx, dummy_tx).await {
                 eprintln!("[control_loop] vision error: {err}");
             }
         });
@@ -732,6 +773,9 @@ pub async fn run_control_loop(
 
     loop {
         interval.tick().await;
+        if let Some(t) = timing.as_mut() {
+            t.tick(Instant::now());
+        }
 
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -809,6 +853,8 @@ pub async fn run_control_loop(
         }
 
         let skill_warning: Option<String>;
+        // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
+        let mut gui_world = None;
         let (commands, targets, applied_choices, escaping) = {
             let world_guard = world.read().await;
             if !field_scale_warned {
@@ -816,7 +862,7 @@ pub async fn run_control_loop(
             }
             // Con la parada activa `skill_state` ya está vacío → sin aviso.
             skill_warning = gui_skill_warning(&skill_state, &world_guard, config.own_team);
-            tick_commands(
+            let out = tick_commands(
                 mode,
                 &world_guard,
                 decider.as_mut(),
@@ -829,13 +875,21 @@ pub async fn run_control_loop(
                 &skill_state,
                 config.own_team,
                 config.num_robots,
-            )
+            );
+            if snapshot_tx.is_some() {
+                gui_world = Some((
+                    robot_views(&world_guard),
+                    ball_view(&world_guard),
+                    skill_statuses(&mut catalog, &out.2, &world_guard, config.own_team),
+                ));
+            }
+            out
         };
         tick_counter = tick_counter.wrapping_add(1);
 
-        // Aviso de skill de GUI que no corre: terminal con límite de frecuencia y
-        // GUI al cambiar o cada período. Antes del `continue` por comandos vacíos:
-        // si el único robot comandado no se ve, no hay comandos.
+        // Aviso de skill de GUI que no corre: terminal con límite de frecuencia (la
+        // GUI lo recibe en cada foto). Antes del `continue` por comandos vacíos: si el
+        // único robot comandado no se ve, no hay comandos.
         let now = Instant::now();
         let due = |last: Option<Instant>| {
             last.is_none_or(|t| now.duration_since(t) >= SKILL_WARNING_PERIOD)
@@ -845,13 +899,6 @@ pub async fn run_control_loop(
         {
             eprintln!("[control_loop] ⚠ {w}");
             skill_warning_logged_at = Some(now);
-        }
-        if let Some(ref tx) = status_tx {
-            let changed = skill_warning_sent.as_ref().map(|(w, _)| w) != Some(&skill_warning);
-            if changed || due(skill_warning_sent.as_ref().map(|(_, t)| *t)) {
-                let _ = tx.try_send(GUI::StatusUpdate::SkillWarning(skill_warning.clone()));
-                skill_warning_sent = Some((skill_warning.clone(), now));
-            }
         }
 
         // Hook de logging — recibe snapshot del mundo + comandos + choices que se aplicaron.
@@ -869,32 +916,51 @@ pub async fn run_control_loop(
             hook(&rec);
         }
 
-        if commands.is_empty() {
-            continue;
+        // Foto del tick para la GUI (también en los ticks sin comandos). Los
+        // `(v_mm_s, w_deg_s)` salen de `command_to_vw`, igual que el frame y el CSV.
+        if let (Some(tx), Some((robots, ball, statuses))) = (snapshot_tx.as_ref(), gui_world.take()) {
+            let own_ids = |keys: Vec<(i32, i32)>| -> Vec<i32> {
+                keys.into_iter()
+                    .filter(|(t, _)| *t == config.own_team)
+                    .map(|(_, i)| i)
+                    .collect()
+            };
+            let manual_ids = own_ids(manual_state.keys().copied().collect());
+            let gui_skill_ids = own_ids(skill_state.keys().copied().collect());
+            let own = OwnTick {
+                mode,
+                own_team: config.own_team,
+                num_robots: config.num_robots,
+                commands: &commands,
+                targets: &targets,
+                applied: &applied_choices,
+                escaping: &escaping,
+                manual_ids: &manual_ids,
+                gui_skill_ids: &gui_skill_ids,
+                statuses: &statuses,
+            }
+            .views(|id| decider.role(id));
+            publish(
+                tx,
+                LoopSnapshot {
+                    tick: tick_counter,
+                    t_ms: started.elapsed().as_millis() as u64,
+                    mode,
+                    estop: estop_engaged,
+                    referee: referee_view(&config.referee),
+                    robots,
+                    ball: Some(ball),
+                    own,
+                    skill_warning: skill_warning.clone(),
+                    timing: timing.as_ref().map(LoopTiming::stats).unwrap_or_default(),
+                    vision: vision_stats.counters(),
+                    radio: radio_counters,
+                },
+            );
         }
 
-        // GUI debug (igual que pre-refactor)
-        if let Some(ref tx) = motion_tx {
-            let updates: Vec<GUI::RobotMotionDebug> = commands
-                .iter()
-                .zip(targets.iter())
-                .map(|(cmd, target)| {
-                    // Mismo cálculo que el CSV de auditoría (skill_log) y el frame →
-                    // overlay, log y radio no pueden divergir. `cmd` ya es un MotionCommand.
-                    let (v_mm_s, w_deg_s) = crate::radio::base_station::command_to_vw(cmd);
-                    GUI::RobotMotionDebug {
-                        team: cmd.team as u32,
-                        id: cmd.id as u32,
-                        vx: cmd.vx as f32,
-                        vy: cmd.vy as f32,
-                        omega: cmd.omega as f32,
-                        target: *target,
-                        v_mm_s,
-                        w_deg_s,
-                    }
-                })
-                .collect();
-            let _ = tx.try_send(updates);
+        if commands.is_empty() {
+            continue;
         }
 
         let mut radio_guard = radio.lock().await;
@@ -907,13 +973,8 @@ pub async fn run_control_loop(
         if let Err(err) = send_result {
             eprintln!("[control_loop] error enviando: {err}");
         }
-        // Reportar el estado del transporte a la GUI solo en transiciones.
-        if last_transport_ok != Some(ok) {
-            last_transport_ok = Some(ok);
-            if let Some(ref tx) = status_tx {
-                let _ = tx.try_send(GUI::StatusUpdate::TransportStatus(ok));
-            }
-        }
+        radio_counters.sends += 1;
+        radio_counters.last_ok = Some(ok);
     }
 
     // Stop sequence: enviar comando con velocidades en cero por cada robot del equipo
@@ -1690,5 +1751,95 @@ mod tests {
         let _shutdown = Arc::new(AtomicBool::new(false));
         // No invocamos run_control_loop porque abre socket UDP de visión real.
         // El smoke test del dispatcher + decider está cubierto arriba.
+    }
+
+    // ── Foto de la GUI ───────────────────────────────────────────────────────
+
+    /// Consultar `SkillStatus` para la foto (solo con GUI) no cambia ningún comando:
+    /// la misma secuencia de ticks, con y sin la consulta, da los mismos comandos.
+    #[test]
+    fn skill_status_for_the_snapshot_does_not_change_commands() {
+        let world = world_with_robot(-0.3, 0.1, 0.4);
+        for skill in [
+            SkillId::GoTo,
+            SkillId::FacePoint,
+            SkillId::ChaseBall,
+            SkillId::ApproachAligned,
+            SkillId::ShootPush,
+            SkillId::Intercept,
+            SkillId::BlockLine,
+            SkillId::GoalKeep,
+            SkillId::Clear,
+            SkillId::SpinKick,
+            SkillId::Mark,
+            SkillId::Hold,
+        ] {
+            let run = |with_status: bool| -> Vec<MotionCommand> {
+                let mut rig = Rig::new(false);
+                let mut decider = FixedSkillDecider::new(0, skill, Vec2::new(0.5, -0.1));
+                let mut out = Vec::new();
+                for _ in 0..90 {
+                    let (cmds, _, applied, _) = tick_commands(
+                        TickMode::Play,
+                        &world,
+                        &mut decider,
+                        rig.tick,
+                        &mut rig.catalog,
+                        &rig.motion,
+                        &mut rig.recovery,
+                        &rig.guard,
+                        &rig.manual,
+                        &rig.gui,
+                        0,
+                        3,
+                    );
+                    if with_status {
+                        let statuses = skill_statuses(&mut rig.catalog, &applied, &world, 0);
+                        assert_eq!(statuses.len(), applied.len(), "{skill:?}");
+                    }
+                    rig.tick += 1;
+                    out.extend(cmds);
+                }
+                out
+            };
+            assert_eq!(run(false), run(true), "{skill:?}");
+        }
+    }
+
+    /// Sin el robot en la visión no hay choice aplicada ni `SkillStatus`.
+    #[test]
+    fn skill_status_skips_robots_not_in_vision() {
+        let world = World::new(3, 3);
+        let mut catalog = SkillCatalog::new(3);
+        let applied = [SkillChoice::new(1, SkillId::GoTo, Vec2::ZERO)];
+        assert!(skill_statuses(&mut catalog, &applied, &world, 0).is_empty());
+    }
+
+    /// `CoachDecider` reenvía el rol del coach; el decisor del probador no reparte roles.
+    #[test]
+    fn coach_decider_forwards_the_role() {
+        struct KeeperCoach;
+        impl Coach for KeeperCoach {
+            fn decide(&mut self, _obs: &Observation) -> Vec<SkillChoice> {
+                Vec::new()
+            }
+            fn role(&self, robot_id: i32) -> Option<Role> {
+                (robot_id == 2).then_some(Role::Keeper)
+            }
+        }
+        let decider = CoachDecider::new(Box::new(KeeperCoach), 0, 6);
+        assert_eq!(decider.role(2), Some(Role::Keeper));
+        assert_eq!(decider.role(0), None);
+        let fixed = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::ZERO);
+        assert_eq!(fixed.role(0), None);
+    }
+
+    /// El coach heurístico informa a su arquero (`coach.keeper_id`) por el trait.
+    #[test]
+    fn heuristic_coach_reports_its_keeper_through_the_trait() {
+        let coach = crate::coach::HeuristicCoach::new(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0));
+        let keeper = crate::params::params().coach.keeper_id;
+        let decider = CoachDecider::new(Box::new(coach), 0, 6);
+        assert_eq!(decider.role(keeper), Some(Role::Keeper));
     }
 }
