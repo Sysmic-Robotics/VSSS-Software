@@ -1,3 +1,4 @@
+pub mod actuator;
 pub mod base_station;
 mod commands;
 mod firasim;

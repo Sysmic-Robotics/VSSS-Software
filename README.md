@@ -31,6 +31,8 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
 | `VSSL_VISION_RECORD` | (off) | Ruta donde grabar los paquetes crudos de visión, para `vision_replay`. |
 | `VSSL_REFEREE_ADDR` | `224.5.23.2:10003` | Dónde escucha el engine los comandos del árbitro (VSSReferee o texto de `tools/referee_cli.py`). |
+| `VSSL_REAL_ACTUATOR` | (off) | `<id de visión>:<full\|half>`: capa de actuador real (sysid) en el transporte de FIRASim, la planta de test y `skill_test --transport plant`. El robot simulado anda con la latencia, la dinámica, el tope por rueda y la zona muerta medidos de ese robot con esa batería (`config/real_calibration.json`). Se aplica a todos los robots del engine. |
+| `VSSL_REAL_CALIBRATION` | `config/real_calibration.json` | Otro archivo de calibración del robot real (ensayos). |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
 | `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
 
@@ -120,7 +122,7 @@ config sigue viniendo del entorno y los bytes enviados son idénticos.
 **3 binarios:**
 - `rustengine` (default): producción headless o con `VSSL_DEBUG_GUI=1`. Coach decide qué skill correr.
 - `scenario`: banco de pruebas tipo "editar y correr". Una skill a la vez, configurada como constantes en la zona de edición al inicio de `src/bin/scenario.rs`. GUI siempre activa. CSV opcional a `logs/scenario_<skill>_<epoch>.csv` (toggle con la constante `log: Option<PathBuf>`: `Some(scenario_log_path(&scenario))` escribe, `None` desactiva el archivo y deja solo el resumen humano a stderr).
-- `skill_test`: probador CLI. Modo `skill` (lazo cerrado, sim o real) y modo `vw` (lazo abierto: v en mm/s y ω en °/s directos al robot real, para bring-up). Ver `--help`.
+- `skill_test`: probador CLI. Modo `skill` (lazo cerrado, sim o real) y modo `vw` (lazo abierto: v en mm/s y ω en °/s directos al robot real, para bring-up; o un perfil de sysid con `--profile`, en el robot, en FIRASim o en la planta offline). Ver `--help`.
 
 ### Probar contra robots reales
 
@@ -249,7 +251,8 @@ src/
 ├── vision.rs              # Recepción multicast (FIRA o SSL_WrapperPacket) + filtros
 ├── bin/
 │   ├── scenario.rs        # Banco "editar y correr": 1 skill, GUI on, CSV a logs/
-│   └── skill_test.rs      # Probador CLI: --mode skill|vw (bring-up real)
+│   └── skill_test.rs      # Probador CLI: --mode skill|vw (bring-up real y perfiles de sysid)
+├── sysid.rs               # Perfiles de identificación (v, ω) a 20 Hz
 ├── world/                 # World, RobotState, BallState (Arc<RwLock>)
 ├── tracker/               # EKF por entidad
 ├── coach/                 # Coach trait + RuleBasedCoach + Observation (52 floats RL)
@@ -257,7 +260,8 @@ src/
 ├── motion/                # UVF + PID + MotionCommand
 ├── radio/
 │   ├── mod.rs             # Radio + RadioTarget. Radio::from_target explícito.
-│   ├── transport.rs       # trait RobotTransport + FiraSimTransport / GrSimTransport
+│   ├── transport.rs       # trait RobotTransport + FiraSimTransport (con la capa de actuador real) / GrSimTransport
+│   ├── actuator.rs        # real_calibration.json + capa de actuador real (VSSL_REAL_ACTUATOR)
 │   ├── base_station.rs    # BaseStationTransport: cinemática inversa diferencial → ASCII "L1,R1,...,L5,R5\n" mm/s
 │   ├── firasim.rs         # FIRASimClient: UDP → 127.0.0.1:20011
 │   ├── grsim.rs           # GrSimClient: UDP protobuf
@@ -312,6 +316,24 @@ cargo run --release --bin vision_replay -- --file logs/vision.bin --ekf-csv logs
 El modo `--ekf-csv` imprime por entidad el RMS del residuo crudo−filtrado; con el robot quieto ese
 RMS es la σ de la cámara (base de M1). Protocolo de torneo: 15 min de grabación al llegar → replay
 → confirmar Q/R → jugar.
+
+## System-ID del actuador (`tools/sysid_*`)
+
+Mide cómo ejecuta el robot real el contrato (v, ω) y hace que el simulador lo imite (CLAUDE.md §8.4, 0.4 y §9.1–9.2):
+
+1. **Sesión de laboratorio**, una por robot y por batería: `tools/sysid_sesion.sh <posición de radio> <id de visión> <full|half>`. El procedimiento imprimible está en `tools/sysid_procedimiento.txt` (`--help`). Empieza por la seguridad: la base no tiene timeout de serial; cortar siempre con Ctrl+C. Corre 6 perfiles fijos de ida y vuelta (`skill_test --list-profiles`) con la visión real grabando la pose cruda, y deja en `~/sysid/<id>/<batería>/` el CSV de comandos, el `.pose.csv`, el `.meta.json` y el `.vision.bin` de cada perfil.
+2. **Ajuste**: `python3 tools/sysid_ajuste.py ajustar ~/sysid/1/full`. Estima latencia, τ y aceleración máxima de v y de ω, ganancias, tope por rueda, track efectivo, zona muerta y el desplazamiento del parche de visión. Informa RMS, R² e intervalos del 90 %, y escribe la medición en `config/real_calibration.json` (con fecha, `MI_ROBOT_ID`, voltaje y notas).
+3. **Capa**: con `VSSL_REAL_ACTUATOR=1:full`, FIRASim y la planta de test aplican ese modelo entre el frame y las ruedas, descontando la dinámica propia de FIRASim (sección `firasim`, que sale de `ajustar --firasim` sobre una sesión en FIRASim sin la capa). Sin la variable, nada cambia.
+4. **Validación sim↔real**: `python3 tools/sysid_validacion.py ~/sysid/1/full <la misma sesión en FIRASim con la capa>` → MEE, DTW, errores de v y ω y fracción saturada, contra los umbrales de D6 (MEE < 0.03 m, v en régimen < 10 %).
+
+Sin robot: `tools/sysid_ensayo.sh DIR [firasim]` ensaya la cadena entera con un modelo conocido: equivalencia de la capa de Rust con el modelo de Python, recuperación del modelo, validación, y con `firasim` la dinámica propia de FIRASim y el descuento. Los scripts solo usan la biblioteca estándar de Python.
+
+```bash
+SYSID_TRANSPORT=firasim SYSID_AUTO=1 tools/sysid_sesion.sh 0 0 full   # la misma sesión en FIRASim
+cargo run --release --bin skill_test -- --mode vw --transport plant --profile v_steps \
+    --robot 0 --team blue --log /tmp/v_steps.csv                       # un perfil en la planta offline
+python3 -m unittest discover -s tools -p 'test_sysid.py'               # tests del ajuste y la validación
+```
 
 ## Árbitro y pelota parada (`src/coach/referee.rs`, `src/coach/plays.rs`)
 
@@ -598,14 +620,15 @@ Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt`
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (378 tests)
+cargo test --lib                 # solo lib (396 tests)
 cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (24 tests)
 cargo test --bin match_director  # director de partido de FIRASim (5 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
-cargo test --bin skill_test      # parser del CLI (19 tests)
+cargo test --bin skill_test      # parser del CLI, perfiles y corte de seguridad (27 tests)
+python3 -m unittest discover -s tools -p 'test_sysid.py'   # ajuste y validación de la sysid (15 tests)
 ```
 
-**432 tests** cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido).
+**458 tests de Rust** (más 15 de Python para la sysid) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

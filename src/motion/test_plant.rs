@@ -10,6 +10,9 @@
 //! - latencia de N ticks entre el comando y las ruedas;
 //! - paredes físicas: el centro no sale de ±(0.75 − 0.04) × ±(0.65 − 0.04).
 //!
+//! Con `VSSL_REAL_ACTUATOR`, la planta usa el robot medido (`radio::actuator`, el modelo
+//! completo, sin descontar nada) en lugar de su latencia, su aceleración y su tope.
+//!
 //! `run` arma el `World` con la pose y la velocidad de la planta, despacha con el mismo
 //! `SkillCatalog` que el loop (con motion rodeando las áreas, como en el loop) y aplica
 //! `control_loop::apply_reflexes`.
@@ -20,6 +23,8 @@ use glam::Vec2;
 
 use super::{BorderRecovery, Motion, MotionCommand, MotionConfig};
 use crate::control_loop::apply_reflexes;
+use crate::radio::actuator::{self, ActuatorModel, ActuatorState};
+use crate::radio::base_station::command_to_vw;
 use crate::skills::zones::ZoneGuard;
 use crate::skills::{SkillCatalog, SkillId};
 use crate::world::World;
@@ -41,6 +46,9 @@ pub(crate) struct Plant {
     pub wheel_brake: f64,
     /// Ticks de latencia comando → ruedas.
     pub latency: usize,
+    /// Capa de actuador real (`VSSL_REAL_ACTUATOR`): si está, reemplaza la latencia, la
+    /// aceleración y el tope de la planta por el robot medido.
+    actuator: Option<(&'static ActuatorModel, ActuatorState)>,
 }
 
 impl Plant {
@@ -55,6 +63,7 @@ impl Plant {
             wheel_accel: 1.2,
             wheel_brake: 3.0,
             latency: 5,
+            actuator: actuator::plant_model().map(|m| (m, ActuatorState::default())),
         }
     }
 
@@ -78,6 +87,15 @@ impl Plant {
     /// Avanza un tick con el comando `cmd` (marco mundo, proyectado al heading con
     /// `cmd.orientation`, como hacen `command_to_vw` y el serializador FIRA).
     pub fn step(&mut self, cmd: &MotionCommand) {
+        if let Some((model, state)) = self.actuator.as_mut() {
+            let (v_mm_s, w_deg_s) = command_to_vw(cmd);
+            let (v, w) = state.step(model, v_mm_s, w_deg_s, DT);
+            let half_track = model.half_track;
+            self.wl = v - w * half_track;
+            self.wr = v + w * half_track;
+            self.integrate(v, w);
+            return;
+        }
         let sim = &crate::params::params().sim;
         let half_track = sim.wheel_base_m / 2.0;
         let max_wheel = sim.max_wheel_rad_s * sim.wheel_radius_m;
@@ -98,6 +116,10 @@ impl Plant {
         self.wr = self.wheel_toward(self.wr, tr);
         let v = self.v();
         let w = (self.wr - self.wl) / sim.wheel_base_m;
+        self.integrate(v, w);
+    }
+
+    fn integrate(&mut self, v: f64, w: f64) {
         self.x = (self.x + (v * self.th.cos() * DT) as f32).clamp(-0.71, 0.71);
         self.y = (self.y + (v * self.th.sin() * DT) as f32).clamp(-0.61, 0.61);
         self.th = Motion::normalize_angle(self.th + w * DT);

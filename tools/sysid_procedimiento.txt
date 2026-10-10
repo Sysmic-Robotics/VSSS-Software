@@ -1,0 +1,114 @@
+PROCEDIMIENTO DE SYSID SOBRE (v, ω): UNA SESIÓN POR ROBOT Y POR BATERÍA
+=========================================================================
+
+  tools/sysid_sesion.sh <posición de radio> <id de visión> <full|half>
+
+-------------------------------------------------------------------------
+ SEGURIDAD: LEER ANTES DE ENCENDER EL ROBOT
+-------------------------------------------------------------------------
+ * La base NO tiene timeout de serial. Si skill_test muere sin mandar
+   ceros (se cuelga, alguien lo mata, se desconecta el USB del PC), la base
+   repite el último comando PARA SIEMPRE y el robot sigue andando.
+ * SIEMPRE tiene que haber alguien listo para LEVANTAR EL ROBOT o para
+   DESENCHUFAR LA BASE, durante toda la sesión.
+ * Para cortar un perfil: Ctrl+C en la terminal. skill_test manda ceros
+   antes de salir. NUNCA cerrar la terminal, matar el proceso (kill,
+   pkill, cerrar la ventana) ni desenchufar el USB del PC con el robot
+   en movimiento.
+ * El perfil se corta solo y manda ceros si el robot sale de la caja
+   segura (0.60 m en x y 0.50 m en y desde el centro) o si la visión lo
+   pierde por 0.5 s. Antes de mover, skill_test exige ver al robot dentro
+   de la caja.
+
+-------------------------------------------------------------------------
+ QUÉ PREPARAR
+-------------------------------------------------------------------------
+ 1. PC de la salita con VSSS-Software actualizado (main), cargo y python3.
+ 2. Visión real (vsss-vision-sysmic) corriendo y calibrada. Ningún otro
+    engine abierto: rustengine, su GUI, skill_test, scenario,
+    motion_bench, match_director. El script no corre si hay uno.
+ 3. Base enchufada por USB. Si no es /dev/ttyUSB0:
+      export VSSL_BASESTATION_DEVICE=/dev/ttyUSBn
+ 4. Robot con el firmware (v, ω) (rama Peluche).
+    - Primera pasada: batería CARGADA. Medir el voltaje con el tester.
+    - Encenderlo QUIETO: al arrancar calibra el giroscopio.
+ 5. Bring-up hecho con este robot (skill_test --mode vw, los 5 pasos del
+    --help). Si algo falló en el bring-up, NO hacer la sysid.
+ 6. Cancha despejada: sin pelota ni otros robots.
+ 7. Equipo: azul por defecto. Si el parche es amarillo:
+      export SYSID_TEAM=yellow
+
+-------------------------------------------------------------------------
+ LA MARCA
+-------------------------------------------------------------------------
+ El centro de la cancha, con el robot mirando hacia +x de la visión: la
+ cara que el bring-up mostró avanzando con --v 300. Los perfiles van y
+ vuelven: el robot se aleja a lo sumo 0.36 m de la marca y vuelve cerca.
+ Recolocarlo en la marca antes de cada perfil.
+
+-------------------------------------------------------------------------
+ DATOS DE LA SESIÓN (anotar a mano también)
+-------------------------------------------------------------------------
+ MI_ROBOT_ID ____   posición de radio (MI_ROBOT_ID − 1) ____
+ id de visión ____  equipo ______
+ batería: full / half   voltaje al empezar ______ V   al terminar ______ V
+ fecha ____________   notas ____________________________________________
+
+-------------------------------------------------------------------------
+ CORRER LA SESIÓN
+-------------------------------------------------------------------------
+ Ejemplo: robot con MI_ROBOT_ID 2 (posición de radio 1), parche de
+ visión 1, batería cargada:
+
+   tools/sysid_sesion.sh 1 1 full
+
+ El script:
+  1. repite el aviso de seguridad y pide el voltaje medido, el
+     MI_ROBOT_ID y notas de la sesión;
+  2. por cada perfil, pide poner el robot en la marca y apretar Enter
+     (s = saltar, q = salir);
+  3. corre el perfil. Antes de mover, verifica que la visión ve al robot
+     dentro de la caja segura; si no, no mueve nada;
+  4. si el perfil no termina, dice por qué y ofrece repetirlo (r),
+     seguir (s) o salir (q);
+  5. guarda todo en ~/sysid/<id de visión>/<batería>/: por perfil, el CSV
+     de comandos, el .pose.csv (pose de visión), el .meta.json y la
+     grabación cruda de la visión (.vision.bin); además, sesion.json.
+
+ Los 6 perfiles (unos 2 minutos de movimiento en total):
+   v_steps  23 s  avanza y retrocede en recta, cada vez más rápido
+   v_ramp   23 s  avanza y retrocede muy lento; después, acelerando
+   v_chirp  23 s  vaivén en recta cada vez más rápido (hasta 3 Hz)
+   w_steps  17 s  gira en el lugar, cada vez más rápido (hasta 2 vueltas/s)
+   w_chirp  23 s  oscila girando en el lugar, cada vez más rápido
+   sat_arc  17 s  círculos chicos (6 a 10 cm de radio), ida y vuelta
+
+ Repetir un solo perfil después:
+   tools/sysid_sesion.sh 1 1 full --repetir v_chirp
+
+-------------------------------------------------------------------------
+ SI ALGO SALE MAL
+-------------------------------------------------------------------------
+ * El robot hace algo que no es el perfil (se va recto sin parar, gira
+   sin control): Ctrl+C. Si no se detiene, levantarlo o desenchufar la
+   base. Anotar qué pasó y no seguir con ese robot.
+ * "la visión no ve al robot": revisar el parche, la iluminación, el id
+   de visión y el equipo (SYSID_TEAM).
+ * "fuera de la caja segura": recolocarlo en la marca y repetir (r). Si
+   pasa siempre en el mismo perfil, anotarlo.
+ * "visión perdida": revisar la visión y repetir.
+ * El robot no se mueve en ningún perfil: volver al bring-up.
+ * Va al revés (retrocede cuando debería avanzar): la marca está bien
+   pero el heading de la visión está girado; anotarlo. El ajuste lo
+   detecta y no escribe nada.
+
+-------------------------------------------------------------------------
+ DESPUÉS
+-------------------------------------------------------------------------
+ 1. Segunda pasada con la batería a MEDIA CARGA (medirla con el tester):
+      tools/sysid_sesion.sh 1 1 half
+ 2. Repetir con cada robot.
+ 3. Copiar ~/sysid/ completo (con los .vision.bin) a la evidencia.
+ 4. Ajuste (2 a 3 minutos por sesión; puede ser en otro PC):
+      python3 tools/sysid_ajuste.py ajustar ~/sysid/1/full
+    Escribe la medición en config/real_calibration.json.

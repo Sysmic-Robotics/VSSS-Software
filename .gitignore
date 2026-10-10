@@ -6,3 +6,6 @@
 # Archivos markdown de documentación/guías (no subir al repositorio)
 *.md
 !README.md
+
+# Caché de Python de los scripts de tools/
+__pycache__/
