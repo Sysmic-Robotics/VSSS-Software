@@ -93,18 +93,21 @@ use tokio::sync::mpsc;
 fn main() {
     // Parámetros calibrables (config/team_params.json o VSSL_PARAMS) antes de todo.
     rustengine::params::TeamParams::install_or_exit("main");
+    // Lo activan una señal (SIGINT, SIGTERM, SIGHUP) o el cierre de la GUI: el lazo para
+    // con ceros antes de que termine el proceso (`rustengine::parada`).
+    let shutdown = Arc::new(AtomicBool::new(false));
     if std::env::var("VSSL_DEBUG_GUI").unwrap_or_default() == "1" {
-        run_with_gui();
+        run_with_gui(shutdown);
     } else {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(None));
+        rt.block_on(async_main(None, shutdown));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Modo debug: GUI en el hilo principal, tokio en background
 // ─────────────────────────────────────────────────────────────────────────────
-fn run_with_gui() {
+fn run_with_gui(shutdown: Arc<AtomicBool>) {
     // Foto de cada tick, lazo → GUI (canal de "último valor": nunca frena el lazo).
     let (snapshot_tx, snapshot_rx) = rustengine::snapshot::snapshot_channel();
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
@@ -124,11 +127,13 @@ fn run_with_gui() {
     );
 
     let estop_loop = estop.clone();
-    std::thread::spawn(move || {
+    let shutdown_loop = shutdown.clone();
+    let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(Some((
-            snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx,
-        ))));
+        rt.block_on(async_main(
+            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx)),
+            shutdown_loop,
+        ));
     });
 
     let setup = GUI::GuiSetup {
@@ -140,7 +145,8 @@ fn run_with_gui() {
         estop,
         run,
     };
-    GUI::run_gui(setup).expect("GUI terminó con error");
+    // Al cerrarse la ventana (o con un pánico), espera la parada del lazo antes de salir.
+    std::process::exit(rustengine::parada::con_gui(|| GUI::run_gui(setup), lazo, &shutdown));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +171,10 @@ type GuiChannelBundle = (
     mpsc::Receiver<Vec<rustengine::radio::TeleportItem>>,
 );
 
-async fn async_main(gui_channels: Option<GuiChannelBundle>) {
+async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<AtomicBool>) {
+    if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
+        eprintln!("[main] no pude registrar las señales de terminación: {e}");
+    }
     let vision_source = VisionSource::from_env();
     let radio_target = RadioTarget::from_env();
     eprintln!(
@@ -242,8 +251,6 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
             teleport_rx: Some(teleport_rx),
         },
     );
-
-    let shutdown = Arc::new(AtomicBool::new(false));
 
     if let Err(err) = run_control_loop(config, decider, on_tick, gui, shutdown).await {
         eprintln!("[main] control loop error: {err}");

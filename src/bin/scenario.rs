@@ -21,10 +21,7 @@ use rustengine::skills::SkillId;
 use rustengine::vision::VisionSource;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,11 +155,23 @@ fn run_bench(
         scenario.name, robot_id, team, transport, vision, log_desc
     );
 
+    // Lo activan una señal o el cierre de la GUI: el lazo para con ceros antes de salir.
+    let shutdown = Arc::new(AtomicBool::new(false));
     let estop_loop = estop.clone();
-    std::thread::spawn(move || {
+    let shutdown_loop = shutdown.clone();
+    let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async_run(
-            scenario, robot_id, team, vision, transport, log, dur_s, snapshot_tx, estop_loop,
+            scenario,
+            robot_id,
+            team,
+            vision,
+            transport,
+            log,
+            dur_s,
+            snapshot_tx,
+            estop_loop,
+            shutdown_loop,
         ));
     });
 
@@ -181,7 +190,7 @@ fn run_bench(
             GUI::CoachKind::Fixed(scenario.skill_id),
         ),
     };
-    GUI::run_gui(setup).expect("GUI terminó con error");
+    std::process::exit(rustengine::parada::con_gui(|| GUI::run_gui(setup), lazo, &shutdown));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,16 +204,10 @@ async fn async_run(
     dur_s: Option<f64>,
     snapshot_tx: rustengine::snapshot::SnapshotSender,
     estop: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("[scenario] Ctrl-C recibido, deteniendo...");
-                shutdown.store(true, Ordering::Relaxed);
-            }
-        });
+    if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
+        eprintln!("[scenario] no pude registrar las señales de terminación: {e}");
     }
 
     let decider = Box::new(FixedSkillDecider::new(

@@ -352,6 +352,9 @@ impl Tab {
 pub enum Message {
     /// Foto del tick (la última publicada por el lazo).
     Snapshot(Arc<LoopSnapshot>),
+    /// El lazo terminó (se cerró el canal de fotos): la GUI se cierra, y el hilo
+    /// principal sale después de la parada (`parada::con_gui`).
+    LazoTerminado,
     /// Nuevo tamaño de la ventana.
     Resized(Size),
     /// Tecla apretada (ver `keys::ruta_tecla`).
@@ -613,6 +616,7 @@ impl DebugGui {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::LazoTerminado => return iced::exit(),
             Message::Snapshot(snap) => {
                 self.fps_gui.registrar(Instant::now());
                 self.salud.push(snap.t_ms, snap.vision, snap.radio);
@@ -1011,16 +1015,9 @@ impl DebugGui {
             "fotos",
             stream::channel(1, move |mut output| async move {
                 let receptor = rx.lock().ok().and_then(|mut r| r.take());
-                if let Some(mut rx) = receptor {
+                if let Some(rx) = receptor {
                     let entre_fotos = Duration::from_secs_f32(1.0 / GUI_MAX_FPS);
-                    while rx.changed().await.is_ok() {
-                        // Clonar el `Arc` suelta el lock del canal al instante.
-                        let foto = rx.borrow_and_update().clone();
-                        if output.send(Message::Snapshot(foto)).await.is_err() {
-                            break;
-                        }
-                        tokio::time::sleep(entre_fotos).await;
-                    }
+                    reenviar_fotos(rx, &mut output, entre_fotos).await;
                 }
                 std::future::pending::<()>().await;
             }),
@@ -1154,6 +1151,24 @@ impl DebugGui {
     }
 }
 
+/// Reenvía a la GUI cada foto nueva, como máximo una cada `entre_fotos`, y avisa con
+/// `Message::LazoTerminado` cuando el lazo termina (se suelta el emisor de fotos).
+async fn reenviar_fotos(
+    mut rx: SnapshotReceiver,
+    output: &mut iced::futures::channel::mpsc::Sender<Message>,
+    entre_fotos: Duration,
+) {
+    while rx.changed().await.is_ok() {
+        // Clonar el `Arc` suelta el lock del canal al instante.
+        let foto = rx.borrow_and_update().clone();
+        if output.send(Message::Snapshot(foto)).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(entre_fotos).await;
+    }
+    let _ = output.send(Message::LazoTerminado).await;
+}
+
 pub fn run_gui(setup: GuiSetup) -> iced::Result {
     let mut app = iced::application(DebugGui::title, DebugGui::update, DebugGui::view)
         .subscription(DebugGui::subscription)
@@ -1176,6 +1191,22 @@ pub fn run_gui(setup: GuiSetup) -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_gui_hears_when_the_loop_ends() {
+        use iced::futures::StreamExt;
+        let (tx, rx) = crate::snapshot::snapshot_channel();
+        crate::snapshot::publish(&tx, LoopSnapshot { tick: 7, ..LoopSnapshot::default() });
+        drop(tx);
+        let (mut output, entrada) = iced::futures::channel::mpsc::channel(4);
+        reenviar_fotos(rx, &mut output, Duration::ZERO).await;
+        drop(output);
+        let mensajes: Vec<Message> = entrada.collect().await;
+        assert!(
+            matches!(mensajes.as_slice(), [Message::Snapshot(f), Message::LazoTerminado] if f.tick == 7),
+            "la última foto y después el aviso"
+        );
+    }
 
     /// 1.4 — Mapeo marco mundo determinista y escalado.
     #[test]

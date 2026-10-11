@@ -303,6 +303,39 @@ fn zero_commands_for_team(
     (cmds, tgts)
 }
 
+/// Un tick sin comandos (la visión no ve a ningún robot propio, o el decider no decidió
+/// nada) manda cero a todos los ids propios: callado, la base repetiría el último frame.
+/// Con algún comando, incluido uno manual sin visión, el tick sale como está (`None`).
+fn ceros_si_no_hay_comandos(
+    commands: &[MotionCommand],
+    world: &World,
+    own_team: i32,
+    num_robots: usize,
+) -> Option<Vec<MotionCommand>> {
+    commands
+        .is_empty()
+        .then(|| zero_commands_for_team(world, own_team, num_robots).0)
+}
+
+/// Cierre del lazo: los ceros de la ruta única (`parada::mandar_ceros`) con el comando cero
+/// de HALT para cada id propio en `0..num_robots`, lo vea o no la visión.
+async fn parada_del_lazo(
+    radio: &TokioMutex<crate::radio::Radio>,
+    world: &TokioRwLock<World>,
+    own_team: i32,
+    num_robots: usize,
+) {
+    let (ceros, _) = zero_commands_for_team(&*world.read().await, own_team, num_robots);
+    crate::parada::mandar_ceros(async || {
+        let mut radio = radio.lock().await;
+        for c in &ceros {
+            radio.add_motion_command(c.clone());
+        }
+        radio.send_commands().await
+    })
+    .await;
+}
+
 /// STOP: traslación cero y la `omega` de cada comando propio; los ids sin comando reciben
 /// cero (ver `zero_commands_for_team`).
 fn stop_translation(
@@ -771,233 +804,221 @@ pub async fn run_control_loop(
     let mut interval = tokio::time::interval(Duration::from_millis(16));
     let started = Instant::now();
 
-    loop {
-        interval.tick().await;
-        if let Some(t) = timing.as_mut() {
-            t.tick(Instant::now());
-        }
-
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        if let Some(max) = config.max_ticks
-            && tick_counter >= max
-        {
-            break;
-        }
-
-        // Drenar el canal manual (no bloqueante) quedándose con el más reciente
-        // por robot; refrescar su marca de tick.
-        if let Some(rx) = manual_rx.as_mut() {
-            while let Ok(mc) = rx.try_recv() {
-                manual_state.insert((mc.team, mc.id), (mc, tick_counter));
+    // El bucle de ticks corre dentro de `parar_al_terminar`: al terminar por cualquier
+    // causa (shutdown, max_ticks, el watchdog de visión o un pánico), el lazo manda los
+    // ceros de la ruta única a todos los ids propios (`crate::parada`). El watchdog del
+    // firmware no alcanza: solo cubre la pérdida de radio, y la base repite el último frame.
+    let bucle = async {
+        loop {
+            interval.tick().await;
+            if let Some(t) = timing.as_mut() {
+                t.tick(Instant::now());
             }
-        }
-        // Expirar comandos manuales sin refresco reciente (modo manual apagado).
-        if !manual_state.is_empty() {
-            manual_state
-                .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
-        }
 
-        // Tuneo de PID de heading desde la GUI (aplica al catálogo en runtime).
-        if let Some(rx) = pid_rx.as_mut() {
-            while let Ok(p) = rx.try_recv() {
-                catalog.set_heading_pid(p.kp, p.ki, p.kd);
+            if shutdown.load(Ordering::Relaxed) {
+                break;
             }
-        }
+            if let Some(max) = config.max_ticks
+                && tick_counter >= max
+            {
+                break;
+            }
 
-        // Teleport (sim) solicitado desde la GUI.
-        if let Some(rx) = teleport_rx.as_mut() {
-            let mut reqs: Vec<crate::radio::TeleportItem> = Vec::new();
-            while let Ok(items) = rx.try_recv() {
-                reqs.extend(items);
-            }
-            if !reqs.is_empty() {
-                let mut radio_guard = radio.lock().await;
-                if let Err(e) = radio_guard.teleport(&reqs).await {
-                    eprintln!("[control_loop] teleport error: {e}");
+            // Drenar el canal manual (no bloqueante) quedándose con el más reciente
+            // por robot; refrescar su marca de tick.
+            if let Some(rx) = manual_rx.as_mut() {
+                while let Ok(mc) = rx.try_recv() {
+                    manual_state.insert((mc.team, mc.id), (mc, tick_counter));
                 }
             }
-        }
-
-        // Drenar y expirar skills de GUI (misma mecánica que el manual).
-        if let Some(rx) = skill_rx.as_mut() {
-            while let Ok(sc) = rx.try_recv() {
-                skill_state.insert((sc.team, sc.id), (sc, tick_counter));
+            // Expirar comandos manuales sin refresco reciente (modo manual apagado).
+            if !manual_state.is_empty() {
+                manual_state
+                    .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
             }
-        }
-        if !skill_state.is_empty() {
-            skill_state
-                .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
-        }
 
-        // Parada de emergencia y HALT del árbitro: prevalecen sobre coach/manual/skills
-        // (mismo camino). STOP: solo corregir orientación (ver `TickMode`).
-        let estop_engaged = estop
-            .as_ref()
-            .map(|e| e.load(Ordering::Relaxed))
-            .unwrap_or(false);
-        let ref_mode = referee_mode(&config.referee);
-        if (ref_mode == TickMode::Halt) != halted_prev {
-            halted_prev = ref_mode == TickMode::Halt;
-            if halted_prev {
-                eprintln!("[control_loop] HALT del árbitro: equipo propio detenido");
-            } else {
-                eprintln!("[control_loop] fin de HALT");
+            // Tuneo de PID de heading desde la GUI (aplica al catálogo en runtime).
+            if let Some(rx) = pid_rx.as_mut() {
+                while let Ok(p) = rx.try_recv() {
+                    catalog.set_heading_pid(p.kp, p.ki, p.kd);
+                }
             }
-        }
-        let mode = tick_mode(estop_engaged, ref_mode);
-        if mode == TickMode::Halt {
-            manual_state.clear();
-            skill_state.clear();
-        }
 
-        let skill_warning: Option<String>;
-        // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
-        let mut gui_world = None;
-        let (commands, targets, applied_choices, escaping) = {
-            let world_guard = world.read().await;
-            if !field_scale_warned {
-                field_scale_warned = warn_if_outside_vsss_field(&world_guard);
+            // Teleport (sim) solicitado desde la GUI.
+            if let Some(rx) = teleport_rx.as_mut() {
+                let mut reqs: Vec<crate::radio::TeleportItem> = Vec::new();
+                while let Ok(items) = rx.try_recv() {
+                    reqs.extend(items);
+                }
+                if !reqs.is_empty() {
+                    let mut radio_guard = radio.lock().await;
+                    if let Err(e) = radio_guard.teleport(&reqs).await {
+                        eprintln!("[control_loop] teleport error: {e}");
+                    }
+                }
             }
-            // Con la parada activa `skill_state` ya está vacío → sin aviso.
-            skill_warning = gui_skill_warning(&skill_state, &world_guard, config.own_team);
-            let out = tick_commands(
-                mode,
-                &world_guard,
-                decider.as_mut(),
-                tick_counter,
-                &mut catalog,
-                &motion,
-                &mut recovery,
-                &zone_guard,
-                &manual_state,
-                &skill_state,
-                config.own_team,
-                config.num_robots,
-            );
-            if snapshot_tx.is_some() {
-                gui_world = Some((
-                    robot_views(&world_guard),
-                    ball_view(&world_guard),
-                    skill_statuses(&mut catalog, &out.2, &world_guard, config.own_team),
-                ));
+
+            // Drenar y expirar skills de GUI (misma mecánica que el manual).
+            if let Some(rx) = skill_rx.as_mut() {
+                while let Ok(sc) = rx.try_recv() {
+                    skill_state.insert((sc.team, sc.id), (sc, tick_counter));
+                }
             }
-            out
-        };
-        tick_counter = tick_counter.wrapping_add(1);
+            if !skill_state.is_empty() {
+                skill_state
+                    .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
+            }
 
-        // Aviso de skill de GUI que no corre: terminal con límite de frecuencia (la
-        // GUI lo recibe en cada foto). Antes del `continue` por comandos vacíos: si el
-        // único robot comandado no se ve, no hay comandos.
-        let now = Instant::now();
-        let due = |last: Option<Instant>| {
-            last.is_none_or(|t| now.duration_since(t) >= SKILL_WARNING_PERIOD)
-        };
-        if let Some(w) = &skill_warning
-            && due(skill_warning_logged_at)
-        {
-            eprintln!("[control_loop] ⚠ {w}");
-            skill_warning_logged_at = Some(now);
-        }
+            // Parada de emergencia y HALT del árbitro: prevalecen sobre coach/manual/skills
+            // (mismo camino). STOP: solo corregir orientación (ver `TickMode`).
+            let estop_engaged = estop
+                .as_ref()
+                .map(|e| e.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            let ref_mode = referee_mode(&config.referee);
+            if (ref_mode == TickMode::Halt) != halted_prev {
+                halted_prev = ref_mode == TickMode::Halt;
+                if halted_prev {
+                    eprintln!("[control_loop] HALT del árbitro: equipo propio detenido");
+                } else {
+                    eprintln!("[control_loop] fin de HALT");
+                }
+            }
+            let mode = tick_mode(estop_engaged, ref_mode);
+            if mode == TickMode::Halt {
+                manual_state.clear();
+                skill_state.clear();
+            }
 
-        // Hook de logging — recibe snapshot del mundo + comandos + choices que se aplicaron.
-        if let Some(ref mut hook) = on_tick {
-            let world_guard = world.read().await;
-            let rec = TickRecord {
-                tick: tick_counter,
-                t_ms: started.elapsed().as_millis() as u64,
-                world: &world_guard,
-                commands: &commands,
-                targets: &targets,
-                choices: &applied_choices,
-                escaping: &escaping,
+            let skill_warning: Option<String>;
+            let ceros: Option<Vec<MotionCommand>>;
+            // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
+            let mut gui_world = None;
+            let (commands, targets, applied_choices, escaping) = {
+                let world_guard = world.read().await;
+                if !field_scale_warned {
+                    field_scale_warned = warn_if_outside_vsss_field(&world_guard);
+                }
+                // Con la parada activa `skill_state` ya está vacío → sin aviso.
+                skill_warning = gui_skill_warning(&skill_state, &world_guard, config.own_team);
+                let out = tick_commands(
+                    mode,
+                    &world_guard,
+                    decider.as_mut(),
+                    tick_counter,
+                    &mut catalog,
+                    &motion,
+                    &mut recovery,
+                    &zone_guard,
+                    &manual_state,
+                    &skill_state,
+                    config.own_team,
+                    config.num_robots,
+                );
+                ceros = ceros_si_no_hay_comandos(&out.0, &world_guard, config.own_team, config.num_robots);
+                if snapshot_tx.is_some() {
+                    gui_world = Some((
+                        robot_views(&world_guard),
+                        ball_view(&world_guard),
+                        skill_statuses(&mut catalog, &out.2, &world_guard, config.own_team),
+                    ));
+                }
+                out
             };
-            hook(&rec);
-        }
+            tick_counter = tick_counter.wrapping_add(1);
 
-        // Foto del tick para la GUI (también en los ticks sin comandos). Los
-        // `(v_mm_s, w_deg_s)` salen de `command_to_vw`, igual que el frame y el CSV.
-        if let (Some(tx), Some((robots, ball, statuses))) = (snapshot_tx.as_ref(), gui_world.take()) {
-            let own_ids = |keys: Vec<(i32, i32)>| -> Vec<i32> {
-                keys.into_iter()
-                    .filter(|(t, _)| *t == config.own_team)
-                    .map(|(_, i)| i)
-                    .collect()
+            // Aviso de skill de GUI que no corre: terminal con límite de frecuencia (la
+            // GUI lo recibe en cada foto). Antes del `continue` por comandos vacíos: si el
+            // único robot comandado no se ve, no hay comandos.
+            let now = Instant::now();
+            let due = |last: Option<Instant>| {
+                last.is_none_or(|t| now.duration_since(t) >= SKILL_WARNING_PERIOD)
             };
-            let manual_ids = own_ids(manual_state.keys().copied().collect());
-            let gui_skill_ids = own_ids(skill_state.keys().copied().collect());
-            let own = OwnTick {
-                mode,
-                own_team: config.own_team,
-                num_robots: config.num_robots,
-                commands: &commands,
-                targets: &targets,
-                applied: &applied_choices,
-                escaping: &escaping,
-                manual_ids: &manual_ids,
-                gui_skill_ids: &gui_skill_ids,
-                statuses: &statuses,
+            if let Some(w) = &skill_warning
+                && due(skill_warning_logged_at)
+            {
+                eprintln!("[control_loop] ⚠ {w}");
+                skill_warning_logged_at = Some(now);
             }
-            .views(|id| decider.role(id));
-            publish(
-                tx,
-                LoopSnapshot {
+
+            // Hook de logging — recibe snapshot del mundo + comandos + choices que se aplicaron.
+            if let Some(ref mut hook) = on_tick {
+                let world_guard = world.read().await;
+                let rec = TickRecord {
                     tick: tick_counter,
                     t_ms: started.elapsed().as_millis() as u64,
+                    world: &world_guard,
+                    commands: &commands,
+                    targets: &targets,
+                    choices: &applied_choices,
+                    escaping: &escaping,
+                };
+                hook(&rec);
+            }
+
+            // Foto del tick para la GUI (también en los ticks sin comandos). Los
+            // `(v_mm_s, w_deg_s)` salen de `command_to_vw`, igual que el frame y el CSV.
+            if let (Some(tx), Some((robots, ball, statuses))) = (snapshot_tx.as_ref(), gui_world.take()) {
+                let own_ids = |keys: Vec<(i32, i32)>| -> Vec<i32> {
+                    keys.into_iter()
+                        .filter(|(t, _)| *t == config.own_team)
+                        .map(|(_, i)| i)
+                        .collect()
+                };
+                let manual_ids = own_ids(manual_state.keys().copied().collect());
+                let gui_skill_ids = own_ids(skill_state.keys().copied().collect());
+                let own = OwnTick {
                     mode,
-                    estop: estop_engaged,
-                    referee: referee_view(&config.referee),
-                    robots,
-                    ball: Some(ball),
-                    own,
-                    skill_warning: skill_warning.clone(),
-                    timing: timing.as_ref().map(LoopTiming::stats).unwrap_or_default(),
-                    vision: vision_stats.counters(),
-                    radio: radio_counters,
-                },
-            );
-        }
+                    own_team: config.own_team,
+                    num_robots: config.num_robots,
+                    commands: &commands,
+                    targets: &targets,
+                    applied: &applied_choices,
+                    escaping: &escaping,
+                    manual_ids: &manual_ids,
+                    gui_skill_ids: &gui_skill_ids,
+                    statuses: &statuses,
+                }
+                .views(|id| decider.role(id));
+                publish(
+                    tx,
+                    LoopSnapshot {
+                        tick: tick_counter,
+                        t_ms: started.elapsed().as_millis() as u64,
+                        mode,
+                        estop: estop_engaged,
+                        referee: referee_view(&config.referee),
+                        robots,
+                        ball: Some(ball),
+                        own,
+                        skill_warning: skill_warning.clone(),
+                        timing: timing.as_ref().map(LoopTiming::stats).unwrap_or_default(),
+                        vision: vision_stats.counters(),
+                        radio: radio_counters,
+                    },
+                );
+            }
 
-        if commands.is_empty() {
-            continue;
+            // El hook y la foto registran lo que decidió el tick; el envío, los ceros si no
+            // hubo comandos.
+            let mut radio_guard = radio.lock().await;
+            for cmd in ceros.as_deref().unwrap_or(&commands) {
+                radio_guard.add_motion_command(cmd.clone());
+            }
+            let send_result = radio_guard.send_commands().await;
+            drop(radio_guard);
+            let ok = send_result.is_ok();
+            if let Err(err) = send_result {
+                eprintln!("[control_loop] error enviando: {err}");
+            }
+            radio_counters.sends += 1;
+            radio_counters.last_ok = Some(ok);
         }
-
-        let mut radio_guard = radio.lock().await;
-        for cmd in &commands {
-            radio_guard.add_motion_command(cmd.clone());
-        }
-        let send_result = radio_guard.send_commands().await;
-        drop(radio_guard);
-        let ok = send_result.is_ok();
-        if let Err(err) = send_result {
-            eprintln!("[control_loop] error enviando: {err}");
-        }
-        radio_counters.sends += 1;
-        radio_counters.last_ok = Some(ok);
-    }
-
-    // Stop sequence: enviar comando con velocidades en cero por cada robot del equipo
-    // que haya estado activo en el último tick. Defensa en profundidad — el watchdog
-    // del firmware ya frena en 200 ms aunque no llegue el stop.
-    let last_world = world.read().await;
-    let team_robots = if config.own_team == 0 {
-        last_world.get_blue_team_active()
-    } else {
-        last_world.get_yellow_team_active()
     };
-    let mut radio_guard = radio.lock().await;
-    for robot in team_robots {
-        radio_guard.add_motion_command(MotionCommand {
-            id: robot.id,
-            team: robot.team,
-            vx: 0.0,
-            vy: 0.0,
-            omega: 0.0,
-            orientation: robot.orientation,
-        });
-    }
-    let _ = radio_guard.send_commands().await;
+    crate::parada::parar_al_terminar(bucle, async || {
+        parada_del_lazo(&radio, &world, config.own_team, config.num_robots).await
+    })
+    .await;
 
     if let Some(handle) = vision_watchdog {
         handle.abort();
@@ -1230,6 +1251,65 @@ mod tests {
         ids.sort();
         assert_eq!(ids, vec![0, 1, 2]);
         assert!(all_zero(&cmds) && cmds.iter().all(|c| c.team == 0));
+    }
+
+    // ── Parada segura: tick sin comandos y cierre del lazo ──────────────────
+
+    #[test]
+    fn a_tick_without_own_robots_sends_zeros_to_every_own_id() {
+        // Pérdida total de visión en juego: el tick no tiene comandos.
+        let world = World::new(3, 3);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.4, 0.0));
+        let (cmds, _) = Rig::new(true).step(TickMode::Play, &world, &mut d);
+        assert!(cmds.is_empty());
+        let ceros = ceros_si_no_hay_comandos(&cmds, &world, 0, 3).expect("ceros");
+        let mut ids: Vec<i32> = ceros.iter().map(|c| c.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert!(all_zero(&ceros) && ceros.iter().all(|c| c.team == 0));
+    }
+
+    #[test]
+    fn a_tick_with_commands_goes_out_as_is() {
+        let world = world_with_robot(0.0, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.4, 0.0));
+        let (cmds, _) = Rig::new(true).step(TickMode::Play, &world, &mut d);
+        assert!(!cmds.is_empty());
+        assert!(ceros_si_no_hay_comandos(&cmds, &world, 0, 3).is_none());
+    }
+
+    #[test]
+    fn manual_control_without_vision_still_goes_out() {
+        let world = World::new(3, 3);
+        let mut rig = Rig::new(true);
+        let manual = ManualCommand { team: 0, id: 1, vx: 0.3, vy: 0.0, omega: 0.0 };
+        rig.manual.insert((0, 1), (manual, 0));
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.4, 0.0));
+        let (cmds, _) = rig.step(TickMode::Play, &world, &mut d);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!((cmds[0].id, cmds[0].vx), (1, 0.3));
+        assert!(ceros_si_no_hay_comandos(&cmds, &world, 0, 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn closing_the_loop_zeroes_every_own_id_even_without_vision() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let radio = TokioMutex::new(crate::radio::Radio::new(Box::new(MockTransport {
+            sent: sent.clone(),
+        })));
+        let world = TokioRwLock::new(World::new(3, 3));
+        parada_del_lazo(&radio, &world, 1, 3).await;
+        let frames = sent.lock().unwrap();
+        assert_eq!(frames.len(), crate::parada::PARADA_FRAMES);
+        for frame in frames.iter() {
+            let mut ids: Vec<i32> = frame.iter().map(|c| c.id).collect();
+            ids.sort();
+            assert_eq!(ids, vec![0, 1, 2]);
+            assert!(frame.iter().all(|c| c.team == 1
+                && c.motion.vx == 0.0
+                && c.motion.vy == 0.0
+                && c.motion.omega == 0.0));
+        }
     }
 
     #[test]

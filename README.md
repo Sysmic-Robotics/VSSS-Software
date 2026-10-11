@@ -106,7 +106,8 @@ visión no los vea (así siempre sale un frame en cero), y prevalece sobre coach
 manual y skills. Mientras está activa no actúan el `ZoneGuard` ni la recuperación de atasco.
 Se libera con **Soltar la parada**, y cada robot retoma sin estado heredado: sin la maniobra
 de escape interrumpida, con la rampa desde cero y la skill reiniciada. Es el mismo camino que
-toma el loop en HALT del árbitro. El watchdog del firmware (200 ms) queda como red final.
+toma el loop en HALT del árbitro. El watchdog del firmware (200 ms) solo cubre la pérdida
+de radio (ver **Parada segura**).
 
 **Skill para el robot elegido** (validador visual, en Herramientas): se elige una skill del
 catálogo o **ninguna (coach)**, y un click en la cancha fija el target (marcador blanco). La
@@ -223,7 +224,7 @@ cargo run --bin skill_test --release -- --transport base-station --mode vw --tea
 cargo run --bin skill_test --release -- --transport base-station --mode vw --team blue --robot 1 --v 300  --w 45  --dur 2   # arco hacia la izquierda (radio ≈ 0.38 m)
 ```
 
-Smoke test del watchdog (200 ms en firmware, `COMM_TIMEOUT_MS` en `config.h`): con los robots moviéndose, `Ctrl+C` y deben detenerse rápido.
+`Ctrl+C` manda ceros antes de salir (ver **Parada segura**). Smoke test del watchdog (200 ms en firmware, `COMM_TIMEOUT_MS` en `config.h`), que solo actúa si se pierde la radio: con los robots moviéndose, desenchufar la base; deben detenerse rápido.
 
 ---
 
@@ -278,6 +279,7 @@ src/
 ├── main.rs                # Wrapper: lee env, arma CoachDecider, llama run_control_loop
 ├── lib.rs
 ├── control_loop.rs        # Loop 60 Hz único. TickDecider trait + CoachDecider + FixedSkillDecider
+├── parada.rs              # Parada segura: ceros al terminar, señales, GUI supervisada
 ├── skill_log.rs           # CsvLogger + CsvRow + SkillLogCtx::build_skill_row (fuente única del CSV)
 ├── vision.rs              # Recepción multicast (FIRA o SSL_WrapperPacket) + filtros
 ├── bin/
@@ -513,6 +515,17 @@ Ambos se recortan a los topes de arriba. Convención: `omega > 0` → `w > 0` �
 
 **Frame serial:** `"V1,W1,V2,W2,V3,W3,V4,W4,V5,W5\n"` (enteros decimales, terminador `\n`), 115200 baud. Solo se incluyen comandos del equipo propio (`VSSL_TEAM_COLOR`). La base descarta una línea con decimales y sigue enviando el comando anterior. **No tiene timeout de serial**: si el PC deja de mandar, repite lo último; el watchdog de 200 ms del robot solo cubre la pérdida de radio.
 
+**Parada segura** (`src/parada.rs`): como la base no tiene timeout de serial, el software nunca termina ni se queda callado con un robot en movimiento. Todas las paradas mandan **6 frames en cero, uno cada 50 ms** (~300 ms), con cero para cada id propio, lo vea o no la visión (el mismo armado de HALT). Paran así:
+
+- **Señales:** Ctrl+C, SIGTERM (`kill`, `timeout`) y SIGHUP (cerrar la terminal), en `main`, `skill_test` y `scenario`.
+- **GUI:**
+  - al cerrar la ventana, o con un pánico en la GUI o en el lazo, el proceso espera los ceros antes de salir: código 0, 1 si la GUI devolvió error, 101 si hubo un pánico;
+  - si el lazo termina primero (una señal, el fin de la duración), la GUI se cierra sola.
+- **Fin del lazo:** por `--dur`, `max_ticks` o el watchdog de visión de `skill_test`, y un error de envío en `skill_test --mode vw`.
+- **Tick sin comandos:** si la visión no ve a ningún robot propio, o con `VSSL_COACH=none`, el lazo manda cero a todos los ids propios en vez de callarse.
+
+Lo que el PC no puede atrapar (`kill -9`, un `abort`, el OOM killer, un corte de luz, el USB desconectado) solo lo cubre un timeout de serial en la base, pendiente en el firmware.
+
 **NaN/Inf safety:** si cualquier campo del `MotionCommand` no es finito, `command_to_vw` devuelve `(0, 0)` sin pánico.
 
 **Bring-up directo** (sin skills): `BaseStationTransport::send_raw_vw_frame(slots)` o el binario `skill_test --mode vw --v MM_S --w DEG_S`.
@@ -651,7 +664,7 @@ Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt`
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (491 tests)
+cargo test --lib                 # solo lib (506 tests)
 cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (24 tests)
 cargo test --bin match_director  # director de partido de FIRASim (5 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
@@ -659,7 +672,7 @@ cargo test --bin skill_test      # parser del CLI, perfiles y corte de seguridad
 python3 -m unittest discover -s tools -p 'test_*.py'   # sysid, lectura de los CSV y medición del lazo (22 tests)
 ```
 
-**553 tests de Rust** (más 22 de Python: sysid, lectura de los CSV y medición del lazo) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración), foto del lazo para la GUI (publicar nunca espera, temporización, fuente de cada comando, consultar el estado de la skill no cambia los comandos, contadores de visión) y GUI (vista y orientación, regla y área del reglamento, parches del Anexo 1, frases de la barra de estado y de las filas, teclado del modo manual, contraste AA, fuentes tabulares, y la cancha dibujada con tiny-skia con datos no finitos).
+**568 tests de Rust** (más 22 de Python: sysid, lectura de los CSV y medición del lazo) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración), foto del lazo para la GUI (publicar nunca espera, temporización, fuente de cada comando, consultar el estado de la skill no cambia los comandos, contadores de visión) y GUI (vista y orientación, regla y área del reglamento, parches del Anexo 1, frases de la barra de estado y de las filas, teclado del modo manual, contraste AA, fuentes tabulares, y la cancha dibujada con tiny-skia con datos no finitos) y parada segura (ceros al terminar, también con un pánico, señales, GUI supervisada y tick sin comandos).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

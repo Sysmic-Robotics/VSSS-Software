@@ -152,8 +152,8 @@ MODO vw CON PERFIL (sysid, ver tools/sysid_procedimiento.txt):
                          dentro de la caja.
     SEGURIDAD: la base NO tiene timeout de serial; si skill_test muere sin mandar
     ceros, la base repite el último comando para siempre. Siempre debe haber
-    alguien listo para levantar el robot o desenchufar la base. Cortar SOLO con
-    Ctrl+C (manda ceros); nunca matar el proceso.
+    alguien listo para levantar el robot o desenchufar la base. Ctrl+C, SIGTERM
+    (kill) y cerrar la terminal mandan ceros; kill -9 NO.
 
 SECUENCIA DE BRING-UP (modo vw). Encender el robot QUIETO (calibra el gyro);
 --dur 2 por paso. Si algo falla, parar y anotar qué pasó.
@@ -632,12 +632,14 @@ async fn run_vw_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), Strin
     let mut tick: u32 = 0;
     let mut last_print = Instant::now() - Duration::from_secs(2);
 
+    // Un error de envío corta el bucle, pero también pasa por la parada antes de salir.
+    let mut error_de_envio: Option<String> = None;
     while !shutdown.load(Ordering::Relaxed) && Instant::now() < deadline {
         interval.tick().await;
-        transport
-            .send_raw_vw_frame(slots)
-            .await
-            .map_err(|e| format!("send error: {e}"))?;
+        if let Err(e) = transport.send_raw_vw_frame(slots).await {
+            error_de_envio = Some(format!("send error: {e}"));
+            break;
+        }
 
         let t_ms = started.elapsed().as_millis() as u64;
         let frame = build_frame_from_vw(slots);
@@ -684,11 +686,13 @@ async fn run_vw_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), Strin
         tick = tick.wrapping_add(1);
     }
 
-    eprintln!("[skill_test] stop secuence (5 frames a cero)");
-    for _ in 0..5 {
-        let _ = transport.send_raw_vw_frame(zero_slots).await;
+    eprintln!("[skill_test] parada: frames en cero");
+    rustengine::parada::mandar_ceros(async || transport.send_raw_vw_frame(zero_slots).await)
+        .await;
+    match error_de_envio {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 
@@ -948,7 +952,7 @@ async fn run_vw_profile(args: &Args, profile: &sysid::Profile, shutdown: Arc<Ato
         interval.tick().await;
         let t = started.elapsed().as_secs_f64() - t0;
         if shutdown.load(Ordering::Relaxed) {
-            break Some("interrumpido (Ctrl+C)".to_string());
+            break Some("interrumpido (señal de terminación)".to_string());
         }
         if t >= profile.duration_s() {
             break None;
@@ -958,7 +962,10 @@ async fn run_vw_profile(args: &Args, profile: &sysid::Profile, shutdown: Arc<Ato
             break Some(format!("cortado: {reason}"));
         }
         let vw = profile.at(t);
-        out.send(args, vw).await?;
+        // Un error de envío también pasa por la parada antes de salir.
+        if let Err(e) = out.send(args, vw).await {
+            break Some(format!("cortado: {e}"));
+        }
         let _ = csv.write_row(&vw_row(args, now_ms() as u64, tick, vw, pose));
         if last_print.elapsed() >= Duration::from_secs(1) {
             eprintln!("[skill_test t={t:.1}/{:.1}s] vw=({},{})", profile.duration_s(), vw.0, vw.1);
@@ -967,11 +974,13 @@ async fn run_vw_profile(args: &Args, profile: &sysid::Profile, shutdown: Arc<Ato
         tick = tick.wrapping_add(1);
     };
 
-    eprintln!("[skill_test] fin del perfil: 5 frames a cero");
-    for _ in 0..5 {
-        let _ = out.send(args, (0, 0)).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    eprintln!("[skill_test] fin del perfil: frames en cero");
+    rustengine::parada::mandar_ceros(async || {
+        out.send(args, (0, 0))
+            .await
+            .map_err(rustengine::radio::TransportError::from)
+    })
+    .await;
     // Medio segundo más de poses para ver el frenado.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let label = status.clone().unwrap_or_else(|| "completo".to_string());
@@ -1152,15 +1161,13 @@ fn main() {
     rustengine::params::TeamParams::install_or_exit("skill_test");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
+    // SIGINT, SIGTERM o SIGHUP: el modo en curso para con ceros antes de salir.
     let shutdown = Arc::new(AtomicBool::new(false));
     {
-        let shutdown = shutdown.clone();
-        rt.spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("[skill_test] Ctrl-C recibido, deteniendo...");
-                shutdown.store(true, Ordering::Relaxed);
-            }
-        });
+        let _runtime = rt.enter();
+        if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
+            eprintln!("[skill_test] no pude registrar las señales de terminación: {e}");
+        }
     }
 
     let result = rt.block_on(async {
