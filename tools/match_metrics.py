@@ -234,14 +234,24 @@ def audit_rules(ticks, own_team, attack_sign) -> dict:
     # oscila sobre la línea del área cuenta una vez, como lo cobraría el árbitro.
     last_in = {"own_area": -EPISODE_GAP_TICKS, "opp_area": -EPISODE_GAP_TICKS}
     ball_in_own = ball_in_opp = 0
+    # El arquero propio sigue siéndolo mientras despeja (`clear`) o espera (`hold`): se recuerda
+    # el último robot que tuvo `goalkeep`. Elegir "el más cercano al arco" en esos ticks tomaba
+    # por arquero a un defensor frente al arco y contaba como falta al arquero en la esquina del área.
+    keeper_id = None
     for i, e in enumerate(ticks):
         own = [r for r in e["robots"] if r["own"] and r["pos"][0] is not None]
         opp = [r for r in e["robots"] if not r["own"] and r["pos"][0] is not None]
         if not own or not opp:
             continue
-        keeper = next((r for r in own if r["skill"] == "goalkeep"), None) or min(own, key=lambda r: dist(r["pos"], own_goal))
+        tagged = next((r for r in own if r["skill"] == "goalkeep"), None)
+        if tagged is not None:
+            keeper_id = tagged["id"]
+        keeper = (next((r for r in own if r["id"] == keeper_id), None)
+                  or min(own, key=lambda r: dist(r["pos"], own_goal)))
         opp_keeper = min(opp, key=lambda r: dist(r["pos"], opp_goal))
-        own_field_in = [r for r in own if r is not keeper and in_area(r["pos"], own_side)]
+        # En STOP/HALT (skill `hold`) no hay juego: el que cruzó la línea al silbato no cuenta
+        # (el árbitro repone); el guardia de zonas solo actúa en juego.
+        own_field_in = [r for r in own if r is not keeper and r["skill"] != "hold" and in_area(r["pos"], own_side)]
         opp_field_in = [r for r in opp if r is not opp_keeper and in_area(r["pos"], opp_side)]
         own_attackers_in = [r for r in own if in_area(r["pos"], opp_side)]
         opp_attackers_in = [r for r in opp if in_area(r["pos"], own_side)]

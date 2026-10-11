@@ -38,6 +38,11 @@ const STUCK_DIST: f64 = 0.05;
 const MARK_X: f64 = 0.375;
 const MARK_Y: f64 = 0.40;
 const MARK_OFFSET: f64 = 0.20;
+/// Área del arquero (frente en |x| = 0.60, mitad del ancho 0.35) y holgura con la que la
+/// reposición deja a los jugadores de campo fuera de ella.
+const AREA_X: f64 = 0.60;
+const AREA_HALF_Y: f64 = 0.35;
+const AREA_KEEP_OUT: f64 = 0.10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Team {
@@ -218,6 +223,8 @@ fn free_ball_placement(ball: (f64, f64), robots: &[Seen], attack_sign: impl Fn(T
         let s = attack_sign(team);
         let theta = if s > 0.0 { 0.0 } else { 180.0 };
         let dist = |r: &Seen| ((r.x - mark.0).powi(2) + (r.y - mark.1).powi(2)).sqrt();
+        let own_side = -s;
+        let in_own_area = |x: f64, y: f64| x * own_side > AREA_X - AREA_KEEP_OUT && y.abs() < AREA_HALF_Y + AREA_KEEP_OUT;
         let mut own: Vec<Seen> = robots.iter().copied().filter(|r| r.team == team).collect();
         // Arquero (id 2) al final: que coloque a un jugador de campo si lo hay.
         own.sort_by(|a, b| (a.id == 2, dist(a)).partial_cmp(&(b.id == 2, dist(b))).unwrap());
@@ -225,8 +232,17 @@ fn free_ball_placement(ball: (f64, f64), robots: &[Seen], attack_sign: impl Fn(T
             if i == 0 {
                 items.push(TeleportItem::Robot { team: team.fira_id(), id: r.id, x: mark.0 - s * MARK_OFFSET, y: mark.1, theta });
             } else if r.id != 2 && dist(r) < 0.35 {
-                let x = (r.x - s * 0.35).clamp(-0.70, 0.70);
+                // Hacia su arco, pero nunca dentro de su propia área (solo el arquero puede
+                // estar ahí): si el corrimiento cae en el área, se queda frente a ella.
+                let mut x = (r.x - s * 0.35).clamp(-0.70, 0.70);
+                if in_own_area(x, r.y) {
+                    x = own_side * (AREA_X - AREA_KEEP_OUT);
+                }
                 items.push(TeleportItem::Robot { team: team.fira_id(), id: r.id, x, y: r.y, theta });
+            } else if r.id != 2 && in_own_area(r.x, r.y) {
+                // Quedó dentro de su área al silbato (cruzó la línea frenando): el árbitro lo
+                // saca antes de reanudar, para que una falta en juego sea siempre del engine.
+                items.push(TeleportItem::Robot { team: team.fira_id(), id: r.id, x: own_side * (AREA_X - AREA_KEEP_OUT), y: r.y, theta });
             }
         }
     }
@@ -529,6 +545,26 @@ mod tests {
         // Los arqueros no se tocan aunque estén cerca de la cruz.
         assert!(!placed.iter().any(|&(_, id, _, _)| id == 2), "{placed:?}");
         assert!(matches!(items[0], TeleportItem::Ball { x, y, .. } if x == 0.375 && y == 0.40));
+    }
+
+    #[test]
+    fn free_ball_never_shoves_a_field_robot_into_its_own_area() {
+        // Azul defiende +x. Azul 1 está cerca de la cruz Q1 frente a su área: correrlo 0.35 m
+        // hacia su arco lo dejaría en x = 0.70 (adentro); se queda frente al área.
+        let robots = [
+            Seen { team: Team::Blue, id: 0, x: 0.30, y: 0.45 },
+            Seen { team: Team::Blue, id: 1, x: 0.45, y: 0.20 },
+            Seen { team: Team::Blue, id: 2, x: 0.68, y: 0.00 },
+            Seen { team: Team::Yellow, id: 0, x: -0.30, y: 0.00 },
+            Seen { team: Team::Yellow, id: 1, x: -0.40, y: 0.30 },
+            Seen { team: Team::Yellow, id: 2, x: -0.68, y: 0.00 },
+        ];
+        let (_, items) = free_ball_placement((0.50, 0.50), &robots, |t| if t == Team::Blue { -1.0 } else { 1.0 });
+        let blue1 = items.iter().find_map(|i| match *i {
+            TeleportItem::Robot { team: 0, id: 1, x, y, .. } => Some((x, y)),
+            _ => None,
+        });
+        assert_eq!(blue1, Some((0.50, 0.20)), "{items:?}");
     }
 
     #[test]
