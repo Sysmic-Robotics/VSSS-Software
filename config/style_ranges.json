@@ -16,7 +16,7 @@
   "standoff_from_ball": [0.2, 0.4],
   "support_depth": [0.1, 0.5],
   "press_distance": [0.15, 0.6],
-  "mark_distance": [0.1, 0.3],
+  "mark_distance": [0.1, 0.45],
   "gk_engage_margin": [0.0, 0.25],
   "gk_clear_max_ball_speed": [0.05, 0.3]
 }

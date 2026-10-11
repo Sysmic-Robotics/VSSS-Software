@@ -132,6 +132,7 @@ def main() -> int:
     ap.add_argument("--vision-port", type=int, default=10002)
     ap.add_argument("--cmd-port", type=int, default=20011)
     ap.add_argument("--referee-port", type=int, default=10003)
+    ap.add_argument("--keep-work", action="store_true", help="conservar CSV y logs de cada partido en WORK")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -145,7 +146,7 @@ def main() -> int:
             for k in range(max(1, args.sims))]
     runners: "queue.Queue[MatchRunner]" = queue.Queue()
     for k, sim in enumerate(sims):
-        runners.put(MatchRunner(sim, args.minutes, args.goals, args.referee_port + k))
+        runners.put(MatchRunner(sim, args.minutes, args.goals, args.referee_port + k, keep_work=args.keep_work))
     pool = ThreadPoolExecutor(max_workers=len(sims))
     results: list[dict] = []
     log = open(args.out / "partidos.jsonl", "a", encoding="utf-8")
