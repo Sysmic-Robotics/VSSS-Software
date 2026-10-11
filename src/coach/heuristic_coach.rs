@@ -284,6 +284,16 @@ impl HeuristicCoach {
         (p.x * -s) >= GOAL_AREA_X && p.y.abs() <= GOAL_AREA_HALF_Y
     }
 
+    /// `true` si la pelota en `p` es del arquero: está dentro del área propia o a menos de
+    /// un robot de su borde o de su arco, donde un jugador de campo no puede ponerse detrás
+    /// de ella sin tocar el área (el guardia lo frena en la línea y la disputa con el
+    /// arquero y los rivales termina con alguien empujado adentro).
+    pub fn ball_is_keepers(&self, p: Vec2) -> bool {
+        use crate::skills::zones::{AreaRect, ROBOT_HALF};
+        const BALL_RADIUS: f32 = 0.02;
+        AreaRect::own(self.attack_sign()).touches_with(p, ROBOT_HALF + BALL_RADIUS)
+    }
+
     /// `true` si `p` está en la mitad de cancha propia.
     fn in_own_half(&self, p: Vec2) -> bool {
         p.x * self.attack_sign() < 0.0
@@ -769,7 +779,8 @@ impl HeuristicCoach {
         let slow = ball_vel.length() <= self.p.gk_clear_max_ball_speed;
         let carried = ball_vel.length() <= self.p.gk_engage_max_ball_speed
             && opp.iter().any(|o| o.active && (o.pos - ball).length() <= self.p.gk_engage_opp_dist);
-        let parked = in_area && slow;
+        // Parada en el área o pegada a su borde: nadie más puede jugarla.
+        let parked = self.ball_is_keepers(ball) && slow;
         let overdue = in_area && self.ball_seconds_in_own_area() >= self.p.gk_force_clear_s;
         let challenge = carried && self.near_own_area(ball);
         if parked || overdue || challenge {
@@ -909,6 +920,7 @@ impl Coach for HeuristicCoach {
         let keeper_active = keeper_choice.is_some();
         let keeper_clearing = keeper_choice.is_some_and(|c| c.skill_id == SkillId::Clear);
         let ball_in_own_area = self.in_own_area(ball) && keeper_active;
+        let ball_on_area_edge = self.ball_is_keepers(ball) && keeper_active;
 
         let mut choices = Vec::with_capacity(3);
         for r in own.iter().filter(|r| r.active) {
@@ -921,6 +933,12 @@ impl Coach for HeuristicCoach {
                 Some(Role::Striker) if keeper_clearing => {
                     let skill = self.commit(r.id, SkillId::Mark, |_| true);
                     SkillChoice::new(r.id, skill, self.standoff_point(ball))
+                }
+                Some(Role::Striker) if ball_on_area_edge => {
+                    // Pelota pegada al área y el arquero aún no la juega: regla, no
+                    // preferencia (sin compromiso con la skill anterior), cubre la línea.
+                    let skill = self.commit(r.id, SkillId::BlockLine, |_| false);
+                    SkillChoice::new(r.id, skill, self.own_goal)
                 }
                 Some(Role::Striker) if self.holds_press_line(r, ball, &opp) => {
                     let skill = self.commit(r.id, SkillId::Mark, |_| true);
@@ -1241,6 +1259,30 @@ mod tests {
         let mut c2 = coach();
         let ch2 = c2.decide(&o2);
         assert_ne!(choice_of(&ch2, 0).skill_id, SkillId::BlockLine);
+    }
+
+    #[test]
+    fn ball_on_the_area_edge_belongs_to_the_keeper() {
+        // Pelota 5 cm fuera de la línea del área (fuera del rectángulo estricto): un
+        // jugador de campo no puede ponerse detrás sin tocar el área. Quieta: el arquero
+        // sale a despejarla y el striker espera a la distancia de apoyo. En movimiento: el
+        // arquero sigue en su arco y el striker cubre la línea, sin compromiso con la skill
+        // que traía.
+        let edge = Vec2::new(-0.55, 0.30);
+        let mut c = coach();
+        assert!(!c.in_own_area(edge) && c.ball_is_keepers(edge));
+        assert!(!c.ball_is_keepers(Vec2::new(-0.50, 0.20)), "a 10 cm del área sigue siendo jugable");
+        let robots = [Vec2::new(-0.40, 0.30), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)];
+        let ch = c.decide(&obs(edge, Vec2::ZERO, robots));
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::Clear);
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::Mark);
+        let mut c = coach();
+        let moving = obs(Vec2::new(-0.20, 0.30), Vec2::new(-0.6, 0.0), robots);
+        let ch_far = c.decide(&moving);
+        assert_ne!(choice_of(&ch_far, 0).skill_id, SkillId::BlockLine, "lejos del área el striker juega");
+        let ch = c.decide(&obs(edge, Vec2::new(-0.6, 0.0), robots));
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::BlockLine, "cambio inmediato, sin compromiso");
     }
 
     #[test]
