@@ -661,6 +661,12 @@ impl HeuristicCoach {
         if !Self::shot_blocked(ball, goal_target, opp) {
             return false;
         }
+        // En pleno duelo (rival a < 0.20 m de la pelota) el pase no sale: en los registros
+        // llegaba el 8 % de las veces, contra 25-35 % con el rival más lejos.
+        let duel = opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.20);
+        if duel {
+            return false;
+        }
         let d = (mate - ball).length();
         (0.25..=0.90).contains(&d)
             && (mate.x - ball.x) * s >= -0.10
@@ -813,14 +819,16 @@ impl HeuristicCoach {
         // Atacando: receptor de pase a la par de la pelota, en el carril contrario al
         // striker (o al lado libre), con línea de tiro al arco y lejos de los rivales. En
         // los registros el apoyo esperaba detrás de la pelota y nunca era opción de pase.
-        // Carriles en el marco de la cancha: a la par en x, al otro lado en y.
+        // Carriles en el marco de la cancha: en diagonal adelante (0.25 m hacia el arco
+        // rival) y al otro lado en y. En los registros, los pases a un receptor 0.30 m
+        // adelantado llegaban el doble que a uno a la par.
         let preferred = match striker {
             Some(st) if (st.pos.y - ball.y).abs() > 0.02 => -(st.pos.y - ball.y).signum(),
             _ => -ball.y.signum(),
         };
         let preferred = if preferred == 0.0 { 1.0 } else { preferred };
         let candidate = |side: f32| -> Option<Vec2> {
-            let raw = Vec2::new(ball.x + s * 0.05, ball.y + self.p.pass_receiver_offset * side);
+            let raw = Vec2::new(ball.x + s * 0.25, ball.y + self.p.pass_receiver_offset * side);
             // Si el carril de ese lado no existe (pelota pegada a la banda), no es opción.
             (raw.y.abs() <= FIELD_ROBOT_MAX_ABS_Y).then(|| self.receiver_point(raw, ball))
         };

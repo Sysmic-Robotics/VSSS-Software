@@ -681,11 +681,12 @@ mod tests {
     #[test]
     fn style_ranges_file_matches_coach_defaults() {
         // Cada clave de config/style_ranges.json es un parámetro numérico del coach y
-        // el default del código cae dentro de su rango (son los 20 de estilo del TDP).
+        // el default del código cae dentro de su rango (los 20 de estilo del TDP más el
+        // receptor de pase).
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(CoachParams::STYLE_RANGES_PATH);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
         let ranges = CoachParams::default().check_style_ranges(&text).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(ranges.len(), 20, "la lista blanca de estilo tiene 20 parámetros");
+        assert_eq!(ranges.len(), 21, "la lista blanca de estilo tiene 21 parámetros");
         assert!(ranges.contains_key("press_distance") && ranges.contains_key("support_depth"));
         // Y también lo cumple el JSON del repo.
         let repo = TeamParams::from_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH)).unwrap();
