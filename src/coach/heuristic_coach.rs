@@ -531,8 +531,14 @@ impl HeuristicCoach {
         // staging, se queda quieto (un tiro tapado vale más que no tirar). No es cero
         // para que el compromiso mínimo siga evitando el ping-pong approach↔shoot.
         let staging_far = clamp01(dist_ball / (2.0 * sp.approach_staging_offset + 0.6));
+        // Ya en el staging y el empuje sigue infactible (pelota en la pared: el staging se
+        // clampa al campo lógico y el robot para a más de la tolerancia lateral): seguir en
+        // approach es quedarse quieto; que gane el giro.
+        let at_staging = crate::skills::tactical::ApproachAlignedSkill::new(target)
+            .staging_point(ball)
+            .is_some_and(|st| (st - r.pos).length() <= sp.approach_pos_tol);
         let approach = p.score_approach_base
-            * if shoot > 0.0 { p.score_approach_when_feasible } else { 1.0 - 0.3 * staging_far };
+            * if shoot > 0.0 || at_staging { p.score_approach_when_feasible } else { 1.0 - 0.3 * staging_far };
 
         [
             (SkillId::ShootPush, clamp01(shoot)),
@@ -1513,6 +1519,29 @@ mod tests {
         let st = sk.staging_point(ball).unwrap();
         assert!(st.y > ball.y && st.x <= 0.70, "staging por detrás, dentro del campo: {st:?}");
         assert!(crate::skills::tactical::shoot_push_feasible_now(st, ball, c.striker_target(ball, &[])));
+    }
+
+    #[test]
+    fn striker_parked_at_a_wall_staging_with_no_push_switches_to_spin() {
+        // Traza real: pelota quieta en la banda, striker ya en el staging (clampado al campo
+        // lógico, 6 cm fuera de la línea de empuje): ShootPush infactible por 1 cm y approach
+        // "terminado" sin moverse 8 s. Con el empuje infactible y el staging alcanzado, el
+        // giro tiene que ganar aunque la adaptación lo haya castigado.
+        let p = CoachParams { score_hysteresis: 0.2, ..CoachParams::default() };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        let ball = Vec2::new(0.28, 0.63);
+        // Primero llega desde lejos (se compromete con approach)...
+        let far = [Vec2::new(-0.10, 0.30), Vec2::new(-0.20, -0.30), Vec2::new(-0.68, 0.0)];
+        let ch = c.decide(&obs(ball, Vec2::ZERO, far));
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::ApproachAligned);
+        // ...y ya en el staging, pasado el compromiso mínimo, cambia al giro.
+        let parked = [Vec2::new(0.20, 0.57), Vec2::new(-0.20, -0.30), Vec2::new(-0.68, 0.0)];
+        let mut last = SkillId::ApproachAligned;
+        for _ in 0..(CoachParams::default().skill_min_hold + 2) {
+            last = choice_of(&c.decide(&obs(ball, Vec2::ZERO, parked)), 0).skill_id;
+        }
+        assert_eq!(last, SkillId::SpinKick, "{:?}", c.last_striker_scores());
     }
 
     #[test]
