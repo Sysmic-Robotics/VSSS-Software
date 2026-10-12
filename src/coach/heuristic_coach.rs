@@ -291,7 +291,10 @@ impl HeuristicCoach {
     pub fn ball_is_keepers(&self, p: Vec2) -> bool {
         use crate::skills::zones::{AreaRect, ROBOT_HALF};
         const BALL_RADIUS: f32 = 0.02;
-        AreaRect::own(self.attack_sign()).touches_with(p, ROBOT_HALF + BALL_RADIUS)
+        // Contra el fondo, fuera del área, el arquero tampoco puede ponerse detrás: esa
+        // pelota es del giro del striker.
+        self.in_own_area(p)
+            || (!self.ball_on_end_wall(p) && AreaRect::own(self.attack_sign()).touches_with(p, ROBOT_HALF + BALL_RADIUS))
     }
 
     /// `true` si `p` está en la mitad de cancha propia.
@@ -378,20 +381,33 @@ impl HeuristicCoach {
         let s = self.attack_sign();
         let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
         let attacking_end = ball.x * s > 0.0;
-        if self.ball_on_end_wall(ball) {
+        let corner = self.ball_on_end_wall(ball) && self.ball_on_side_wall(ball);
+        if corner {
+            // Esquina: no hay dónde ponerse detrás; el objetivo solo orienta al giro
+            // (SpinKick la saca hacia ahí). Rival: al frente del arco. Propia: por la banda.
             return if attacking_end {
-                // Fondo/esquina rival: sacarla al frente del arco (segunda pelota).
                 Vec2::new(s * (GOAL_AREA_X - 0.12), -side * 0.10)
             } else {
-                // Fondo/esquina propia: despejar por la banda hacia adelante.
                 Vec2::new(s * 0.20, side * 0.50)
             };
         }
+        if self.ball_on_end_wall(ball) {
+            // Contra el fondo solo se puede empujar A LO LARGO de la pared: cualquier
+            // objetivo hacia el campo deja el staging dentro de la pared y el robot se queda
+            // frente a la pelota sin poder empujarla (`clear` congelado 20 s en los registros).
+            // Fondo rival: hacia la boca del arco; propio: hacia la esquina, de donde el giro
+            // la saca por la banda.
+            return if attacking_end {
+                Vec2::new(ball.x, side * (GOAL_HALF_Y - 0.05))
+            } else {
+                Vec2::new(ball.x, side * 0.70)
+            };
+        }
         if self.ball_on_side_wall(ball) {
-            // Banda: conducir a lo largo de la banda con un ángulo suave hacia adentro
-            // (~13°), para que la pelota se despegue de la pared camino al arco. Más
-            // ángulo deja el staging detrás de la pelota dentro de la pared.
-            return Vec2::new(ball.x + s * 0.35, side * (ball.y.abs() - 0.08));
+            // Banda: conducir a lo largo de la pared, sin ángulo. Con 13° hacia adentro el
+            // staging caía en la pared y, clampado al campo lógico, quedaba justo en la
+            // tolerancia lateral del empuje: approach↔shoot sin tocar la pelota.
+            return Vec2::new(ball.x + s * 0.35, ball.y);
         }
         if self.in_own_half(ball) && (ball.x * -s) > 0.35 {
             return self.clear_target(ball);
@@ -480,7 +496,10 @@ impl HeuristicCoach {
         let depth = ball.x * -s; // distancia "hacia nuestro arco" desde el centro
         let danger = clamp01((depth - p.clear_zone_start_x) / (p.clear_zone_full_x - p.clear_zone_start_x).max(1e-3));
         let pressure = clamp01(1.0 - min_opp_dist / 0.30);
-        let clear = if self.in_own_half(ball) { danger * (0.6 + 0.4 * pressure) } else { 0.0 };
+        // En una pared el despeje hacia el campo no tiene staging: la saca ShootPush a lo
+        // largo de la pared o el giro.
+        let on_wall = self.ball_on_side_wall(ball) || self.ball_on_end_wall(ball);
+        let clear = if self.in_own_half(ball) && !on_wall { danger * (0.6 + 0.4 * pressure) } else { 0.0 };
 
         // SpinKick: pelota quieta y disputada (rival encima) o en el fondo/esquina,
         // con el robot cerca; pierde valor si igual se puede empujar.
@@ -1471,9 +1490,46 @@ mod tests {
         let ball = Vec2::new(0.0, 0.58);
         let t = c.striker_target(ball, &[]);
         assert!(t.x > ball.x, "debe empujar hacia adelante: {t:?}");
-        assert!(t.y > 0.0 && t.y < ball.y, "ángulo suave hacia adentro: {t:?}");
+        assert_eq!(t.y, ball.y, "a lo largo de la pared, sin ángulo: {t:?}");
         // Sin pared: apunta al arco.
         assert_eq!(c.striker_target(Vec2::new(0.0, 0.2), &[]), ATTACK);
+    }
+
+    #[test]
+    fn ball_on_end_wall_is_pushed_along_the_wall() {
+        let c = coach();
+        // Fondo rival (atacamos +x), fuera de la esquina: a lo largo del fondo hacia la boca.
+        let t = c.striker_target(Vec2::new(0.73, 0.45), &[]);
+        assert_eq!(t.x, 0.73, "{t:?}");
+        assert!(t.y > 0.0 && t.y < 0.20, "hacia la boca del arco por la misma pared: {t:?}");
+        // Fondo propio: a lo largo del fondo hacia la esquina (de ahí la saca el giro).
+        let t = c.striker_target(Vec2::new(-0.73, -0.40), &[]);
+        assert_eq!(t.x, -0.73, "{t:?}");
+        assert!(t.y < -0.40, "hacia la esquina: {t:?}");
+        // El staging de approach queda dentro del campo lógico y detrás de la pelota sobre
+        // la línea de empuje: el empuje es factible desde ahí.
+        let ball = Vec2::new(0.73, 0.45);
+        let sk = crate::skills::tactical::ApproachAlignedSkill::new(c.striker_target(ball, &[]));
+        let st = sk.staging_point(ball).unwrap();
+        assert!(st.y > ball.y && st.x <= 0.70, "staging por detrás, dentro del campo: {st:?}");
+        assert!(crate::skills::tactical::shoot_push_feasible_now(st, ball, c.striker_target(ball, &[])));
+    }
+
+    #[test]
+    fn walls_disable_clear_and_end_wall_ball_is_not_the_keepers() {
+        let mut c = coach();
+        // Pelota quieta en nuestro fondo, fuera del área: Clear no tiene staging, así que
+        // no puntúa; el arquero no la reclama; el striker la juega (approach o giro).
+        let ball = Vec2::new(-0.73, 0.45);
+        assert!(!c.ball_is_keepers(ball));
+        let o = obs(ball, Vec2::ZERO, [Vec2::new(-0.40, 0.30), Vec2::new(0.2, -0.3), Vec2::new(-0.68, 0.0)]);
+        let ch = c.decide(&o);
+        assert_ne!(choice_of(&ch, 0).skill_id, SkillId::Clear);
+        assert_ne!(choice_of(&ch, 0).skill_id, SkillId::BlockLine);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        let r = RobotView { id: 0, pos: Vec2::new(-0.60, 0.45), theta: 0.0, active: true };
+        let scores = c.striker_scores(&r, ball, Vec2::ZERO, &[], c.striker_target(ball, &[]));
+        assert_eq!(scores.iter().find(|(s, _)| *s == SkillId::Clear).unwrap().1, 0.0);
     }
 
     #[test]
