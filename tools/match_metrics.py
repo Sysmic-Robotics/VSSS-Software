@@ -115,11 +115,11 @@ def infer_attack_sign(ticks, own_team):
 def play_start(ticks) -> int:
     """Índice del saque inicial: el engine arranca antes que el director y el registro
     empieza con la pelota y los robots donde quedó el partido anterior (a menudo la pelota
-    dentro del arco). El saque es el primer teleport de la pelota al centro: un salto de
-    más de 0.3 m que la deja a menos de 0.03 m del origen. Sin saque visible, 0."""
-    for i in range(1, len(ticks)):
-        b, prev = ticks[i]["ball"], ticks[i - 1]["ball"]
-        if math.hypot(b[0], b[1]) < 0.03 and math.hypot(b[0] - prev[0], b[1] - prev[1]) > 0.3:
+    dentro del arco). El saque es la primera vez que la pelota está en el centro (a menos de
+    0.03 m del origen): el teleport del director o, en un simulador recién abierto, la
+    posición inicial. Sin centro visible, 0."""
+    for i, e in enumerate(ticks):
+        if math.hypot(e["ball"][0], e["ball"][1]) < 0.03:
             return i
     return 0
 
