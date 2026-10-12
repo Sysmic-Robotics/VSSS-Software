@@ -17,6 +17,7 @@ use crate::radio::base_station::{SLOT_COUNT, build_frame_from_vw, command_to_vw}
 use crate::radio::{RadioTarget, TeamColor};
 use crate::skills::zones::AccionGuardia;
 use crate::skills::{Face, SkillId};
+use crate::rutinas::RutinaVista;
 use crate::snapshot::TickDebug;
 use crate::vision::VisionSource;
 use crate::world::RobotState;
@@ -326,10 +327,32 @@ pub const MATCH_CSV_HEADER: &str = "t_ms,tick,team,robot,own,skill,target_x,targ
 role,progress,feasible,face,nav_dest_x,nav_dest_y,nav_aim_x,nav_aim_y,nav_detour,nav_side,nav_reverse,\
 guard,guard_proj_x,guard_proj_y,escape_dx,escape_dy,arrival_s,coach_decision,striker,score_shoot,score_clear,\
 score_spin,score_intercept,score_approach,pick_score,pick,bonus_skill,commit_left,stall,stall_s,\
-adapt_shot_upper,adapt_shot_center,adapt_shot_lower,adapt_duel\n";
+adapt_shot_upper,adapt_shot_center,adapt_shot_lower,adapt_duel,\
+rutina,rutina_fase,puesto,repeticion,paso,accion\n";
 
-/// Cantidad de columnas de depuración al final de `MATCH_CSV_HEADER`.
+/// Cantidad de columnas de depuración después de las 21 de base de `MATCH_CSV_HEADER`.
 const MATCH_DEBUG_COLS: usize = 34;
+/// Cantidad de columnas de rutina al final de `MATCH_CSV_HEADER` (capability
+/// `rutinas-ejecucion`).
+const MATCH_RUTINA_COLS: usize = 6;
+
+/// Columnas de rutina de la fila del robot propio `id`: `rutina` (el id, sin comas),
+/// fase, puesto, repetición, paso (desde 1) y tipo del paso. Vacías sin rutina o si el
+/// robot no tiene puesto.
+fn columnas_rutina(rutina: Option<&RutinaVista>, id: i32) -> String {
+    let Some((v, r)) = rutina.and_then(|v| v.de_robot(id).map(|r| (v, r))) else {
+        return ",".repeat(MATCH_RUTINA_COLS - 1);
+    };
+    [
+        v.rutina.id.clone(),
+        v.fase.etiqueta().to_string(),
+        v.nombre_puesto(r.puesto).to_string(),
+        if v.repeticion > 0 { v.repeticion.to_string() } else { String::new() },
+        r.paso.map(|p| (p + 1).to_string()).unwrap_or_default(),
+        r.accion.unwrap_or_default().to_string(),
+    ]
+    .join(",")
+}
 
 /// Columnas de depuración de la fila del robot propio `id` (capability
 /// `depuracion-tick`), separadas por coma y sin comas adentro. Un dato que no existe
@@ -477,7 +500,7 @@ impl MatchLogger {
             let robot = rec.world.get_robot_state(cmd.id, cmd.team);
             writeln!(
                 self.file,
-                "{},{},{},{},1,{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},1,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 rec.t_ms,
                 rec.tick,
                 cmd.team,
@@ -495,7 +518,8 @@ impl MatchLogger {
                 cmd.vy,
                 cmd.omega,
                 ball_cols,
-                columnas_depuracion(rec.debug, cmd.id)
+                columnas_depuracion(rec.debug, cmd.id),
+                columnas_rutina(rec.rutina, cmd.id)
             )?;
         }
         // Rivales: solo pose.
@@ -520,7 +544,7 @@ impl MatchLogger {
                 r.velocity.y,
                 r.angular_velocity,
                 ball_cols,
-                ",".repeat(MATCH_DEBUG_COLS - 1)
+                ",".repeat(MATCH_DEBUG_COLS - 1 + MATCH_RUTINA_COLS)
             )?;
         }
         Ok(())
@@ -585,6 +609,7 @@ mod tests {
             choices,
             escaping: &[],
             debug: None,
+            rutina: None,
         }
     }
 
@@ -779,8 +804,64 @@ mod tests {
             l.split(',').nth(i).unwrap().to_string()
         };
         assert_eq!(col(lines[2], "ball_vx"), "0.2", "pelota en fila rival: {}", lines[2]);
-        assert!(lines[2].ends_with(&",".repeat(MATCH_DEBUG_COLS)), "depuración vacía en el rival");
+        assert!(
+            lines[2].ends_with(&",".repeat(MATCH_DEBUG_COLS + MATCH_RUTINA_COLS)),
+            "depuración y rutina vacías en el rival"
+        );
         assert_eq!(col(lines[1], "role"), "", "sin depuración, vacía");
+        assert_eq!(col(lines[1], "rutina"), "", "sin rutina, vacía");
+        assert!(MATCH_CSV_HEADER.trim_end().ends_with(",adapt_duel,rutina,rutina_fase,puesto,repeticion,paso,accion"));
+    }
+
+    #[test]
+    fn match_csv_carries_the_routine_columns() {
+        use crate::rutinas::vista::{Fase, RobotEnRutina, RutinaVista};
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, Vec2::new(0.1, 0.2), 0.0, Vec2::ZERO, 0.0);
+        world.update_robot(1, 0, Vec2::new(-0.3, -0.2), 0.0, Vec2::ZERO, 0.0);
+        world.update_robot(0, 1, Vec2::new(0.4, 0.0), 0.0, Vec2::ZERO, 0.0);
+        let rutina = crate::rutinas::prueba::rutina(&crate::rutinas::prueba::un_puesto(
+            r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }, { "paso": "ir", "x": 0.0, "y": 0.27 }"#,
+        ));
+        let mut rutina_id = (*rutina).clone();
+        rutina_id.id = "triangulo".to_string();
+        let vista = RutinaVista {
+            rutina: std::sync::Arc::new(rutina_id),
+            fase: Fase::Ejecutando,
+            frase: String::new(),
+            velocidad_pct: 100,
+            repeticion: 3,
+            repeticiones: crate::rutinas::Repeticiones::Veces(3),
+            robots: vec![RobotEnRutina {
+                robot: 1,
+                puesto: 0,
+                paso: Some(1),
+                total_pasos: 2,
+                accion: Some("ir"),
+                destino: Some(Vec2::new(0.0, 0.27)),
+            }],
+            resumen: None,
+        };
+        let cmd = |id: i32| MotionCommand { id, team: 0, vx: 0.0, vy: 0.0, omega: 0.0, orientation: 0.0 };
+        let commands = vec![cmd(0), cmd(1)];
+        let targets = [None, None];
+        let mut rec = empty_tick_record(&world, &commands, &targets, &[]);
+        rec.rutina = Some(&vista);
+        let path = std::env::temp_dir().join(format!("vsss_match_rutina_test_{}.csv", std::process::id()));
+        {
+            let mut logger = MatchLogger::new(&path, 0).unwrap();
+            logger.write_tick(&rec).unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        let ncols = MATCH_CSV_HEADER.trim_end().split(',').count();
+        for l in &lines {
+            assert_eq!(l.split(',').count(), ncols, "columnas en '{l}'");
+        }
+        assert!(lines[2].ends_with(",triangulo,ejecutando,A,3,2,ir"), "robot en rutina: {}", lines[2]);
+        assert!(lines[1].ends_with(&",".repeat(MATCH_RUTINA_COLS)), "robot sin puesto: {}", lines[1]);
+        assert!(lines[3].ends_with(&",".repeat(MATCH_RUTINA_COLS)), "rival: {}", lines[3]);
     }
 
     #[test]
@@ -838,7 +919,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let lines: Vec<&str> = text.lines().collect();
         let header: Vec<&str> = lines[0].split(',').collect();
-        assert_eq!(header.len(), 21 + MATCH_DEBUG_COLS);
+        assert_eq!(header.len(), 21 + MATCH_DEBUG_COLS + MATCH_RUTINA_COLS);
         let col = |l: &str, nombre: &str| -> String {
             let i = header.iter().position(|h| *h == nombre).unwrap();
             l.split(',').nth(i).unwrap().to_string()

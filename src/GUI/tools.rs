@@ -103,6 +103,7 @@ impl DebugGui {
             FrameMode::Robot => "W y S avanzan y retroceden, A y D giran. Esc sale del modo manual.",
         };
 
+        let rutina_en_curso = self.snap.rutina.as_ref().is_some_and(|v| v.fase.activa());
         column![
             titulo("Control manual"),
             entrar,
@@ -112,6 +113,11 @@ impl DebugGui {
             nota(ayuda),
             nota("Espacio detiene todo, en cualquier modo."),
         ]
+        .push_maybe(rutina_en_curso.then(|| {
+            text("Hay una rutina en curso: tomar en manual un robot asignado la aborta.")
+                .size(theme::TXT_CHICO)
+                .style(theme::alerta)
+        }))
         .spacing(theme::SP_SM)
         .into()
     }

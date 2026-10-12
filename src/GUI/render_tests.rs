@@ -162,6 +162,7 @@ fn cuadro(
     snap: &LoopSnapshot,
     skill_target: Option<Vec2>,
     trazas: &Trazas,
+    rutina: Option<&super::rutinas::DibujoRutina>,
 ) -> Vec<Capa> {
     let capas: std::collections::HashSet<Layer> = CAPAS.into_iter().collect();
     let cancha = FieldCanvas {
@@ -177,6 +178,7 @@ fn cuadro(
         capas: &capas,
         trazas,
         sim: true,
+        rutina: rutina.cloned(),
     };
     renderer.clear();
     let geometrias = canvas::Program::<super::Message>::draw(
@@ -213,7 +215,7 @@ fn tiny_skia_damage_stays_finite_with_moving_labels_and_non_finite_data() {
     let mut anteriores: Option<Vec<Capa>> = None;
     for (i, (snap, target)) in fotos().iter().enumerate() {
         trazas.registrar(snap);
-        let capas = cuadro(&mut renderer, &base, snap, *target, &trazas);
+        let capas = cuadro(&mut renderer, &base, snap, *target, &trazas, None);
         if let Some(prev) = &anteriores {
             // Lo mismo que hace el compositor de tiny-skia antes de presentar.
             let danio = damage::diff(prev, &capas, |c| vec![c.bounds], Capa::damage);
@@ -223,6 +225,39 @@ fn tiny_skia_damage_stays_finite_with_moving_labels_and_non_finite_data() {
                     !r.center().distance(Point::ORIGIN).is_nan(),
                     "cuadro {i}: rectángulo de daño con NaN {r:?}"
                 );
+            }
+            damage::group(danio, Rectangle::with_size(VENTANA));
+        }
+        anteriores = Some(capas);
+    }
+}
+
+/// La capa Rutina con la rutina asignada a robots con poses NaN e infinitas, y moviéndose
+/// entre cuadros (la asignación prevista y el paso en curso cambian): daño finito.
+#[test]
+fn routine_layer_damage_stays_finite_with_non_finite_robots() {
+    use super::rutinas::DibujoRutina;
+    let rutina = crate::rutinas::prueba::rutina(&crate::rutinas::prueba::un_puesto(
+        r#"{ "paso": "ir", "x": 0.3, "y": -0.25, "orientacion_deg": 90 }, { "paso": "mirar", "x": 0.75, "y": 0.0 },
+           { "paso": "girar", "sentido": "horario", "vueltas": 1 }, { "paso": "esperar", "tiempo_s": 2 },
+           { "paso": "ir", "x": -0.3, "y": -0.25 }"#,
+    ));
+    let mut renderer = renderer_tiny_skia();
+    let base = Cache::new();
+    let trazas = Trazas::default();
+    let mut anteriores: Option<Vec<Capa>> = None;
+    for (i, (snap, _)) in fotos().iter().enumerate() {
+        let dibujo = DibujoRutina {
+            rutina: rutina.clone(),
+            asignacion: vec![(0, i as i32 % 3)],
+            en_curso: vec![(0, i)],
+            puestos: 1,
+        };
+        let capas = cuadro(&mut renderer, &base, snap, None, &trazas, Some(&dibujo));
+        if let Some(prev) = &anteriores {
+            let danio = damage::diff(prev, &capas, |c| vec![c.bounds], Capa::damage);
+            for r in &danio {
+                assert!(!r.center().distance(Point::ORIGIN).is_nan(), "cuadro {i}: daño con NaN {r:?}");
             }
             damage::group(danio, Rectangle::with_size(VENTANA));
         }

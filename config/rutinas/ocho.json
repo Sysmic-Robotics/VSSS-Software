@@ -1,0 +1,23 @@
+{
+  "nombre": "Ocho",
+  "grupo": "circuito",
+  "descripcion": "Un ocho de 0.8 × 0.5 m con cruce en el centro; los puntos intermedios con tolerancia amplia para que fluya.",
+  "robots": { "min": 1, "max": 1 },
+  "repeticiones": 3,
+  "puestos": [
+    {
+      "nombre": "A",
+      "inicio": { "x": 0.00, "y": 0.00, "orientacion_deg": 51 },
+      "pasos": [
+        { "paso": "ir", "x": 0.20, "y": 0.25, "tolerancia_m": 0.08 },
+        { "paso": "ir", "x": 0.40, "y": 0.00, "tolerancia_m": 0.08 },
+        { "paso": "ir", "x": 0.20, "y": -0.25, "tolerancia_m": 0.08 },
+        { "paso": "ir", "x": 0.00, "y": 0.00, "tolerancia_m": 0.08 },
+        { "paso": "ir", "x": -0.20, "y": 0.25, "tolerancia_m": 0.08 },
+        { "paso": "ir", "x": -0.40, "y": 0.00, "tolerancia_m": 0.08 },
+        { "paso": "ir", "x": -0.20, "y": -0.25, "tolerancia_m": 0.08 },
+        { "paso": "ir", "x": 0.00, "y": 0.00 }
+      ]
+    }
+  ]
+}

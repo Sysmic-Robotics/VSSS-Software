@@ -24,19 +24,21 @@ use iced::{Color, Element, Point};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Capas de esta fase, en el orden de la barra.
-pub const CAPAS: [Layer; 5] = [
+pub const CAPAS: [Layer; 6] = [
     Layer::Navegacion,
     Layer::Coach,
     Layer::Reflejos,
     Layer::Trazas,
     Layer::Skills,
+    Layer::Rutina,
 ];
 /// Encendidas al abrir la GUI.
-pub const CAPAS_INICIALES: [Layer; 4] = [
+pub const CAPAS_INICIALES: [Layer; 5] = [
     Layer::Navegacion,
     Layer::Coach,
     Layer::Reflejos,
     Layer::Trazas,
+    Layer::Rutina,
 ];
 /// Segundos de trazas.
 pub const TRAZA_S: f32 = 3.0;
@@ -53,6 +55,7 @@ pub fn nombre_capa(capa: Layer) -> &'static str {
         Layer::Trazas => "Trazas",
         Layer::VisionCruda => "Visión cruda",
         Layer::Skills => "Skills",
+        Layer::Rutina => "Rutina",
     }
 }
 

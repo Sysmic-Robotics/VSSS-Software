@@ -35,6 +35,9 @@ pub const ROBOT_HALF: f32 = 0.04;
 pub const AREA_NAV_MARGIN: f32 = 0.06;
 /// Holgura de navegación al área: medio robot + `AREA_NAV_MARGIN`.
 pub const AREA_CLEARANCE: f32 = ROBOT_HALF + AREA_NAV_MARGIN;
+/// Cateto de los triángulos de las esquinas de la cancha (7 cm). Lo usan la GUI (dibujo)
+/// y la validación de las rutinas (zona segura).
+pub const TRIANGLE_M: f32 = 0.07;
 /// Arco del reglamento sobre el frente del área: cuerda de 20 cm centrada en el frente
 /// y flecha de 5 cm hacia la cancha (vértice en |x| = 0.55). Es un segmento del círculo
 /// de radio `(0.10² + 0.05²) / (2·0.05) = 0.125` m con centro en

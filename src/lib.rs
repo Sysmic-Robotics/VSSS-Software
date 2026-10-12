@@ -14,6 +14,7 @@ pub mod parada;
 pub mod params;
 pub mod protos;
 pub mod radio;
+pub mod rutinas;
 pub mod skill_log;
 pub mod skills;
 pub mod snapshot;

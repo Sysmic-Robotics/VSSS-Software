@@ -12,6 +12,7 @@ use crate::coach::debug::CoachDebug;
 use crate::coach::{Coach, Foul, Observation, Role, SharedReferee, SkillChoice};
 use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig, NavDebug};
 use crate::radio::{RadioTarget, TransportError};
+use crate::rutinas::RutinaVista;
 use crate::skills::zones::{GuardiaDebug, ZoneGuard};
 use crate::skills::{SkillCatalog, SkillId, SkillStatus};
 use crate::snapshot::{
@@ -46,6 +47,139 @@ pub trait TickDecider: Send {
     fn coach_debug(&self) -> Option<CoachDebug> {
         None
     }
+
+    /// Lo que pasó en el tick, al final de cada tick y en todos los modos (también en
+    /// HALT y en el corte sin visión, cuando el lazo no llama a `decide`). Lo usa la
+    /// rutina para sus abortos y su resumen.
+    fn observar(&mut self, _ctx: &ContextoTick<'_>) {}
+
+    /// Perfil de velocidad que el lazo aplica a motion y a Spin (rutinas). `None` = el
+    /// perfil normal: el lazo no toca nada.
+    fn perfil_velocidad(&self) -> Option<PerfilVelocidad> {
+        None
+    }
+
+    /// Lo que el decisor pide teletransportar (simulación); el lazo lo envía y lo vacía.
+    fn tomar_teleport(&mut self) -> Vec<crate::radio::TeleportItem> {
+        Vec::new()
+    }
+
+    /// Vista de la rutina activa, para la foto y el CSV. `None` sin rutina.
+    fn rutina(&self) -> Option<Arc<RutinaVista>> {
+        None
+    }
+}
+
+/// Lo que el lazo le cuenta al decisor al final de cada tick (`TickDecider::observar`).
+#[derive(Debug, Clone, Copy)]
+pub struct ContextoTick<'a> {
+    pub tick: u32,
+    pub modo: TickMode,
+    /// La parada de emergencia está activa (distingue la parada del HALT del árbitro).
+    pub estop: bool,
+    /// Ids propios con un comando manual o una skill de la GUI vigente.
+    pub intervenidos: &'a [i32],
+    /// La GUI teletransportó algo en este tick.
+    pub teleport_gui: bool,
+    /// Ids propios que la recuperación de atasco hizo escapar en el tick.
+    pub escapando: &'a [i32],
+    /// Ids propios que el guardia frenó o sacó en el tick.
+    pub guardia: &'a [i32],
+}
+
+/// Perfil de velocidad de una rutina: escala de los topes de motion y giro de Spin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerfilVelocidad {
+    /// Factor sobre `max_linear_speed` y `max_angular_speed` (0.2 a 1).
+    pub escala: f64,
+    /// Giro de Spin de cada robot (rad/s).
+    pub omega_giro: f64,
+}
+
+/// Valores que el perfil reemplaza, guardados para restaurarlos exactos.
+#[derive(Debug, Clone, PartialEq)]
+struct Guardado {
+    max_linear_speed: f64,
+    max_angular_speed: f64,
+    spin: Vec<f64>,
+}
+
+/// Perfil de velocidad aplicado por el lazo. Al empezar cada tick, `aplicar` compara el
+/// perfil del decisor con el aplicado y solo escribe si cambió:
+/// - al pasar a con perfil, guarda los topes de motion y el giro de Spin de cada robot;
+/// - con perfil, escribe siempre desde lo guardado (nunca acumula escalas);
+/// - al pasar a sin perfil, restaura lo guardado por asignación (bit a bit).
+///
+/// Sin perfil nunca escribe nada: con el coach, los comandos no cambian.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct PerfilEnLazo {
+    aplicado: Option<PerfilVelocidad>,
+    guardado: Option<Guardado>,
+}
+
+impl PerfilEnLazo {
+    pub(crate) fn aplicar(&mut self, perfil: Option<PerfilVelocidad>, motion: &mut Motion, catalog: &mut SkillCatalog) {
+        if perfil == self.aplicado {
+            return;
+        }
+        match perfil {
+            Some(p) => {
+                let g = self.guardado.get_or_insert_with(|| Guardado {
+                    max_linear_speed: motion.config.max_linear_speed,
+                    max_angular_speed: motion.config.max_angular_speed,
+                    spin: (0..catalog.num_robots()).map(|i| catalog.spin_omega_for(i)).collect(),
+                });
+                motion.config.max_linear_speed = g.max_linear_speed * p.escala;
+                motion.config.max_angular_speed = g.max_angular_speed * p.escala;
+                for i in 0..catalog.num_robots() {
+                    catalog.set_spin_omega_for(i, p.omega_giro);
+                }
+            }
+            None => {
+                if let Some(g) = self.guardado.take() {
+                    motion.config.max_linear_speed = g.max_linear_speed;
+                    motion.config.max_angular_speed = g.max_angular_speed;
+                    for (i, w) in g.spin.into_iter().enumerate() {
+                        catalog.set_spin_omega_for(i, w);
+                    }
+                }
+            }
+        }
+        self.aplicado = perfil;
+    }
+}
+
+/// Ids propios con un comando manual o una skill de la GUI vigente, ordenados.
+pub(crate) fn intervenidos(
+    manual_state: &HashMap<(i32, i32), (ManualCommand, u32)>,
+    skill_state: &HashMap<(i32, i32), (GuiSkillCommand, u32)>,
+    own_team: i32,
+) -> Vec<i32> {
+    let mut ids: Vec<i32> = manual_state
+        .keys()
+        .chain(skill_state.keys())
+        .filter(|(t, _)| *t == own_team)
+        .map(|(_, i)| *i)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Ids propios que escaparon y que el guardia frenó o sacó en el tick, desde la salida de
+/// `tick_commands`.
+pub(crate) fn escapes_y_guardia(out: &TickOut, own_team: i32) -> (Vec<i32>, Vec<i32>) {
+    let (cmds, _, _, escaping, guardia) = out;
+    let propios = || cmds.iter().enumerate().filter(|(_, c)| c.team == own_team);
+    let escapando = propios()
+        .filter(|(i, _)| escaping.get(*i).copied().unwrap_or(false))
+        .map(|(_, c)| c.id)
+        .collect();
+    let frenados = propios()
+        .filter(|(i, _)| guardia.get(*i).copied().flatten().is_some_and(|g| g.accion.is_some()))
+        .map(|(_, c)| c.id)
+        .collect();
+    (escapando, frenados)
 }
 
 /// Configuración del loop. `vision_source` y `radio_target` se pasan EXPLÍCITOS
@@ -113,6 +247,8 @@ pub struct TickRecord<'a> {
     pub escaping: &'a [bool],
     /// Depuración del tick, si el lazo la arma (GUI o `exportar_depuracion`).
     pub debug: Option<&'a TickDebug>,
+    /// Vista de la rutina activa (después de `observar`), o `None`.
+    pub rutina: Option<&'a RutinaVista>,
 }
 
 pub type OnTick = Box<dyn FnMut(&TickRecord<'_>) + Send>;
@@ -909,8 +1045,11 @@ pub async fn run_control_loop(
     // áreas por la tangente, con las mismas reglas.
     let attack_sign = crate::skills::zones::attack_sign_from_env(config.own_team);
     let keeper_id = crate::params::params().coach.keeper_id;
-    let motion = Motion::with_config(motion_cfg).with_areas(attack_sign, keeper_id);
+    let mut motion = Motion::with_config(motion_cfg).with_areas(attack_sign, keeper_id);
     let zone_guard = ZoneGuard::new(attack_sign, keeper_id);
+    // Perfil de velocidad de una rutina (topes de motion y giro de Spin); sin rutina no
+    // escribe nada.
+    let mut perfil = PerfilEnLazo::default();
     let mut field_scale_warned = false;
     let mut halted_prev = false;
     // Corte por pérdida de visión (ver `TickMode::SinVision`). Antes del primer cuadro el
@@ -966,12 +1105,14 @@ pub async fn run_control_loop(
             }
 
             // Teleport (sim) solicitado desde la GUI.
+            let mut teleport_gui = false;
             if let Some(rx) = teleport_rx.as_mut() {
                 let mut reqs: Vec<crate::radio::TeleportItem> = Vec::new();
                 while let Ok(items) = rx.try_recv() {
                     reqs.extend(items);
                 }
                 if !reqs.is_empty() {
+                    teleport_gui = true;
                     let mut radio_guard = radio.lock().await;
                     if let Err(e) = radio_guard.teleport(&reqs).await {
                         eprintln!("[control_loop] teleport error: {e}");
@@ -989,6 +1130,10 @@ pub async fn run_control_loop(
                 skill_state
                     .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
             }
+
+            // Perfil de velocidad del decisor (rutinas), antes de decidir: el decisor que
+            // decide en este tick es el que dio el perfil.
+            perfil.aplicar(decider.perfil_velocidad(), &mut motion, &mut catalog);
 
             // Parada de emergencia y HALT del árbitro: prevalecen sobre coach/manual/skills
             // (mismo camino). STOP: solo corregir orientación (ver `TickMode`).
@@ -1017,7 +1162,7 @@ pub async fn run_control_loop(
             let mode: TickMode;
             // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
             let mut gui_world = None;
-            let (commands, targets, applied_choices, escaping, debug) = {
+            let (commands, targets, applied_choices, escaping, debug, (escapando, frenados)) = {
                 let world_guard = world.read().await;
                 if !field_scale_warned {
                     field_scale_warned = warn_if_outside_vsss_field(&world_guard);
@@ -1045,6 +1190,7 @@ pub async fn run_control_loop(
                     config.num_robots,
                 );
                 ceros = ceros_si_no_hay_comandos(&out.0, &world_guard, config.own_team, config.num_robots);
+                let reflejos = escapes_y_guardia(&out, config.own_team);
                 let statuses = if exportar {
                     skill_statuses(&mut catalog, &out.2, &world_guard, config.own_team)
                 } else {
@@ -1067,8 +1213,29 @@ pub async fn run_control_loop(
                     gui_world = Some((robot_views(&world_guard), ball_view(&world_guard), statuses));
                 }
                 let (c, t, a, e, _) = out;
-                (c, t, a, e, debug)
+                (c, t, a, e, debug, reflejos)
             };
+
+            // Teleport que pidió el decisor (preparación de una rutina en simulación).
+            let pedidos = decider.tomar_teleport();
+            if !pedidos.is_empty() {
+                let mut radio_guard = radio.lock().await;
+                if let Err(e) = radio_guard.teleport(&pedidos).await {
+                    eprintln!("[control_loop] teleport de la rutina: {e}");
+                }
+            }
+            // Al final del tick, en todos los modos: lo que pasó, para el decisor.
+            let intervenidos_ids = intervenidos(&manual_state, &skill_state, config.own_team);
+            decider.observar(&ContextoTick {
+                tick: tick_counter,
+                modo: mode,
+                estop: estop_engaged,
+                intervenidos: &intervenidos_ids,
+                teleport_gui,
+                escapando: &escapando,
+                guardia: &frenados,
+            });
+            let rutina_vista = decider.rutina();
             tick_counter = tick_counter.wrapping_add(1);
 
             if ciego != ciego_prev {
@@ -1111,6 +1278,7 @@ pub async fn run_control_loop(
                     choices: &applied_choices,
                     escaping: &escaping,
                     debug: debug.as_deref(),
+                    rutina: rutina_vista.as_deref(),
                 };
                 hook(&rec);
             }
@@ -1155,6 +1323,7 @@ pub async fn run_control_loop(
                         vision: vision_stats.counters(),
                         radio: radio_counters,
                         debug: debug.clone(),
+                        rutina: rutina_vista.clone(),
                     },
                 );
             }
@@ -1652,6 +1821,29 @@ mod tests {
         assert_eq!(r0.prohibidas, vec![rig.guard.own_area()]);
         // Los robots que la visión no ve no tienen áreas prohibidas ni comando.
         assert!(dbg.robot(1).unwrap().prohibidas.is_empty());
+    }
+
+    #[test]
+    fn escapes_and_guard_ids_come_from_the_tick_output() {
+        use crate::skills::zones::AccionGuardia;
+        let c = |id: i32, team: i32| MotionCommand { id, team, vx: 0.0, vy: 0.0, omega: 0.0, orientation: 0.0 };
+        let g = |accion: Option<AccionGuardia>| Some(GuardiaDebug { proyeccion: Vec2::ZERO, accion });
+        let out: TickOut = (
+            vec![c(0, 0), c(1, 0), c(2, 1), c(2, 0)],
+            vec![None; 4],
+            Vec::new(),
+            vec![true, false, true, false],
+            vec![g(None), g(Some(AccionGuardia::Frena)), g(Some(AccionGuardia::Saca)), None],
+        );
+        assert_eq!(escapes_y_guardia(&out, 0), (vec![0], vec![1]), "solo los propios, y el guardia que actuó");
+        let mut manual = HashMap::new();
+        manual.insert((0, 2), (ManualCommand { team: 0, id: 2, vx: 0.0, vy: 0.0, omega: 0.0 }, 0));
+        manual.insert((1, 0), (ManualCommand { team: 1, id: 0, vx: 0.0, vy: 0.0, omega: 0.0 }, 0));
+        let mut gui = HashMap::new();
+        let skill = GuiSkillCommand { team: 0, id: 2, skill_id: SkillId::Hold, target: Vec2::ZERO, spin_omega: 20.0 };
+        gui.insert((0, 2), (skill.clone(), 0));
+        gui.insert((0, 0), (GuiSkillCommand { id: 0, ..skill }, 0));
+        assert_eq!(intervenidos(&manual, &gui, 0), vec![0, 2], "ordenados y sin repetir");
     }
 
     #[test]

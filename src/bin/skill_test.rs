@@ -10,7 +10,8 @@
 
 use glam::Vec2;
 use rustengine::control_loop::{
-    ControlLoopConfig, FixedSkillDecider, GuiChannels, TickRecord, run_control_loop,
+    ContextoTick, ControlLoopConfig, FixedSkillDecider, GuiChannels, PerfilVelocidad, TickDecider, TickRecord,
+    run_control_loop,
 };
 use rustengine::motion::{KickerCommand, MotionCommand, RobotCommand};
 use rustengine::radio::{
@@ -18,8 +19,13 @@ use rustengine::radio::{
     base_station::SLOT_COUNT,
     base_station::{build_frame_from_vw, clamp_vw, radio_slot},
 };
+use rustengine::rutinas::resumen::{Resultado, ResumenCorrida, corrida_json, escribir_resumen, junto_al_log};
+use rustengine::rutinas::{
+    ContextoValidacion, Eleccion, OpcionesCorrida, OrdenCorrida, Repeticiones, RoutineDecider, RutinaVista,
+    velocidad_valida,
+};
 use rustengine::skill_log::{
-    CsvLogger, CsvRow, SkillLogCtx, format_human_summary, team_label, transport_label, vision_label,
+    CsvLogger, CsvRow, MatchLogger, SkillLogCtx, format_human_summary, team_label, transport_label, vision_label,
 };
 use rustengine::skills::SkillId;
 use rustengine::sysid;
@@ -42,6 +48,7 @@ use std::time::{Duration, Instant};
 enum Mode {
     Vw,
     Skill,
+    Rutina,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +77,13 @@ struct Args {
     battery_v: Option<f64>,
     /// Caja segura (|x|, |y| máximos, m): fuera de ella, el perfil se corta.
     safe_box: (f32, f32),
+    /// Modo rutina: id de `config/rutinas/` o ruta a un `.json`.
+    rutina: Option<String>,
+    /// Modo rutina: un robot por puesto; `None` = automático.
+    robots: Option<Vec<i32>>,
+    velocidad: Option<u32>,
+    repeticiones: Option<Repeticiones>,
+    teletransportar: bool,
 }
 
 /// Caja segura por defecto del modo vw con perfil (m).
@@ -94,8 +108,10 @@ FLAGS COMUNES (obligatorios):
                        la posición de radio sale de robot.radio_slot_by_vision_id
                        (config/team_params.json); sin entrada, posición = N.
     --team <blue|yellow>
-    --mode <vw|skill>
+    --mode <vw|skill|rutina>
     --dur S            segundos antes del auto-stop (float > 0). No con --profile.
+                       En --mode rutina es opcional: un tope que aborta la rutina.
+    (--robot no va en --mode rutina: los robots salen de la asignación.)
 
 FLAGS COMUNES (opcionales):
     --log RUTA           CSV estructurado al archivo. SIN --log no se escribe
@@ -113,6 +129,24 @@ FLAGS MODO skill:
                          -0.75,0) y mark (punto donde pararse mirando la pelota)
                          (spin solo usa el signo de x: + = CCW, − = CW)
                          opcional para chaseball; ignorado por intercept
+
+FLAGS MODO rutina (circuitos de config/rutinas/, ver README):
+    --rutina NOMBRE      id de config/rutinas/ (o de VSSL_RUTINAS_DIR) o ruta a un
+                         .json. Una rutina inválida se rechaza con sus razones.
+    --vision <sim|real>  obligatorio.
+    --robots auto|N,M    robots por puesto, en orden (default auto: los más
+                         cercanos a los inicios). Ids de visión.
+    --velocidad PCT      de 20 a 100 en pasos de 10 (default 60 con base-station,
+                         100 en simulación). Escala los topes de motion y el giro.
+    --repeticiones N|bucle   default: las del archivo.
+    --teletransportar    solo firasim/grsim: pone los robots en su inicio y saca
+                         de la cancha a los demás y a la pelota.
+    --log RUTA           CSV de partido (con las columnas de rutina) y el resumen
+                         en <RUTA sin .csv>.resumen.json.
+    --listar-rutinas     lista las rutinas con su validez y sale.
+    La rutina se prepara, arranca sola al quedar lista y el proceso termina al
+    cerrarla. Ctrl+C la aborta (en bucle: "detenida") y escribe el resumen.
+    Código de salida: 0 completada (o detenida en bucle), 2 abortada, 1 error.
 
 VARIABLES DE ENTORNO:
     VSSL_BIDIRECTIONAL=1   motion de dos caras: el heading se controla mod 180°
@@ -194,6 +228,11 @@ EJEMPLOS:
         --mode skill --skill spin --target 1,0 --robot 1 --team blue --dur 3 \
         --log /tmp/spin.csv
 
+    # Sim, el triángulo 10 veces, con ruido de cámara y teleport:
+    VSSL_VISION_NOISE=1 cargo run --bin skill_test -- --transport firasim \
+        --vision sim --team blue --mode rutina --rutina triangulo \
+        --repeticiones 10 --teletransportar --log /tmp/triangulo.csv
+
     # Sim, empuje de dos caras hacia el arco rival:
     VSSL_BIDIRECTIONAL=1 cargo run --bin skill_test -- --transport firasim \
         --vision sim --mode skill --skill shoot --target 0.75,0 \
@@ -223,11 +262,51 @@ impl Args {
         let mut battery: Option<String> = None;
         let mut battery_v: Option<f64> = None;
         let mut safe_box: Option<(f32, f32)> = None;
+        let mut rutina: Option<String> = None;
+        let mut robots: Option<Vec<i32>> = None;
+        let mut velocidad: Option<u32> = None;
+        let mut repeticiones: Option<Repeticiones> = None;
+        let mut teletransportar = false;
 
         while let Some(arg) = iter.next() {
             match arg.as_str() {
                 "--help" | "-h" => return Err("__HELP__".to_string()),
                 "--list-profiles" => return Err("__PROFILES__".to_string()),
+                "--listar-rutinas" => return Err("__RUTINAS__".to_string()),
+                "--rutina" => {
+                    rutina = Some(iter.next().ok_or("--rutina requiere un nombre")?);
+                }
+                "--robots" => {
+                    let v = iter.next().ok_or("--robots requiere auto o N,M")?;
+                    robots = if v == "auto" {
+                        None
+                    } else {
+                        let ids: Result<Vec<i32>, String> = v
+                            .split(',')
+                            .map(|x| {
+                                let n: i32 = x.trim().parse().map_err(|e| format!("--robots: '{x}' no es entero ({e})"))?;
+                                if n < 0 || n as usize >= SLOT_COUNT {
+                                    return Err(format!("--robots: {n} fuera de rango [0, {SLOT_COUNT})"));
+                                }
+                                Ok(n)
+                            })
+                            .collect();
+                        Some(ids?)
+                    };
+                }
+                "--velocidad" => {
+                    let v = iter.next().ok_or("--velocidad requiere un porcentaje")?;
+                    let p: u32 = v.parse().map_err(|e| format!("--velocidad: '{v}' no es entero ({e})"))?;
+                    if !velocidad_valida(p) {
+                        return Err(format!("--velocidad {p}: de 20 a 100 en pasos de 10"));
+                    }
+                    velocidad = Some(p);
+                }
+                "--repeticiones" => {
+                    let v = iter.next().ok_or("--repeticiones requiere N o bucle")?;
+                    repeticiones = Some(Repeticiones::de_texto(&v).map_err(|e| format!("--{e}"))?);
+                }
+                "--teletransportar" => teletransportar = true,
                 "--transport" => {
                     let v = iter.next().ok_or("--transport requiere un valor")?;
                     plant = v == "plant";
@@ -322,6 +401,7 @@ impl Args {
                     mode = Some(match v.as_str() {
                         "vw" => Mode::Vw,
                         "skill" => Mode::Skill,
+                        "rutina" => Mode::Rutina,
                         "wheels" => {
                             return Err("--mode wheels ya no existe (era del protocolo L,R): \
                                         usar --mode vw --v MM_S --w DEG_S"
@@ -329,7 +409,7 @@ impl Args {
                         }
                         other => {
                             return Err(format!(
-                                "--mode: valor inválido '{other}' (esperaba vw|skill)"
+                                "--mode: valor inválido '{other}' (esperaba vw|skill|rutina)"
                             ));
                         }
                     });
@@ -427,7 +507,6 @@ impl Args {
 
         // Obligatorios comunes
         let transport = transport.ok_or("--transport es obligatorio")?;
-        let robot = robot.ok_or("--robot es obligatorio")?;
         let team = team.ok_or("--team es obligatorio")?;
         let mode = mode.ok_or("--mode es obligatorio")?;
         let profile_only = [
@@ -436,6 +515,68 @@ impl Args {
             ("--battery-v", battery_v.is_some()),
             ("--safe-box", safe_box.is_some()),
         ];
+        let rutina_only = [
+            ("--rutina", rutina.is_some()),
+            ("--robots", robots.is_some()),
+            ("--velocidad", velocidad.is_some()),
+            ("--repeticiones", repeticiones.is_some()),
+            ("--teletransportar", teletransportar),
+        ];
+
+        // Modo rutina: sus propias reglas.
+        if mode == Mode::Rutina {
+            if robot.is_some() {
+                return Err("modo rutina no usa --robot: los robots salen de la asignación (--robots auto|N,M)".to_string());
+            }
+            if vision.is_none() {
+                return Err("modo rutina requiere --vision".to_string());
+            }
+            if skill.is_some() || target.is_some() || v_mm_s.is_some() || w_deg_s.is_some() || profile.is_some() {
+                return Err("modo rutina NO acepta --skill, --target, --v, --w ni --profile".to_string());
+            }
+            if plant || dry_run {
+                return Err("modo rutina no admite --transport plant ni --dry-run".to_string());
+            }
+            if let Some((flag, _)) = profile_only.iter().find(|(_, given)| *given) {
+                return Err(format!("{flag} solo aplica a --mode vw con --profile"));
+            }
+            if rutina.is_none() {
+                return Err("modo rutina requiere --rutina NOMBRE (--listar-rutinas muestra las que hay)".to_string());
+            }
+            if teletransportar && transport == RadioTarget::BaseStation {
+                return Err("--teletransportar es solo de simulación (firasim o grsim)".to_string());
+            }
+            return Ok(Self {
+                transport,
+                vision,
+                robot: 0,
+                team,
+                mode,
+                dur: dur.unwrap_or(f64::INFINITY),
+                log,
+                dry_run,
+                vision_timeout_s,
+                skill: None,
+                target: None,
+                v_mm_s: None,
+                w_deg_s: None,
+                profile: None,
+                plant: false,
+                track: None,
+                battery: None,
+                battery_v: None,
+                safe_box: DEFAULT_SAFE_BOX,
+                rutina,
+                robots,
+                velocidad,
+                repeticiones,
+                teletransportar,
+            });
+        }
+        if let Some((flag, _)) = rutina_only.iter().find(|(_, given)| *given) {
+            return Err(format!("{flag} solo aplica a --mode rutina"));
+        }
+        let robot = robot.ok_or("--robot es obligatorio")?;
 
         // Modo vw con perfil (sysid): sus propias reglas.
         if let Some(name) = &profile {
@@ -505,6 +646,11 @@ impl Args {
                 battery,
                 battery_v,
                 safe_box: safe_box.unwrap_or(DEFAULT_SAFE_BOX),
+                rutina: None,
+                robots: None,
+                velocidad: None,
+                repeticiones: None,
+                teletransportar: false,
             });
         }
         if plant {
@@ -558,6 +704,7 @@ impl Args {
                     ));
                 }
             }
+            Mode::Rutina => unreachable!("el modo rutina se valida arriba"),
         }
 
         Ok(Self {
@@ -580,6 +727,11 @@ impl Args {
             battery,
             battery_v,
             safe_box: DEFAULT_SAFE_BOX,
+            rutina: None,
+            robots: None,
+            velocidad: None,
+            repeticiones: None,
+            teletransportar: false,
         })
     }
 }
@@ -1137,6 +1289,185 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Modo rutina
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// La rutina por consola: aborta la rutina con Ctrl+C (`detener`) o con el tope de
+/// `--dur`, para que el resumen se escriba antes de parar el lazo.
+struct DecisorDeConsola {
+    rutina: RoutineDecider,
+    detener: Arc<AtomicBool>,
+    /// Tick del tope de `--dur`.
+    tope: Option<u32>,
+}
+
+impl TickDecider for DecisorDeConsola {
+    fn decide(&mut self, tick: u32, world: &rustengine::world::World) -> Vec<rustengine::coach::SkillChoice> {
+        self.rutina.decide(tick, world)
+    }
+
+    fn observar(&mut self, ctx: &ContextoTick<'_>) {
+        self.rutina.observar(ctx);
+        if self.detener.load(Ordering::Relaxed) {
+            self.rutina.ordenar(OrdenCorrida::Abortar);
+        }
+        if self.tope.is_some_and(|t| ctx.tick >= t) {
+            self.rutina.abortar("tiempo máximo de la corrida");
+        }
+    }
+
+    fn perfil_velocidad(&self) -> Option<PerfilVelocidad> {
+        self.rutina.perfil_velocidad()
+    }
+
+    fn tomar_teleport(&mut self) -> Vec<TeleportItem> {
+        self.rutina.tomar_teleport()
+    }
+
+    fn rutina(&self) -> Option<Arc<RutinaVista>> {
+        TickDecider::rutina(&self.rutina)
+    }
+}
+
+/// `--listar-rutinas`: cada rutina de la carpeta con su validez (lado de `VSSL_SIDE` para
+/// el equipo azul).
+fn listar_rutinas() {
+    let dir = rustengine::rutinas::carpeta();
+    match rustengine::rutinas::cargar_carpeta(&dir, &ContextoValidacion::vigente(0)) {
+        Err(e) => eprintln!("error: {e}"),
+        Ok(entradas) => {
+            println!("Rutinas en {}:", dir.display());
+            for e in entradas {
+                match (e.valida(), &e.rutina) {
+                    (Some(r), _) => println!("  ✓ {:<16} {} ({}): {}", e.id, r.nombre, r.texto_robots(), r.descripcion),
+                    (None, rutina) => {
+                        let nombre = rutina.as_ref().map_or(String::new(), |r| format!(" {}", r.nombre));
+                        println!("  ✗ {:<16}{nombre}", e.id);
+                        for razon in &e.razones {
+                            println!("      - {razon}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Corre la rutina y devuelve el código de salida: 0 completada (o detenida en bucle), 2
+/// abortada.
+async fn run_rutina_mode(args: &Args, shutdown: Arc<AtomicBool>, detener: Arc<AtomicBool>) -> Result<i32, String> {
+    let own_team = args.team.as_team_id();
+    let nombre = args.rutina.as_deref().expect("validado");
+    let entrada = rustengine::rutinas::buscar(nombre, &ContextoValidacion::vigente(own_team))?;
+    let Some(rutina) = entrada.valida().cloned() else {
+        return Err(format!(
+            "la rutina `{}` no se puede correr:\n  - {}",
+            entrada.id,
+            entrada.razones.join("\n  - ")
+        ));
+    };
+    let vision_source = args.vision.expect("validado");
+    let simulacion = args.transport != RadioTarget::BaseStation;
+    let mut op = OpcionesCorrida::por_defecto(&rutina, simulacion);
+    if let Some(ids) = &args.robots {
+        op.eleccion = Eleccion::Manual(ids.clone());
+    }
+    if let Some(p) = args.velocidad {
+        op.velocidad_pct = p;
+    }
+    if let Some(r) = args.repeticiones {
+        op.repeticiones = r;
+    }
+    op.teletransportar = args.teletransportar;
+    op.inicio_automatico = true;
+    eprintln!(
+        "[rutina] {} ({}) al {} %, {} {}",
+        rutina.nombre,
+        rutina.id,
+        op.velocidad_pct,
+        op.repeticiones.texto(),
+        if op.repeticiones == Repeticiones::Veces(1) { "vez" } else { "veces" }
+    );
+    let tope = args
+        .dur
+        .is_finite()
+        .then(|| (args.dur / rustengine::motion::CONTROL_DT).ceil() as u32);
+    let decider = Box::new(DecisorDeConsola {
+        rutina: RoutineDecider::vigente(rutina, op, own_team, SLOT_COUNT),
+        detener: detener.clone(),
+        tope,
+    });
+
+    let config = ControlLoopConfig {
+        own_team,
+        num_robots: SLOT_COUNT,
+        vision_source,
+        radio_target: args.transport,
+        max_ticks: None,
+        vision_timeout: matches!(vision_source, VisionSource::SslVision)
+            .then(|| Duration::from_secs_f64(args.vision_timeout_s)),
+        referee: None,
+        // El CSV de partido lleva la depuración, como en `main`.
+        exportar_depuracion: true,
+    };
+
+    let mut logger = match &args.log {
+        Some(p) => Some(MatchLogger::new(p, own_team).map_err(|e| format!("--log: {e}"))?),
+        None => None,
+    };
+    let ruta_resumen = args.log.as_ref().map(|p| junto_al_log(p, ".resumen.json"));
+    let corrida = corrida_json(transport_label(args.transport), vision_label(args.vision), own_team);
+    let resultado: Arc<Mutex<Option<Arc<ResumenCorrida>>>> = Arc::new(Mutex::new(None));
+    let (resultado_hook, shutdown_hook) = (resultado.clone(), shutdown.clone());
+    let mut ultima_frase = String::new();
+    let mut ticks_deteniendo = 0u32;
+    let on_tick: Box<dyn FnMut(&TickRecord<'_>) + Send> = Box::new(move |rec: &TickRecord<'_>| {
+        if let Some(l) = logger.as_mut() {
+            let _ = l.write_tick(rec);
+        }
+        if let Some(v) = rec.rutina {
+            if v.frase != ultima_frase {
+                eprintln!("[rutina] {}", v.frase);
+                ultima_frase = v.frase.clone();
+            }
+            let mut guardado = resultado_hook.lock().unwrap();
+            if guardado.is_none()
+                && let Some(r) = &v.resumen
+            {
+                for linea in r.lineas() {
+                    eprintln!("[rutina] {linea}");
+                }
+                if let Some(ruta) = &ruta_resumen {
+                    match escribir_resumen(ruta, r, corrida.clone()) {
+                        Ok(()) => eprintln!("[rutina] resumen → {}", ruta.display()),
+                        Err(e) => eprintln!("[rutina] no se pudo escribir {}: {e}", ruta.display()),
+                    }
+                }
+                *guardado = Some(r.clone());
+                shutdown_hook.store(true, Ordering::Relaxed);
+            }
+        }
+        // Por si la rutina no cierra tras la señal: el lazo para igual a los ~2 s.
+        if detener.load(Ordering::Relaxed) {
+            ticks_deteniendo += 1;
+            if ticks_deteniendo > 120 {
+                shutdown_hook.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+
+    run_control_loop(config, decider, Some(on_tick), None as Option<GuiChannels>, shutdown)
+        .await
+        .map_err(|e| format!("control loop: {e}"))?;
+    let resumen = resultado.lock().unwrap().clone();
+    match resumen.map(|r| r.resultado) {
+        Some(Resultado::Completada | Resultado::Detenida) => Ok(0),
+        Some(Resultado::Abortada) => Ok(2),
+        None => Err("el lazo terminó antes de cerrar la rutina".to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1153,6 +1484,11 @@ fn main() {
             print_profiles();
             std::process::exit(0);
         }
+        Err(msg) if msg == "__RUTINAS__" => {
+            rustengine::params::TeamParams::install_or_exit("skill_test");
+            listar_rutinas();
+            std::process::exit(0);
+        }
         Err(msg) => {
             eprintln!("error: {msg}\n");
             eprintln!("usa --help para ver opciones");
@@ -1162,25 +1498,34 @@ fn main() {
     rustengine::params::TeamParams::install_or_exit("skill_test");
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    // SIGINT, SIGTERM o SIGHUP: el modo en curso para con ceros antes de salir.
+    // SIGINT, SIGTERM o SIGHUP: el modo en curso para con ceros antes de salir. En el modo
+    // rutina, la señal primero aborta la rutina (para escribir el resumen) y el lazo para
+    // al cerrarla.
     let shutdown = Arc::new(AtomicBool::new(false));
+    let detener = Arc::new(AtomicBool::new(false));
     {
         let _runtime = rt.enter();
-        if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
+        let flag = if args.mode == Mode::Rutina { detener.clone() } else { shutdown.clone() };
+        if let Err(e) = rustengine::parada::al_recibir_senal(flag) {
             eprintln!("[skill_test] no pude registrar las señales de terminación: {e}");
         }
     }
 
     let result = rt.block_on(async {
         match args.mode {
-            Mode::Vw => run_vw_mode(&args, shutdown.clone()).await,
-            Mode::Skill => run_skill_mode(&args, shutdown.clone()).await,
+            Mode::Vw => run_vw_mode(&args, shutdown.clone()).await.map(|_| 0),
+            Mode::Skill => run_skill_mode(&args, shutdown.clone()).await.map(|_| 0),
+            Mode::Rutina => run_rutina_mode(&args, shutdown.clone(), detener.clone()).await,
         }
     });
 
-    if let Err(msg) = result {
-        eprintln!("error: {msg}");
-        std::process::exit(1);
+    match result {
+        Ok(0) => {}
+        Ok(codigo) => std::process::exit(codigo),
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1715,6 +2060,85 @@ mod tests {
     #[test]
     fn help_documents_profiles_and_safety() {
         for needle in ["--profile", "--list-profiles", "--battery", "--track", "--safe-box", "plant", "Ctrl+C", "levantar el robot"] {
+            assert!(HELP_TEXT.contains(needle), "falta '{needle}' en el --help");
+        }
+    }
+
+    // ---------- Modo rutina ----------
+
+    const RUTINA: [&str; 10] = [
+        "--transport", "firasim", "--vision", "sim", "--team", "blue", "--mode", "rutina", "--rutina", "triangulo",
+    ];
+
+    fn parse_rutina(extra: &[&str]) -> Result<Args, String> {
+        let mut v: Vec<&str> = RUTINA.to_vec();
+        v.extend_from_slice(extra);
+        parse(&v)
+    }
+
+    #[test]
+    fn routine_mode_valid() {
+        let a = parse_rutina(&["--repeticiones", "10", "--teletransportar"]).unwrap();
+        assert_eq!(a.mode, Mode::Rutina);
+        assert_eq!(a.rutina.as_deref(), Some("triangulo"));
+        assert_eq!(a.repeticiones, Some(Repeticiones::Veces(10)));
+        assert!(a.teletransportar);
+        assert_eq!(a.robots, None, "automático");
+        assert!(a.dur.is_infinite(), "sin --dur no hay tope");
+        let b = parse_rutina(&["--robots", "1,0", "--velocidad", "60", "--repeticiones", "bucle", "--dur", "90"]).unwrap();
+        assert_eq!(b.robots, Some(vec![1, 0]));
+        assert_eq!(b.velocidad, Some(60));
+        assert_eq!(b.repeticiones, Some(Repeticiones::Bucle));
+        assert_eq!(b.dur, 90.0);
+        assert_eq!(parse_rutina(&["--robots", "auto"]).unwrap().robots, None);
+    }
+
+    #[test]
+    fn routine_mode_rejects_robot_and_skill_flags() {
+        let err = parse_rutina(&["--robot", "1"]).unwrap_err();
+        assert!(err.contains("no usa --robot"), "{err}");
+        let err = parse_rutina(&["--skill", "goto"]).unwrap_err();
+        assert!(err.contains("NO acepta --skill"), "{err}");
+        let err = parse(&["--transport", "firasim", "--team", "blue", "--mode", "rutina", "--rutina", "x"]).unwrap_err();
+        assert!(err.contains("requiere --vision"), "{err}");
+        let err = parse(&["--transport", "firasim", "--vision", "sim", "--team", "blue", "--mode", "rutina"]).unwrap_err();
+        assert!(err.contains("requiere --rutina"), "{err}");
+    }
+
+    #[test]
+    fn routine_teleport_is_only_for_simulation() {
+        let err = parse(&[
+            "--transport", "base-station", "--vision", "real", "--team", "blue", "--mode", "rutina", "--rutina",
+            "triangulo", "--teletransportar",
+        ])
+        .unwrap_err();
+        assert!(err.contains("solo de simulación"), "{err}");
+    }
+
+    #[test]
+    fn routine_speed_and_repetitions_are_checked() {
+        for malo in ["10", "65", "110"] {
+            let err = parse_rutina(&["--velocidad", malo]).unwrap_err();
+            assert!(err.contains("de 20 a 100 en pasos de 10"), "{err}");
+        }
+        assert!(parse_rutina(&["--repeticiones", "0"]).unwrap_err().contains("repeticiones"));
+        assert!(parse_rutina(&["--robots", "1,9"]).unwrap_err().contains("fuera de rango"));
+    }
+
+    #[test]
+    fn routine_flags_only_in_routine_mode() {
+        let err = parse(&[
+            "--transport", "firasim", "--vision", "sim", "--mode", "skill", "--skill", "goto", "--target", "0.3,0",
+            "--robot", "0", "--team", "blue", "--dur", "5", "--velocidad", "60",
+        ])
+        .unwrap_err();
+        assert!(err.contains("--velocidad solo aplica a --mode rutina"), "{err}");
+        assert_eq!(parse(&["--listar-rutinas"]).unwrap_err(), "__RUTINAS__");
+    }
+
+    #[test]
+    fn help_documents_the_routine_mode() {
+        for needle in ["--mode <vw|skill|rutina>", "--rutina NOMBRE", "--teletransportar", "--listar-rutinas", ".resumen.json"] {
             assert!(HELP_TEXT.contains(needle), "falta '{needle}' en el --help");
         }
     }

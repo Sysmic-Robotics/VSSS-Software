@@ -37,7 +37,7 @@ pub const WALL_M: f32 = 0.025;
 /// Profundidad interior de los arcos (10 cm).
 pub const GOAL_DEPTH_M: f32 = 0.10;
 /// Cateto de los triángulos de las esquinas (7 cm).
-pub const TRIANGLE_M: f32 = 0.07;
+pub use crate::skills::zones::TRIANGLE_M;
 /// Radio de la pelota (42.7 mm de diámetro).
 pub const BALL_RADIUS_M: f32 = 0.02135;
 /// Ancho de las líneas de cal (3 mm).
@@ -319,6 +319,8 @@ pub struct FieldCanvas<'a> {
     pub trazas: &'a Trazas,
     /// Transporte de simulación: se puede teletransportar arrastrando.
     pub sim: bool,
+    /// Rutina de la capa U: la activa o la elegida (vista previa).
+    pub rutina: Option<super::rutinas::DibujoRutina>,
 }
 
 /// Un arrastre de menos de esto (px) es un click.
@@ -469,6 +471,17 @@ impl canvas::Program<Message> for FieldCanvas<'_> {
                 trazos,
             }
             .dibujar(&mut debajo, &vista);
+            if self.capas.contains(&Layer::Rutina)
+                && let Some(d) = &self.rutina
+            {
+                let pose = |id: i32| {
+                    self.snap
+                        .robot(self.own_team, id)
+                        .filter(|r| r.active)
+                        .map(|r| r.position)
+                };
+                super::rutinas::dibujar(&mut debajo, &vista, d, pose, trazos);
+            }
             capas.push(debajo.into_geometry());
         }
         let mut objetos = Frame::new(renderer, bounds.size());

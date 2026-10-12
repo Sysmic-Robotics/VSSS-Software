@@ -181,6 +181,7 @@ fn run_bench(
         skill_tx: None,
         pid_tx: None,
         teleport_tx: None,
+        rutina_tx: None, // las rutinas se lanzan desde main con GUI
         estop,
         run: GUI::RunInfo::from_env(
             transport,

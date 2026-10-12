@@ -24,7 +24,9 @@ use rustengine::control_loop::{
     TickDecider, run_control_loop,
 };
 use rustengine::radio::{RadioTarget, TeamColor};
-use rustengine::skill_log::MatchLogger;
+use rustengine::rutinas::resumen::{VigiaResumen, corrida_json, escribir_resumen, junto_al_log};
+use rustengine::rutinas::{DecisorConRutinas, OrdenRutina};
+use rustengine::skill_log::{MatchLogger, transport_label, vision_label};
 use rustengine::vision::VisionSource;
 use rustengine::world::World;
 
@@ -115,6 +117,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>) {
     let (pid_tx, pid_rx) = mpsc::channel::<HeadingPid>(16);
     let (teleport_tx, teleport_rx) =
         mpsc::channel::<Vec<rustengine::radio::TeleportItem>>(16);
+    let (rutina_tx, rutina_rx) = mpsc::channel::<OrdenRutina>(16);
     let estop = Arc::new(AtomicBool::new(false));
 
     // Configuración de la corrida para la barra de estado y el Inspector (solo lectura).
@@ -131,7 +134,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>) {
     let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(
-            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx)),
+            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx, rutina_rx)),
             shutdown_loop,
         ));
     });
@@ -142,6 +145,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>) {
         skill_tx: Some(skill_tx),
         pid_tx: Some(pid_tx),
         teleport_tx: Some(teleport_tx),
+        rutina_tx: Some(rutina_tx),
         estop,
         run,
     };
@@ -169,6 +173,7 @@ type GuiChannelBundle = (
     Arc<AtomicBool>,
     mpsc::Receiver<HeadingPid>,
     mpsc::Receiver<Vec<rustengine::radio::TeleportItem>>,
+    mpsc::Receiver<OrdenRutina>,
 );
 
 async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<AtomicBool>) {
@@ -209,9 +214,21 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<Atomic
         60.0 / COACH_DECISION_PERIOD as f64
     );
 
-    let decider: Box<dyn TickDecider> = match coach {
+    let base: Box<dyn TickDecider> = match coach {
         Some(c) => Box::new(CoachDecider::new(c, own_team, COACH_DECISION_PERIOD)),
         None => Box::new(NoOpDecider),
+    };
+    // Con GUI, las rutinas: el coach (o ninguno) hasta que la GUI prepara una.
+    let (gui_channels, rutina_rx) = match gui_channels {
+        Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, rutina_rx)) => (
+            Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)),
+            Some(rutina_rx),
+        ),
+        None => (None, None),
+    };
+    let decider: Box<dyn TickDecider> = match rutina_rx {
+        Some(rx) => Box::new(DecisorConRutinas::new(base, rx, own_team, NUM_ROBOTS)),
+        None => base,
     };
 
     // Registro de partido (CSV por tick, propios y rivales) con VSSL_MATCH_LOG=ruta.
@@ -219,8 +236,21 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<Atomic
         Ok(path) if !path.trim().is_empty() => match MatchLogger::new(&path, own_team) {
             Ok(mut logger) => {
                 eprintln!("[main] registro de partido → {path}");
+                // El resumen de cada rutina va junto al CSV: `<log>.rutina-<n>-<id>.json`.
+                let base = std::path::PathBuf::from(path.trim());
+                let mut vigia = VigiaResumen::default();
+                let mut corridas = 0u32;
+                let (transporte, vision) = (transport_label(radio_target), vision_label(Some(vision_source)));
                 Some(Box::new(move |rec: &rustengine::control_loop::TickRecord<'_>| {
                     let _ = logger.write_tick(rec);
+                    if let Some(r) = vigia.nuevo(rec.rutina) {
+                        corridas += 1;
+                        let ruta = junto_al_log(&base, &format!(".rutina-{corridas}-{}.json", r.rutina));
+                        match escribir_resumen(&ruta, &r, corrida_json(transporte, vision, own_team)) {
+                            Ok(()) => eprintln!("[main] resumen de la rutina → {}", ruta.display()),
+                            Err(e) => eprintln!("[main] no se pudo escribir {}: {e}", ruta.display()),
+                        }
+                    }
                 }) as rustengine::control_loop::OnTick)
             }
             Err(e) => {

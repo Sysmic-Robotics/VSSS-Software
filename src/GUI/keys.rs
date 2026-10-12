@@ -27,7 +27,7 @@ pub fn tecla_de(key: &Key) -> Option<Tecla> {
     }
 }
 
-/// Capas de la cancha (fase 2). Declaradas con su tecla; en esta fase no dibujan.
+/// Capas de la cancha, con su tecla.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Layer {
     Navegacion,
@@ -36,16 +36,19 @@ pub enum Layer {
     Trazas,
     VisionCruda,
     Skills,
+    /// Recorrido de la rutina seleccionada o activa (capability `gui-rutinas`).
+    Rutina,
 }
 
 impl Layer {
-    pub const ALL: [Layer; 6] = [
+    pub const ALL: [Layer; 7] = [
         Layer::Navegacion,
         Layer::Coach,
         Layer::Reflejos,
         Layer::Trazas,
         Layer::VisionCruda,
         Layer::Skills,
+        Layer::Rutina,
     ];
 
     /// Tecla de la capa (§5 de la especificación).
@@ -57,6 +60,7 @@ impl Layer {
             Layer::Trazas => 't',
             Layer::VisionCruda => 'v',
             Layer::Skills => 's',
+            Layer::Rutina => 'u',
         }
     }
 
@@ -136,6 +140,12 @@ mod tests {
     fn space_stops_in_every_mode() {
         assert_eq!(ruta_tecla(Tecla::Espacio, true), AccionTecla::Parada);
         assert_eq!(ruta_tecla(Tecla::Espacio, false), AccionTecla::Parada);
+    }
+
+    #[test]
+    fn u_belongs_to_the_routine_layer_outside_manual_only() {
+        assert_eq!(ruta_tecla(Tecla::Letra('u'), false), AccionTecla::Capa(Layer::Rutina));
+        assert_eq!(ruta_tecla(Tecla::Letra('u'), true), AccionTecla::Nada);
     }
 
     #[test]

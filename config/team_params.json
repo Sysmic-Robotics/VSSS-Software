@@ -89,5 +89,20 @@
     "proxy_drop_prob": 0.02,
     "real_theta_offset_deg": 180.0,
     "blind_stop_s": 0.4
+  },
+  "rutinas": {
+    "zona_segura_m": 0.1,
+    "distancia_minima_m": 0.2,
+    "distancia_choque_m": 0.1,
+    "tolerancia_m": 0.05,
+    "tolerancia_deg": 10.0,
+    "tiempo_max_s": 8.0,
+    "preparacion_max_s": 20.0,
+    "quieto_s": 0.5,
+    "quieto_m": 0.005,
+    "quieto_deg": 3.0,
+    "velocidad_real_pct": 60,
+    "velocidad_sim_pct": 100,
+    "giro_max_rad_s": 12.0
   }
 }

@@ -20,6 +20,7 @@ mod por_que;
 #[cfg(test)]
 mod render_tests;
 mod robot_rows;
+mod rutinas;
 pub mod run_info;
 mod status_line;
 mod tag;
@@ -36,6 +37,7 @@ use tag::MarcasRobot;
 
 use crate::control_loop::{GuiSkillCommand, HeadingPid, ManualCommand};
 use crate::radio::TeleportItem;
+use crate::rutinas::OrdenRutina;
 use crate::skills::SkillId;
 use crate::snapshot::{LoopSnapshot, SnapshotReceiver};
 use glam::Vec2;
@@ -320,6 +322,9 @@ const VENTANA_INICIAL: (f32, f32) = (1440.0, 900.0);
 /// Ancho de la planilla de robots y del panel de pestañas, y alto de los gráficos.
 const ANCHO_ROBOTS: f32 = 300.0;
 const ANCHO_PANEL: f32 = 300.0;
+/// Espaciado y margen lateral de la barra de pestañas (cinco en `ANCHO_PANEL`).
+const BARRA_PESTANAS_SP: f32 = theme::SP_XS;
+const BARRA_PESTANAS_MARGEN: f32 = 4.0;
 const ALTO_GRAFICOS: f32 = 168.0;
 
 /// Pestañas del panel derecho. La barra muestra solo las implementadas.
@@ -330,6 +335,8 @@ pub enum Tab {
     Inspector,
     /// Comandos del árbitro (fase 4).
     Arbitro,
+    /// Rutinas: lista, opciones, botones por fase y estado (capability `gui-rutinas`).
+    Rutinas,
     Parametros,
     /// Provisional hasta la fase 4: control manual, skills de la GUI y teleport.
     Herramientas,
@@ -337,13 +344,14 @@ pub enum Tab {
 
 impl Tab {
     /// Las implementadas en esta fase.
-    pub const VISIBLES: [Tab; 4] = [Tab::PorQue, Tab::Inspector, Tab::Parametros, Tab::Herramientas];
+    pub const VISIBLES: [Tab; 5] = [Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Parametros, Tab::Herramientas];
 
     pub fn titulo(self) -> &'static str {
         match self {
             Tab::PorQue => "Por qué",
             Tab::Inspector => "Inspector",
             Tab::Arbitro => "Árbitro",
+            Tab::Rutinas => "Rutinas",
             Tab::Parametros => "Parámetros",
             Tab::Herramientas => "Herramientas",
         }
@@ -402,6 +410,8 @@ pub enum Message {
     SetFieltro(Fieltro),
     SetOrientacion(OrientacionVista),
     SetMarcas(MarcasRobot),
+    /// Pestaña Rutinas.
+    Rutina(rutinas::MensajeRutina),
 }
 
 /// Cuadros por segundo de la propia GUI (fotos procesadas por segundo).
@@ -448,6 +458,9 @@ pub struct GuiSetup {
     pub pid_tx: Option<mpsc::Sender<HeadingPid>>,
     /// Canal de teleport (sim) → lazo.
     pub teleport_tx: Option<mpsc::Sender<Vec<TeleportItem>>>,
+    /// Órdenes de las rutinas → conmutador de `main`. `None` (p. ej. `scenario`): la
+    /// pestaña muestra la lista y la vista previa, sin poder preparar.
+    pub rutina_tx: Option<mpsc::Sender<OrdenRutina>>,
     /// Flag de parada de emergencia compartido con el lazo.
     pub estop: Arc<AtomicBool>,
     /// Configuración de la corrida (solo lectura).
@@ -535,12 +548,19 @@ pub struct DebugGui {
     telemetry_window_s: f64,
     // Trazas de la capa T (últimos segundos de cada robot y de la pelota).
     trazas: capas::Trazas,
+    // Pestaña Rutinas.
+    rutinas: rutinas::EstadoRutinas,
 }
 
 impl DebugGui {
     fn new(setup: GuiSetup) -> (Self, Task<Message>) {
         let own_goal = own_goal_center(setup.run.defend_left);
         let selected_team = setup.run.own_team.max(0) as u32;
+        let rutinas = rutinas::EstadoRutinas::new(
+            setup.rutina_tx,
+            setup.run.own_team,
+            !setup.run.is_base_station(),
+        );
         (
             DebugGui {
                 snap: Arc::new(LoopSnapshot::default()),
@@ -606,6 +626,7 @@ impl DebugGui {
                 telemetry_frozen: false,
                 telemetry_window_s: TELEMETRY_WINDOW_DEFAULT_S,
                 run: setup.run,
+                rutinas,
             },
             Task::none(),
         )
@@ -832,6 +853,7 @@ impl DebugGui {
                 self.cache_base.clear();
             }
             Message::SetMarcas(m) => self.marcas = m,
+            Message::Rutina(m) => self.mensaje_rutina(m),
         }
         Task::none()
     }
@@ -1077,6 +1099,7 @@ impl DebugGui {
             capas: &self.capas,
             trazas: &self.trazas,
             sim: !self.run.is_base_station(),
+            rutina: self.dibujo_rutina(),
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -1090,8 +1113,8 @@ impl DebugGui {
 
     /// Panel derecho: barra de pestañas y la pestaña activa (con scroll).
     fn vista_panel(&self) -> Element<'_, Message> {
-        // Cuatro pestañas en 300 px: espaciado y margen chicos, texto de 13 px.
-        let mut barra = row![].spacing(theme::SP_SM).align_y(Alignment::End);
+        // Cinco pestañas en 300 px: espaciado y margen chicos, texto de 12 px.
+        let mut barra = row![].spacing(BARRA_PESTANAS_SP).align_y(Alignment::End);
         for t in Tab::VISIBLES {
             let activa = t == self.tab;
             let boton = button(
@@ -1113,13 +1136,14 @@ impl DebugGui {
         let contenido = match self.tab {
             Tab::Herramientas => self.pestana_herramientas(),
             Tab::Inspector => self.pestana_inspector(),
+            Tab::Rutinas => self.pestana_rutinas(),
             Tab::Parametros => self.pestana_parametros(),
             Tab::PorQue => self.pestana_por_que(),
             Tab::Arbitro => text("Llega en una fase posterior.").into(),
         };
         container(
             column![
-                container(barra).padding([8, 8]),
+                container(barra).padding([8.0, BARRA_PESTANAS_MARGEN]),
                 horizontal_rule(1).style(theme::filete),
                 scrollable(container(contenido).padding([10, 14]).width(Length::Fill))
                     .height(Length::Fill),
@@ -1220,6 +1244,19 @@ pub fn run_gui(setup: GuiSetup) -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_five_tabs_fit_in_the_panel() {
+        assert_eq!(Tab::VISIBLES[2], Tab::Rutinas, "Rutinas va después de Inspector");
+        let titulos: f32 = Tab::VISIBLES
+            .iter()
+            .map(|t| field::ancho_texto(t.titulo(), theme::TXT_PESTANA))
+            .sum();
+        let total = titulos
+            + BARRA_PESTANAS_SP * (Tab::VISIBLES.len() - 1) as f32
+            + 2.0 * BARRA_PESTANAS_MARGEN;
+        assert!(total <= ANCHO_PANEL, "la barra mide {total} px");
+    }
 
     #[tokio::test]
     async fn the_gui_hears_when_the_loop_ends() {

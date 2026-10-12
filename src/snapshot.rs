@@ -18,6 +18,7 @@ use crate::coach::{Foul, Role, SharedReferee, SkillChoice};
 use crate::control_loop::TickMode;
 use crate::motion::{MotionCommand, NavDebug};
 use crate::radio::base_station::command_to_vw;
+use crate::rutinas::RutinaVista;
 use crate::skills::zones::{AreaRect, GuardiaDebug};
 use crate::skills::{SkillId, SkillStatus};
 use crate::world::World;
@@ -72,6 +73,8 @@ pub struct LoopSnapshot {
     pub radio: RadioCounters,
     /// Depuración del tick (`None` si el lazo no la arma).
     pub debug: Option<Arc<TickDebug>>,
+    /// Rutina activa (capability `rutinas-ejecucion`), tomada después de `observar`.
+    pub rutina: Option<Arc<RutinaVista>>,
 }
 
 impl Default for LoopSnapshot {
@@ -90,6 +93,7 @@ impl Default for LoopSnapshot {
             vision: VisionCounters::default(),
             radio: RadioCounters::default(),
             debug: None,
+            rutina: None,
         }
     }
 }

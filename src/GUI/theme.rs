@@ -92,8 +92,8 @@ pub const TXT: f32 = 14.0;
 pub const TXT_CHICO: f32 = 13.0;
 /// Etiquetas pequeñas (ejes, regla).
 pub const TXT_MINI: f32 = 12.0;
-/// Pestañas (con 13 px caben las cuatro en el panel derecho).
-pub const TXT_PESTANA: f32 = 13.0;
+/// Pestañas (con 12 px caben las cinco en el panel derecho).
+pub const TXT_PESTANA: f32 = 12.0;
 /// Títulos de panel.
 pub const TXT_TITULO: f32 = 17.0;
 /// Nombre de robot y título de la barra de estado.
