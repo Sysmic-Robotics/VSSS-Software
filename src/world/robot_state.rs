@@ -82,13 +82,12 @@ impl RobotState {
         self.active = false;
     }
 
-    /// Verifica si el robot está inactivo (última actualización hace más de threshold segundos)
-    pub fn is_inactive(&self, threshold_seconds: u64) -> bool {
-        if let Ok(elapsed) = self.last_update.elapsed() {
-            elapsed.as_secs() > threshold_seconds
-        } else {
-            false
-        }
+    /// Si el último dato tiene más de `umbral_s` segundos, con decimales: en segundos
+    /// enteros, un umbral de 2 s se volvía 3 s.
+    pub fn is_inactive(&self, umbral_s: f64) -> bool {
+        self.last_update
+            .elapsed()
+            .is_ok_and(|elapsed| elapsed.as_secs_f64() > umbral_s)
     }
 }
 
@@ -124,5 +123,14 @@ mod tests {
         let mut state = RobotState::new(1, 0);
         state.mark_inactive();
         assert!(!state.active);
+    }
+
+    #[test]
+    fn inactivity_compares_seconds_with_decimals() {
+        let mut state = RobotState::new(1, 0);
+        state.last_update = SystemTime::now() - std::time::Duration::from_secs_f64(2.5);
+        assert!(state.is_inactive(2.0), "2.5 s > 2.0 s (en segundos enteros daba 2, no > 2)");
+        state.last_update = SystemTime::now() - std::time::Duration::from_secs_f64(1.5);
+        assert!(!state.is_inactive(2.0));
     }
 }

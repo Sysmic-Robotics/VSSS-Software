@@ -371,6 +371,11 @@ pub struct VisionParams {
     /// visión real (`VSSL_VISION_SOURCE=sslvision`), antes del EKF y de la GUI.
     /// vsss-vision-sysmic entrega el heading girado 180°. FIRASim no se toca.
     pub real_theta_offset_deg: f64,
+    /// Corte por pérdida de visión (s): si ningún robot propio tuvo un dato en este
+    /// tiempo, el lazo detiene al equipo (`TickMode::SinVision`). 0.4 s son ~25 cuadros:
+    /// una pérdida breve no corta. Pendiente de revisar con la medición de la cámara
+    /// real (frames perdidos y duración de los huecos).
+    pub blind_stop_s: f64,
 }
 
 impl Default for VisionParams {
@@ -391,6 +396,7 @@ impl Default for VisionParams {
             proxy_latency_ms: 90.0,
             proxy_drop_prob: 0.02,
             real_theta_offset_deg: 0.0,
+            blind_stop_s: 0.4,
         }
     }
 }
@@ -421,6 +427,13 @@ impl TeamParams {
         let p: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
         p.robot.validate()?;
         p.validate_tolerances()?;
+        if p.vision.blind_stop_s <= 0.0 {
+            return Err(format!(
+                "vision.blind_stop_s ({}) debe ser mayor que cero: es el tiempo sin ver robots \
+                 propios tras el cual el lazo detiene al equipo",
+                p.vision.blind_stop_s
+            ));
+        }
         Ok(p)
     }
 
@@ -607,6 +620,18 @@ mod tests {
         // Los defaults y el JSON del repo cumplen la relación.
         let d = TeamParams::default();
         assert!(d.motion.arrival_threshold < d.skills.approach_pos_tol);
+    }
+
+    #[test]
+    fn blind_stop_defaults_to_0_4_s_and_must_be_positive() {
+        assert_eq!(TeamParams::default().vision.blind_stop_s, 0.4);
+        let p = TeamParams::from_json(r#"{ "vision": { "blind_stop_s": 0.3 } }"#).unwrap();
+        assert_eq!(p.vision.blind_stop_s, 0.3);
+        for malo in ["0", "-0.4"] {
+            let err = TeamParams::from_json(&format!(r#"{{ "vision": {{ "blind_stop_s": {malo} }} }}"#))
+                .unwrap_err();
+            assert!(err.contains("vision.blind_stop_s"), "{err}");
+        }
     }
 
     #[test]

@@ -196,7 +196,7 @@ pub enum CommandSource {
     GuiSkill,
     /// Control manual por teclado.
     Manual,
-    /// Parada de emergencia o HALT del árbitro: cero.
+    /// Parada de emergencia, HALT del árbitro o corte sin visión: cero.
     Halt,
     /// STOP del árbitro: sin traslación.
     Stop,
@@ -301,6 +301,10 @@ impl OwnTick<'_> {
                 let choice = self.applied.iter().find(|c| c.robot_id == id);
                 let source = match self.mode {
                     TickMode::Halt => Some(CommandSource::Halt),
+                    // En el corte sin visión, el manual sigue (brazo de abajo).
+                    TickMode::SinVision if !(self.manual_ids.contains(&id) && idx.is_some()) => {
+                        Some(CommandSource::Halt)
+                    }
                     TickMode::Stop if idx.is_some() => Some(CommandSource::Stop),
                     _ if self.manual_ids.contains(&id) && idx.is_some() => Some(CommandSource::Manual),
                     _ if choice.is_some() && self.gui_skill_ids.contains(&id) => Some(CommandSource::GuiSkill),
@@ -604,6 +608,26 @@ mod tests {
         let v = tick.views(|_| None);
         assert_eq!(v[0].source, Some(CommandSource::Stop));
         assert_eq!(v[0].skill, Some(SkillId::GoTo), "en STOP la skill sigue corriendo (solo ω)");
+    }
+
+    #[test]
+    fn own_views_in_the_blind_cut() {
+        let commands = [cmd(0, 0.0, 0.0, 0.0, 0.0), cmd(1, 0.3, 0.0, 0.0, 0.0)];
+        let tick = OwnTick {
+            mode: TickMode::SinVision,
+            own_team: 0,
+            num_robots: 2,
+            commands: &commands,
+            targets: &[None, None],
+            applied: &[],
+            escaping: &[false, false],
+            manual_ids: &[1],
+            gui_skill_ids: &[],
+            statuses: &[],
+        };
+        let v = tick.views(|_| None);
+        assert_eq!(v[0].source, Some(CommandSource::Halt), "detenido sin visión");
+        assert_eq!(v[1].source, Some(CommandSource::Manual), "el manual sigue");
     }
 
     #[test]

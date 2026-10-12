@@ -25,7 +25,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
 /// Decide qué skills correr en este tick. Producción: `CoachDecider`.
@@ -70,6 +70,10 @@ pub enum TickMode {
     /// HALT del árbitro o parada de emergencia: cero a todos los ids propios, sin
     /// decider, sin skills y sin reflejos.
     Halt,
+    /// Corte por pérdida de visión: ningún robot propio tuvo un dato en los últimos
+    /// `vision.blind_stop_s`. Como HALT, pero el control manual sigue (no necesita
+    /// visión).
+    SinVision,
 }
 
 /// Modo que impone el árbitro según su último comando (`Play` sin árbitro o con el lock
@@ -274,10 +278,25 @@ pub(crate) fn skill_statuses(
         .collect()
 }
 
-/// Modo del tick: la parada de emergencia toma el camino de HALT, prevalezca lo que
-/// diga el árbitro.
-pub fn tick_mode(estop_engaged: bool, ref_mode: TickMode) -> TickMode {
-    if estop_engaged { TickMode::Halt } else { ref_mode }
+/// Modo del tick. La parada de emergencia y el HALT del árbitro van primero (el mismo
+/// camino); después, el corte sin visión, que prevalece sobre STOP y el juego.
+pub fn tick_mode(estop_engaged: bool, ref_mode: TickMode, sin_vision: bool) -> TickMode {
+    if estop_engaged || ref_mode == TickMode::Halt {
+        TickMode::Halt
+    } else if sin_vision {
+        TickMode::SinVision
+    } else {
+        ref_mode
+    }
+}
+
+/// Si el equipo está sin visión: ningún robot propio se vio nunca, o su último dato
+/// (`World::ultimo_dato_de`) tiene más de `umbral`. Un reloj que retrocede no corta.
+pub fn sin_vision(ultimo: Option<SystemTime>, ahora: SystemTime, umbral: Duration) -> bool {
+    match ultimo {
+        None => true,
+        Some(t) => ahora.duration_since(t).is_ok_and(|edad| edad > umbral),
+    }
 }
 
 /// Comando cero para cada id del equipo propio en `0..num_robots`, lo vea o no la visión
@@ -382,10 +401,14 @@ pub(crate) fn tick_commands(
     own_team: i32,
     num_robots: usize,
 ) -> (Vec<MotionCommand>, Vec<Option<Vec2>>, Vec<SkillChoice>, Vec<bool>) {
-    if mode == TickMode::Halt {
+    if matches!(mode, TickMode::Halt | TickMode::SinVision) {
         recovery.reset();
         catalog.forget_last_skills();
-        let (cmds, tgts) = zero_commands_for_team(world, own_team, num_robots);
+        let (mut cmds, mut tgts) = zero_commands_for_team(world, own_team, num_robots);
+        if mode == TickMode::SinVision {
+            // El manual no necesita visión: sigue en el corte (en HALT ya está vacío).
+            apply_manual_overrides(&mut cmds, &mut tgts, manual_state, world);
+        }
         let esc = vec![false; cmds.len()];
         return (cmds, tgts, Vec::new(), esc);
     }
@@ -800,6 +823,11 @@ pub async fn run_control_loop(
     let zone_guard = ZoneGuard::new(attack_sign, keeper_id);
     let mut field_scale_warned = false;
     let mut halted_prev = false;
+    // Corte por pérdida de visión (ver `TickMode::SinVision`). Antes del primer cuadro el
+    // equipo está en corte, sin aviso.
+    let blind_stop = Duration::from_secs_f64(crate::params::params().vision.blind_stop_s);
+    let mut ciego_prev = true;
+    let mut visto_alguna_vez = false;
     let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
     let started = Instant::now();
@@ -884,14 +912,16 @@ pub async fn run_control_loop(
                     eprintln!("[control_loop] fin de HALT");
                 }
             }
-            let mode = tick_mode(estop_engaged, ref_mode);
-            if mode == TickMode::Halt {
+            // La parada y HALT vacían el manual y las skills de la GUI; el corte sin visión no.
+            if tick_mode(estop_engaged, ref_mode, false) == TickMode::Halt {
                 manual_state.clear();
                 skill_state.clear();
             }
 
             let skill_warning: Option<String>;
             let ceros: Option<Vec<MotionCommand>>;
+            let ciego: bool;
+            let mode: TickMode;
             // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
             let mut gui_world = None;
             let (commands, targets, applied_choices, escaping) = {
@@ -901,6 +931,12 @@ pub async fn run_control_loop(
                 }
                 // Con la parada activa `skill_state` ya está vacío → sin aviso.
                 skill_warning = gui_skill_warning(&skill_state, &world_guard, config.own_team);
+                ciego = sin_vision(
+                    world_guard.ultimo_dato_de(config.own_team),
+                    SystemTime::now(),
+                    blind_stop,
+                );
+                mode = tick_mode(estop_engaged, ref_mode, ciego);
                 let out = tick_commands(
                     mode,
                     &world_guard,
@@ -926,6 +962,20 @@ pub async fn run_control_loop(
                 out
             };
             tick_counter = tick_counter.wrapping_add(1);
+
+            if ciego != ciego_prev {
+                if ciego {
+                    eprintln!(
+                        "[control_loop] sin visión de robots propios hace más de {:.1} s: \
+                         equipo detenido (el manual sigue)",
+                        blind_stop.as_secs_f64()
+                    );
+                } else if visto_alguna_vez {
+                    eprintln!("[control_loop] visión de robots propios: el equipo vuelve a jugar");
+                }
+                visto_alguna_vez |= !ciego;
+                ciego_prev = ciego;
+            }
 
             // Aviso de skill de GUI que no corre: terminal con límite de frecuencia (la
             // GUI lo recibe en cada foto). Antes del `continue` por comandos vacíos: si el
@@ -1165,9 +1215,78 @@ mod tests {
         assert_eq!(referee_mode(&referee), TickMode::Play);
         // La parada de emergencia toma el camino de HALT diga lo que diga el árbitro.
         for m in [TickMode::Play, TickMode::Stop, TickMode::Halt] {
-            assert_eq!(tick_mode(true, m), TickMode::Halt);
-            assert_eq!(tick_mode(false, m), m);
+            assert_eq!(tick_mode(true, m, false), TickMode::Halt);
+            assert_eq!(tick_mode(false, m, false), m);
         }
+    }
+
+    // ── Corte por pérdida de visión ─────────────────────────────────────────
+
+    #[test]
+    fn blind_cut_yields_to_halt_and_estop_and_beats_stop_and_play() {
+        assert_eq!(tick_mode(true, TickMode::Play, true), TickMode::Halt);
+        assert_eq!(tick_mode(false, TickMode::Halt, true), TickMode::Halt);
+        assert_eq!(tick_mode(false, TickMode::Stop, true), TickMode::SinVision);
+        assert_eq!(tick_mode(false, TickMode::Play, true), TickMode::SinVision);
+    }
+
+    #[test]
+    fn a_brief_gap_does_not_cut_and_a_long_one_does() {
+        let umbral = Duration::from_millis(400);
+        let t = SystemTime::now();
+        assert!(!sin_vision(Some(t), t + Duration::from_millis(250), umbral), "hueco de 0.25 s");
+        assert!(sin_vision(Some(t), t + Duration::from_millis(450), umbral), "hueco de 0.45 s");
+        assert!(sin_vision(None, t, umbral), "nunca se vio un robot propio");
+        assert!(!sin_vision(Some(t), t - Duration::from_millis(50), umbral), "reloj que retrocede");
+    }
+
+    #[test]
+    fn rivals_alone_do_not_keep_the_team_playing() {
+        let umbral = Duration::from_millis(400);
+        let mut w = World::new(3, 3);
+        w.update_robot(0, 1, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
+        assert!(sin_vision(w.ultimo_dato_de(0), SystemTime::now(), umbral));
+        w.update_robot(2, 0, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
+        assert!(!sin_vision(w.ultimo_dato_de(0), SystemTime::now(), umbral), "un propio alcanza");
+    }
+
+    #[test]
+    fn blind_cut_zeroes_every_own_id_without_the_decider_and_keeps_manual() {
+        let world = world_with_robot(0.0, 0.0, 0.0);
+        let mut d = CountingDecider {
+            inner: FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.6, 0.0)),
+            calls: 0,
+        };
+        let mut rig = Rig::new(true);
+        let (cmds, _) = rig.step(TickMode::SinVision, &world, &mut d);
+        assert_eq!(d.calls, 0, "sin decider");
+        let mut ids: Vec<i32> = cmds.iter().map(|c| c.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert!(all_zero(&cmds));
+        // El manual sigue en el corte.
+        let manual = ManualCommand { team: 0, id: 1, vx: 0.3, vy: 0.0, omega: 0.0 };
+        rig.manual.insert((0, 1), (manual, 0));
+        let (cmds, _) = rig.step(TickMode::SinVision, &world, &mut d);
+        let r1 = cmds.iter().find(|c| c.id == 1).expect("robot 1");
+        assert_eq!(r1.vx, 0.3);
+        assert!(all_zero(&cmds.iter().filter(|c| c.id != 1).cloned().collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn leaving_the_blind_cut_starts_clean() {
+        let world = world_with_robot(0.0, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.6, 0.0));
+        let mut rig = Rig::new(true);
+        drive_into_escape(&mut rig, &world, &mut d);
+        for _ in 0..10 {
+            rig.step(TickMode::SinVision, &world, &mut d);
+        }
+        let (cmds, esc) = rig.step(TickMode::Play, &world, &mut d);
+        assert!(!esc[0], "el escape interrumpido no sigue");
+        let c = robot0(&cmds);
+        let v = c.vx.hypot(c.vy);
+        assert!(v <= rig.motion.config.max_linear_accel * crate::motion::CONTROL_DT + 1e-9, "rampa: v={v}");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use super::format::{num, pct};
 use super::run_info::{CoachKind, RunInfo};
 use super::{DebugGui, Message, fonts, theme};
 use crate::coach::Foul;
+use crate::control_loop::TickMode;
 use crate::radio::RadioTarget;
 use crate::snapshot::{LoopSnapshot, RadioCounters, VisionCounters};
 use crate::vision::VisionSource;
@@ -203,6 +204,9 @@ pub fn frases_estado(
     }
     if snap.estop {
         out.push(Frase::alerta_si("Parada de emergencia: todos en cero", true));
+    }
+    if snap.mode == TickMode::SinVision {
+        out.push(Frase::alerta_si("Sin visión de nuestros robots: equipo detenido", true));
     }
     if !run.tracker_on {
         out.push(Frase::alerta_si("Filtro de Kalman apagado (VSSL_TRACKER)", true));
@@ -484,6 +488,17 @@ mod tests {
         let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
         assert!(f.iter().any(|x| x.texto == "Árbitro: HALT, todos detenidos" && x.alerta));
         assert!(f.iter().any(|x| x.texto == "Parada de emergencia: todos en cero" && x.alerta));
+    }
+
+    #[test]
+    fn the_blind_cut_is_an_alert() {
+        const FRASE: &str = "Sin visión de nuestros robots: equipo detenido";
+        let mut snap = snap_sano();
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        assert!(!f.iter().any(|x| x.texto == FRASE), "en juego no aparece");
+        snap.mode = TickMode::SinVision;
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        assert!(f.iter().any(|x| x.texto == FRASE && x.alerta));
     }
 
     #[test]
