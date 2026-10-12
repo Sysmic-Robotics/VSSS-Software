@@ -75,10 +75,9 @@ def dist(a, b):
 def infer_attack_sign(ticks, own_team):
     """Lado de ataque: el arquero propio (skill `goalkeep`, en todo el registro) vive en
     nuestro arco, así que atacamos hacia el otro. Sin arquero etiquetado (rule_based), lo dan
-    los propios en los 10 s que siguen al saque inicial (ticks 300-900: el simulador conserva
-    las posiciones del partido anterior hasta que el director repone a los ~4 s). Último
-    recurso: convención por color (azul ataca +x). Mirar solo los primeros 10 s fallaba por
-    esas posiciones heredadas y por el arquero en `hold` durante el saque."""
+    los propios en los 10 s que siguen al saque inicial (`ticks` ya empieza en el saque: ver
+    `play_start`). Último recurso: convención por color (azul ataca +x). Mirar al arquero solo
+    al principio fallaba porque pasa el saque en `hold`."""
     xs = [
         r["pos"][0]
         for e in ticks
@@ -102,7 +101,7 @@ def infer_attack_sign(ticks, own_team):
             return -1.0 if mean_x > 0 else 1.0
     xs = [
         r["pos"][0]
-        for e in ticks[300:900]
+        for e in ticks[:600]
         for r in e["robots"]
         if r["own"] and r["pos"][0] is not None
     ]
@@ -113,8 +112,26 @@ def infer_attack_sign(ticks, own_team):
     return 1.0 if own_team == 0 else -1.0
 
 
-def analyze(path: str) -> dict:
+def play_start(ticks) -> int:
+    """Índice del saque inicial: el engine arranca antes que el director y el registro
+    empieza con la pelota y los robots donde quedó el partido anterior (a menudo la pelota
+    dentro del arco). El saque es el primer teleport de la pelota al centro: un salto de
+    más de 0.3 m que la deja a menos de 0.03 m del origen. Sin saque visible, 0."""
+    for i in range(1, len(ticks)):
+        b, prev = ticks[i]["ball"], ticks[i - 1]["ball"]
+        if math.hypot(b[0], b[1]) < 0.03 and math.hypot(b[0] - prev[0], b[1] - prev[1]) > 0.3:
+            return i
+    return 0
+
+
+def load_play(path: str):
+    """Como `load`, pero desde el saque inicial."""
     ticks, own_team = load(path)
+    return ticks[play_start(ticks):], own_team
+
+
+def analyze(path: str) -> dict:
+    ticks, own_team = load_play(path)
     if not ticks or own_team is None:
         return {"archivo": path, "error": "sin filas propias"}
     attack_sign = infer_attack_sign(ticks, own_team)
