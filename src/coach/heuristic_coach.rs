@@ -96,10 +96,6 @@ enum StallAction {
 // del arquero activo son parámetros de estilo de juego: `CoachParams`
 // (`config/team_params.json`, rangos en `config/style_ranges.json`).
 
-/// Margen lateral libre de rivales que exige la línea de pase (m): más que el 0.09 del tiro,
-/// porque el pase tarda en salir (el striker se pone detrás de la pelota) y el rival se mueve.
-const PASS_LANE_MARGIN: f32 = 0.15;
-
 pub struct HeuristicCoach {
     pub attack_goal: Vec2,
     pub own_goal: Vec2,
@@ -127,9 +123,6 @@ pub struct HeuristicCoach {
     /// Ya se comparó el lado configurado con la posición inicial del equipo.
     side_checked: bool,
     push_stall: Stall,
-    /// Decisión en la que el striker eligió pasar: el pase se sostiene ~1 s mientras la
-    /// línea siga libre, para que "tiro tapado" no parpadee entre arco y compañero.
-    pass_committed: Option<u64>,
 }
 
 fn clamp01(x: f32) -> f32 {
@@ -189,7 +182,6 @@ impl HeuristicCoach {
             adaptation: Adaptation::new(p.adapt_enabled, p.adapt_alpha),
             side_checked: false,
             push_stall: Stall::None,
-            pass_committed: None,
             p,
         }
     }
@@ -658,56 +650,10 @@ impl HeuristicCoach {
         pos
     }
 
-    /// Pase: con el tiro al arco tapado y la pelota lejos de las paredes, si el compañero
-    /// está a la par o adelante, a distancia útil, con la línea pelota→compañero libre y con
-    /// tiro libre desde ahí, el striker le empuja la pelota. En los registros, el 56-64 % de
-    /// los tiros terminaban en un rival y el apoyo estaba siempre detrás.
-    fn pass_option(&self, ball: Vec2, opp: &[RobotView], mate: Vec2, goal_target: Vec2) -> bool {
-        let s = self.attack_sign();
-        if self.ball_on_side_wall(ball) || self.ball_on_end_wall(ball) {
-            return false;
-        }
-        if !Self::shot_blocked(ball, goal_target, opp) {
-            return false;
-        }
-        // En pleno duelo (rival a < 0.20 m de la pelota) el pase no sale: en los registros
-        // llegaba el 8 % de las veces, contra 25-35 % con el rival más lejos.
-        let duel = opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.20);
-        if duel {
-            return false;
-        }
-        let d = (mate - ball).length();
-        (0.25..=0.90).contains(&d)
-            && (mate.x - ball.x) * s >= -0.10
-            && !Self::line_blocked(ball, mate, opp, PASS_LANE_MARGIN)
-            && !Self::shot_blocked(mate, self.attack_goal, opp)
-    }
-
-    /// Destino del empuje si corresponde pasar (`Some(compañero)`), sosteniendo el pase ~1 s
-    /// mientras la línea al compañero siga libre.
-    fn pass_target(&mut self, ball: Vec2, opp: &[RobotView], support: Option<Vec2>, goal_target: Vec2) -> Option<Vec2> {
-        let Some(mate) = support else {
-            self.pass_committed = None;
-            return None;
-        };
-        let now = self.decision_count;
-        if self.pass_option(ball, opp, mate, goal_target) {
-            self.pass_committed = Some(now);
-            return Some(mate);
-        }
-        // Dos segundos: ponerse detrás de la pelota sobre la línea al compañero toma más de
-        // uno y, si el pase se suelta antes, el striker vuelve al arco a medio camino.
-        let hold = (2.0 * self.p.decision_hz.max(1.0)) as u64;
-        let holding = self.pass_committed.is_some_and(|t| now.saturating_sub(t) < hold);
-        if holding && !Self::line_blocked(ball, mate, opp, PASS_LANE_MARGIN) && (mate - ball).length() >= 0.25 {
-            return Some(mate);
-        }
-        self.pass_committed = None;
-        None
-    }
-
     /// `support`: posición del compañero de campo, destino del pase cuando el empuje
-    /// se traba.
+    /// se traba. (Un pase deliberado con el tiro tapado se probó y se descartó: por empuje,
+    /// sin pateador, llegaba al receptor el 9-20 % de las veces y más de la mitad terminaba
+    /// en un rival; queda el apoyo adelantado como receptor de segunda pelota.)
     fn striker_choice(
         &mut self,
         r: &RobotView,
@@ -716,11 +662,7 @@ impl HeuristicCoach {
         opp: &[RobotView],
         support: Option<Vec2>,
     ) -> SkillChoice {
-        let goal_target = self.striker_target(ball, opp);
-        let mut target = match self.pass_target(ball, opp, support, goal_target) {
-            Some(mate) => mate,
-            None => goal_target,
-        };
+        let mut target = self.striker_target(ball, opp);
         let mut scores = self.striker_scores(r, ball, ball_vel, opp, target);
         let current = self.committed[r.id as usize].map(|c| c.skill);
         match self.update_push_stall(current, r.pos, ball, ball_vel) {
@@ -828,16 +770,16 @@ impl HeuristicCoach {
         // Atacando: receptor de pase a la par de la pelota, en el carril contrario al
         // striker (o al lado libre), con línea de tiro al arco y lejos de los rivales. En
         // los registros el apoyo esperaba detrás de la pelota y nunca era opción de pase.
-        // Carriles en el marco de la cancha: en diagonal adelante (0.15 m hacia el arco
-        // rival) y al otro lado en y, a ~0.30 m de la pelota en total: más lejos, el empuje
-        // suelta la pelota a ~0.4 m/s y no llega (a 0.48 m llegaba el 9 % de los pases).
+        // Carriles en el marco de la cancha: en diagonal adelante (0.25 m hacia el arco
+        // rival) y al otro lado en y. Es la posición de segunda pelota: rebotes y pelotas
+        // sueltas del lado libre, con línea de tiro propia.
         let preferred = match striker {
             Some(st) if (st.pos.y - ball.y).abs() > 0.02 => -(st.pos.y - ball.y).signum(),
             _ => -ball.y.signum(),
         };
         let preferred = if preferred == 0.0 { 1.0 } else { preferred };
         let candidate = |side: f32| -> Option<Vec2> {
-            let raw = Vec2::new(ball.x + s * 0.15, ball.y + self.p.pass_receiver_offset * side);
+            let raw = Vec2::new(ball.x + s * 0.25, ball.y + self.p.pass_receiver_offset * side);
             // Si el carril de ese lado no existe (pelota pegada a la banda), no es opción.
             (raw.y.abs() <= FIELD_ROBOT_MAX_ABS_Y).then(|| self.receiver_point(raw, ball))
         };
@@ -1681,35 +1623,6 @@ mod tests {
         let mut o2 = o.clone();
         o2.opp_robots[0] = robot(Vec2::new(-0.02, 0.10), 180.0);
         assert_eq!(choice_of(&c2.decide(&o2), 1).skill_id, SkillId::BlockLine);
-    }
-
-    #[test]
-    fn striker_passes_to_the_open_mate_when_the_shot_is_blocked() {
-        let mut c = coach();
-        let ball = Vec2::new(0.30, 0.20);
-        let mate = Vec2::new(0.35, -0.25);
-        // Striker detrás de la pelota sobre la línea al arco; un rival tapa esa línea.
-        let mut o = obs(ball, Vec2::ZERO, [Vec2::new(0.18, 0.26), mate, Vec2::new(-0.68, 0.0)]);
-        o.opp_robots[0] = robot(Vec2::new(0.50, 0.11), 180.0);
-        let ch = c.decide(&o);
-        assert_eq!(c.role_of(0), Some(Role::Striker));
-        let st = choice_of(&ch, 0);
-        assert!((st.target - mate).length() < 0.05, "pasa al compañero: {:?} ({:?})", st.target, st.skill_id);
-        // Con un rival sobre la línea de pase, apunta al arco (sin pase).
-        let mut c2 = coach();
-        let mut o2 = o.clone();
-        o2.opp_robots[1] = robot(Vec2::new(0.33, -0.03), 180.0);
-        let st2 = choice_of(&c2.decide(&o2), 0);
-        assert!((st2.target - mate).length() > 0.10, "línea de pase tapada: {:?}", st2.target);
-        // Con el compañero detrás de la pelota, tampoco.
-        let mut c3 = coach();
-        let o3 = {
-            let mut o3 = o.clone();
-            o3.own_robots[1] = robot(Vec2::new(0.05, -0.25), 0.0);
-            o3
-        };
-        let st3 = choice_of(&c3.decide(&o3), 0);
-        assert!((st3.target - Vec2::new(0.05, -0.25)).length() > 0.10, "compañero detrás: {:?}", st3.target);
     }
 
     #[test]
