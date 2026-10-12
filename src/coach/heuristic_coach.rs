@@ -649,13 +649,13 @@ impl HeuristicCoach {
         pos
     }
 
-    /// Pase: con el tiro al arco tapado, en campo rival y lejos de las paredes, si el
-    /// compañero está a la par o adelante, a distancia útil, con la línea pelota→compañero
-    /// libre y con tiro libre desde ahí, el striker le empuja la pelota. En los registros,
-    /// el 56-64 % de los tiros terminaban en un rival y el apoyo estaba siempre detrás.
+    /// Pase: con el tiro al arco tapado y la pelota lejos de las paredes, si el compañero
+    /// está a la par o adelante, a distancia útil, con la línea pelota→compañero libre y con
+    /// tiro libre desde ahí, el striker le empuja la pelota. En los registros, el 56-64 % de
+    /// los tiros terminaban en un rival y el apoyo estaba siempre detrás.
     fn pass_option(&self, ball: Vec2, opp: &[RobotView], mate: Vec2, goal_target: Vec2) -> bool {
         let s = self.attack_sign();
-        if self.in_own_half(ball) || self.ball_on_side_wall(ball) || self.ball_on_end_wall(ball) {
+        if self.ball_on_side_wall(ball) || self.ball_on_end_wall(ball) {
             return false;
         }
         if !Self::shot_blocked(ball, goal_target, opp) {
@@ -680,7 +680,9 @@ impl HeuristicCoach {
             self.pass_committed = Some(now);
             return Some(mate);
         }
-        let hold = (self.p.decision_hz.max(1.0)) as u64;
+        // Dos segundos: ponerse detrás de la pelota sobre la línea al compañero toma más de
+        // uno y, si el pase se suelta antes, el striker vuelve al arco a medio camino.
+        let hold = (2.0 * self.p.decision_hz.max(1.0)) as u64;
         let holding = self.pass_committed.is_some_and(|t| now.saturating_sub(t) < hold);
         if holding && !Self::shot_blocked(ball, mate, opp) && (mate - ball).length() >= 0.25 {
             return Some(mate);
@@ -780,7 +782,13 @@ impl HeuristicCoach {
         striker: Option<&RobotView>,
         opp: &[RobotView],
     ) -> SkillChoice {
-        let defending = self.in_own_half(ball);
+        // Defiende (cubre la línea) con la pelota en nuestra mitad, salvo que el striker la
+        // tenga sin rival encima: entonces se ofrece como receptor también desde ahí. Sin
+        // esto, alrededor de la mitad de cancha el apoyo oscilaba entre receptor y
+        // BlockLine y el pase moría a medio camino.
+        let striker_has_it = striker.is_some_and(|st| (st.pos - ball).length() <= 0.20)
+            && !opp.iter().any(|o| o.active && (o.pos - ball).length() <= 0.25);
+        let defending = self.in_own_half(ball) && !striker_has_it;
         if defending {
             let skill = self.commit(r.id, SkillId::BlockLine, |_| true);
             return SkillChoice::new(r.id, skill, self.own_goal);
@@ -1186,12 +1194,13 @@ mod tests {
     #[test]
     fn support_blocks_when_defending_and_positions_when_attacking() {
         let mut c = coach();
-        // Pelota en campo propio → support cubre la línea al arco.
-        let o = obs(
+        // Pelota disputada en campo propio (rival encima) → support cubre la línea al arco.
+        let mut o = obs(
             Vec2::new(-0.3, 0.2),
             Vec2::ZERO,
             [Vec2::new(-0.2, 0.2), Vec2::new(0.3, -0.3), Vec2::new(-0.63, 0.0)],
         );
+        o.opp_robots[0] = robot(Vec2::new(-0.36, 0.24), 0.0);
         let ch = c.decide(&o);
         assert_eq!(c.role_of(0), Some(Role::Striker));
         let sup = choice_of(&ch, 1);
@@ -1636,6 +1645,25 @@ mod tests {
         assert!(sup.target.x >= ball.x - 0.02, "a la par o adelante, no detrás: {:?}", sup.target);
         assert!((sup.target - ball).length() >= c.p.standoff_from_ball - 1e-3);
         assert!(!c.in_own_area(sup.target) && sup.target.x < GOAL_AREA_X - 0.10, "fuera del área rival: {:?}", sup.target);
+    }
+
+    #[test]
+    fn support_receives_in_own_half_when_the_striker_has_the_ball() {
+        let mut c = coach();
+        // Pelota apenas en nuestra mitad, striker encima y ningún rival cerca: el apoyo no
+        // se va a la línea de gol, se ofrece a la par en el carril contrario.
+        let ball = Vec2::new(-0.10, 0.15);
+        let o = obs(ball, Vec2::ZERO, [Vec2::new(-0.20, 0.17), Vec2::new(-0.40, -0.20), Vec2::new(-0.68, 0.0)]);
+        let ch = c.decide(&o);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        let sup = choice_of(&ch, 1);
+        assert_eq!(sup.skill_id, SkillId::Mark, "{sup:?}");
+        assert!(sup.target.x >= ball.x - 0.02 && sup.target.y < 0.0, "{:?}", sup.target);
+        // Con un rival sobre la pelota, vuelve a cubrir la línea.
+        let mut c2 = coach();
+        let mut o2 = o.clone();
+        o2.opp_robots[0] = robot(Vec2::new(-0.02, 0.10), 180.0);
+        assert_eq!(choice_of(&c2.decide(&o2), 1).skill_id, SkillId::BlockLine);
     }
 
     #[test]
