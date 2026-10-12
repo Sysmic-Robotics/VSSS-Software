@@ -73,18 +73,42 @@ def dist(a, b):
 
 
 def infer_attack_sign(ticks, own_team):
-    """Lado de ataque: el arquero propio (skill `goalkeep`) está en nuestro arco, así que
-    atacamos hacia el lado contrario. Sin arquero visible, convención por color
-    (azul ataca +x). El simulador puede poner a cada color en cualquier lado (VSSL_SIDE)."""
+    """Lado de ataque: el arquero propio (skill `goalkeep`, en todo el registro) vive en
+    nuestro arco, así que atacamos hacia el otro. Sin arquero etiquetado (rule_based), lo dan
+    los propios en los 10 s que siguen al saque inicial (ticks 300-900: el simulador conserva
+    las posiciones del partido anterior hasta que el director repone a los ~4 s). Último
+    recurso: convención por color (azul ataca +x). Mirar solo los primeros 10 s fallaba por
+    esas posiciones heredadas y por el arquero en `hold` durante el saque."""
     xs = [
         r["pos"][0]
-        for e in ticks[: min(len(ticks), 600)]
+        for e in ticks
         for r in e["robots"]
         if r["own"] and r["skill"] == "goalkeep" and r["pos"][0] is not None
     ]
     if xs:
         mean_x = sum(xs) / len(xs)
-        if abs(mean_x) > 0.2:
+        if abs(mean_x) > 0.3:
+            return -1.0 if mean_x > 0 else 1.0
+    # Ambos coaches usan el robot 2 de arquero (el rule_based lo manda con `goto` a su arco).
+    xs = [
+        r["pos"][0]
+        for e in ticks
+        for r in e["robots"]
+        if r["own"] and r["id"] == 2 and r["pos"][0] is not None
+    ]
+    if xs:
+        mean_x = sum(xs) / len(xs)
+        if abs(mean_x) > 0.3:
+            return -1.0 if mean_x > 0 else 1.0
+    xs = [
+        r["pos"][0]
+        for e in ticks[300:900]
+        for r in e["robots"]
+        if r["own"] and r["pos"][0] is not None
+    ]
+    if xs:
+        mean_x = sum(xs) / len(xs)
+        if abs(mean_x) > 0.1:
             return -1.0 if mean_x > 0 else 1.0
     return 1.0 if own_team == 0 else -1.0
 
