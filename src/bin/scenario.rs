@@ -226,6 +226,7 @@ async fn async_run(
         max_ticks,
         vision_timeout: None,
         referee: None,
+        exportar_depuracion: false,
     };
 
     let mut csv: Option<CsvLogger> = match &log {

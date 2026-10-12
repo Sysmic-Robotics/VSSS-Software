@@ -8,14 +8,15 @@
 //! Principio de fidelidad: si una skill pasa la prueba en `skill_test`, debe
 //! comportarse idéntico al correrla bajo `main` con el mismo target.
 
+use crate::coach::debug::CoachDebug;
 use crate::coach::{Coach, Foul, Observation, Role, SharedReferee, SkillChoice};
-use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig};
+use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig, NavDebug};
 use crate::radio::{RadioTarget, TransportError};
-use crate::skills::zones::ZoneGuard;
+use crate::skills::zones::{GuardiaDebug, ZoneGuard};
 use crate::skills::{SkillCatalog, SkillId, SkillStatus};
 use crate::snapshot::{
-    LoopSnapshot, LoopTiming, OwnTick, RadioCounters, SnapshotSender, ball_view, publish,
-    referee_view, robot_views,
+    LoopSnapshot, LoopTiming, OwnTick, RadioCounters, RobotDebug, SnapshotSender, TickDebug,
+    ball_view, publish, referee_view, robot_views,
 };
 use crate::vision::{Vision, VisionEvent, VisionSource, VisionStats};
 use crate::world::{RobotState, World};
@@ -39,6 +40,12 @@ pub trait TickDecider: Send {
     fn role(&self, _robot_id: i32) -> Option<Role> {
         None
     }
+
+    /// Depuración de la última decisión del coach, para la GUI y el CSV de partido.
+    /// `None` si el decisor no la exporta. No altera ninguna decisión.
+    fn coach_debug(&self) -> Option<CoachDebug> {
+        None
+    }
 }
 
 /// Configuración del loop. `vision_source` y `radio_target` se pasan EXPLÍCITOS
@@ -57,6 +64,9 @@ pub struct ControlLoopConfig {
     /// equipo propio y con STOP solo deja corregir la orientación (ver `TickMode`).
     /// `None` = sin árbitro: el loop no lo consulta.
     pub referee: Option<SharedReferee>,
+    /// Arma la depuración por tick (`TickDebug`) aunque no haya GUI: `main` lo activa con
+    /// el registro de partido (`VSSL_MATCH_LOG`). Con GUI se arma siempre.
+    pub exportar_depuracion: bool,
 }
 
 /// Qué hace el loop con el equipo propio en un tick.
@@ -101,6 +111,8 @@ pub struct TickRecord<'a> {
     /// Paralelo a `commands`: `true` si en este tick la recuperación de atasco
     /// reemplazó el comando por la maniobra de escape (lo cuenta `motion_bench`).
     pub escaping: &'a [bool],
+    /// Depuración del tick, si el lazo la arma (GUI o `exportar_depuracion`).
+    pub debug: Option<&'a TickDebug>,
 }
 
 pub type OnTick = Box<dyn FnMut(&TickRecord<'_>) + Send>;
@@ -140,6 +152,19 @@ impl TickDecider for CoachDecider {
 
     fn role(&self, robot_id: i32) -> Option<Role> {
         self.coach.role(robot_id)
+    }
+
+    /// La del coach, con la skill que quedó aplicada al atacante (sin elección entre
+    /// opciones, BlockLine, Mark o la de una jugada de pelota parada).
+    fn coach_debug(&self) -> Option<CoachDebug> {
+        let mut d = self.coach.debug()?;
+        if d.skill_atacante.is_none() {
+            d.skill_atacante = d
+                .atacante
+                .and_then(|id| self.last_choices.iter().find(|c| c.robot_id == id))
+                .map(|c| c.skill_id);
+        }
+        Some(d)
     }
 }
 
@@ -249,11 +274,34 @@ pub fn apply_reflexes(
     manual_keys: &HashSet<(i32, i32)>,
     own_team: i32,
 ) -> Vec<bool> {
-    zone_guard.guard_commands(cmds, world, own_team, manual_keys);
+    apply_reflexes_detalle(cmds, world, recovery, zone_guard, manual_keys, own_team).0
+}
+
+/// `apply_reflexes`, que además devuelve lo que hizo el guardia en la primera pasada (con
+/// el comando de la skill), paralelo a `cmds`. La misma cuenta, para la depuración.
+pub fn apply_reflexes_detalle(
+    cmds: &mut [MotionCommand],
+    world: &World,
+    recovery: &mut BorderRecovery,
+    zone_guard: &ZoneGuard,
+    manual_keys: &HashSet<(i32, i32)>,
+    own_team: i32,
+) -> (Vec<bool>, Vec<Option<GuardiaDebug>>) {
+    let guardia = zone_guard.guard_commands(cmds, world, own_team, manual_keys);
     let escaping = recovery.guard_commands(cmds, world, manual_keys, own_team);
     zone_guard.guard_commands(cmds, world, own_team, manual_keys);
-    escaping
+    (escaping, guardia)
 }
+
+/// Comandos de un tick con lo que hizo el guardia: `(comandos, targets, choices aplicadas,
+/// en escape, guardia)`.
+pub(crate) type TickOut = (
+    Vec<MotionCommand>,
+    Vec<Option<Vec2>>,
+    Vec<SkillChoice>,
+    Vec<bool>,
+    Vec<Option<GuardiaDebug>>,
+);
 
 /// `SkillStatus` de cada choice aplicada, con el mismo target que recibió
 /// `SkillCatalog::tick` en este tick (solo para la foto de la GUI). `status` no muta
@@ -400,7 +448,7 @@ pub(crate) fn tick_commands(
     skill_state: &HashMap<(i32, i32), (GuiSkillCommand, u32)>,
     own_team: i32,
     num_robots: usize,
-) -> (Vec<MotionCommand>, Vec<Option<Vec2>>, Vec<SkillChoice>, Vec<bool>) {
+) -> TickOut {
     if matches!(mode, TickMode::Halt | TickMode::SinVision) {
         recovery.reset();
         catalog.forget_last_skills();
@@ -410,7 +458,8 @@ pub(crate) fn tick_commands(
             apply_manual_overrides(&mut cmds, &mut tgts, manual_state, world);
         }
         let esc = vec![false; cmds.len()];
-        return (cmds, tgts, Vec::new(), esc);
+        let guardia = vec![None; cmds.len()];
+        return (cmds, tgts, Vec::new(), esc, guardia);
     }
     // Override en vivo de la velocidad de Spin desde la GUI (por robot).
     for ((team, id), (cmd, _)) in skill_state {
@@ -427,13 +476,54 @@ pub(crate) fn tick_commands(
         catalog.forget_last_skills();
         stop_translation(&mut cmds, &mut tgts, world, own_team, num_robots);
         let esc = vec![false; cmds.len()];
-        return (cmds, tgts, applied, esc);
+        let guardia = vec![None; cmds.len()];
+        return (cmds, tgts, applied, esc, guardia);
     }
     // Reflejos de bajo nivel (áreas y atasco) sobre los comandos autónomos del equipo
     // propio (salta manual).
     let manual_keys: HashSet<(i32, i32)> = manual_state.keys().copied().collect();
-    let esc = apply_reflexes(&mut cmds, world, recovery, zone_guard, &manual_keys, own_team);
-    (cmds, tgts, applied, esc)
+    let (esc, guardia) =
+        apply_reflexes_detalle(&mut cmds, world, recovery, zone_guard, &manual_keys, own_team);
+    (cmds, tgts, applied, esc, guardia)
+}
+
+/// La depuración del tick (`TickDebug`), con lo que ya calcularon el coach, motion, los
+/// reflejos y las skills: por id propio en `0..num_robots`, su navegación, lo que hizo el
+/// guardia, sus áreas prohibidas, el escape y el estado de su skill.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tick_debug(
+    coach: Option<CoachDebug>,
+    nav: &HashMap<(i32, i32), NavDebug>,
+    out: &TickOut,
+    recovery: &BorderRecovery,
+    zone_guard: &ZoneGuard,
+    statuses: &[(i32, SkillStatus)],
+    world: &World,
+    own_team: i32,
+    num_robots: usize,
+) -> TickDebug {
+    let (cmds, _, _, escaping, guardia) = out;
+    let robots = (0..num_robots as i32)
+        .map(|id| {
+            let idx = cmds.iter().position(|c| c.team == own_team && c.id == id);
+            let visto = world.get_robot_state(id, own_team).is_some_and(|r| r.active);
+            RobotDebug {
+                id,
+                nav: nav.get(&(own_team, id)).copied(),
+                guardia: idx.and_then(|i| guardia.get(i).copied().flatten()),
+                prohibidas: if visto {
+                    zone_guard.areas_prohibidas(id, world, own_team)
+                } else {
+                    Vec::new()
+                },
+                escape: idx
+                    .filter(|&i| escaping.get(i).copied().unwrap_or(false))
+                    .and_then(|_| recovery.escape(own_team, id)),
+                status: statuses.iter().find(|(i, _)| *i == id).map(|(_, s)| *s),
+            }
+        })
+        .collect();
+    TickDebug { coach, robots }
 }
 
 /// Límites físicos de la cancha VSSS con margen (m). Fuera de esto la fuente de
@@ -828,6 +918,9 @@ pub async fn run_control_loop(
     let blind_stop = Duration::from_secs_f64(crate::params::params().vision.blind_stop_s);
     let mut ciego_prev = true;
     let mut visto_alguna_vez = false;
+    // Depuración por tick: con GUI o con el registro de partido (`exportar_depuracion`).
+    let exportar = snapshot_tx.is_some() || config.exportar_depuracion;
+    motion.registrar(exportar);
     let mut tick_counter: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
     let started = Instant::now();
@@ -924,7 +1017,7 @@ pub async fn run_control_loop(
             let mode: TickMode;
             // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
             let mut gui_world = None;
-            let (commands, targets, applied_choices, escaping) = {
+            let (commands, targets, applied_choices, escaping, debug) = {
                 let world_guard = world.read().await;
                 if !field_scale_warned {
                     field_scale_warned = warn_if_outside_vsss_field(&world_guard);
@@ -952,14 +1045,29 @@ pub async fn run_control_loop(
                     config.num_robots,
                 );
                 ceros = ceros_si_no_hay_comandos(&out.0, &world_guard, config.own_team, config.num_robots);
+                let statuses = if exportar {
+                    skill_statuses(&mut catalog, &out.2, &world_guard, config.own_team)
+                } else {
+                    Vec::new()
+                };
+                let debug = exportar.then(|| {
+                    Arc::new(tick_debug(
+                        decider.coach_debug(),
+                        &motion.tomar_registro(),
+                        &out,
+                        &recovery,
+                        &zone_guard,
+                        &statuses,
+                        &world_guard,
+                        config.own_team,
+                        config.num_robots,
+                    ))
+                });
                 if snapshot_tx.is_some() {
-                    gui_world = Some((
-                        robot_views(&world_guard),
-                        ball_view(&world_guard),
-                        skill_statuses(&mut catalog, &out.2, &world_guard, config.own_team),
-                    ));
+                    gui_world = Some((robot_views(&world_guard), ball_view(&world_guard), statuses));
                 }
-                out
+                let (c, t, a, e, _) = out;
+                (c, t, a, e, debug)
             };
             tick_counter = tick_counter.wrapping_add(1);
 
@@ -1002,6 +1110,7 @@ pub async fn run_control_loop(
                     targets: &targets,
                     choices: &applied_choices,
                     escaping: &escaping,
+                    debug: debug.as_deref(),
                 };
                 hook(&rec);
             }
@@ -1045,6 +1154,7 @@ pub async fn run_control_loop(
                         timing: timing.as_ref().map(LoopTiming::stats).unwrap_or_default(),
                         vision: vision_stats.counters(),
                         radio: radio_counters,
+                        debug: debug.clone(),
                     },
                 );
             }
@@ -1135,7 +1245,7 @@ mod tests {
         }
 
         fn step(&mut self, mode: TickMode, world: &World, decider: &mut dyn TickDecider) -> (Vec<MotionCommand>, Vec<bool>) {
-            let (cmds, _, _, esc) = tick_commands(
+            let (cmds, _, _, esc, _) = tick_commands(
                 mode,
                 world,
                 decider,
@@ -1429,6 +1539,119 @@ mod tests {
                 && c.motion.vy == 0.0
                 && c.motion.omega == 0.0));
         }
+    }
+
+    // ── Depuración por tick: la exportación no cambia ningún comando ─────────
+
+    /// Mundo con guion: los robots y la pelota recorren trayectorias fijas en `t`.
+    fn mundo_con_guion(t: u32) -> World {
+        let s = t as f32 / 60.0;
+        let mut w = World::new(3, 3);
+        let pi = std::f64::consts::PI;
+        w.update_robot(0, 0, Vec2::new(0.3 - 0.3 * (s * 0.7).sin(), 0.2 * (s * 0.5).cos()), (s * 0.8) as f64, Vec2::ZERO, 0.0);
+        // Cerca del área propia: el guardia tiene trabajo.
+        w.update_robot(1, 0, Vec2::new(-0.47 + 0.04 * (s * 1.3).sin(), 0.25 * (s * 0.9).sin()), pi + (s * 0.3) as f64, Vec2::ZERO, 0.0);
+        w.update_robot(2, 0, Vec2::new(-0.68, 0.1 * (s * 0.6).sin()), 0.0, Vec2::ZERO, 0.0);
+        w.update_robot(0, 1, Vec2::new(0.1 + 0.2 * (s * 0.4).cos(), -0.2), pi, Vec2::ZERO, 0.0);
+        w.update_robot(1, 1, Vec2::new(0.6, 0.1 * s.sin()), pi, Vec2::ZERO, 0.0);
+        w.update_ball(
+            Vec2::new(0.4 * (s * 0.3).sin(), 0.3 * (s * 0.45).cos()),
+            Vec2::new(0.12 * (s * 0.3).cos(), -0.135 * (s * 0.45).sin()),
+        );
+        w
+    }
+
+    #[test]
+    fn debug_export_does_not_change_any_command() {
+        // Coach heurístico (por `CoachDecider`, cada 6 ticks), catálogo, motion y reflejos,
+        // 360 ticks: con la exportación (registro de motion, `status`, `coach_debug`,
+        // `tick_debug`) y sin ella, los comandos de cada tick son idénticos.
+        let correr = |exportar: bool| {
+            let mut rig = Rig::new(true);
+            rig.motion.registrar(exportar);
+            let coach = crate::coach::HeuristicCoach::with_options(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0), 2, true);
+            let mut d = CoachDecider::new(Box::new(coach), 0, 6);
+            let (mut comandos, mut opciones, mut rodeos, mut guardia) = (Vec::new(), 0, 0, 0);
+            for t in 0..360u32 {
+                let world = mundo_con_guion(t);
+                let out = tick_commands(
+                    TickMode::Play,
+                    &world,
+                    &mut d,
+                    t,
+                    &mut rig.catalog,
+                    &rig.motion,
+                    &mut rig.recovery,
+                    &rig.guard,
+                    &rig.manual,
+                    &rig.gui,
+                    0,
+                    3,
+                );
+                if exportar {
+                    let statuses = skill_statuses(&mut rig.catalog, &out.2, &world, 0);
+                    let dbg = tick_debug(
+                        d.coach_debug(),
+                        &rig.motion.tomar_registro(),
+                        &out,
+                        &rig.recovery,
+                        &rig.guard,
+                        &statuses,
+                        &world,
+                        0,
+                        3,
+                    );
+                    assert_eq!(dbg.robots.len(), 3);
+                    opciones += usize::from(dbg.coach.as_ref().is_some_and(|c| c.opciones.is_some()));
+                    rodeos += dbg.robots.iter().filter(|r| r.nav.is_some_and(|n| n.rodeo.is_some())).count();
+                    guardia += dbg.robots.iter().filter(|r| r.guardia.is_some()).count();
+                }
+                comandos.push(out.0);
+            }
+            (comandos, opciones, rodeos, guardia)
+        };
+        let (con, opciones, rodeos, guardia) = correr(true);
+        let (sin, ..) = correr(false);
+        assert_eq!(con.len(), sin.len());
+        for (t, (a, b)) in con.iter().zip(&sin).enumerate() {
+            assert_eq!(a, b, "tick {t}: comandos distintos con la exportación");
+        }
+        // El guion recorre los caminos que se exportan.
+        assert!(opciones > 0 && rodeos > 0 && guardia > 0, "opciones {opciones}, rodeos {rodeos}, guardia {guardia}");
+    }
+
+    #[test]
+    fn tick_debug_carries_the_escape_and_the_guard() {
+        let world = world_with_robot(0.0, 0.0, 0.0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.6, 0.0));
+        let mut rig = Rig::new(true);
+        drive_into_escape(&mut rig, &world, &mut d);
+        let out = tick_commands(
+            TickMode::Play,
+            &world,
+            &mut d,
+            0,
+            &mut rig.catalog,
+            &rig.motion,
+            &mut rig.recovery,
+            &rig.guard,
+            &rig.manual,
+            &rig.gui,
+            0,
+            3,
+        );
+        let dbg = tick_debug(None, &HashMap::new(), &out, &rig.recovery, &rig.guard, &[], &world, 0, 3);
+        let r0 = dbg.robot(0).unwrap();
+        if out.3[0] {
+            let e = r0.escape.expect("escapa: la dirección viaja");
+            assert!(e == Vec2::ZERO || (e.length() - 1.0).abs() < 1e-3, "unitaria o cero (solo giro): {e}");
+        } else {
+            assert!(r0.escape.is_none());
+        }
+        assert!(r0.guardia.is_some(), "un jugador de campo siempre pasa por el guardia");
+        assert_eq!(r0.prohibidas, vec![rig.guard.own_area()]);
+        // Los robots que la visión no ve no tienen áreas prohibidas ni comando.
+        assert!(dbg.robot(1).unwrap().prohibidas.is_empty());
     }
 
     #[test]
@@ -1944,6 +2167,7 @@ mod tests {
             max_ticks: Some(5),
             vision_timeout: None,
             referee: None,
+            exportar_depuracion: false,
         };
         let _decider: Box<dyn TickDecider> =
             Box::new(FixedSkillDecider::new(0, SkillId::GoTo, Vec2::ZERO));
@@ -1978,7 +2202,7 @@ mod tests {
                 let mut decider = FixedSkillDecider::new(0, skill, Vec2::new(0.5, -0.1));
                 let mut out = Vec::new();
                 for _ in 0..90 {
-                    let (cmds, _, applied, _) = tick_commands(
+                    let (cmds, _, applied, _, _) = tick_commands(
                         TickMode::Play,
                         &world,
                         &mut decider,

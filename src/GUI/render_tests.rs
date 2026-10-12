@@ -4,7 +4,9 @@
 //! `iced_graphics::damage::group`, y con la GUI se cae el proceso entero.
 
 use super::charts::{LineChart, MuestraSenal, SenalChart};
-use super::field::{Fieltro, FieldCanvas, OrientacionVista};
+use super::capas::{CAPAS, Trazas};
+use super::field::{EstadoCancha, Fieltro, FieldCanvas, OrientacionVista};
+use super::keys::Layer;
 use super::run_info::run_info_de_prueba;
 use super::status_line::{Tasas, frases_estado};
 use super::tag::MarcasRobot;
@@ -71,11 +73,86 @@ fn fotos() -> Vec<(LoopSnapshot, Option<Vec2>)> {
         position: Vec2::new(f32::NAN, f32::INFINITY),
         velocity: Vec2::splat(f32::NAN),
     });
-    vec![
+    let mut fotos = vec![
         (sana(0.0), Some(Vec2::new(0.2, 0.1))),
         (rara, Some(Vec2::new(f32::INFINITY, f32::NAN))),
         (sana(0.1), Some(Vec2::new(0.2, 0.1))),
-    ]
+    ];
+    for (i, (snap, _)) in fotos.iter_mut().enumerate() {
+        con_depuracion(snap, i == 1);
+    }
+    fotos
+}
+
+/// La depuración del tick para las capas (con NaN e infinitos si `raro`).
+fn con_depuracion(snap: &mut LoopSnapshot, raro: bool) {
+    use crate::coach::Play;
+    use crate::coach::Role;
+    use crate::coach::adaptation::{Lane, Rate};
+    use crate::coach::debug::{AdaptacionDebug, CoachDebug, Compromiso, OpcionesAtacante, Tiro, TipoObjetivo, Trabada};
+    use crate::motion::NavDebug;
+    use crate::motion::avoid::{Rodeado, Rodeo};
+    use crate::skills::zones::{AccionGuardia, AreaRect, GuardiaDebug};
+    use crate::skills::{Face, SkillId, SkillStatus};
+    use crate::snapshot::{CommandSource, OwnRobotView, RobotDebug, TickDebug};
+    let n = |v: Vec2| if raro { Vec2::new(f32::NAN, f32::INFINITY) } else { v };
+    let status = SkillStatus { progress: if raro { f32::NAN } else { 0.4 }, done: false, feasible: !raro, face: Face::Back };
+    snap.own = (0..3)
+        .map(|id| OwnRobotView {
+            id,
+            source: Some(CommandSource::Coach),
+            role: Some([Role::Striker, Role::Support, Role::Keeper][id as usize]),
+            skill: Some([SkillId::ShootPush, SkillId::BlockLine, SkillId::GoalKeep][id as usize]),
+            status: Some(status),
+            target: None,
+            command: None,
+            escaping: id == 1,
+        })
+        .collect();
+    let robots = (0..3)
+        .map(|id| RobotDebug {
+            id,
+            nav: Some(NavDebug {
+                destino: n(Vec2::new(0.1, 0.0)),
+                mira: n(Vec2::new(0.05, 0.12)),
+                llego: false,
+                espaldas: id == 0,
+                evita_pelota: true,
+                rodeo: Some(Rodeo {
+                    obstaculo: [Rodeado::Pelota, Rodeado::AreaIzquierda, Rodeado::AreaDerecha][id as usize],
+                    lado: 1,
+                    tangencia: n(Vec2::new(0.0, 0.1)),
+                    holgura: if raro { f32::INFINITY } else { 0.09 },
+                }),
+            }),
+            guardia: Some(GuardiaDebug { proyeccion: n(Vec2::new(-0.6, 0.0)), accion: Some(AccionGuardia::Frena) }),
+            prohibidas: vec![AreaRect::own(1.0)],
+            escape: Some(n(Vec2::new(1.0, 0.0))),
+            status: Some(status),
+        })
+        .collect();
+    let r = Rate { value: 0.5, samples: 0 };
+    let coach = CoachDebug {
+        decision: 1,
+        jugada: Play::Open,
+        atacante: Some(0),
+        arquero: 2,
+        opciones: Some(OpcionesAtacante {
+            puntajes: [(SkillId::ShootPush, if raro { f32::NAN } else { 0.8 }), (SkillId::Clear, 0.0), (SkillId::SpinKick, 0.0), (SkillId::Intercept, 0.0), (SkillId::ApproachAligned, 0.2)],
+            ganadora: SkillId::ShootPush,
+            aplicada: SkillId::ShootPush,
+            bono: None,
+            compromiso: Compromiso { skill: SkillId::ShootPush, restantes: 0, minimo: 3, retuvo: false },
+            tiro: Tiro { factible: true, tapado: false, factor: 1.0, carril: Lane::Center },
+        }),
+        skill_atacante: Some(SkillId::ShootPush),
+        objetivo: Some((n(Vec2::new(0.75, -0.14)), TipoObjetivo::PaloLejano)),
+        roles: Vec::new(),
+        cambio: None,
+        trabada: Trabada::Libre,
+        adaptacion: AdaptacionDebug { activa: false, tiros: [r; 3], duelos: r },
+    };
+    snap.debug = Some(std::sync::Arc::new(TickDebug { coach: Some(coach), robots }));
 }
 
 /// Dibuja la cancha como el widget (trasladada a su lugar) y devuelve las capas.
@@ -84,7 +161,9 @@ fn cuadro(
     base: &Cache,
     snap: &LoopSnapshot,
     skill_target: Option<Vec2>,
+    trazas: &Trazas,
 ) -> Vec<Capa> {
+    let capas: std::collections::HashSet<Layer> = CAPAS.into_iter().collect();
     let cancha = FieldCanvas {
         snap,
         base,
@@ -95,11 +174,14 @@ fn cuadro(
         selected: Some((0, 1)),
         skill_target,
         radio_slots: None,
+        capas: &capas,
+        trazas,
+        sim: true,
     };
     renderer.clear();
     let geometrias = canvas::Program::<super::Message>::draw(
         &cancha,
-        &(),
+        &EstadoCancha::default(),
         renderer,
         &Theme::Light,
         Rectangle::with_size(CANCHA.size()),
@@ -127,9 +209,11 @@ fn renderer_tiny_skia() -> iced::Renderer {
 fn tiny_skia_damage_stays_finite_with_moving_labels_and_non_finite_data() {
     let mut renderer = renderer_tiny_skia();
     let base = Cache::new();
+    let mut trazas = Trazas::default();
     let mut anteriores: Option<Vec<Capa>> = None;
     for (i, (snap, target)) in fotos().iter().enumerate() {
-        let capas = cuadro(&mut renderer, &base, snap, *target);
+        trazas.registrar(snap);
+        let capas = cuadro(&mut renderer, &base, snap, *target, &trazas);
         if let Some(prev) = &anteriores {
             // Lo mismo que hace el compositor de tiny-skia antes de presentar.
             let danio = damage::diff(prev, &capas, |c| vec![c.bounds], Capa::damage);

@@ -105,7 +105,7 @@ pub fn datos_fila(id: i32, run: &RunInfo, snap: &LoopSnapshot, skill_warning: Op
     let vista = snap.own_robot(id);
     let robot = snap.robot(run.own_team, id);
     let skill = vista.and_then(|v| {
-        v.skill.map(|s| match v.status {
+        v.skill.map(|s| match v.status.filter(|st| st.progress.is_finite()) {
             Some(st) => format!("{s:?}, {:.0} %", (st.progress.clamp(0.0, 1.0) * 100.0).round()),
             None => format!("{s:?}"),
         })

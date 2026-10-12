@@ -17,17 +17,20 @@
 //! visión o del filtro) no se dibujan en ese cuadro: lyon rechaza los puntos no
 //! finitos al armar un `Path`.
 
+use super::capas::{Debajo, Encima, Trazas};
+use super::keys::Layer;
 use super::tag::{self, MarcasRobot, Pose};
 use super::{Message, fonts, theme};
 use crate::coach::heuristic_coach::GOAL_HALF_Y;
 use crate::coach::plays::{CENTER_CIRCLE_R, MARK_X, MARK_Y};
 use crate::coach::{FIELD_HALF_X, FIELD_HALF_Y};
 use crate::skills::zones::{ARC_CENTER_X, ARC_RADIUS, AREA_HALF_Y, AREA_X};
+use crate::radio::TeleportItem;
 use crate::snapshot::{LoopSnapshot, RobotView};
 use glam::Vec2;
 use iced::widget::canvas::{self, Cache, Frame, Path, Stroke};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, mouse};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Ancho de las paredes vistas desde arriba (2.5 cm, reglamento).
 pub const WALL_M: f32 = 0.025;
@@ -231,13 +234,13 @@ pub fn ancho_texto(texto: &str, tamano: f32) -> f32 {
 /// cuadros, por ejemplo el rótulo de un robot que se mueve. Como trazos de sus
 /// glifos, el texto tiene límites finitos. Con wgpu no hay cálculo de daño, y el
 /// texto va como texto.
-fn texto_como_trazos(renderer: &Renderer) -> bool {
+pub(super) fn texto_como_trazos(renderer: &Renderer) -> bool {
     matches!(renderer, Renderer::Secondary(_))
 }
 
 /// Escribe `texto` en el canvas, como texto o como trazos (ver
 /// [`texto_como_trazos`]).
-fn escribir(frame: &mut Frame, texto: canvas::Text, trazos: bool) {
+pub(super) fn escribir(frame: &mut Frame, texto: canvas::Text, trazos: bool) {
     if trazos {
         texto.draw_with(|path, color| frame.fill(&path, color));
     } else {
@@ -311,32 +314,138 @@ pub struct FieldCanvas<'a> {
     pub skill_target: Option<Vec2>,
     /// Mapa visión → radio, solo con la base station (rótulo "radio P").
     pub radio_slots: Option<&'a BTreeMap<u32, u32>>,
+    /// Capas encendidas y trazas de la capa T.
+    pub capas: &'a HashSet<Layer>,
+    pub trazas: &'a Trazas,
+    /// Transporte de simulación: se puede teletransportar arrastrando.
+    pub sim: bool,
+}
+
+/// Un arrastre de menos de esto (px) es un click.
+const CLICK_PX: f32 = 4.0;
+
+/// Lo que se puede arrastrar para teletransportar (solo en simulación).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Arrastrable {
+    Robot { team: i32, id: i32, pos: Vec2, theta: f32 },
+    Pelota { pos: Vec2 },
+}
+
+/// Qué hay en el punto `mundo` para arrastrar: la pelota primero (es chica; a menos de
+/// `radio_pelota`), o un robot activo a menos de su medio lado del centro.
+pub fn arrastrable_en(snap: &LoopSnapshot, mundo: Vec2, radio_pelota: f32) -> Option<Arrastrable> {
+    if let Some(b) = snap.ball.as_ref().filter(|b| b.position.is_finite())
+        && (b.position - mundo).length() <= radio_pelota
+    {
+        return Some(Arrastrable::Pelota { pos: b.position });
+    }
+    snap.robots
+        .iter()
+        .filter(|r| r.active && pose_finita(r))
+        .filter(|r| (r.position - mundo).length() <= tag::ROBOT_HALF_M)
+        .min_by(|a, b| (a.position - mundo).length().total_cmp(&(b.position - mundo).length()))
+        .map(|r| Arrastrable::Robot { team: r.team, id: r.id, pos: r.position, theta: r.orientation as f32 })
+}
+
+/// El teleport al soltar: mover (botón izquierdo) u orientar hacia `mundo` (derecho).
+pub fn teleport_al_soltar(que: Arrastrable, orientar: bool, mundo: Vec2) -> Option<TeleportItem> {
+    match que {
+        Arrastrable::Pelota { .. } if orientar => None,
+        Arrastrable::Pelota { .. } => Some(TeleportItem::Ball { x: mundo.x as f64, y: mundo.y as f64, vx: 0.0, vy: 0.0 }),
+        Arrastrable::Robot { team, id, pos, theta } => {
+            let (destino, theta) = if orientar {
+                let d = mundo - pos;
+                (pos, if d.length() > 1e-4 { d.y.atan2(d.x) } else { theta })
+            } else {
+                (mundo, theta)
+            };
+            Some(TeleportItem::Robot {
+                team: team as u32,
+                id: id as u32,
+                x: destino.x as f64,
+                y: destino.y as f64,
+                theta: (theta as f64).to_degrees(),
+            })
+        }
+    }
+}
+
+/// Arrastre en curso (estado del canvas).
+#[derive(Debug, Clone, Copy)]
+pub struct Arrastre {
+    que: Arrastrable,
+    orientar: bool,
+    inicio: Point,
+    actual: Point,
+}
+
+#[derive(Debug, Default)]
+pub struct EstadoCancha {
+    arrastre: Option<Arrastre>,
 }
 
 impl canvas::Program<Message> for FieldCanvas<'_> {
-    type State = ();
+    type State = EstadoCancha;
 
     fn update(
         &self,
-        _state: &mut Self::State,
+        state: &mut Self::State,
         event: canvas::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
-        if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
-            && let Some(p) = cursor.position_in(bounds)
-        {
-            let mundo = Vista::new(bounds.size(), self.orientacion).a_mundo(p);
-            if en_cancha(mundo) {
-                return (canvas::event::Status::Captured, Some(Message::FieldClicked(mundo)));
+        use canvas::event::Status;
+        let vista = Vista::new(bounds.size(), self.orientacion);
+        let canvas::Event::Mouse(evento) = event else {
+            return (Status::Ignored, None);
+        };
+        match evento {
+            mouse::Event::ButtonPressed(boton @ (mouse::Button::Left | mouse::Button::Right)) => {
+                let Some(p) = cursor.position_in(bounds) else {
+                    return (Status::Ignored, None);
+                };
+                let mundo = vista.a_mundo(p);
+                let orientar = boton == mouse::Button::Right;
+                let radio_pelota = (6.0 / vista.px(1.0)).max(BALL_RADIUS_M * 1.5);
+                if self.sim
+                    && let Some(que) = arrastrable_en(self.snap, mundo, radio_pelota)
+                    && !(orientar && matches!(que, Arrastrable::Pelota { .. }))
+                {
+                    state.arrastre = Some(Arrastre { que, orientar, inicio: p, actual: p });
+                    return (Status::Captured, None);
+                }
+                if !orientar && en_cancha(mundo) {
+                    return (Status::Captured, Some(Message::FieldClicked(mundo)));
+                }
             }
+            mouse::Event::CursorMoved { .. } => {
+                if let (Some(a), Some(p)) = (state.arrastre.as_mut(), cursor.position_in(bounds)) {
+                    a.actual = p;
+                    return (Status::Captured, None);
+                }
+            }
+            mouse::Event::ButtonReleased(mouse::Button::Left | mouse::Button::Right) => {
+                if let Some(a) = state.arrastre.take() {
+                    let movido = (a.actual.x - a.inicio.x).hypot(a.actual.y - a.inicio.y);
+                    if movido < CLICK_PX {
+                        // Click corto: lo de siempre (fijar el target de la skill de la GUI).
+                        let mundo = vista.a_mundo(a.inicio);
+                        let click = (!a.orientar && en_cancha(mundo)).then_some(Message::FieldClicked(mundo));
+                        return (Status::Captured, click);
+                    }
+                    let mensaje = teleport_al_soltar(a.que, a.orientar, vista.a_mundo(a.actual))
+                        .map(|item| Message::TeleportArrastre(vec![item]));
+                    return (Status::Captured, mensaje);
+                }
+            }
+            _ => {}
         }
-        (canvas::event::Status::Ignored, None)
+        (Status::Ignored, None)
     }
 
     fn draw(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
@@ -347,15 +456,56 @@ impl canvas::Program<Message> for FieldCanvas<'_> {
         let base = self.base.draw(renderer, bounds.size(), |frame| {
             dibujar_base(frame, &vista, self.fieltro, trazos)
         });
-        // Fase 2: aquí van las capas, entre la base y los objetos.
+        let mut capas = vec![base];
+        // Capas debajo de los robots: trazas, reflejos y navegación.
+        if !self.capas.is_empty() {
+            let mut debajo = Frame::new(renderer, bounds.size());
+            Debajo {
+                snap: self.snap,
+                capas: self.capas,
+                trazas: self.trazas,
+                own_team: self.own_team,
+                seleccionado: self.selected.filter(|(t, _)| *t == self.own_team).map(|(_, id)| id),
+                trazos,
+            }
+            .dibujar(&mut debajo, &vista);
+            capas.push(debajo.into_geometry());
+        }
         let mut objetos = Frame::new(renderer, bounds.size());
         self.dibujar_objetos(&mut objetos, &vista, trazos);
-        vec![base, objetos.into_geometry()]
+        // Encima: rótulos del coach, línea de skills y la silueta del arrastre.
+        Encima { snap: self.snap, capas: self.capas, own_team: self.own_team, trazos }.dibujar(&mut objetos, &vista);
+        if let Some(a) = state.arrastre {
+            dibujar_silueta(&mut objetos, &vista, a);
+        }
+        capas.push(objetos.into_geometry());
+        capas
+    }
+}
+
+/// Silueta del arrastre: dónde queda el robot o la pelota, y hacia dónde mira.
+fn dibujar_silueta(frame: &mut Frame, vista: &Vista, a: Arrastre) {
+    let mundo = vista.a_mundo(a.actual);
+    let (x, y, theta) = match teleport_al_soltar(a.que, a.orientar, mundo) {
+        Some(TeleportItem::Robot { x, y, theta, .. }) => (x, y, theta),
+        Some(TeleportItem::Ball { x, y, .. }) => (x, y, 0.0),
+        None => return,
+    };
+    let centro = vista.a_pantalla(Vec2::new(x as f32, y as f32));
+    let silueta = Stroke::default().with_width(1.8).with_color(theme::alfa(theme::CAL, 0.9));
+    match a.que {
+        Arrastrable::Pelota { .. } => frame.stroke(&Path::circle(centro, vista.px(BALL_RADIUS_M).max(3.0)), silueta),
+        Arrastrable::Robot { .. } => {
+            frame.stroke(&Path::circle(centro, vista.px(tag::ROBOT_HALF_M * 1.3)), silueta);
+            let th = (theta as f32).to_radians();
+            let frente = vista.a_pantalla(Vec2::new(x as f32, y as f32) + Vec2::new(th.cos(), th.sin()) * tag::ROBOT_HALF_M * 1.6);
+            frame.stroke(&Path::line(centro, frente), silueta);
+        }
     }
 }
 
 /// Rectángulo del mundo como polígono (sirve con la vista espejada).
-fn rect_mundo(vista: &Vista, x0: f32, y0: f32, x1: f32, y1: f32) -> Path {
+pub(super) fn rect_mundo(vista: &Vista, x0: f32, y0: f32, x1: f32, y1: f32) -> Path {
     Path::new(|b| {
         b.move_to(vista.a_pantalla(Vec2::new(x0, y0)));
         b.line_to(vista.a_pantalla(Vec2::new(x1, y0)));
@@ -365,7 +515,7 @@ fn rect_mundo(vista: &Vista, x0: f32, y0: f32, x1: f32, y1: f32) -> Path {
     })
 }
 
-fn polilinea(vista: &Vista, puntos: &[Vec2]) -> Path {
+pub(super) fn polilinea(vista: &Vista, puntos: &[Vec2]) -> Path {
     Path::new(|b| {
         for (i, p) in puntos.iter().enumerate() {
             let q = vista.a_pantalla(*p);
@@ -756,5 +906,46 @@ mod tests {
         assert_eq!(OrientacionVista::parse("girada180"), Some(OrientacionVista::Girada180));
         assert_eq!(OrientacionVista::parse("ESPEJO-H"), Some(OrientacionVista::EspejoHorizontal));
         assert_eq!(OrientacionVista::parse("diagonal"), None);
+    }
+
+    fn foto_para_arrastrar() -> LoopSnapshot {
+        let robot = |id: i32, x: f32, activo: bool| RobotView {
+            team: 0,
+            id,
+            position: Vec2::new(x, 0.0),
+            orientation: 0.5,
+            velocity: Vec2::ZERO,
+            angular_velocity: 0.0,
+            active: activo,
+            age_s: 0.0,
+        };
+        LoopSnapshot {
+            robots: vec![robot(0, -0.3, true), robot(1, 0.3, false), robot(2, f32::NAN, true)],
+            ball: Some(crate::snapshot::BallView { position: Vec2::new(0.1, 0.0), velocity: Vec2::ZERO }),
+            ..LoopSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn hit_test_finds_the_ball_first_then_active_robots() {
+        let s = foto_para_arrastrar();
+        assert_eq!(arrastrable_en(&s, Vec2::new(0.11, 0.0), 0.03), Some(Arrastrable::Pelota { pos: Vec2::new(0.1, 0.0) }));
+        assert!(matches!(arrastrable_en(&s, Vec2::new(-0.28, 0.02), 0.03), Some(Arrastrable::Robot { id: 0, .. })));
+        assert_eq!(arrastrable_en(&s, Vec2::new(0.3, 0.0), 0.03), None, "robot inactivo");
+        assert_eq!(arrastrable_en(&s, Vec2::new(-0.2, 0.3), 0.03), None);
+    }
+
+    #[test]
+    fn releasing_moves_or_orients() {
+        let r = Arrastrable::Robot { team: 0, id: 1, pos: Vec2::new(0.0, 0.0), theta: 0.5 };
+        let mover = teleport_al_soltar(r, false, Vec2::new(0.3, -0.2)).unwrap();
+        assert!(matches!(mover, TeleportItem::Robot { id: 1, x, y, theta, .. }
+            if (x - 0.3).abs() < 1e-6 && (y + 0.2).abs() < 1e-6 && (theta - 0.5f64.to_degrees()).abs() < 1e-4));
+        let orientar = teleport_al_soltar(r, true, Vec2::new(0.0, 0.2)).unwrap();
+        assert!(matches!(orientar, TeleportItem::Robot { x, y, theta, .. }
+            if x == 0.0 && y == 0.0 && (theta - 90.0).abs() < 1e-4));
+        let pelota = Arrastrable::Pelota { pos: Vec2::ZERO };
+        assert!(teleport_al_soltar(pelota, true, Vec2::ONE).is_none(), "la pelota no se orienta");
+        assert!(matches!(teleport_al_soltar(pelota, false, Vec2::new(0.2, 0.1)), Some(TeleportItem::Ball { vx, vy, .. }) if vx == 0.0 && vy == 0.0));
     }
 }

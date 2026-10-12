@@ -128,6 +128,14 @@ impl BorderRecovery {
         Self::new(enabled)
     }
 
+    /// Dirección del último escape del robot `(team, id)` (depuración; solo lectura; cero
+    /// si el escape es solo un giro, lejos de las paredes). El contador del escape se
+    /// descuenta en el mismo tick, así que quien la lee la usa solo en los ticks en que
+    /// `guard` devolvió `true`.
+    pub fn escape(&self, team: i32, id: i32) -> Option<Vec2> {
+        self.states.get(&(team, id)).map(|st| st.escape_dir)
+    }
+
     /// Vacía el estado de todos los robots (ventanas de detección y maniobras de escape en
     /// curso). El control loop la llama mientras el equipo está detenido (parada de
     /// emergencia, HALT o STOP), para que al retomar no continúe un escape interrumpido.

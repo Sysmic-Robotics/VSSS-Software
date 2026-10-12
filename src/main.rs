@@ -239,6 +239,8 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<Atomic
         max_ticks: None,
         vision_timeout: None,
         referee: Some(referee.clone()),
+        // El CSV de partido lleva la depuración por tick (columnas al final).
+        exportar_depuracion: on_tick.is_some(),
     };
 
     let gui = gui_channels.map(

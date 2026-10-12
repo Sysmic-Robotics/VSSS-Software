@@ -44,6 +44,27 @@ pub enum Obstacle {
     Area(AreaRect),
 }
 
+/// Obstáculo que se rodea, para la depuración (`aim_point_detalle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rodeado {
+    Pelota,
+    /// Área del lado de x < 0.
+    AreaIzquierda,
+    /// Área del lado de x > 0.
+    AreaDerecha,
+}
+
+/// Cómo se rodea un obstáculo en un tick: qué, por qué lado, el punto de tangencia y la
+/// holgura usada (m; menor que la nominal si el robot ya está adentro de ella).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rodeo {
+    pub obstaculo: Rodeado,
+    /// +1: tangente antihoraria desde la dirección al destino; −1: horaria.
+    pub lado: i8,
+    pub tangencia: Vec2,
+    pub holgura: f32,
+}
+
 /// Obstáculo y lado elegidos en el tick anterior (histéresis). Lado +1: la tangente que
 /// gira antihorario desde la dirección al destino; −1: la horaria.
 pub type Memo = Option<(u8, i8)>;
@@ -147,6 +168,12 @@ fn wrap(a: f32) -> f32 {
 /// Punto de mira para ir de `p` a `target` rodeando `obstacles` por la tangente. `memo`
 /// guarda el lado elegido entre ticks (por robot).
 pub fn aim_point(p: Vec2, target: Vec2, obstacles: &[Obstacle], memo: &mut Memo) -> Vec2 {
+    aim_point_detalle(p, target, obstacles, memo).0
+}
+
+/// `aim_point` con el rodeo elegido (`None` si va directo): la misma cuenta, para la
+/// depuración.
+pub fn aim_point_detalle(p: Vec2, target: Vec2, obstacles: &[Obstacle], memo: &mut Memo) -> (Vec2, Option<Rodeo>) {
     // Se descarta el que contiene el destino, y aquel sobre cuya forma ya está el robot: no
     // hay tangente (encima de la pelota es una falla de visión; dentro del área, la salida
     // es del guardia).
@@ -173,10 +200,10 @@ pub fn aim_point(p: Vec2, target: Vec2, obstacles: &[Obstacle], memo: &mut Memo)
         *memo = None;
         let to_target = target - p;
         if push_out == Vec2::ZERO || to_target.length() < 1e-6 {
-            return target;
+            return (target, None);
         }
         let dir = (to_target.normalize() + push_out).normalize_or_zero();
-        return if dir == Vec2::ZERO { target } else { p + dir * to_target.length() };
+        return (if dir == Vec2::ZERO { target } else { p + dir * to_target.length() }, None);
     };
     let m = o.margin_from(p, target);
     let tdir = (target - p).y.atan2((target - p).x);
@@ -199,9 +226,9 @@ pub fn aim_point(p: Vec2, target: Vec2, obstacles: &[Obstacle], memo: &mut Memo)
     }
     if !(lo.0.is_finite() && hi.0.is_finite()) {
         *memo = None;
-        return target;
+        return (target, None);
     }
-    // Por lado: (desvío, válido, punto de mira).
+    // Por lado: (desvío, válido, punto de mira, punto de tangencia).
     let side = |(rel, len): (f32, f32)| {
         let tangent = Vec2::from_angle(tdir + rel);
         let touch = p + tangent * len;
@@ -212,7 +239,7 @@ pub fn aim_point(p: Vec2, target: Vec2, obstacles: &[Obstacle], memo: &mut Memo)
                 .iter()
                 .filter(|x| x.key() != o.key())
                 .all(|x| x.first_hit(p, touch, x.margin_from(p, target)).is_none());
-        (rel.abs(), valid, p + dir * len.max(MIN_AIM))
+        (rel.abs(), valid, p + dir * len.max(MIN_AIM), touch)
     };
     let sides = [(1i8, side(hi)), (-1i8, side(lo))];
     let kept = memo
@@ -227,7 +254,13 @@ pub fn aim_point(p: Vec2, target: Vec2, obstacles: &[Obstacle], memo: &mut Memo)
             .expect("hay dos lados")
     });
     *memo = Some((o.key(), chosen.0));
-    chosen.1 .2
+    let obstaculo = match o.key() {
+        0 => Rodeado::Pelota,
+        2 => Rodeado::AreaDerecha,
+        _ => Rodeado::AreaIzquierda,
+    };
+    let rodeo = Rodeo { obstaculo, lado: chosen.0, tangencia: chosen.1 .3, holgura: m };
+    (chosen.1 .2, Some(rodeo))
 }
 
 #[cfg(test)]
@@ -394,5 +427,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_exported_detour_is_the_one_kept_in_the_memo() {
+        let (p, t, ball) = (Vec2::new(-0.45, 0.02), Vec2::new(0.45, 0.0), Vec2::ZERO);
+        let mut memo = None;
+        let (aim, rodeo) = aim_point_detalle(p, t, &[Obstacle::Ball(ball)], &mut memo);
+        assert_eq!(aim, aim_point(p, t, &[Obstacle::Ball(ball)], &mut None));
+        let r = rodeo.expect("la pelota está en el camino");
+        assert_eq!(r.obstaculo, Rodeado::Pelota);
+        assert_eq!(memo, Some((0, r.lado)), "el lado exportado es el del memo");
+        assert!((r.holgura - BALL_CLEARANCE).abs() < 1e-6);
+        assert!(((r.tangencia - ball).length() - BALL_CLEARANCE).abs() < 1e-3, "tangente a la holgura");
+        // Con el camino libre no hay rodeo.
+        let libre = aim_point_detalle(Vec2::new(-0.4, 0.3), Vec2::new(0.4, 0.3), &[Obstacle::Ball(ball)], &mut None);
+        assert!(libre.1.is_none());
     }
 }

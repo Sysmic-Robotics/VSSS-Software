@@ -1,3 +1,4 @@
+use crate::coach::debug::CoachDebug;
 use crate::coach::heuristic_coach::Role;
 use crate::coach::observation::Observation;
 use crate::coach::skill_choice::SkillChoice;
@@ -35,6 +36,12 @@ pub trait Coach: Send + Sync {
     /// Rol vigente del robot propio `robot_id`, para la GUI. `None` si el coach no
     /// reparte roles. Solo lectura: no altera ninguna decisión.
     fn role(&self, _robot_id: i32) -> Option<Role> {
+        None
+    }
+
+    /// Depuración de la última decisión (puntajes, roles, objetivo…), para la GUI y el
+    /// CSV de partido. `None` si el coach no la exporta. Solo lectura.
+    fn debug(&self) -> Option<CoachDebug> {
         None
     }
 }

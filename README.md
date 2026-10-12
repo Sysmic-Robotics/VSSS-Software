@@ -27,7 +27,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro y avanza de espaldas cuando conviene. |
 | `VSSL_BORDER_RECOVERY` | (on) | `0`: apaga la recuperación de atasco. Hay atasco si durante 30 ticks se le comanda avanzar (> 0.1 m/s a lo largo del heading) y todas sus poses medidas quedan a menos de 0.03 m de la primera de la ventana (un salto de la pose estimada, como el sobrepaso del estimador al chocar la pelota, cuenta como movimiento); entonces hace una maniobra de escape de 25 ticks. Si la racha de avance arranca desde el reposo (las últimas 30 poses a menos de 0.01 m de la más vieja, aunque gire en el lugar, o el robot recién aparece), los primeros 30 ticks no cuentan: al alinearse y acelerar, la latencia y el torque limitado le impiden recorrer 3 cm en 0.5 s. Un robot trabado desde quieto escapa a los 60 ticks; uno que venía andando, a los 30. |
 | `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |
-| `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota). |
+| `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota y la depuración por tick). |
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
 | `VSSL_VISION_RECORD` | (off) | Ruta donde grabar los paquetes crudos de visión, para `vision_replay`. |
 | `VSSL_REFEREE_ADDR` | `224.5.23.2:10003` | Dónde escucha el engine los comandos del árbitro (VSSReferee o texto de `tools/referee_cli.py`). |
@@ -66,7 +66,21 @@ La interfaz se ve como la mesa de la salita: es neutra, y el único color es el 
 - **Cancha** (centro): medidas del reglamento, tomadas de las mismas constantes que usan el
   guardia de zonas y los plays; paredes, triángulos, regla en cm, robots de 7.5 cm con sus
   caras cóncavas y marcas de identificación, y pelota a escala.
-- **Pestañas** (derecha): **Herramientas** (control manual, skill para el robot elegido y
+- **Capas** sobre la cancha, con una barra de botones arriba a la izquierda y sus teclas
+  (fuera del modo manual). Arrancan encendidas N, C, R y T:
+  - **N, Navegación:** del robot elegido, el destino que navega motion, el punto de mira, la
+    holgura y el lado del rodeo (pelota o área) y el punto de tangencia; de los demás, solo el
+    destino y el punto de mira, tenues. Además, la línea de tiro del atacante al objetivo del
+    coach, con su nombre ("palo lejano"…);
+  - **C, Coach:** un rótulo por robot propio con el rol y lo que hace ("Atacante, se alinea");
+  - **R, Reflejos:** áreas prohibidas, la proyección de 0.30 s del guardia (en alerta cuando
+    frena o saca al robot) y los escapes de la recuperación;
+  - **T, Trazas:** los últimos 3 s de cada robot y de la pelota;
+  - **S, Skills:** progreso, cara y, si no es factible, "no factible" en alerta.
+- **Pestañas** (derecha): **Por qué** (abierta por defecto: qué hace el robot elegido y por
+  qué, las barras de las 5 opciones del atacante con la aplicada en azul, el bono, el
+  compromiso, el tiro, el objetivo, la pelota trabada, la condición para cambiar de atacante y
+  la adaptación al rival), **Herramientas** (control manual, skill para el robot elegido y
   teleport), **Inspector** (robot elegido, salud en detalle, visión, radio y mapeo visión →
   radio, error de la skill) y **Parámetros** (vista, escalas y rampa del manual, Spin ω, PID
   de heading, presets).
@@ -123,7 +137,19 @@ aunque la visión no vea al robot.
 
 **Teleport (simulación):** reposiciona el robot elegido a `(x, y, θ)` y la pelota a `(x, y)`
 en FIRASim o grSim. `x, y` van en metros y **θ en grados** (la unidad del replacement de los
-dos simuladores). Con la base station no hace nada.
+dos simuladores). Con la base station no hace nada. También **arrastrando** en la cancha:
+con el botón izquierdo sobre un robot o la pelota se los mueve (el robot conserva su
+orientación), y con el derecho sobre un robot se lo orienta hacia el cursor. Un click corto
+sigue siendo el click de siempre.
+
+**Depuración por tick** (`TickDebug`, `src/snapshot.rs`): con GUI, o con `VSSL_MATCH_LOG`,
+el lazo arma en cada tick lo que ya calcularon el coach (puntajes de las 5 opciones del
+atacante, bono, compromiso, factores del tiro, objetivo, roles con su tiempo de llegada,
+pelota trabada y adaptación), motion (destino, punto de mira, rodeo), el guardia (proyección
+y si frenó), la recuperación (escape) y las skills (`status`). Se anota durante la única
+llamada real de cada uno y no cambia ningún comando: un test corre 360 ticks del coach
+heurístico con la exportación encendida y apagada y exige comandos idénticos. Va a las capas,
+a la pestaña "Por qué" y al CSV de partido.
 
 **La GUI no frena el lazo.** Con GUI, el lazo publica una foto inmutable de cada tick
 (`src/snapshot.rs`: el `World` del tick, los comandos, la skill y su estado, el rol, la
@@ -398,7 +424,20 @@ python tools/referee_cli.py penalty yellow
 ## Métricas de partido (`tools/match_metrics.py`)
 
 Con `VSSL_MATCH_LOG=logs/partido.csv` el engine escribe el registro del partido; el script lo
-convierte en números (solo biblioteca estándar de Python):
+convierte en números (solo biblioteca estándar de Python). Al final de cada fila van las
+columnas de la depuración por tick (vacías en las filas de rivales; el script lee por nombre
+de columna y no las usa):
+
+```
+role, progress, feasible, face, nav_dest_x, nav_dest_y, nav_aim_x, nav_aim_y, nav_detour,
+nav_side, nav_reverse, guard, guard_proj_x, guard_proj_y, escape_dx, escape_dy, arrival_s,
+coach_decision, striker, score_shoot, score_clear, score_spin, score_intercept,
+score_approach, pick_score, pick, bonus_skill, commit_left, stall, stall_s,
+adapt_shot_upper, adapt_shot_center, adapt_shot_lower, adapt_duel
+```
+
+Los datos del coach (decisión, atacante, puntajes, elección, bono, compromiso, pelota trabada
+y adaptación) se repiten en cada fila propia del tick.
 
 ```bash
 python tools/match_metrics.py logs/partido_azul.csv            # tabla
@@ -672,15 +711,15 @@ Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt`
 
 ```bash
 cargo test                       # toda la suite
-cargo test --lib                 # solo lib (517 tests)
+cargo test --lib                 # solo lib (542 tests)
 cargo test --bin motion_bench    # métricas, criterios, suites y reanudación del bench de aceptación (24 tests)
 cargo test --bin match_director  # director de partido de FIRASim (5 tests)
 cargo test --bin scenario        # constructores de Scenario (6 tests)
 cargo test --bin skill_test      # parser del CLI, perfiles y corte de seguridad (27 tests)
-python3 -m unittest discover -s tools -p 'test_*.py'   # sysid, lectura de los CSV y medición del lazo (22 tests)
+python3 -m unittest discover -s tools -p 'test_*.py'   # sysid, lectura de los CSV, medición del lazo y métricas de partido (23 tests)
 ```
 
-**579 tests de Rust** (más 22 de Python: sysid, lectura de los CSV y medición del lazo) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración), foto del lazo para la GUI (publicar nunca espera, temporización, fuente de cada comando, consultar el estado de la skill no cambia los comandos, contadores de visión) y GUI (vista y orientación, regla y área del reglamento, parches del Anexo 1, frases de la barra de estado y de las filas, teclado del modo manual, contraste AA, fuentes tabulares, y la cancha dibujada con tiny-skia con datos no finitos) y parada segura (ceros al terminar, también con un pánico, señales, GUI supervisada, tick sin comandos y corte sin visión).
+**604 tests de Rust** (más 23 de Python: sysid, lectura de los CSV, medición del lazo y métricas de partido) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración), foto del lazo para la GUI (publicar nunca espera, temporización, fuente de cada comando, consultar el estado de la skill no cambia los comandos, contadores de visión) y GUI (vista y orientación, regla y área del reglamento, parches del Anexo 1, frases de la barra de estado y de las filas, teclado del modo manual, contraste AA, fuentes tabulares, y la cancha dibujada con tiny-skia con datos no finitos) y parada segura (ceros al terminar, también con un pánico, señales, GUI supervisada, tick sin comandos y corte sin visión) y depuración por tick (comandos idénticos con la exportación, coach, navegación, guardia, columnas del CSV de partido, capas, panel "Por qué" y teleport arrastrando).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

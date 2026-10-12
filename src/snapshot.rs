@@ -5,16 +5,20 @@
 //! foto, publicar nunca espera a la GUI y una GUI atrasada ve la más reciente, no una
 //! cola de fotos viejas. Es la única entrada de datos de la vista.
 //!
-//! Puntos de extensión:
-//! - Fase 2: la estructura de depuración por tick (la misma que va al CSV, cambio de
-//!   contrato) se cuelga de `LoopSnapshot` como `debug: Option<Arc<TickDebug>>`.
+//! La depuración por tick ([`TickDebug`]: lo que ya calcularon el coach, motion, los
+//! reflejos y las skills) viaja en `LoopSnapshot::debug` y, para el CSV de partido, en
+//! `TickRecord::debug`.
+//!
+//! Punto de extensión:
 //! - Fase 3: el búfer de 30 s se alimenta desde [`publish`], el único punto de
 //!   publicación.
 
+use crate::coach::debug::CoachDebug;
 use crate::coach::{Foul, Role, SharedReferee, SkillChoice};
 use crate::control_loop::TickMode;
-use crate::motion::MotionCommand;
+use crate::motion::{MotionCommand, NavDebug};
 use crate::radio::base_station::command_to_vw;
+use crate::skills::zones::{AreaRect, GuardiaDebug};
 use crate::skills::{SkillId, SkillStatus};
 use crate::world::World;
 use glam::Vec2;
@@ -66,7 +70,8 @@ pub struct LoopSnapshot {
     pub vision: VisionCounters,
     /// Contadores monótonos de la radio.
     pub radio: RadioCounters,
-    // Fase 2: pub debug: Option<Arc<TickDebug>>,
+    /// Depuración del tick (`None` si el lazo no la arma).
+    pub debug: Option<Arc<TickDebug>>,
 }
 
 impl Default for LoopSnapshot {
@@ -84,7 +89,42 @@ impl Default for LoopSnapshot {
             timing: TimingStats::default(),
             vision: VisionCounters::default(),
             radio: RadioCounters::default(),
+            debug: None,
         }
+    }
+}
+
+/// Depuración del tick (capability `depuracion-tick`): lo que ya calcularon el coach,
+/// motion, los reflejos y las skills en el tick, capturado en su única llamada. Va a las
+/// capas de la GUI y al CSV de partido; no decide nada.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TickDebug {
+    /// La última decisión del coach (decide cada pocos ticks).
+    pub coach: Option<CoachDebug>,
+    /// Un elemento por id propio en `0..num_robots`, en orden.
+    pub robots: Vec<RobotDebug>,
+}
+
+/// Depuración de un robot propio en el tick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RobotDebug {
+    pub id: i32,
+    /// Lo que calculó `Motion::navigate` (`None` si no navegó en el tick).
+    pub nav: Option<NavDebug>,
+    /// Lo que hizo el guardia con el comando de la skill.
+    pub guardia: Option<GuardiaDebug>,
+    /// Áreas que tiene prohibidas (vacío si la visión no lo ve).
+    pub prohibidas: Vec<AreaRect>,
+    /// Dirección del escape, si la recuperación lo reemplazó en el tick.
+    pub escape: Option<Vec2>,
+    /// `SkillStatus` de su skill aplicada.
+    pub status: Option<SkillStatus>,
+}
+
+impl TickDebug {
+    /// La depuración del robot propio `id`.
+    pub fn robot(&self, id: i32) -> Option<&RobotDebug> {
+        self.robots.iter().find(|r| r.id == id)
     }
 }
 

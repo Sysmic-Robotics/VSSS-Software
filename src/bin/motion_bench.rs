@@ -689,6 +689,7 @@ async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedRefe
         max_ticks: Some((total_dur(case) * 60.0).round() as u32),
         vision_timeout: Some(Duration::from_secs(3)),
         referee,
+        exportar_depuracion: false,
     };
     let decider = Box::new(ScriptDecider { case: *case, robot_id: rid as i32 });
     run_control_loop(cfg, decider, Some(hook), None, Arc::new(AtomicBool::new(false)))

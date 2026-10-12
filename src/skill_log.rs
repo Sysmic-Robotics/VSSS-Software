@@ -9,10 +9,15 @@
 //!   `TickRecord` y el contexto coinciden.
 //! - `format_human_summary`: línea humana corta para el print rate-limited a stderr (NO CSV).
 
+use crate::coach::Role;
+use crate::coach::debug::Trabada;
 use crate::control_loop::TickRecord;
+use crate::motion::avoid::Rodeado;
 use crate::radio::base_station::{SLOT_COUNT, build_frame_from_vw, command_to_vw};
 use crate::radio::{RadioTarget, TeamColor};
-use crate::skills::SkillId;
+use crate::skills::zones::AccionGuardia;
+use crate::skills::{Face, SkillId};
+use crate::snapshot::TickDebug;
 use crate::vision::VisionSource;
 use crate::world::RobotState;
 use std::fmt::Display;
@@ -317,7 +322,108 @@ fn vw_to_slots(slot: Option<usize>, v: i16, w: i16) -> [(i16, i16); SLOT_COUNT] 
 //  Registro de partido (VSSL_MATCH_LOG) — una fila por robot y tick
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const MATCH_CSV_HEADER: &str = "t_ms,tick,team,robot,own,skill,target_x,target_y,pose_x,pose_y,pose_theta,vel_x,vel_y,omega,cmd_vx,cmd_vy,cmd_omega,ball_x,ball_y,ball_vx,ball_vy\n";
+pub const MATCH_CSV_HEADER: &str = "t_ms,tick,team,robot,own,skill,target_x,target_y,pose_x,pose_y,pose_theta,vel_x,vel_y,omega,cmd_vx,cmd_vy,cmd_omega,ball_x,ball_y,ball_vx,ball_vy,\
+role,progress,feasible,face,nav_dest_x,nav_dest_y,nav_aim_x,nav_aim_y,nav_detour,nav_side,nav_reverse,\
+guard,guard_proj_x,guard_proj_y,escape_dx,escape_dy,arrival_s,coach_decision,striker,score_shoot,score_clear,\
+score_spin,score_intercept,score_approach,pick_score,pick,bonus_skill,commit_left,stall,stall_s,\
+adapt_shot_upper,adapt_shot_center,adapt_shot_lower,adapt_duel\n";
+
+/// Cantidad de columnas de depuración al final de `MATCH_CSV_HEADER`.
+const MATCH_DEBUG_COLS: usize = 34;
+
+/// Columnas de depuración de la fila del robot propio `id` (capability
+/// `depuracion-tick`), separadas por coma y sin comas adentro. Un dato que no existe
+/// queda vacío; sin depuración, todas vacías.
+fn columnas_depuracion(debug: Option<&TickDebug>, id: i32) -> String {
+    let num = |x: Option<f32>| x.map(|v| format!("{v:.3}")).unwrap_or_default();
+    let Some(d) = debug else {
+        return ",".repeat(MATCH_DEBUG_COLS - 1);
+    };
+    let r = d.robot(id);
+    let nav = r.and_then(|r| r.nav);
+    let guardia = r.and_then(|r| r.guardia);
+    let escape = r.and_then(|r| r.escape);
+    let status = r.and_then(|r| r.status);
+    let coach = d.coach.as_ref();
+    let rol = coach.and_then(|c| c.roles.iter().find(|x| x.id == id));
+    let opciones = coach.and_then(|c| c.opciones);
+    let puntaje = |s: SkillId| num(opciones.and_then(|o| o.puntajes.iter().find(|p| p.0 == s).map(|p| p.1)));
+    let (trabada, trabada_s) = match coach.map(|c| c.trabada) {
+        None => ("", None),
+        Some(Trabada::Libre) => ("none", None),
+        Some(Trabada::Contando(s)) => ("counting", Some(s)),
+        Some(Trabada::Pateando(s)) => ("kicking", Some(s)),
+        Some(Trabada::GiroProhibido(s)) => ("banned", Some(s)),
+    };
+    let adapt = coach.map(|c| c.adaptacion);
+    [
+        rol.and_then(|x| x.rol)
+            .map(|x| match x {
+                Role::Keeper => "keeper",
+                Role::Striker => "striker",
+                Role::Support => "support",
+            })
+            .unwrap_or_default()
+            .to_string(),
+        num(status.map(|s| s.progress)),
+        status.map(|s| u8::from(s.feasible).to_string()).unwrap_or_default(),
+        status
+            .map(|s| if s.face == Face::Front { "front" } else { "back" })
+            .unwrap_or_default()
+            .to_string(),
+        num(nav.map(|n| n.destino.x)),
+        num(nav.map(|n| n.destino.y)),
+        num(nav.map(|n| n.mira.x)),
+        num(nav.map(|n| n.mira.y)),
+        nav.and_then(|n| n.rodeo)
+            .map(|r| match r.obstaculo {
+                Rodeado::Pelota => "ball",
+                Rodeado::AreaIzquierda => "area_left",
+                Rodeado::AreaDerecha => "area_right",
+            })
+            .unwrap_or_default()
+            .to_string(),
+        nav.and_then(|n| n.rodeo).map(|r| r.lado.to_string()).unwrap_or_default(),
+        nav.map(|n| u8::from(n.espaldas).to_string()).unwrap_or_default(),
+        guardia
+            .and_then(|g| g.accion)
+            .map(|a| match a {
+                AccionGuardia::Frena => "brake",
+                AccionGuardia::Saca => "exit",
+            })
+            .unwrap_or_default()
+            .to_string(),
+        num(guardia.map(|g| g.proyeccion.x)),
+        num(guardia.map(|g| g.proyeccion.y)),
+        num(escape.map(|e| e.x)),
+        num(escape.map(|e| e.y)),
+        num(rol.and_then(|x| x.llegada_s)),
+        coach.map(|c| c.decision.to_string()).unwrap_or_default(),
+        coach.and_then(|c| c.atacante).map(|a| a.to_string()).unwrap_or_default(),
+        puntaje(SkillId::ShootPush),
+        puntaje(SkillId::Clear),
+        puntaje(SkillId::SpinKick),
+        puntaje(SkillId::Intercept),
+        puntaje(SkillId::ApproachAligned),
+        opciones.map(|o| skill_label(Some(o.ganadora)).to_string()).unwrap_or_default(),
+        coach
+            .and_then(|c| c.skill_atacante)
+            .map(|s| skill_label(Some(s)).to_string())
+            .unwrap_or_default(),
+        opciones
+            .and_then(|o| o.bono)
+            .map(|b| skill_label(Some(b.0)).to_string())
+            .unwrap_or_default(),
+        opciones.map(|o| o.compromiso.restantes.to_string()).unwrap_or_default(),
+        trabada.to_string(),
+        num(trabada_s),
+        num(adapt.map(|a| a.tiros[0].value)),
+        num(adapt.map(|a| a.tiros[1].value)),
+        num(adapt.map(|a| a.tiros[2].value)),
+        num(adapt.map(|a| a.duelos.value)),
+    ]
+    .join(",")
+}
 
 /// CSV de partido: por tick, una fila por robot propio (skill, target y comando)
 /// y una por rival (solo pose, `own=0`). La pelota se repite en cada fila para
@@ -362,15 +468,16 @@ impl MatchLogger {
             "{},{},{},{}",
             ball.position.x, ball.position.y, ball.velocity.x, ball.velocity.y
         );
-        // Propios: filas paralelas a `commands`. La choice/target pueden faltar si
-        // el comando vino de control manual (no del coach).
+        // Propios: filas paralelas a `commands` (y `targets`). La elección aplicada se
+        // busca por id de robot: con un comando manual o con STOP, las listas no van en
+        // paralelo. Puede faltar si el comando vino de control manual.
         for (i, cmd) in rec.commands.iter().enumerate() {
-            let choice = rec.choices.get(i);
+            let choice = rec.choices.iter().find(|c| c.robot_id == cmd.id);
             let target = rec.targets.get(i).copied().flatten();
             let robot = rec.world.get_robot_state(cmd.id, cmd.team);
             writeln!(
                 self.file,
-                "{},{},{},{},1,{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},1,{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 rec.t_ms,
                 rec.tick,
                 cmd.team,
@@ -387,7 +494,8 @@ impl MatchLogger {
                 cmd.vx,
                 cmd.vy,
                 cmd.omega,
-                ball_cols
+                ball_cols,
+                columnas_depuracion(rec.debug, cmd.id)
             )?;
         }
         // Rivales: solo pose.
@@ -400,7 +508,7 @@ impl MatchLogger {
         for r in opps {
             writeln!(
                 self.file,
-                "{},{},{},{},0,,,,{},{},{},{},{},{},,,,{}",
+                "{},{},{},{},0,,,,{},{},{},{},{},{},,,,{},{}",
                 rec.t_ms,
                 rec.tick,
                 r.team,
@@ -411,7 +519,8 @@ impl MatchLogger {
                 r.velocity.x,
                 r.velocity.y,
                 r.angular_velocity,
-                ball_cols
+                ball_cols,
+                ",".repeat(MATCH_DEBUG_COLS - 1)
             )?;
         }
         Ok(())
@@ -475,6 +584,7 @@ mod tests {
             targets,
             choices,
             escaping: &[],
+            debug: None,
         }
     }
 
@@ -664,7 +774,92 @@ mod tests {
         }
         assert!(lines[1].contains(",1,shoot,0.75,0,"), "fila propia: {}", lines[1]);
         assert!(lines[2].starts_with("0,0,1,1,0,,,,"), "fila rival: {}", lines[2]);
-        assert!(lines[2].ends_with("0.5,-0.1,0.2,0"), "pelota en fila rival: {}", lines[2]);
+        let col = |l: &str, nombre: &str| -> String {
+            let i = MATCH_CSV_HEADER.trim_end().split(',').position(|h| h == nombre).unwrap();
+            l.split(',').nth(i).unwrap().to_string()
+        };
+        assert_eq!(col(lines[2], "ball_vx"), "0.2", "pelota en fila rival: {}", lines[2]);
+        assert!(lines[2].ends_with(&",".repeat(MATCH_DEBUG_COLS)), "depuración vacía en el rival");
+        assert_eq!(col(lines[1], "role"), "", "sin depuración, vacía");
+    }
+
+    #[test]
+    fn match_csv_carries_the_debug_columns_matched_by_robot_id() {
+        use crate::coach::{Coach, HeuristicCoach, Observation};
+        use crate::motion::NavDebug;
+        use crate::motion::avoid::{Rodeado, Rodeo};
+        use crate::skills::SkillStatus;
+        use crate::skills::zones::{AccionGuardia, GuardiaDebug};
+        use crate::snapshot::RobotDebug;
+        // Una decisión real del coach heurístico.
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, Vec2::new(-0.5, 0.3), 0.0, Vec2::ZERO, 0.0);
+        world.update_robot(1, 0, Vec2::new(0.0, -0.1), 0.0, Vec2::ZERO, 0.0);
+        world.update_robot(2, 0, Vec2::new(-0.63, 0.0), 0.0, Vec2::ZERO, 0.0);
+        world.update_ball(Vec2::new(0.2, 0.0), Vec2::ZERO);
+        let mut c = HeuristicCoach::with_options(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0), 2, true);
+        let choices = c.decide(&Observation::from_world(&world, 0));
+        let coach = c.debug().unwrap();
+        let striker = coach.atacante.unwrap();
+        let elegida = *choices.iter().find(|ch| ch.robot_id == striker).unwrap();
+        let debug = TickDebug {
+            coach: Some(coach),
+            robots: vec![RobotDebug {
+                id: striker,
+                nav: Some(NavDebug {
+                    destino: Vec2::new(0.1, 0.05),
+                    mira: Vec2::new(0.05, 0.12),
+                    llego: false,
+                    espaldas: true,
+                    evita_pelota: true,
+                    rodeo: Some(Rodeo { obstaculo: Rodeado::Pelota, lado: 1, tangencia: Vec2::new(0.15, 0.1), holgura: 0.09 }),
+                }),
+                guardia: Some(GuardiaDebug { proyeccion: Vec2::new(0.2, 0.0), accion: Some(AccionGuardia::Frena) }),
+                prohibidas: Vec::new(),
+                escape: None,
+                status: Some(SkillStatus { progress: 0.5, done: false, feasible: true, face: Face::Back }),
+            }],
+        };
+        // El robot manual va primero en la lista de comandos y no tiene elección: la del
+        // atacante se busca por id, no por posición.
+        let manual = 3 - striker - 2;
+        let cmd = |id: i32| MotionCommand { id, team: 0, vx: 0.1, vy: 0.0, omega: 0.0, orientation: 0.0 };
+        let commands = vec![cmd(manual), cmd(striker)];
+        let targets = [None, Some(elegida.target)];
+        let applied = [elegida];
+        let mut rec = empty_tick_record(&world, &commands, &targets, &applied);
+        rec.debug = Some(&debug);
+        let path = std::env::temp_dir().join(format!("vsss_match_debug_test_{}.csv", std::process::id()));
+        {
+            let mut logger = MatchLogger::new(&path, 0).unwrap();
+            logger.write_tick(&rec).unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        let header: Vec<&str> = lines[0].split(',').collect();
+        assert_eq!(header.len(), 21 + MATCH_DEBUG_COLS);
+        let col = |l: &str, nombre: &str| -> String {
+            let i = header.iter().position(|h| *h == nombre).unwrap();
+            l.split(',').nth(i).unwrap().to_string()
+        };
+        for l in &lines {
+            assert_eq!(l.split(',').count(), header.len(), "columnas en '{l}'");
+        }
+        let (fila_manual, fila_atacante) = (lines[1], lines[2]);
+        assert_eq!(col(fila_manual, "skill"), "", "el manual no tiene elección");
+        assert_eq!(col(fila_atacante, "skill"), skill_label(Some(elegida.skill_id)));
+        assert_eq!(col(fila_atacante, "role"), "striker");
+        assert_eq!(col(fila_atacante, "pick"), skill_label(Some(elegida.skill_id)));
+        assert!(!col(fila_atacante, "score_approach").is_empty());
+        assert_eq!(col(fila_atacante, "nav_detour"), "ball");
+        assert_eq!(col(fila_atacante, "nav_side"), "1");
+        assert_eq!(col(fila_atacante, "nav_reverse"), "1");
+        assert_eq!(col(fila_atacante, "guard"), "brake");
+        assert_eq!(col(fila_atacante, "face"), "back");
+        assert_eq!(col(fila_atacante, "progress"), "0.500");
+        assert_eq!(col(fila_atacante, "coach_decision"), "1");
+        assert_eq!(col(fila_manual, "role"), "support", "los datos de coach van en cada fila propia");
     }
 
     #[test]

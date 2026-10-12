@@ -67,6 +67,8 @@ pub const PELOTA_BORDE: Color = hex(0xa8420a);
 pub const REGLA: Color = hex(0xe9e9e2);
 /// Fondo de los gráficos y pista de las barras.
 pub const PISTA: Color = hex(0xd3d8cf);
+/// Línea de tiro sobre el fieltro (capa Navegación).
+pub const TIRO: Color = hex(0xffe08a);
 /// Texto sobre el botón de parada.
 pub const BLANCO: Color = Color::WHITE;
 
@@ -90,8 +92,8 @@ pub const TXT: f32 = 14.0;
 pub const TXT_CHICO: f32 = 13.0;
 /// Etiquetas pequeñas (ejes, regla).
 pub const TXT_MINI: f32 = 12.0;
-/// Pestañas.
-pub const TXT_PESTANA: f32 = 15.0;
+/// Pestañas (con 13 px caben las cuatro en el panel derecho).
+pub const TXT_PESTANA: f32 = 13.0;
 /// Títulos de panel.
 pub const TXT_TITULO: f32 = 17.0;
 /// Nombre de robot y título de la barra de estado.
@@ -171,6 +173,23 @@ pub fn boton_opcion(activo: bool) -> impl Fn(&Theme, button::Status) -> button::
             boton_activo(theme, status)
         } else {
             boton(theme, status)
+        }
+    }
+}
+
+/// Botón de una capa sobre la cancha: hoja casi opaca; encendida, texto y borde en
+/// tinta; apagada, texto gris y borde raya (mockup).
+pub fn boton_capa(on: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let fondo = match status {
+            button::Status::Hovered | button::Status::Pressed => HOJA,
+            _ => alfa(HOJA, 0.92),
+        };
+        button::Style {
+            background: Some(Background::Color(fondo)),
+            text_color: if on { TINTA } else { GRIS },
+            border: borde(if on { TINTA } else { RAYA }, 1.0),
+            shadow: Shadow::default(),
         }
     }
 }

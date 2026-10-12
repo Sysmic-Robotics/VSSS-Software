@@ -24,6 +24,7 @@
 
 use crate::coach::adaptation::{Adaptation, Lane};
 use crate::coach::coach_trait::Coach;
+use crate::coach::debug::{CoachDebug, TipoObjetivo};
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation, RobotObs};
 use crate::coach::plays::{Play, formation};
 use crate::coach::referee::SharedReferee;
@@ -33,6 +34,8 @@ use crate::params::{CoachParams, params};
 use crate::skills::{SkillId, shoot_push_feasible_now};
 use glam::Vec2;
 use std::f32::consts::{FRAC_PI_2, PI};
+
+mod depuracion;
 
 // ── Geometría del campo (LARC VSSS 3v3, m) ────────────────────────────────────
 /// |x| desde el que empieza el área de arco propio/rival (área 70×15 cm).
@@ -137,6 +140,8 @@ pub struct HeuristicCoach {
     /// Ya se comparó el lado configurado con la posición inicial del equipo.
     side_checked: bool,
     push_stall: Stall,
+    /// Depuración de las decisiones (GUI y CSV de partido; no decide nada).
+    depuracion: depuracion::Registro,
 }
 
 fn clamp01(x: f32) -> f32 {
@@ -201,6 +206,7 @@ impl HeuristicCoach {
             adaptation: Adaptation::new(p.adapt_enabled, p.adapt_alpha),
             side_checked: false,
             push_stall: Stall::None,
+            depuracion: depuracion::Registro::default(),
             p,
         }
     }
@@ -354,6 +360,12 @@ impl HeuristicCoach {
                     .partial_cmp(&(b.pos - self.attack_goal).length())
                     .unwrap()
             });
+        self.depuracion
+            .tipo_objetivo(if keeper.is_some_and(|k| k.pos.y.abs() > 0.03) {
+                TipoObjetivo::PaloLejano
+            } else {
+                TipoObjetivo::Arco
+            });
         let post_y = GOAL_HALF_Y - 0.06;
         match keeper {
             Some(k) if k.pos.y.abs() > 0.03 => Vec2::new(self.attack_goal.x, -k.pos.y.signum() * post_y),
@@ -388,6 +400,11 @@ impl HeuristicCoach {
         let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
         let attacking_end = ball.x * s > 0.0;
         if self.ball_on_end_wall(ball) {
+            self.depuracion.tipo_objetivo(if attacking_end {
+                TipoObjetivo::FondoRival
+            } else {
+                TipoObjetivo::FondoPropio
+            });
             return if attacking_end {
                 // Fondo/esquina rival: sacarla al frente del arco (segunda pelota).
                 Vec2::new(s * (GOAL_AREA_X - 0.12), -side * 0.10)
@@ -400,9 +417,11 @@ impl HeuristicCoach {
             // Banda: conducir a lo largo de la banda con un ángulo suave hacia adentro
             // (~13°), para que la pelota se despegue de la pared camino al arco. Más
             // ángulo deja el staging detrás de la pelota dentro de la pared.
+            self.depuracion.tipo_objetivo(TipoObjetivo::Banda);
             return Vec2::new(ball.x + s * 0.35, side * (ball.y.abs() - 0.08));
         }
         if self.in_own_half(ball) && (ball.x * -s) > 0.35 {
+            self.depuracion.tipo_objetivo(TipoObjetivo::Despeje);
             return self.clear_target(ball);
         }
         self.aim_point(opp)
@@ -648,6 +667,7 @@ impl HeuristicCoach {
         let skill = self.commit(r.id, wanted, |prev| {
             scores.iter().any(|(s, v)| *s == prev && *v > 0.0)
         });
+        self.depuracion_atacante(r, ball, opp, target, &scores, current, wanted, skill);
         SkillChoice::new(r.id, skill, target)
     }
 
@@ -806,6 +826,7 @@ impl HeuristicCoach {
             .map(|r| (r, self.time_to_reach(r, ball)))
             .collect();
         field.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        self.depuracion_roles(&field);
 
         let Some((best, best_t)) = field.first().copied() else {
             self.striker_id = None;
@@ -831,6 +852,10 @@ impl HeuristicCoach {
 impl Coach for HeuristicCoach {
     fn role(&self, robot_id: i32) -> Option<Role> {
         self.role_of(robot_id)
+    }
+
+    fn debug(&self) -> Option<CoachDebug> {
+        Some(self.depuracion())
     }
 
     fn decide(&mut self, obs: &Observation) -> Vec<SkillChoice> {

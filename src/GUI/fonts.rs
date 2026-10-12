@@ -80,6 +80,8 @@ mod tests {
             include_str!("charts.rs"),
             include_str!("field.rs"),
             include_str!("format.rs"),
+            include_str!("capas.rs"),
+            include_str!("por_que.rs"),
         ];
         let mut fallas = Vec::new();
         for fuente in fuentes {

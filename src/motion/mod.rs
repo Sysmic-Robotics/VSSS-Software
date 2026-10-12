@@ -20,6 +20,7 @@ use crate::world::{RobotState, World};
 use glam::Vec2;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Paso de control de motion (s, ~60 Hz): la rampa limita el avance a `max_linear_accel · CONTROL_DT` por tick.
 pub const CONTROL_DT: f64 = 0.016;
@@ -109,6 +110,26 @@ pub struct Motion {
     areas: Option<AreaRules>,
     /// Lado de rodeo elegido por robot (histéresis de `avoid::aim_point`).
     side_by_robot: Mutex<HashMap<(i32, i32), avoid::Memo>>,
+    /// Depuración (GUI y CSV de partido): con `registrar`, `navigate` anota lo que
+    /// calculó por robot; el lazo lo toma una vez por tick. No cambia ningún comando.
+    registrar: AtomicBool,
+    registro: Mutex<HashMap<(i32, i32), NavDebug>>,
+}
+
+/// Lo que calculó `navigate` para un robot en un tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NavDebug {
+    /// Destino que navega (el de la skill: staging, punto de empuje, de bloqueo…).
+    pub destino: Vec2,
+    /// Punto de mira: el destino, o el que rodea un obstáculo por la tangente.
+    pub mira: Vec2,
+    /// Llegó (a menos de `arrival_threshold`): solo se orienta.
+    pub llego: bool,
+    /// Avanza de espaldas (modo bidireccional).
+    pub espaldas: bool,
+    /// Rodea la pelota (movimiento de posición) o no (de contacto).
+    pub evita_pelota: bool,
+    pub rodeo: Option<avoid::Rodeo>,
 }
 
 impl Motion {
@@ -129,6 +150,28 @@ impl Motion {
             v_prev_by_robot: Mutex::new(HashMap::new()),
             areas: None,
             side_by_robot: Mutex::new(HashMap::new()),
+            registrar: AtomicBool::new(false),
+            registro: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Enciende o apaga el registro de navegación (depuración).
+    pub fn registrar(&self, on: bool) {
+        self.registrar.store(on, Ordering::Relaxed);
+    }
+
+    /// Lo que registró `navigate` desde la última llamada (y lo vacía): un robot que no
+    /// navegó en el tick no aparece.
+    pub fn tomar_registro(&self) -> HashMap<(i32, i32), NavDebug> {
+        if !self.registrar.load(Ordering::Relaxed) {
+            return HashMap::new();
+        }
+        std::mem::take(&mut *self.registro.lock().expect("registro lock poisoned"))
+    }
+
+    fn anotar(&self, key: (i32, i32), nav: NavDebug) {
+        if self.registrar.load(Ordering::Relaxed) {
+            self.registro.lock().expect("registro lock poisoned").insert(key, nav);
         }
     }
 
@@ -226,7 +269,13 @@ impl Motion {
 
     /// Punto de mira hacia `target`: el destino, o la tangente de la pelota (si
     /// `avoid_ball`) o de un área prohibida que esté en el camino (`avoid::aim_point`).
-    fn aim_point(&self, robot_state: &RobotState, target: Vec2, world: &World, avoid_ball: bool) -> Vec2 {
+    fn aim_point(
+        &self,
+        robot_state: &RobotState,
+        target: Vec2,
+        world: &World,
+        avoid_ball: bool,
+    ) -> (Vec2, Option<avoid::Rodeo>) {
         let mut obstacles: Vec<avoid::Obstacle> = self
             .forbidden_areas(robot_state, world)
             .into_iter()
@@ -237,7 +286,7 @@ impl Motion {
         }
         let mut memos = self.side_by_robot.lock().expect("side lock poisoned");
         let memo = memos.entry((robot_state.team, robot_state.id)).or_default();
-        avoid::aim_point(robot_state.position, target, &obstacles, memo)
+        avoid::aim_point_detalle(robot_state.position, target, &obstacles, memo)
     }
 
     /// Navega hacia `move_target` con una ley de seguimiento de heading para robot
@@ -304,10 +353,19 @@ impl Motion {
                 .lock()
                 .expect("v_prev lock poisoned")
                 .insert(key, 0.0);
+            let nav = NavDebug {
+                destino: move_target,
+                mira: move_target,
+                llego: true,
+                espaldas: false,
+                evita_pelota: avoid_ball,
+                rodeo: None,
+            };
+            self.anotar(key, nav);
             return self.face_to(robot_state, face_target, kp, ki, kd);
         }
 
-        let aim = self.aim_point(robot_state, move_target, world, avoid_ball);
+        let (aim, rodeo) = self.aim_point(robot_state, move_target, world, avoid_ball);
         let theta_d = self.uvf_toward(robot_state, aim, move_target, world) as f64;
         let raw = Self::normalize_angle(theta_d - robot_state.orientation);
         let (err, dir) = if self.config.bidirectional && raw.abs() > std::f64::consts::FRAC_PI_2
@@ -326,6 +384,15 @@ impl Motion {
         let v_profile = self.config.min_linear_speed
             + normalized * (self.config.max_linear_speed - self.config.min_linear_speed);
         let v = self.ramp(key, dir * v_profile * err.cos().max(0.0));
+        let nav = NavDebug {
+            destino: move_target,
+            mira: aim,
+            llego: false,
+            espaldas: dir < 0.0,
+            evita_pelota: avoid_ball,
+            rodeo,
+        };
+        self.anotar(key, nav);
 
         let th = robot_state.orientation;
         MotionCommand {
@@ -954,9 +1021,9 @@ mod tests {
         let keeper = robot_id(2, -0.66, -0.45, 1.57);
         let field = robot_id(0, -0.66, -0.45, 1.57);
         assert!(motion.forbidden_areas(&keeper, &world).is_empty());
-        assert_eq!(motion.aim_point(&keeper, target, &world, true), target);
+        assert_eq!(motion.aim_point(&keeper, target, &world, true).0, target);
         assert_eq!(motion.forbidden_areas(&field, &world).len(), 1);
-        let aim = motion.aim_point(&field, target, &world, true);
+        let aim = motion.aim_point(&field, target, &world, true).0;
         assert!(aim.x > -0.66, "el jugador de campo rodea por el frente: {aim:?}");
     }
 
@@ -970,10 +1037,10 @@ mod tests {
         world.update_ball(FAR_BALL, Vec2::ZERO);
         world.update_robot(1, 0, Vec2::new(0.68, 0.0), 0.0, Vec2::ZERO, 0.0);
         assert!(motion.forbidden_areas(&r0, &world).iter().any(|a| a.side > 0.0));
-        let aim = motion.aim_point(&r0, target, &world, true);
+        let aim = motion.aim_point(&r0, target, &world, true).0;
         assert!(aim.x < 0.66, "rodea el área rival por el frente: {aim:?}");
         world.update_robot(1, 0, Vec2::new(0.0, 0.3), 0.0, Vec2::ZERO, 0.0);
-        assert_eq!(motion.aim_point(&r0, target, &world, true), target);
+        assert_eq!(motion.aim_point(&r0, target, &world, true).0, target);
     }
 
     #[test]
@@ -1066,5 +1133,39 @@ mod tests {
         let ball = Vec2::new(0.2, 0.2);
         let trace = run(&Case::new(SkillId::ChaseBall, ball, (-0.4, -0.3, 0.0), ball));
         assert!(trace.first_within(ball, 0.075).is_some(), "ChaseBall no llegó a la pelota");
+    }
+
+    #[test]
+    fn the_navigation_record_does_not_change_commands() {
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let robot = RobotState { id: 0, team: 0, position: Vec2::new(-0.45, 0.02), ..RobotState::new(0, 0) };
+        let target = Vec2::new(0.45, 0.0);
+        let run = |registrar: bool| {
+            let motion = Motion::new();
+            motion.registrar(registrar);
+            let cmds: Vec<MotionCommand> =
+                (0..20).map(|_| motion.move_and_face(&robot, target, target, &world, 1.0, 0.0, 0.0)).collect();
+            (cmds, motion.tomar_registro())
+        };
+        let (con, registro) = run(true);
+        let (sin, vacio) = run(false);
+        assert_eq!(con, sin, "mismos comandos con y sin registro");
+        assert!(vacio.is_empty());
+        let nav = registro[&(0, 0)];
+        assert_eq!(nav.destino, target);
+        assert!(nav.evita_pelota && !nav.llego);
+        assert_eq!(nav.rodeo.map(|r| r.obstaculo), Some(avoid::Rodeado::Pelota));
+    }
+
+    #[test]
+    fn the_record_is_taken_once_per_tick() {
+        let world = World::new(3, 3);
+        let robot = RobotState { id: 1, team: 0, position: Vec2::new(-0.3, 0.0), ..RobotState::new(1, 0) };
+        let motion = Motion::new();
+        motion.registrar(true);
+        motion.move_and_face_contact(&robot, Vec2::new(0.3, 0.0), Vec2::new(0.3, 0.0), &world, 1.0, 0.0, 0.0);
+        assert_eq!(motion.tomar_registro().len(), 1);
+        assert!(motion.tomar_registro().is_empty(), "un robot que no navegó no arrastra el registro");
     }
 }

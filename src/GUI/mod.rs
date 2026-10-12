@@ -9,12 +9,14 @@
 //! canal de "último valor": nunca frena el lazo) y manda comandos explícitos (manual,
 //! skill, PID, teleport, parada) por los mismos canales de siempre.
 
+mod capas;
 mod charts;
 mod field;
 mod fonts;
 mod format;
 mod inspector;
 mod keys;
+mod por_que;
 #[cfg(test)]
 mod render_tests;
 mod robot_rows;
@@ -335,7 +337,7 @@ pub enum Tab {
 
 impl Tab {
     /// Las implementadas en esta fase.
-    pub const VISIBLES: [Tab; 3] = [Tab::Herramientas, Tab::Inspector, Tab::Parametros];
+    pub const VISIBLES: [Tab; 4] = [Tab::PorQue, Tab::Inspector, Tab::Parametros, Tab::Herramientas];
 
     pub fn titulo(self) -> &'static str {
         match self {
@@ -376,6 +378,10 @@ pub enum Message {
     ManualAngAccelChanged(String),
     SelectSkill(Option<SkillId>),
     FieldClicked(Vec2),
+    /// Encender o apagar una capa (botón de la barra de capas).
+    ToggleCapa(Layer),
+    /// Teleport arrastrando en la cancha (solo en simulación).
+    TeleportArrastre(Vec<TeleportItem>),
     SpinOmegaChanged(String),
     PidKpChanged(String),
     PidKiChanged(String),
@@ -527,6 +533,8 @@ pub struct DebugGui {
     cache_cuadros: Cache,
     telemetry_frozen: bool,
     telemetry_window_s: f64,
+    // Trazas de la capa T (últimos segundos de cada robot y de la pelota).
+    trazas: capas::Trazas,
 }
 
 impl DebugGui {
@@ -541,12 +549,13 @@ impl DebugGui {
                 fps_gui: FpsGui::new(),
                 ancho: VENTANA_INICIAL.0,
                 alto: VENTANA_INICIAL.1,
-                tab: Tab::Herramientas,
+                tab: Tab::PorQue,
                 fieltro: Fieltro::default(),
                 orientacion: OrientacionVista::from_env(),
                 marcas: MarcasRobot::from_env(),
                 cache_base: Cache::default(),
-                capas: HashSet::new(),
+                capas: capas::CAPAS_INICIALES.into_iter().collect(),
+                trazas: capas::Trazas::default(),
                 selected_robot: 0,
                 selected_team,
                 manual_enabled: false,
@@ -620,6 +629,7 @@ impl DebugGui {
             Message::Snapshot(snap) => {
                 self.fps_gui.registrar(Instant::now());
                 self.salud.push(snap.t_ms, snap.vision, snap.radio);
+                self.trazas.registrar(&snap);
                 self.snap = snap;
                 self.registrar_cuadros();
                 if !self.telemetry_frozen {
@@ -636,17 +646,19 @@ impl DebugGui {
                 AccionTecla::Mover(c) => {
                     self.keys.insert(c);
                 }
-                AccionTecla::Capa(capa) => {
-                    if !self.capas.remove(&capa) {
-                        self.capas.insert(capa);
-                    }
-                }
+                AccionTecla::Capa(capa) => self.alternar_capa(capa),
                 AccionTecla::Nada => {}
             },
             Message::TeclaSoltada(c) => {
                 self.keys.remove(&c);
             }
             Message::ManualTick => self.manual_tick(),
+            Message::ToggleCapa(capa) => self.alternar_capa(capa),
+            Message::TeleportArrastre(items) => {
+                if let Some(tx) = &self.teleport_tx {
+                    let _ = tx.try_send(items);
+                }
+            }
             Message::SelectTab(t) => self.tab = t,
             Message::SelectRow(id) => {
                 let team = self.run.own_team.max(0) as u32;
@@ -827,6 +839,16 @@ impl DebugGui {
     /// Entra o sale del modo manual. Al salir se vacían las teclas y la rampa (para no
     /// arrancar con inercia la próxima vez); el lazo frena al robot cuando el comando
     /// manual expira.
+    /// Enciende o apaga una capa de esta fase (la V, de la fase 4, no tiene efecto).
+    fn alternar_capa(&mut self, capa: Layer) {
+        if !capas::CAPAS.contains(&capa) {
+            return;
+        }
+        if !self.capas.remove(&capa) {
+            self.capas.insert(capa);
+        }
+    }
+
     fn set_manual(&mut self, on: bool) {
         self.manual_enabled = on;
         if !on {
@@ -1052,10 +1074,15 @@ impl DebugGui {
                 .active_skill
                 .and_then(|s| skill_marker(s, self.skill_target, self.own_goal)),
             radio_slots: self.run.radio_slots(),
+            capas: &self.capas,
+            trazas: &self.trazas,
+            sim: !self.run.is_base_station(),
         })
         .width(Length::Fill)
         .height(Length::Fill);
-        container(canvas)
+        // La barra de capas va sobre la cancha, arriba a la izquierda (mockup).
+        let barra = container(capas::barra_capas(&self.capas)).padding(theme::SP_SM);
+        container(iced::widget::stack![canvas, barra])
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1063,7 +1090,8 @@ impl DebugGui {
 
     /// Panel derecho: barra de pestañas y la pestaña activa (con scroll).
     fn vista_panel(&self) -> Element<'_, Message> {
-        let mut barra = row![].spacing(theme::SP_MD).align_y(Alignment::End);
+        // Cuatro pestañas en 300 px: espaciado y margen chicos, texto de 13 px.
+        let mut barra = row![].spacing(theme::SP_SM).align_y(Alignment::End);
         for t in Tab::VISIBLES {
             let activa = t == self.tab;
             let boton = button(
@@ -1086,11 +1114,12 @@ impl DebugGui {
             Tab::Herramientas => self.pestana_herramientas(),
             Tab::Inspector => self.pestana_inspector(),
             Tab::Parametros => self.pestana_parametros(),
-            Tab::PorQue | Tab::Arbitro => text("Llega en una fase posterior.").into(),
+            Tab::PorQue => self.pestana_por_que(),
+            Tab::Arbitro => text("Llega en una fase posterior.").into(),
         };
         container(
             column![
-                container(barra).padding([8, 12]),
+                container(barra).padding([8, 8]),
                 horizontal_rule(1).style(theme::filete),
                 scrollable(container(contenido).padding([10, 14]).width(Length::Fill))
                     .height(Length::Fill),
