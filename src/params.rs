@@ -90,6 +90,9 @@ pub struct CoachParams {
     /// Cuánto se ubica el apoyo detrás de la pelota (hacia nuestro arco) cuando el
     /// equipo ataca (m): chico = ofensivo, grande = conservador.
     pub support_depth: f32,
+    /// Desplazamiento lateral del apoyo como receptor de pase, al carril contrario del
+    /// striker y a la par de la pelota (m).
+    pub pass_receiver_offset: f32,
     /// Presión: con un rival encima de la pelota, el striker va a disputarla solo si
     /// está a menos de esto de ella (m); más lejos espera sobre la línea pelota–arco
     /// propio a esta distancia de la pelota. Grande = presiona siempre.
@@ -135,6 +138,7 @@ impl Default for CoachParams {
             spin_ban_s: 2.0,
             standoff_from_ball: 0.30,
             support_depth: 0.30,
+            pass_receiver_offset: 0.35,
             press_distance: 0.60,
             gk_engage_margin: 0.05,
             gk_engage_opp_dist: 0.20,
