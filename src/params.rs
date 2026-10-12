@@ -138,7 +138,7 @@ impl Default for CoachParams {
             spin_ban_s: 2.0,
             standoff_from_ball: 0.30,
             support_depth: 0.30,
-            pass_receiver_offset: 0.35,
+            pass_receiver_offset: 0.25,
             press_distance: 0.60,
             gk_engage_margin: 0.05,
             gk_engage_opp_dist: 0.20,

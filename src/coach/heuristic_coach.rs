@@ -96,6 +96,10 @@ enum StallAction {
 // del arquero activo son parámetros de estilo de juego: `CoachParams`
 // (`config/team_params.json`, rangos en `config/style_ranges.json`).
 
+/// Margen lateral libre de rivales que exige la línea de pase (m): más que el 0.09 del tiro,
+/// porque el pase tarda en salir (el striker se pone detrás de la pelota) y el rival se mueve.
+const PASS_LANE_MARGIN: f32 = 0.15;
+
 pub struct HeuristicCoach {
     pub attack_goal: Vec2,
     pub own_goal: Vec2,
@@ -441,6 +445,11 @@ impl HeuristicCoach {
 
     /// `true` si un rival está sobre el segmento pelota→objetivo (tapa el tiro).
     fn shot_blocked(ball: Vec2, target: Vec2, opp: &[RobotView]) -> bool {
+        Self::line_blocked(ball, target, opp, 0.09)
+    }
+
+    /// Un rival a menos de `margin` del segmento `ball`→`target` (y por delante de la pelota).
+    fn line_blocked(ball: Vec2, target: Vec2, opp: &[RobotView], margin: f32) -> bool {
         let seg = target - ball;
         let len = seg.length();
         if len < 1e-3 {
@@ -451,7 +460,7 @@ impl HeuristicCoach {
             let rel = o.pos - ball;
             let along = rel.dot(dir);
             let lateral = (rel - dir * along).length();
-            along > 0.05 && along < len && lateral < 0.09
+            along > 0.05 && along < len && lateral < margin
         })
     }
 
@@ -670,7 +679,7 @@ impl HeuristicCoach {
         let d = (mate - ball).length();
         (0.25..=0.90).contains(&d)
             && (mate.x - ball.x) * s >= -0.10
-            && !Self::shot_blocked(ball, mate, opp)
+            && !Self::line_blocked(ball, mate, opp, PASS_LANE_MARGIN)
             && !Self::shot_blocked(mate, self.attack_goal, opp)
     }
 
@@ -690,7 +699,7 @@ impl HeuristicCoach {
         // uno y, si el pase se suelta antes, el striker vuelve al arco a medio camino.
         let hold = (2.0 * self.p.decision_hz.max(1.0)) as u64;
         let holding = self.pass_committed.is_some_and(|t| now.saturating_sub(t) < hold);
-        if holding && !Self::shot_blocked(ball, mate, opp) && (mate - ball).length() >= 0.25 {
+        if holding && !Self::line_blocked(ball, mate, opp, PASS_LANE_MARGIN) && (mate - ball).length() >= 0.25 {
             return Some(mate);
         }
         self.pass_committed = None;
@@ -819,16 +828,16 @@ impl HeuristicCoach {
         // Atacando: receptor de pase a la par de la pelota, en el carril contrario al
         // striker (o al lado libre), con línea de tiro al arco y lejos de los rivales. En
         // los registros el apoyo esperaba detrás de la pelota y nunca era opción de pase.
-        // Carriles en el marco de la cancha: en diagonal adelante (0.25 m hacia el arco
-        // rival) y al otro lado en y. En los registros, los pases a un receptor 0.30 m
-        // adelantado llegaban el doble que a uno a la par.
+        // Carriles en el marco de la cancha: en diagonal adelante (0.15 m hacia el arco
+        // rival) y al otro lado en y, a ~0.30 m de la pelota en total: más lejos, el empuje
+        // suelta la pelota a ~0.4 m/s y no llega (a 0.48 m llegaba el 9 % de los pases).
         let preferred = match striker {
             Some(st) if (st.pos.y - ball.y).abs() > 0.02 => -(st.pos.y - ball.y).signum(),
             _ => -ball.y.signum(),
         };
         let preferred = if preferred == 0.0 { 1.0 } else { preferred };
         let candidate = |side: f32| -> Option<Vec2> {
-            let raw = Vec2::new(ball.x + s * 0.25, ball.y + self.p.pass_receiver_offset * side);
+            let raw = Vec2::new(ball.x + s * 0.15, ball.y + self.p.pass_receiver_offset * side);
             // Si el carril de ese lado no existe (pelota pegada a la banda), no es opción.
             (raw.y.abs() <= FIELD_ROBOT_MAX_ABS_Y).then(|| self.receiver_point(raw, ball))
         };
@@ -1649,7 +1658,7 @@ mod tests {
         assert_eq!(c.role_of(0), Some(Role::Striker));
         let sup = choice_of(&ch, 1);
         assert_eq!(sup.skill_id, SkillId::Mark);
-        assert!(sup.target.y < -0.10, "carril contrario: {:?}", sup.target);
+        assert!(sup.target.y < 0.0, "carril contrario: {:?}", sup.target);
         assert!(sup.target.x >= ball.x - 0.02, "a la par o adelante, no detrás: {:?}", sup.target);
         assert!((sup.target - ball).length() >= c.p.standoff_from_ball - 1e-3);
         assert!(!c.in_own_area(sup.target) && sup.target.x < GOAL_AREA_X - 0.10, "fuera del área rival: {:?}", sup.target);
