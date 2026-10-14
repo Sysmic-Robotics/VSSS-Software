@@ -463,17 +463,23 @@ mod tests {
     }
 
     #[test]
-    fn the_included_circuits_are_valid_on_both_sides() {
+    fn the_included_routines_are_valid_on_both_sides() {
+        // Todas las rutinas de config/rutinas/ validan en los dos lados (se siguen agregando
+        // bailes sin tocar este test) y los cinco circuitos de un robot están entre ellas.
+        const CIRCUITOS: [&str; 5] = ["cuadrado_giros", "ida_vuelta", "ocho", "triangulo", "zigzag"];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/rutinas");
         for lado in [1.0, -1.0] {
             let entradas = crate::rutinas::formato::cargar_carpeta(&dir, &ContextoValidacion::por_defecto(lado)).unwrap();
-            let ids: Vec<&str> = entradas.iter().map(|e| e.id.as_str()).collect();
-            assert_eq!(ids, ["cuadrado_giros", "ida_vuelta", "ocho", "triangulo", "zigzag"]);
+            for id in CIRCUITOS {
+                assert!(entradas.iter().any(|e| e.id == id), "falta el circuito {id} (lado {lado})");
+            }
             for e in &entradas {
                 assert!(e.razones.is_empty(), "{} (lado {lado}): {:?}", e.id, e.razones);
                 let r = e.valida().unwrap();
-                assert_eq!(r.grupo, crate::rutinas::Grupo::Circuito, "{}", e.id);
-                assert_eq!((r.robots_min, r.robots_max), (1, 1), "{}", e.id);
+                if CIRCUITOS.contains(&e.id.as_str()) {
+                    assert_eq!(r.grupo, crate::rutinas::Grupo::Circuito, "{}", e.id);
+                    assert_eq!((r.robots_min, r.robots_max), (1, 1), "{}", e.id);
+                }
             }
         }
     }
