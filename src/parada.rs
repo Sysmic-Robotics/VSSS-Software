@@ -228,6 +228,7 @@ mod tests {
     }
 
     /// Espera hasta 2 s a que `flag` se active.
+    #[cfg(unix)]
     async fn se_activa(flag: &AtomicBool) -> bool {
         let hasta = Instant::now() + Duration::from_secs(2);
         while Instant::now() < hasta {
