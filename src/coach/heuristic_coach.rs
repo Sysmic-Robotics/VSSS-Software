@@ -874,13 +874,43 @@ impl HeuristicCoach {
         let parked = self.ball_is_keepers(ball) && slow;
         let overdue = in_area && self.ball_seconds_in_own_area() >= self.p.gk_force_clear_s;
         let challenge = carried && self.near_own_area(ball);
-        if parked || overdue || challenge {
-            let target = self.clear_target(ball);
+        let target = self.clear_target(ball);
+        // Bloquear antes que despejar. En los registros, el 39 % de los goles en contra
+        // entraba con el arquero despejando (y despeja solo el 6 % del tiempo): giraba en el
+        // lugar o rodeaba la pelota para alinearse, dejaba el arco y la pelota lenta o el
+        // empujón del rival entraban.
+        let incoming = self.ball_heads_into_own_goal(ball, ball_vel);
+        let yield_to_rival = self.p.gk_yield_contested
+            && opp.iter().any(|o| o.active && (o.pos - ball).length() <= 0.12)
+            && !Self::keeper_ready(r, ball, target);
+        if (parked || overdue || challenge) && !incoming && !yield_to_rival {
             let skill = self.commit(r.id, SkillId::Clear, |_| true);
             return SkillChoice::new(r.id, skill, target);
         }
-        let skill = self.commit(r.id, SkillId::GoalKeep, |_| true);
+        // Volver a la línea por una de esas dos reglas es inmediato (sin compromiso).
+        let rule = incoming || yield_to_rival;
+        let skill = self.commit(r.id, SkillId::GoalKeep, |_| !rule);
         SkillChoice::new(r.id, skill, self.own_goal)
+    }
+
+    /// La pelota avanza hacia nuestro arco a más de `gk_block_incoming_speed` y su
+    /// trayectoria cruza la línea de gol dentro de la boca (con 5 cm de margen).
+    fn ball_heads_into_own_goal(&self, ball: Vec2, ball_vel: Vec2) -> bool {
+        let to_goal = (self.own_goal - ball).normalize_or_zero();
+        if ball_vel.dot(to_goal) <= self.p.gk_block_incoming_speed || ball_vel.x.abs() < 1e-3 {
+            return false;
+        }
+        let t = (self.own_goal.x - ball.x) / ball_vel.x;
+        t > 0.0 && (ball.y + ball_vel.y * t).abs() <= GOAL_HALF_Y + 0.05
+    }
+
+    /// El arquero puede pegarle ya a la pelota hacia `target`: a menos de 0.15 m, detrás de
+    /// ella respecto del despeje y con una cara a menos de 45° de esa dirección.
+    fn keeper_ready(r: &RobotView, ball: Vec2, target: Vec2) -> bool {
+        let dir = (target - ball).normalize_or_zero();
+        let rel = r.pos - ball;
+        let heading = Vec2::new(r.theta.cos(), r.theta.sin());
+        rel.length() <= 0.15 && rel.dot(dir) <= 0.03 && heading.dot(dir).abs() >= std::f32::consts::FRAC_1_SQRT_2
     }
 
     // ── Play: roles ──────────────────────────────────────────────────────────
@@ -1234,8 +1264,10 @@ mod tests {
     fn keeper_challenges_rival_carrying_ball_into_area() {
         // Partido 3: el rival condujo la pelota 8 s por nuestra área a 0.1-0.2 m/s y el
         // arquero esperó en la línea hasta el gol. Con un rival encima de una pelota
-        // lenta en el área o su borde, sale a despejar.
-        let mut c = coach();
+        // lenta en el área o su borde, sale a despejar (regla de ceder al rival apagada:
+        // ver `keeper_blocks_instead_of_clearing_when_it_cannot_win_the_ball`).
+        let p = CoachParams { gk_yield_contested: false, ..CoachParams::default() };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p.clone(), true);
         let mut o = obs(
             Vec2::new(-0.57, -0.25),
             Vec2::new(-0.15, -0.05),
@@ -1251,12 +1283,12 @@ mod tests {
         assert!((striker.target - Vec2::new(-0.57, -0.25)).length() >= c.p.standoff_from_ball - 1e-3);
         assert!(!c.in_own_area(striker.target));
         // Misma pelota sin rival encima: sigue en la línea.
-        let mut c = coach();
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p.clone(), true);
         o.opp_robots[0] = RobotObs::default();
         assert_eq!(choice_of(&c.decide(&o), 2).skill_id, SkillId::GoalKeep);
         // Rival encima pero junto a la línea de fondo fuera del margen del área: no sale
         // (ahí el rival no puede marcar y el arco quedaría vacío).
-        let mut c = coach();
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
         let mut far = obs(
             Vec2::new(-0.73, -0.44),
             Vec2::ZERO,
@@ -1264,6 +1296,42 @@ mod tests {
         );
         far.opp_robots[0] = robot(Vec2::new(-0.68, -0.50), 180.0);
         assert_eq!(choice_of(&c.decide(&far), 2).skill_id, SkillId::GoalKeep);
+    }
+
+    #[test]
+    fn keeper_blocks_instead_of_clearing_when_it_cannot_win_the_ball() {
+        let old = CoachParams { gk_block_incoming_speed: 9.9, gk_yield_contested: false, ..CoachParams::default() };
+        // 1) Pelota lenta en el área rodando hacia la boca del arco: antes se despejaba
+        //    ("parada" a 0.14 m/s); ahora el arquero la bloquea desde la línea.
+        let rolling = obs(
+            Vec2::new(-0.66, 0.05),
+            Vec2::new(-0.14, 0.0),
+            [Vec2::new(-0.35, -0.20), Vec2::new(0.2, -0.3), Vec2::new(-0.70, -0.10)],
+        );
+        let mut before = HeuristicCoach::from_params(ATTACK, OWN, old.clone(), true);
+        assert_eq!(choice_of(&before.decide(&rolling), 2).skill_id, SkillId::Clear);
+        assert_eq!(choice_of(&coach().decide(&rolling), 2).skill_id, SkillId::GoalKeep);
+        // La misma pelota rodando hacia la banda no entra: se despeja como siempre.
+        let mut wide = rolling.clone();
+        wide.ball.vy = 0.14 / 1.5;
+        wide.ball.vx = 0.0;
+        assert_eq!(choice_of(&coach().decide(&wide), 2).skill_id, SkillId::Clear);
+
+        // 2) Pelota quieta en el área con un rival encima y el arquero lejos: antes salía
+        //    a despejar y dejaba el arco; ahora vuelve a la línea.
+        let mut contested = obs(
+            Vec2::new(-0.57, -0.25),
+            Vec2::new(-0.15, -0.05),
+            [Vec2::new(-0.35, -0.20), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)],
+        );
+        contested.opp_robots[0] = robot(Vec2::new(-0.49, -0.22), 180.0);
+        let mut before = HeuristicCoach::from_params(ATTACK, OWN, old, true);
+        assert_eq!(choice_of(&before.decide(&contested), 2).skill_id, SkillId::Clear);
+        assert_eq!(choice_of(&coach().decide(&contested), 2).skill_id, SkillId::GoalKeep);
+        // Con el arquero ya detrás de la pelota, cerca y alineado con el despeje, sí la juega.
+        let mut ready = contested.clone();
+        ready.own_robots[2] = robot(Vec2::new(-0.667, -0.228), 0.0);
+        assert_eq!(choice_of(&coach().decide(&ready), 2).skill_id, SkillId::Clear);
     }
 
     #[test]

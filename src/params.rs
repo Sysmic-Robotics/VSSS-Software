@@ -104,6 +104,12 @@ pub struct CoachParams {
     pub gk_engage_opp_dist: f32,
     /// Arquero activo: solo sale a una pelota más lenta que esto (m/s).
     pub gk_engage_max_ball_speed: f32,
+    /// Arquero: una pelota que avanza hacia la boca de nuestro arco a más de esto (m/s) se
+    /// bloquea desde la línea, no se despeja. Grande (p. ej. 9.9) = desactivado.
+    pub gk_block_incoming_speed: f32,
+    /// Arquero: con un rival en contacto con la pelota, si el arquero no está listo para
+    /// despejarla (cerca, detrás y alineado), vuelve a la línea en vez de ir a buscarla.
+    pub gk_yield_contested: bool,
 }
 
 impl Default for CoachParams {
@@ -143,6 +149,8 @@ impl Default for CoachParams {
             gk_engage_margin: 0.05,
             gk_engage_opp_dist: 0.20,
             gk_engage_max_ball_speed: 0.40,
+            gk_block_incoming_speed: 0.10,
+            gk_yield_contested: true,
         }
     }
 }
