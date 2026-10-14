@@ -8,6 +8,9 @@ use glam::Vec2;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
+/// Un robot sin datos de visión durante más de esto (s) pasa a inactivo.
+pub const INACTIVO_TRAS_S: f64 = 2.0;
+
 /// Modelo del mundo que almacena el estado de todos los robots y el balón
 pub struct World {
     blue_robots: HashMap<i32, RobotState>,
@@ -41,6 +44,18 @@ impl World {
             1 => self.yellow_robots.get(&id),
             _ => None,
         }
+    }
+
+    /// Hora del último dato de visión de algún robot del equipo `team` (0 azul, 1
+    /// amarillo); `None` si nunca se vio ninguno. Sirve para el corte por pérdida de
+    /// visión del lazo, con un umbral más corto que el de inactividad.
+    pub fn ultimo_dato_de(&self, team: i32) -> Option<std::time::SystemTime> {
+        let robots = match team {
+            0 => &self.blue_robots,
+            1 => &self.yellow_robots,
+            _ => return None,
+        };
+        robots.values().map(|r| r.last_update).max()
     }
 
     /// Obtiene el estado del balón
@@ -104,9 +119,10 @@ impl World {
 
     /// Actualiza el estado del mundo, marcando robots inactivos si no han sido actualizados recientemente
     ///
-    /// Un robot se marca como inactivo si su última actualización fue hace más de 2 segundos
+    /// Un robot se marca como inactivo si su última actualización fue hace más de
+    /// `INACTIVO_TRAS_S` segundos.
     pub fn update(&mut self) {
-        let threshold = 2; // segundos
+        let threshold = INACTIVO_TRAS_S;
 
         // Marcar robots azules inactivos
         for robot in self.blue_robots.values_mut() {
@@ -216,6 +232,39 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
+
+    /// Mundo con los robots propios (azules) 0, 1 y 2, el último dato de cada uno hace
+    /// `edades_s`, y un rival visto ahora.
+    fn mundo_con_edades(edades_s: [f64; 3]) -> World {
+        let mut w = World::new(3, 3);
+        for (id, edad) in edades_s.iter().enumerate() {
+            w.update_robot(id as i32, 0, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
+            w.blue_robots.get_mut(&(id as i32)).unwrap().last_update =
+                SystemTime::now() - Duration::from_secs_f64(*edad);
+        }
+        w.update_robot(0, 1, Vec2::ZERO, 0.0, Vec2::ZERO, 0.0);
+        w
+    }
+
+    #[test]
+    fn update_marks_inactive_after_2_0_s_not_3() {
+        let mut w = mundo_con_edades([2.5, 1.5, 0.0]);
+        w.update();
+        assert!(!w.get_robot_state(0, 0).unwrap().active, "2.5 s sin datos: inactivo");
+        assert!(w.get_robot_state(1, 0).unwrap().active, "1.5 s: sigue activo");
+        assert!(w.get_robot_state(2, 0).unwrap().active);
+    }
+
+    #[test]
+    fn last_data_of_a_team_is_its_freshest_robot() {
+        let w = mundo_con_edades([1.0, 1.0, 0.1]);
+        let edad = w.ultimo_dato_de(0).unwrap().elapsed().unwrap().as_secs_f64();
+        assert!((0.1..0.2).contains(&edad), "{edad}");
+        // Los rivales tienen su propio último dato; un equipo sin robots, ninguno.
+        assert!(w.ultimo_dato_de(1).unwrap().elapsed().unwrap() < Duration::from_millis(100));
+        assert!(World::new(3, 3).ultimo_dato_de(0).is_none());
+    }
 
     #[test]
     fn test_world_new() {

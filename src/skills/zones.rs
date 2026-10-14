@@ -35,6 +35,9 @@ pub const ROBOT_HALF: f32 = 0.04;
 pub const AREA_NAV_MARGIN: f32 = 0.06;
 /// Holgura de navegación al área: medio robot + `AREA_NAV_MARGIN`.
 pub const AREA_CLEARANCE: f32 = ROBOT_HALF + AREA_NAV_MARGIN;
+/// Cateto de los triángulos de las esquinas de la cancha (7 cm). Lo usan la GUI (dibujo)
+/// y la validación de las rutinas (zona segura).
+pub const TRIANGLE_M: f32 = 0.07;
 /// Arco del reglamento sobre el frente del área: cuerda de 20 cm centrada en el frente
 /// y flecha de 5 cm hacia la cancha (vértice en |x| = 0.55). Es un segmento del círculo
 /// de radio `(0.10² + 0.05²) / (2·0.05) = 0.125` m con centro en
@@ -74,9 +77,26 @@ pub fn attack_sign_from_env(own_team: i32) -> f32 {
 }
 
 /// Rectángulo del área frente al arco del lado `side` (signo de x del arco).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AreaRect {
     pub side: f32,
+}
+
+/// Qué hizo el guardia con un robot en un tick (depuración; no decide nada).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GuardiaDebug {
+    /// Punto proyectado a `LOOK_AHEAD_S` sobre el heading con el comando que llegó al
+    /// guardia (el robot mismo si ya tocaba el área).
+    pub proyeccion: Vec2,
+    pub accion: Option<AccionGuardia>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccionGuardia {
+    /// La proyección tocaba el área: anuló la traslación.
+    Frena,
+    /// Ya tocaba el área: lo saca (o lo gira hacia afuera).
+    Saca,
 }
 
 impl AreaRect {
@@ -123,7 +143,9 @@ impl AreaRect {
     /// - si su avance a lo largo del heading la tocaría dentro de `LOOK_AHEAD_S`:
     ///   anula la traslación y conserva `omega`;
     /// - si no: el comando queda intacto.
-    pub fn restrict(&self, p: Vec2, theta: f64, cmd: &mut MotionCommand) {
+    ///
+    /// Devuelve lo que hizo (depuración); quien no lo usa lo ignora.
+    pub fn restrict(&self, p: Vec2, theta: f64, cmd: &mut MotionCommand) -> GuardiaDebug {
         let h = Vec2::new(theta.cos() as f32, theta.sin() as f32);
         if self.touches(p) {
             let out = Vec2::new(-self.side, 0.0);
@@ -140,13 +162,17 @@ impl AreaRect {
                 cmd.vy = 0.0;
                 cmd.omega = (EXIT_TURN_GAIN * err).clamp(-EXIT_TURN_MAX, EXIT_TURN_MAX);
             }
-            return;
+            return GuardiaDebug { proyeccion: p, accion: Some(AccionGuardia::Saca) };
         }
         let v = cmd.vx as f32 * h.x + cmd.vy as f32 * h.y;
-        if self.touches(p + h * v * LOOK_AHEAD_S) {
+        let proyeccion = p + h * v * LOOK_AHEAD_S;
+        let mut accion = None;
+        if self.touches(proyeccion) {
             cmd.vx = 0.0;
             cmd.vy = 0.0;
+            accion = Some(AccionGuardia::Frena);
         }
+        GuardiaDebug { proyeccion, accion }
     }
 }
 
@@ -173,21 +199,43 @@ impl ZoneGuard {
         self.opp_area
     }
 
+    /// Áreas prohibidas para el robot propio `robot_id`: la propia salvo para el arquero,
+    /// y la rival si otro robot propio ya la toca (las mismas reglas que
+    /// `guard_commands`).
+    pub fn areas_prohibidas(&self, robot_id: i32, world: &World, own_team: i32) -> Vec<AreaRect> {
+        let own = if own_team == 0 {
+            world.get_blue_team_active()
+        } else {
+            world.get_yellow_team_active()
+        };
+        let mut out = Vec::new();
+        if robot_id != self.keeper_id {
+            out.push(self.own_area);
+        }
+        if own.iter().any(|r| r.id != robot_id && self.opp_area.touches(r.position)) {
+            out.push(self.opp_area);
+        }
+        out
+    }
+
     /// Recorta los comandos del equipo propio. `manual` = robots bajo control
-    /// manual de la GUI (no se tocan).
+    /// manual de la GUI (no se tocan). Devuelve, paralelo a `cmds`, lo que hizo el
+    /// guardia con cada robot (`None` si no lo evaluó: otro equipo, manual, sin visión o
+    /// sin áreas prohibidas).
     pub fn guard_commands(
         &self,
         cmds: &mut [MotionCommand],
         world: &World,
         own_team: i32,
         manual: &HashSet<(i32, i32)>,
-    ) {
+    ) -> Vec<Option<GuardiaDebug>> {
         let own: Vec<_> = if own_team == 0 {
             world.get_blue_team_active()
         } else {
             world.get_yellow_team_active()
         };
-        for cmd in cmds.iter_mut() {
+        let mut out = vec![None; cmds.len()];
+        for (cmd, guardia) in cmds.iter_mut().zip(out.iter_mut()) {
             if cmd.team != own_team || manual.contains(&(cmd.team, cmd.id)) {
                 continue;
             }
@@ -196,15 +244,21 @@ impl ZoneGuard {
             };
             let (p, theta) = (robot.position, robot.orientation);
             if cmd.id != self.keeper_id {
-                self.own_area.restrict(p, theta, cmd);
+                *guardia = Some(self.own_area.restrict(p, theta, cmd));
             }
             let another_inside = own
                 .iter()
                 .any(|r| r.id != cmd.id && self.opp_area.touches(r.position));
             if another_inside {
-                self.opp_area.restrict(p, theta, cmd);
+                let g = self.opp_area.restrict(p, theta, cmd);
+                // La proyección es la del comando de la skill (la primera evaluación).
+                *guardia = Some(match *guardia {
+                    Some(primera) => GuardiaDebug { accion: primera.accion.or(g.accion), ..primera },
+                    None => g,
+                });
             }
         }
+        out
     }
 }
 
@@ -453,5 +507,37 @@ mod tests {
             assert_eq!(attack_sign_from_env(0), 1.0);
             assert_eq!(attack_sign_from_env(1), -1.0);
         }
+    }
+
+    #[test]
+    fn the_guard_reports_what_it_did() {
+        let guard = ZoneGuard::new(1.0, 2);
+        // Frena: la proyección toca el área propia.
+        let w = world_with(&[(0, 0, -0.52, 0.10, 0.0)]);
+        let mut cmds = vec![cmd(0, -1.0, 0.3)];
+        let g = guard.guard_commands(&mut cmds, &w, 0, &HashSet::new())[0].expect("evaluado");
+        assert_eq!(g.accion, Some(AccionGuardia::Frena));
+        assert!(g.proyeccion.x < -0.52, "proyección hacia el arco: {:?}", g.proyeccion);
+        // Saca: ya toca el área.
+        let w = world_with(&[(0, 0, -0.62, 0.10, 0.0)]);
+        let mut cmds = vec![cmd(0, 0.3, 0.0)];
+        let g = guard.guard_commands(&mut cmds, &w, 0, &HashSet::new())[0].unwrap();
+        assert_eq!(g.accion, Some(AccionGuardia::Saca));
+        // Lejos: evaluado, sin acción; el arquero, sin área prohibida, no se evalúa.
+        let w = world_with(&[(0, 0, 0.0, 0.1, 3.0), (2, 0, -0.68, 0.0, 0.0)]);
+        let mut cmds = vec![cmd(0, -1.0, 0.3), cmd(2, -0.3, 0.0)];
+        let gs = guard.guard_commands(&mut cmds, &w, 0, &HashSet::new());
+        assert_eq!(gs[0].unwrap().accion, None);
+        assert!(gs[1].is_none());
+    }
+
+    #[test]
+    fn forbidden_areas_follow_the_guard_rules() {
+        let guard = ZoneGuard::new(1.0, 2);
+        let w = world_with(&[(0, 0, 0.62, 0.0, 0.0), (1, 0, 0.2, 0.0, 0.0), (2, 0, -0.68, 0.0, 0.0)]);
+        assert_eq!(guard.areas_prohibidas(2, &w, 0), vec![guard.opp_area()], "el arquero: solo la rival, que ya toca el 0");
+        // El robot 0 ya toca el área rival: para el 1 quedan prohibidas la propia y la rival.
+        assert_eq!(guard.areas_prohibidas(1, &w, 0), vec![guard.own_area(), guard.opp_area()]);
+        assert_eq!(guard.areas_prohibidas(0, &w, 0), vec![guard.own_area()]);
     }
 }

@@ -21,12 +21,8 @@ use rustengine::skills::SkillId;
 use rustengine::vision::VisionSource;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Scenario: wrapper privado al bin sobre (SkillId, Vec2).
@@ -146,12 +142,9 @@ fn run_bench(
     log: Option<PathBuf>,
     dur_s: Option<f64>,
 ) {
-    let (status_tx, status_rx) = mpsc::channel(100);
-    let (motion_tx, motion_rx) = mpsc::channel::<Vec<GUI::RobotMotionDebug>>(32);
-    let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
-
-    let ip = vision.multicast_ip().to_string();
-    let port = vision.port();
+    // Foto de cada tick, lazo → GUI. La parada la comparten la GUI y el lazo.
+    let (snapshot_tx, snapshot_rx) = rustengine::snapshot::snapshot_channel();
+    let estop = Arc::new(AtomicBool::new(false));
 
     let log_desc = log
         .as_ref()
@@ -162,33 +155,43 @@ fn run_bench(
         scenario.name, robot_id, team, transport, vision, log_desc
     );
 
-    std::thread::spawn(move || {
+    // Lo activan una señal o el cierre de la GUI: el lazo para con ceros antes de salir.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let estop_loop = estop.clone();
+    let shutdown_loop = shutdown.clone();
+    let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async_run(
-            scenario, robot_id, team, vision, transport, log, dur_s, status_tx, motion_tx,
+            scenario,
+            robot_id,
+            team,
+            vision,
+            transport,
+            log,
+            dur_s,
+            snapshot_tx,
+            estop_loop,
+            shutdown_loop,
         ));
     });
 
     let setup = GUI::GuiSetup {
-        ip,
-        port,
-        config_tx,
-        status_rx,
-        motion_rx,
+        snapshot_rx,
         manual_tx: None, // el bench no usa control manual
         skill_tx: None,
         pid_tx: None,
         teleport_tx: None,
-        estop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        num_robots: 3,
-        own_team: team.as_team_id() as u32,
-        radio_target_label: format!("{transport:?}"),
-        radio_port: std::env::var("VSSL_BASESTATION_DEVICE")
-            .unwrap_or_else(|_| "/dev/ttyUSB0".to_string()),
-        radio_baud: std::env::var("VSSL_BASESTATION_BAUD")
-            .unwrap_or_else(|_| "115200".to_string()),
+        rutina_tx: None, // las rutinas se lanzan desde main con GUI
+        estop,
+        run: GUI::RunInfo::from_env(
+            transport,
+            vision,
+            team.as_team_id(),
+            SLOT_COUNT,
+            GUI::CoachKind::Fixed(scenario.skill_id),
+        ),
     };
-    GUI::run_gui(setup).expect("GUI terminó con error");
+    std::process::exit(rustengine::parada::con_gui(|| GUI::run_gui(setup), lazo, &shutdown));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,18 +203,12 @@ async fn async_run(
     transport: RadioTarget,
     log: Option<PathBuf>,
     dur_s: Option<f64>,
-    status_tx: mpsc::Sender<GUI::StatusUpdate>,
-    motion_tx: mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
+    snapshot_tx: rustengine::snapshot::SnapshotSender,
+    estop: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("[scenario] Ctrl-C recibido, deteniendo...");
-                shutdown.store(true, Ordering::Relaxed);
-            }
-        });
+    if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
+        eprintln!("[scenario] no pude registrar las señales de terminación: {e}");
     }
 
     let decider = Box::new(FixedSkillDecider::new(
@@ -230,6 +227,7 @@ async fn async_run(
         max_ticks,
         vision_timeout: None,
         referee: None,
+        exportar_depuracion: false,
     };
 
     let mut csv: Option<CsvLogger> = match &log {
@@ -271,11 +269,10 @@ async fn async_run(
     });
 
     let gui = Some(GuiChannels {
-        status_tx,
-        motion_tx,
+        snapshot_tx,
         manual_rx: None,
         skill_rx: None,
-        estop: None,
+        estop: Some(estop),
         pid_rx: None,
         teleport_rx: None,
     });

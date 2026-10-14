@@ -2911,6 +2911,7 @@ dependencies = [
  "async-trait",
  "glam 0.24.2",
  "iced",
+ "iced_tiny_skia",
  "nalgebra",
  "protobuf",
  "protobuf-codegen",

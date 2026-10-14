@@ -1,0 +1,40 @@
+{
+  "nombre": "Ola",
+  "grupo": "coreografia",
+  "descripcion": "Los tres robots en línea dan una vuelta uno tras otro, como una ola, y después todos juntos.",
+  "robots": { "min": 1, "max": 3 },
+  "repeticiones": 3,
+  "puestos": [
+    {
+      "nombre": "A",
+      "inicio": { "x": 0.00, "y": 0.30, "orientacion_deg": 0 },
+      "pasos": [
+        { "paso": "girar", "sentido": "antihorario", "vueltas": 1 },
+        { "paso": "esperar", "tiempo_s": 2.0 },
+        { "paso": "girar", "sentido": "horario", "vueltas": 1 },
+        { "paso": "esperar", "tiempo_s": 0.5 }
+      ]
+    },
+    {
+      "nombre": "B",
+      "inicio": { "x": 0.00, "y": 0.00, "orientacion_deg": 0 },
+      "pasos": [
+        { "paso": "esperar", "tiempo_s": 1.0 },
+        { "paso": "girar", "sentido": "antihorario", "vueltas": 1 },
+        { "paso": "esperar", "tiempo_s": 1.0 },
+        { "paso": "girar", "sentido": "horario", "vueltas": 1 },
+        { "paso": "esperar", "tiempo_s": 0.5 }
+      ]
+    },
+    {
+      "nombre": "C",
+      "inicio": { "x": 0.00, "y": -0.30, "orientacion_deg": 0 },
+      "pasos": [
+        { "paso": "esperar", "tiempo_s": 2.0 },
+        { "paso": "girar", "sentido": "antihorario", "vueltas": 1 },
+        { "paso": "girar", "sentido": "horario", "vueltas": 1 },
+        { "paso": "esperar", "tiempo_s": 0.5 }
+      ]
+    }
+  ]
+}

@@ -24,7 +24,9 @@ use rustengine::control_loop::{
     TickDecider, run_control_loop,
 };
 use rustengine::radio::{RadioTarget, TeamColor};
-use rustengine::skill_log::MatchLogger;
+use rustengine::rutinas::resumen::{VigiaResumen, corrida_json, escribir_resumen, junto_al_log};
+use rustengine::rutinas::{DecisorConRutinas, OrdenRutina};
+use rustengine::skill_log::{MatchLogger, transport_label, vision_label};
 use rustengine::vision::VisionSource;
 use rustengine::world::World;
 
@@ -93,64 +95,62 @@ use tokio::sync::mpsc;
 fn main() {
     // Parámetros calibrables (config/team_params.json o VSSL_PARAMS) antes de todo.
     rustengine::params::TeamParams::install_or_exit("main");
+    // Lo activan una señal (SIGINT, SIGTERM, SIGHUP) o el cierre de la GUI: el lazo para
+    // con ceros antes de que termine el proceso (`rustengine::parada`).
+    let shutdown = Arc::new(AtomicBool::new(false));
     if std::env::var("VSSL_DEBUG_GUI").unwrap_or_default() == "1" {
-        run_with_gui();
+        run_with_gui(shutdown);
     } else {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(None));
+        rt.block_on(async_main(None, shutdown));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Modo debug: GUI en el hilo principal, tokio en background
 // ─────────────────────────────────────────────────────────────────────────────
-fn run_with_gui() {
-    let (status_tx, status_rx) = mpsc::channel(100);
-    let (motion_tx, motion_rx) = mpsc::channel::<Vec<GUI::RobotMotionDebug>>(32);
-    let (config_tx, _config_rx) = mpsc::channel::<GUI::ConfigUpdate>(8);
+fn run_with_gui(shutdown: Arc<AtomicBool>) {
+    // Foto de cada tick, lazo → GUI (canal de "último valor": nunca frena el lazo).
+    let (snapshot_tx, snapshot_rx) = rustengine::snapshot::snapshot_channel();
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
     let (skill_tx, skill_rx) = mpsc::channel::<GuiSkillCommand>(32);
     let (pid_tx, pid_rx) = mpsc::channel::<HeadingPid>(16);
     let (teleport_tx, teleport_rx) =
         mpsc::channel::<Vec<rustengine::radio::TeleportItem>>(16);
+    let (rutina_tx, rutina_rx) = mpsc::channel::<OrdenRutina>(16);
     let estop = Arc::new(AtomicBool::new(false));
 
-    let source = VisionSource::from_env();
-    let ip = source.multicast_ip().to_string();
-    let port = source.port();
-
-    // Config de radio para el panel (etiqueta + defaults de base station).
-    let radio_target_label = format!("{:?}", RadioTarget::from_env());
-    let radio_port =
-        std::env::var("VSSL_BASESTATION_DEVICE").unwrap_or_else(|_| "/dev/ttyUSB0".to_string());
-    let radio_baud = std::env::var("VSSL_BASESTATION_BAUD").unwrap_or_else(|_| "115200".to_string());
+    // Configuración de la corrida para la barra de estado y el Inspector (solo lectura).
+    let run = GUI::RunInfo::from_env(
+        RadioTarget::from_env(),
+        VisionSource::from_env(),
+        own_team_from_env(),
+        NUM_ROBOTS,
+        GUI::CoachKind::from_env(),
+    );
 
     let estop_loop = estop.clone();
-    std::thread::spawn(move || {
+    let shutdown_loop = shutdown.clone();
+    let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(Some((
-            status_tx, motion_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx,
-        ))));
+        rt.block_on(async_main(
+            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx, rutina_rx)),
+            shutdown_loop,
+        ));
     });
 
     let setup = GUI::GuiSetup {
-        ip,
-        port,
-        config_tx,
-        status_rx,
-        motion_rx,
+        snapshot_rx,
         manual_tx: Some(manual_tx),
         skill_tx: Some(skill_tx),
         pid_tx: Some(pid_tx),
         teleport_tx: Some(teleport_tx),
+        rutina_tx: Some(rutina_tx),
         estop,
-        num_robots: NUM_ROBOTS,
-        own_team: own_team_from_env() as u32,
-        radio_target_label,
-        radio_port,
-        radio_baud,
+        run,
     };
-    GUI::run_gui(setup).expect("GUI terminó con error");
+    // Al cerrarse la ventana (o con un pánico), espera la parada del lazo antes de salir.
+    std::process::exit(rustengine::parada::con_gui(|| GUI::run_gui(setup), lazo, &shutdown));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -160,23 +160,26 @@ fn run_with_gui() {
 //    - Lee env (VSSL_COACH, VSSL_VISION_SOURCE, VSSL_RADIO_TARGET) una sola vez.
 //    - Arma un CoachDecider con frame-skip COACH_DECISION_PERIOD=6.
 //    - Delega en run_control_loop (60 Hz, dispatcher idéntico al pre-refactor).
-//    - GUI recibe los mismos RobotMotionDebug por canal.
+//    - Con GUI, el lazo publica una foto por tick (`rustengine::snapshot`).
 //
 //  Si necesitas cambiar el lazo de control, edita src/control_loop.rs — esta
 //  función solo arma la configuración.
 // ─────────────────────────────────────────────────────────────────────────────
 /// Canales GUI→loop / loop→GUI que `run_with_gui` pasa a `async_main`.
 type GuiChannelBundle = (
-    mpsc::Sender<GUI::StatusUpdate>,
-    mpsc::Sender<Vec<GUI::RobotMotionDebug>>,
+    rustengine::snapshot::SnapshotSender,
     mpsc::Receiver<ManualCommand>,
     mpsc::Receiver<GuiSkillCommand>,
     Arc<AtomicBool>,
     mpsc::Receiver<HeadingPid>,
     mpsc::Receiver<Vec<rustengine::radio::TeleportItem>>,
+    mpsc::Receiver<OrdenRutina>,
 );
 
-async fn async_main(gui_channels: Option<GuiChannelBundle>) {
+async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<AtomicBool>) {
+    if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
+        eprintln!("[main] no pude registrar las señales de terminación: {e}");
+    }
     let vision_source = VisionSource::from_env();
     let radio_target = RadioTarget::from_env();
     eprintln!(
@@ -211,9 +214,21 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         60.0 / COACH_DECISION_PERIOD as f64
     );
 
-    let decider: Box<dyn TickDecider> = match coach {
+    let base: Box<dyn TickDecider> = match coach {
         Some(c) => Box::new(CoachDecider::new(c, own_team, COACH_DECISION_PERIOD)),
         None => Box::new(NoOpDecider),
+    };
+    // Con GUI, las rutinas: el coach (o ninguno) hasta que la GUI prepara una.
+    let (gui_channels, rutina_rx) = match gui_channels {
+        Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, rutina_rx)) => (
+            Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)),
+            Some(rutina_rx),
+        ),
+        None => (None, None),
+    };
+    let decider: Box<dyn TickDecider> = match rutina_rx {
+        Some(rx) => Box::new(DecisorConRutinas::new(base, rx, own_team, NUM_ROBOTS)),
+        None => base,
     };
 
     // Registro de partido (CSV por tick, propios y rivales) con VSSL_MATCH_LOG=ruta.
@@ -221,8 +236,21 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         Ok(path) if !path.trim().is_empty() => match MatchLogger::new(&path, own_team) {
             Ok(mut logger) => {
                 eprintln!("[main] registro de partido → {path}");
+                // El resumen de cada rutina va junto al CSV: `<log>.rutina-<n>-<id>.json`.
+                let base = std::path::PathBuf::from(path.trim());
+                let mut vigia = VigiaResumen::default();
+                let mut corridas = 0u32;
+                let (transporte, vision) = (transport_label(radio_target), vision_label(Some(vision_source)));
                 Some(Box::new(move |rec: &rustengine::control_loop::TickRecord<'_>| {
                     let _ = logger.write_tick(rec);
+                    if let Some(r) = vigia.nuevo(rec.rutina) {
+                        corridas += 1;
+                        let ruta = junto_al_log(&base, &format!(".rutina-{corridas}-{}.json", r.rutina));
+                        match escribir_resumen(&ruta, &r, corrida_json(transporte, vision, own_team)) {
+                            Ok(()) => eprintln!("[main] resumen de la rutina → {}", ruta.display()),
+                            Err(e) => eprintln!("[main] no se pudo escribir {}: {e}", ruta.display()),
+                        }
+                    }
                 }) as rustengine::control_loop::OnTick)
             }
             Err(e) => {
@@ -241,12 +269,13 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
         max_ticks: None,
         vision_timeout: None,
         referee: Some(referee.clone()),
+        // El CSV de partido lleva la depuración por tick (columnas al final).
+        exportar_depuracion: on_tick.is_some(),
     };
 
     let gui = gui_channels.map(
-        |(status_tx, motion_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)| GuiChannels {
-            status_tx,
-            motion_tx,
+        |(snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)| GuiChannels {
+            snapshot_tx,
             manual_rx: Some(manual_rx),
             skill_rx: Some(skill_rx),
             estop: Some(estop),
@@ -254,8 +283,6 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>) {
             teleport_rx: Some(teleport_rx),
         },
     );
-
-    let shutdown = Arc::new(AtomicBool::new(false));
 
     if let Err(err) = run_control_loop(config, decider, on_tick, gui, shutdown).await {
         eprintln!("[main] control loop error: {err}");

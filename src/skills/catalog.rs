@@ -343,6 +343,14 @@ impl SkillCatalog {
         }
     }
 
+    /// Velocidad angular vigente de `Spin` del robot (rad/s). Lo guarda el lazo antes de
+    /// aplicar el perfil de una rutina, para restaurarlo exacto.
+    ///
+    /// **Pánico**: si `robot_id` no está en `0..num_robots()`.
+    pub fn spin_omega_for(&self, robot_id: usize) -> f64 {
+        self.spin[robot_id].omega_max
+    }
+
     /// Despacha el skill seleccionado para el robot indicado y devuelve
     /// el `MotionCommand` resultante.
     ///

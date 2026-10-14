@@ -454,6 +454,11 @@ pub struct VisionParams {
     /// visión real (`VSSL_VISION_SOURCE=sslvision`), antes del EKF y de la GUI.
     /// vsss-vision-sysmic entrega el heading girado 180°. FIRASim no se toca.
     pub real_theta_offset_deg: f64,
+    /// Corte por pérdida de visión (s): si ningún robot propio tuvo un dato en este
+    /// tiempo, el lazo detiene al equipo (`TickMode::SinVision`). 0.4 s son ~25 cuadros:
+    /// una pérdida breve no corta. Pendiente de revisar con la medición de la cámara
+    /// real (frames perdidos y duración de los huecos).
+    pub blind_stop_s: f64,
 }
 
 impl Default for VisionParams {
@@ -474,6 +479,63 @@ impl Default for VisionParams {
             proxy_latency_ms: 90.0,
             proxy_drop_prob: 0.02,
             real_theta_offset_deg: 0.0,
+            blind_stop_s: 0.4,
+        }
+    }
+}
+
+/// Rutinas (`crate::rutinas`): validación de los archivos, tolerancias y tiempos por
+/// defecto de los pasos, quietud y velocidad de la corrida. Los tiempos están medidos al
+/// 100 % de velocidad: el decisor divide los de movimiento por la escala de la corrida.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RutinasParams {
+    /// Distancia mínima de todo destino a las paredes y a los triángulos de las esquinas (m).
+    pub zona_segura_m: f32,
+    /// Solo validación del archivo: distancia mínima entre los inicios de los puestos (y,
+    /// en la fase 2, en cada barrera) (m). No aborta nada en vivo.
+    pub distancia_minima_m: f32,
+    /// Aborto en vivo por casi choque: dos robots propios a menos de esto entre centros (m).
+    pub distancia_choque_m: f32,
+    /// Tolerancia de posición por defecto de los pasos (m). ≥ `motion.arrival_threshold`.
+    pub tolerancia_m: f32,
+    /// Tolerancia de orientación por defecto de los pasos (grados).
+    pub tolerancia_deg: f64,
+    /// Tiempo máximo por defecto de un paso de movimiento, al 100 % (s).
+    pub tiempo_max_s: f64,
+    /// Tiempo máximo de la preparación, al 100 % (s).
+    pub preparacion_max_s: f64,
+    /// Ventana de quietud (s).
+    pub quieto_s: f64,
+    /// Diferencia máxima entre las posiciones medias de las dos mitades de la ventana (m).
+    pub quieto_m: f32,
+    /// Diferencia máxima entre las orientaciones medias de las dos mitades (grados).
+    pub quieto_deg: f64,
+    /// Porcentaje de velocidad por defecto con la base station.
+    pub velocidad_real_pct: u32,
+    /// Porcentaje de velocidad por defecto en simulación.
+    pub velocidad_sim_pct: u32,
+    /// Tope de giro de `girar` (rad/s): el del firmware, 450 mm/s por rueda sobre una vía
+    /// de 75 mm. Se recalibra con la sysid.
+    pub giro_max_rad_s: f64,
+}
+
+impl Default for RutinasParams {
+    fn default() -> Self {
+        Self {
+            zona_segura_m: 0.10,
+            distancia_minima_m: 0.20,
+            distancia_choque_m: 0.10,
+            tolerancia_m: 0.05,
+            tolerancia_deg: 10.0,
+            tiempo_max_s: 8.0,
+            preparacion_max_s: 20.0,
+            quieto_s: 0.5,
+            quieto_m: 0.005,
+            quieto_deg: 3.0,
+            velocidad_real_pct: 60,
+            velocidad_sim_pct: 100,
+            giro_max_rad_s: 12.0,
         }
     }
 }
@@ -487,6 +549,7 @@ pub struct TeamParams {
     pub robot: RobotParams,
     pub sim: SimRobotParams,
     pub vision: VisionParams,
+    pub rutinas: RutinasParams,
 }
 
 static PARAMS: OnceLock<TeamParams> = OnceLock::new();
@@ -504,6 +567,14 @@ impl TeamParams {
         let p: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
         p.robot.validate()?;
         p.validate_tolerances()?;
+        p.validate_rutinas()?;
+        if p.vision.blind_stop_s <= 0.0 {
+            return Err(format!(
+                "vision.blind_stop_s ({}) debe ser mayor que cero: es el tiempo sin ver robots \
+                 propios tras el cual el lazo detiene al equipo",
+                p.vision.blind_stop_s
+            ));
+        }
         Ok(p)
     }
 
@@ -533,6 +604,53 @@ impl TeamParams {
                  si no, un staging que ApproachAligned da por terminado no es factible para ShootPush",
                 s.shoot_lateral_tol, s.approach_pos_tol
             ));
+        }
+        Ok(())
+    }
+
+    /// Rutinas: la tolerancia por defecto no pide más precisión que motion, el casi choque
+    /// queda por debajo de la distancia del archivo, y los porcentajes en 20–100.
+    fn validate_rutinas(&self) -> Result<(), String> {
+        let r = &self.rutinas;
+        if r.tolerancia_m < self.motion.arrival_threshold {
+            return Err(format!(
+                "rutinas.tolerancia_m ({}) debe ser mayor o igual que motion.arrival_threshold ({}): \
+                 motion se detiene a esa distancia y el paso nunca terminaría",
+                r.tolerancia_m, self.motion.arrival_threshold
+            ));
+        }
+        let choque_ok = r.distancia_choque_m > 0.0 && r.distancia_choque_m <= r.distancia_minima_m;
+        if !choque_ok {
+            return Err(format!(
+                "rutinas.distancia_choque_m ({}) debe ser mayor que cero y menor o igual que \
+                 rutinas.distancia_minima_m ({})",
+                r.distancia_choque_m, r.distancia_minima_m
+            ));
+        }
+        for (nombre, pct) in [
+            ("velocidad_real_pct", r.velocidad_real_pct),
+            ("velocidad_sim_pct", r.velocidad_sim_pct),
+        ] {
+            if !(20..=100).contains(&pct) || !pct.is_multiple_of(10) {
+                return Err(format!(
+                    "rutinas.{nombre} ({pct}) debe ir de 20 a 100 en pasos de 10"
+                ));
+            }
+        }
+        let positivos = [
+            ("zona_segura_m", r.zona_segura_m as f64),
+            ("tolerancia_deg", r.tolerancia_deg),
+            ("tiempo_max_s", r.tiempo_max_s),
+            ("preparacion_max_s", r.preparacion_max_s),
+            ("quieto_s", r.quieto_s),
+            ("quieto_m", r.quieto_m as f64),
+            ("quieto_deg", r.quieto_deg),
+            ("giro_max_rad_s", r.giro_max_rad_s),
+        ];
+        for (nombre, v) in positivos {
+            if v.is_nan() || v <= 0.0 {
+                return Err(format!("rutinas.{nombre} ({v}) debe ser mayor que cero"));
+            }
         }
         Ok(())
     }
@@ -718,6 +836,18 @@ mod tests {
     }
 
     #[test]
+    fn blind_stop_defaults_to_0_4_s_and_must_be_positive() {
+        assert_eq!(TeamParams::default().vision.blind_stop_s, 0.4);
+        let p = TeamParams::from_json(r#"{ "vision": { "blind_stop_s": 0.3 } }"#).unwrap();
+        assert_eq!(p.vision.blind_stop_s, 0.3);
+        for malo in ["0", "-0.4"] {
+            let err = TeamParams::from_json(&format!(r#"{{ "vision": {{ "blind_stop_s": {malo} }} }}"#))
+                .unwrap_err();
+            assert!(err.contains("vision.blind_stop_s"), "{err}");
+        }
+    }
+
+    #[test]
     fn coupling_floor_is_no_longer_accepted() {
         // Se eliminó: un JSON local que todavía la tenga falla al cargar.
         let err = TeamParams::from_json(r#"{ "motion": { "coupling_floor": 0.22 } }"#).unwrap_err();
@@ -752,6 +882,52 @@ mod tests {
         assert!(err.contains("shoot_lateral_tol") && err.contains("approach_pos_tol"), "{err}");
         let d = TeamParams::default();
         assert!(d.skills.shoot_lateral_tol >= d.skills.approach_pos_tol);
+    }
+
+    #[test]
+    fn rutinas_defaults_and_repo_file() {
+        let d = RutinasParams::default();
+        assert_eq!(d.distancia_minima_m, 0.20);
+        assert_eq!(d.distancia_choque_m, 0.10);
+        assert_eq!((d.velocidad_real_pct, d.velocidad_sim_pct), (60, 100));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH);
+        let p = TeamParams::from_file(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(p.rutinas, d, "el JSON del repo trae los valores por defecto");
+    }
+
+    #[test]
+    fn rutinas_tolerance_must_cover_arrival_threshold() {
+        let err = TeamParams::from_json(
+            r#"{ "motion": { "arrival_threshold": 0.04 }, "rutinas": { "tolerancia_m": 0.03 } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("rutinas.tolerancia_m") && err.contains("arrival_threshold"), "{err}");
+        // Igual a arrival_threshold vale.
+        assert!(TeamParams::from_json(r#"{ "rutinas": { "tolerancia_m": 0.04 } }"#).is_ok());
+    }
+
+    #[test]
+    fn rutinas_crash_distance_below_file_distance() {
+        for malo in [
+            r#"{ "rutinas": { "distancia_choque_m": 0.0 } }"#,
+            r#"{ "rutinas": { "distancia_choque_m": 0.25 } }"#,
+        ] {
+            let err = TeamParams::from_json(malo).unwrap_err();
+            assert!(err.contains("distancia_choque_m"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rutinas_speed_percent_in_tens_from_20_to_100() {
+        for malo in ["10", "105", "65"] {
+            let err = TeamParams::from_json(&format!(
+                r#"{{ "rutinas": {{ "velocidad_real_pct": {malo} }} }}"#
+            ))
+            .unwrap_err();
+            assert!(err.contains("velocidad_real_pct"), "{err}");
+        }
+        let err = TeamParams::from_json(r#"{ "rutinas": { "quieto_s": 0 } }"#).unwrap_err();
+        assert!(err.contains("quieto_s"), "{err}");
     }
 
     #[test]

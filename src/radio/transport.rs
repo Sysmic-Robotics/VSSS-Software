@@ -228,6 +228,36 @@ mod tests {
         assert!((l * r_wheel - 0.45).abs() < 1e-3 && (r * r_wheel - 0.45).abs() < 1e-3, "{l} {r}");
     }
 
+    #[tokio::test]
+    async fn without_the_layer_firasim_gets_the_same_bytes_as_before() {
+        // Sin VSSL_REAL_ACTUATOR, el transporte manda byte a byte lo que arma el
+        // serializador FIRA, que la capa no tocó: lo mismo que antes de la capa.
+        if std::env::var(crate::radio::actuator::ACTUATOR_ENV).is_ok() {
+            return;
+        }
+        let sim = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = sim.local_addr().unwrap().port();
+        let mut transport = FiraSimTransport::new("127.0.0.1", port).await.unwrap();
+        assert!(transport.actuator.is_none());
+        let mut yellow = command(1, -0.2, -5.0, -2.5);
+        yellow.team = 1;
+        yellow.motion.team = 1;
+        let cases = [
+            vec![command(0, 0.3, 0.0, 0.0)],
+            vec![command(0, 0.6, 2.0, 1.2), yellow, command(2, 0.0, 9.0, 3.0)],
+            vec![command(2, 1.5, 20.0, 0.4)],
+            vec![command(0, f64::NAN, 0.0, 0.0)],
+            vec![command(0, 0.3, 0.0, 0.0)],
+        ];
+        for cmds in &cases {
+            transport.send_commands(cmds).await.unwrap();
+            let mut buf = [0u8; 2048];
+            let n = sim.recv(&mut buf).await.unwrap();
+            let expected = super::super::commands::serialize_to_fira_actuator(cmds).unwrap();
+            assert_eq!(&buf[..n], expected.as_slice(), "comandos {cmds:?}");
+        }
+    }
+
     #[test]
     fn layer_keeps_a_state_per_robot() {
         let mut layer = layer();

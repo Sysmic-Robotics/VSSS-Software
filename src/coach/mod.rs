@@ -1,5 +1,6 @@
 pub mod adaptation;
 mod coach_trait;
+pub mod debug;
 pub mod heuristic_coach;
 mod observation;
 pub mod plays;
