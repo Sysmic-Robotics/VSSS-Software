@@ -4,12 +4,14 @@
 
 use super::validacion::{fuera_de_zona, nombre_area};
 use crate::coach::{FIELD_HALF_X, FIELD_HALF_Y};
-use crate::skills::ApproachAlignedSkill;
+use crate::skills::{ApproachAlignedSkill, LOGICAL_FIELD_HALF_X, LOGICAL_FIELD_HALF_Y};
 use crate::skills::zones::{AREA_CLEARANCE, AreaRect};
 use glam::Vec2;
 
-/// Empate en la elección del rescatador (m): dentro de esto va el dueño del próximo paso.
-const EMPATE_M: f32 = 0.05;
+/// El despegue elige su dirección con el lugar detrás a esto o más dentro del campo lógico
+/// (m): en el borde, el robot queda en el límite de la tolerancia lateral de ShootPush y
+/// oscila entre alinearse y empujar (punto de control de la etapa 1).
+const DESPEGUE_MARGEN_M: f32 = 0.02;
 /// La menor distancia a la que ApproachAligned acerca su lugar detrás de la pelota (m), con
 /// un margen de redondeo.
 const LUGAR_MIN_M: f32 = 0.08 - 1e-3;
@@ -81,19 +83,23 @@ pub(super) fn distancia_a_pared(p: Vec2) -> f32 {
     (FIELD_HALF_X - p.x.abs()).min(FIELD_HALF_Y - p.y.abs())
 }
 
-/// El rescatador (D3): el candidato más cercano a la pelota en línea recta; con un empate
-/// dentro de `EMPATE_M`, `preferido` (el dueño del próximo paso con pelota).
-pub(super) fn elegir_rescatador(pelota: Vec2, candidatos: &[(usize, Vec2)], preferido: Option<usize>) -> Option<usize> {
-    let dist = |p: Vec2| (p - pelota).length();
-    let (mejor, d_mejor) = candidatos
+/// El más cercano a la pelota en línea recta (D3: va cuando el dueño de la zona no puede).
+pub(super) fn mas_cercano(pelota: Vec2, candidatos: &[(usize, Vec2)]) -> Option<usize> {
+    candidatos
         .iter()
-        .map(|&(k, p)| (k, dist(p)))
-        .min_by(|a, b| a.1.total_cmp(&b.1))?;
-    let pref = preferido.and_then(|k| candidatos.iter().find(|(j, _)| *j == k));
-    match pref {
-        Some(&(k, p)) if dist(p) <= d_mejor + EMPATE_M => Some(k),
-        _ => Some(mejor),
-    }
+        .map(|&(k, p)| (k, (p - pelota).length()))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(k, _)| k)
+}
+
+/// El dueño de la zona donde está la pelota (D15): el puesto con el punto de referencia (su
+/// inicio o un punto de `recibir`) más cercano a la pelota.
+pub(super) fn dueno_de_zona(pelota: Vec2, referencias: &[(usize, Vec<Vec2>)]) -> Option<usize> {
+    referencias
+        .iter()
+        .filter_map(|(k, ps)| ps.iter().map(|p| (*p - pelota).length()).min_by(f32::total_cmp).map(|d| (*k, d)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(k, _)| k)
 }
 
 /// Dónde espera un robot que no va por la pelota (D3): su punto de referencia, si queda a
@@ -150,9 +156,14 @@ pub(super) fn direccion_despegue(pelota: Vec2, hacia: Option<Vec2>, max_deg: f32
     None
 }
 
-/// Si un empuje de despegue en la dirección `d` deja lugar legal detrás de la pelota.
+/// Si un empuje de despegue en la dirección `d` deja lugar legal detrás de la pelota, con
+/// `DESPEGUE_MARGEN_M` dentro del campo lógico.
 pub(super) fn despegue_legal(pelota: Vec2, d: Vec2) -> bool {
-    sin_lugar_detras(&ApproachAlignedSkill::new(pelota + d * DESPEGUE_ALCANCE_M), pelota).is_none()
+    let alinear = ApproachAlignedSkill::new(pelota + d * DESPEGUE_ALCANCE_M);
+    let con_margen = alinear.staging_point(pelota).is_some_and(|l| {
+        l.x.abs() <= LOGICAL_FIELD_HALF_X - DESPEGUE_MARGEN_M && l.y.abs() <= LOGICAL_FIELD_HALF_Y - DESPEGUE_MARGEN_M
+    });
+    con_margen && sin_lugar_detras(&alinear, pelota).is_none()
 }
 
 #[cfg(test)]
@@ -160,15 +171,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_nearest_goes_and_a_tie_goes_to_the_owner() {
-        let pelota = Vec2::new(0.0, 0.0);
+    fn the_zone_owner_and_the_nearest() {
         let c = [(0, Vec2::new(0.30, 0.0)), (1, Vec2::new(0.10, 0.0)), (2, Vec2::new(0.13, 0.0))];
-        assert_eq!(elegir_rescatador(pelota, &c, None), Some(1));
-        // El dueño del paso a 0.03 m del más cercano: empate, va el dueño.
-        assert_eq!(elegir_rescatador(pelota, &c, Some(2)), Some(2));
-        // A 0.20 m: va el más cercano.
-        assert_eq!(elegir_rescatador(pelota, &c, Some(0)), Some(1));
-        assert_eq!(elegir_rescatador(pelota, &[], None), None);
+        assert_eq!(mas_cercano(Vec2::ZERO, &c), Some(1));
+        assert_eq!(mas_cercano(Vec2::ZERO, &[]), None);
+        // Dos puestos, uno en cada mitad: la zona es la mitad.
+        let refs = [(0, vec![Vec2::new(-0.40, 0.0)]), (1, vec![Vec2::new(0.40, 0.0)])];
+        assert_eq!(dueno_de_zona(Vec2::new(-0.05, 0.30), &refs), Some(0));
+        assert_eq!(dueno_de_zona(Vec2::new(0.05, -0.30), &refs), Some(1));
+        // Con varios puntos de referencia, cuenta el más cercano de cada puesto.
+        let refs = [(0, vec![Vec2::new(-0.40, 0.0), Vec2::new(0.20, -0.15)]), (1, vec![Vec2::new(0.40, 0.30)])];
+        assert_eq!(dueno_de_zona(Vec2::new(0.25, -0.10), &refs), Some(0));
     }
 
     #[test]
@@ -195,13 +208,16 @@ mod tests {
     #[test]
     fn a_ball_near_the_side_wall_is_pushed_along_it_with_an_inward_angle() {
         // Como los `sin_lugar` medidos en FIRASim: hacia el receptor no hay lugar detrás.
-        let pelota = Vec2::new(-0.27, -0.57);
+        let pelota = Vec2::new(-0.27, -0.56);
         let receptor = Vec2::new(0.40, 0.0);
         assert!(sin_lugar_detras(&ApproachAlignedSkill::new(receptor), pelota).is_some());
         let d = direccion_despegue(pelota, Some(receptor), 45.0, |d| despegue_legal(pelota, d)).expect("hay despegue");
         let adentro = d.y.atan2(d.x.abs()).to_degrees();
-        assert!((10.0..=30.0).contains(&adentro), "{adentro:.1}° hacia adentro: {d:?}");
+        // Con el lugar detrás a 0.02 m dentro del campo lógico, el ángulo es chico.
+        assert!(adentro > 0.0 && adentro <= 10.0, "{adentro:.1}° hacia adentro: {d:?}");
         assert!(d.x > 0.0, "hacia el receptor: {d:?}");
+        let lugar = ApproachAlignedSkill::new(pelota + d * DESPEGUE_ALCANCE_M).staging_point(pelota).unwrap();
+        assert!(lugar.y.abs() <= LOGICAL_FIELD_HALF_Y - DESPEGUE_MARGEN_M, "{lugar:?}");
     }
 
     #[test]
