@@ -56,6 +56,11 @@ const VENTANA_RAPIDEZ_S: f64 = 0.25;
 /// Tope de la gracia del casi choque tras el teleport de la preparación (s): dura hasta ver a
 /// los robots en su inicio, y a lo sumo esto.
 const TELEPORT_MAX_S: f64 = 2.0;
+/// Despegue que oscila (D15): `OSCILA_MAX` idas y vueltas entre alinearse y empujar dentro de
+/// `OSCILA_VENTANA_S` lo dan por fallido. En el segundo punto de control, el robot alternaba
+/// en cada tick mientras empujaba la pelota de a poco por la pared.
+const OSCILA_MAX: usize = 4;
+const OSCILA_VENTANA_S: f64 = 1.0;
 
 /// Frase antes de asignar robots: la rutina espera el juego y la visión.
 const FRASE_ESPERA: &str = "Preparando: esperando la visión de los robots propios y el juego";
@@ -109,10 +114,6 @@ pub struct Entorno {
     pub alcance_m: f32,
     /// Pelota quieta: más lenta que esto (`skills.intercept_min_ball_speed`, m/s).
     pub pelota_lenta: f32,
-    /// Solo para el A/B del punto de control de la etapa 1 (`VSSL_RUTINA_REGLA10=1`): el
-    /// receptor va por la pelota que rueda despacio tras el contacto (la regla 10, D8). Se
-    /// retira después del A/B.
-    pub regla10: bool,
 }
 
 impl Entorno {
@@ -128,7 +129,6 @@ impl Entorno {
             params: p.rutinas.clone(),
             alcance_m: p.skills.intercept_reach_radius,
             pelota_lenta: p.skills.intercept_min_ball_speed,
-            regla10: std::env::var("VSSL_RUTINA_REGLA10").is_ok_and(|v| v == "1"),
         }
     }
 }
@@ -141,11 +141,6 @@ pub enum OrdenCorrida {
     Reanudar,
     Abortar,
 }
-
-/// `recibir`: después del contacto o del cruce de su línea, el receptor va por la pelota
-/// que rueda más lenta que esto (m/s) dentro de `recepcion_radio_m` (D3). Medido en FIRASim:
-/// tras pegar en una esquina del receptor, la pelota se escapa a 0.13–0.3 m/s.
-const PELOTA_ESCAPA_MAX: f32 = 0.3;
 
 /// Una causa de aborto: su tipo, como dato, y la frase para mostrar.
 #[derive(Debug, Clone, PartialEq)]
@@ -178,8 +173,6 @@ struct EnCurso {
     control: u32,
     /// `recibir`: ticks seguidos con la pelota quieta fuera de `recepcion_radio_m`.
     afuera: u32,
-    /// `recibir`: la pelota ya llegó al robot o cruzó su línea.
-    contacto: bool,
     err_suma: f64,
     err_n: u32,
     err_max: f64,
@@ -199,7 +192,6 @@ impl EnCurso {
             empuje_desde: None,
             control: 0,
             afuera: 0,
-            contacto: false,
             err_suma: 0.0,
             err_n: 0,
             err_max: 0.0,
@@ -217,7 +209,6 @@ impl EnCurso {
         self.empuje_desde = None;
         self.control = 0;
         self.afuera = 0;
-        self.contacto = false;
         self.hecho = self.paso >= total;
     }
 
@@ -231,7 +222,6 @@ impl EnCurso {
         self.empuje_desde = None;
         self.control = 0;
         self.afuera = 0;
-        self.contacto = false;
         self.hecho = false;
     }
 }
@@ -271,9 +261,8 @@ struct Despegando {
     pendiente: usize,
     objetivo: Vec2,
     desde: f64,
-    /// La pelota al empezar, y las veces que el robot entró al empuje y volvió a alinearse.
-    pelota0: Vec2,
-    vueltas: u32,
+    /// Cuándo el robot entró al empuje y volvió a alinearse (las del último segundo).
+    vueltas: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1340,12 +1329,7 @@ impl RoutineDecider {
         };
         let radio = self.p().recepcion_radio_m;
         let en_radio = (b.position - punto).length() <= radio;
-        let n = (punto - origen).normalize_or_zero();
-        let llego = (b.position - r.position).length() <= self.ent.alcance_m;
-        let cruzo = n != Vec2::ZERO && (punto - b.position).dot(n) <= 0.0;
         let e = &mut self.en_curso[k];
-        e.contacto |= llego || cruzo;
-        let contacto = e.contacto;
         e.control = if controla { e.control + 1 } else { 0 };
         e.afuera = if quieta && !en_radio { e.afuera + 1 } else { 0 };
         let afuera = e.afuera;
@@ -1369,10 +1353,8 @@ impl RoutineDecider {
             return Ok(Evaluacion::Sigue(choice(r.id, SkillId::Hold, Vec2::ZERO)));
         }
         // Va por la pelota cuando se detuvo dentro del radio; si no, la espera de frente (no
-        // sale a buscarla ni la persigue). Con la regla 10 (solo para el A/B), también tras el
-        // contacto, si se le escapa despacio dentro del radio.
-        let escapa = self.ent.regla10 && contacto && b.velocity.length() < PELOTA_ESCAPA_MAX;
-        if en_radio && (quieta || escapa) {
+        // sale a buscarla ni la persigue: la que se le escapa la toma el rescate, D8).
+        if en_radio && quieta {
             Ok(Evaluacion::Sigue(choice(r.id, SkillId::Intercept, b.position)))
         } else {
             let espera = punto_de_espera(punto, origen, b.position, b.velocity, self.ent.pelota_lenta, radio);
@@ -1598,8 +1580,7 @@ impl RoutineDecider {
                     pendiente,
                     objetivo: pelota + d * DESPEGUE_ALCANCE_M,
                     desde: self.t,
-                    pelota0: pelota,
-                    vueltas: 0,
+                    vueltas: Vec::new(),
                 });
             }
             None => self.sacar_de_juego(pendiente, FueraDeJuego::Pegada),
@@ -1732,8 +1713,10 @@ impl RoutineDecider {
                 self.estado = EstadoPelota::Suelta(res);
             }
             EstadoPelota::Despegue(mut d) => {
-                // Vence, u oscila entre alinearse y empujar sin mover la pelota (D15).
-                let oscila = d.vueltas >= 3 && (b.position - d.pelota0).length() < 0.02;
+                // Vence, u oscila entre alinearse y empujar (D15): las idas y vueltas del último
+                // segundo, aunque la pelota avance de a poco por la pared.
+                d.vueltas.retain(|t| self.t - t <= OSCILA_VENTANA_S);
+                let oscila = d.vueltas.len() >= OSCILA_MAX;
                 if self.t - d.desde > self.p().tiempo_max_s / self.escala || oscila {
                     self.eventos.despegues_fallidos += 1;
                     self.en_curso[d.puesto].empuje_desde = None;
@@ -1749,10 +1732,10 @@ impl RoutineDecider {
                         match self.empujar_hacia(*k, d.objetivo, r, world) {
                             Some(c) => {
                                 if empujaba && self.en_curso[*k].empuje_desde.is_none() {
-                                    d.vueltas += 1;
+                                    d.vueltas.push(self.t);
                                 }
                                 if let EstadoPelota::Despegue(x) = &mut self.estado {
-                                    x.vueltas = d.vueltas;
+                                    x.vueltas = d.vueltas.clone();
                                 }
                                 out.push(c);
                             }
@@ -2070,7 +2053,6 @@ mod tests {
             params: RutinasParams::default(),
             alcance_m: 0.09,
             pelota_lenta: 0.08,
-            regla10: false,
         }
     }
 
@@ -2884,32 +2866,57 @@ mod tests {
         assert!(matches!(d.estado, EstadoPelota::Suelta(_)), "{:?}", d.estado);
     }
 
-    #[test]
-    fn a_despegue_that_oscillates_fails_at_once() {
-        // El robot entra al empuje y vuelve a alinearse tres veces sin mover la pelota: el
-        // despegue falla sin esperar los 8 s, y la pelota queda fuera de juego (D15).
-        let mut d = pases(opciones(true));
-        let t = hasta_ejecutar(&mut d, &cancha((A, 0.0), (B, 180.0), MARCA, Vec2::ZERO));
+    /// Hasta el despegue con la pelota junto a la banda; devuelve el tick siguiente, la
+    /// pelota y el despegue.
+    fn hasta_el_despegue(d: &mut RoutineDecider) -> (u32, Vec2, Despegando) {
+        let t = hasta_ejecutar(d, &cancha((A, 0.0), (B, 180.0), MARCA, Vec2::ZERO));
         let pelota = Vec2::new(-0.27, -0.57);
-        correr_p(&mut d, &cancha((A, 0.0), (B, 180.0), pelota, Vec2::ZERO), t + 1, 2);
+        correr_p(d, &cancha((A, 0.0), (B, 180.0), pelota, Vec2::ZERO), t + 1, 2);
         let EstadoPelota::Despegue(desp) = d.estado.clone() else { panic!("{:?}", d.estado) };
+        (t + 3, pelota, desp)
+    }
+
+    /// Una ida y vuelta del despegue: A en el lugar detrás de `pelota`, alineado (empuja), y
+    /// después corrido 0.08 m al costado (deja de ser factible y vuelve a alinearse).
+    fn oscilar(d: &mut RoutineDecider, t: u32, pelota: Vec2, desp: &Despegando) {
         let dir = (desp.objetivo - pelota).normalize();
         let lugar = ApproachAlignedSkill::new(desp.objetivo).staging_point(pelota).unwrap();
         let th = f64::from(dir.y).atan2(f64::from(dir.x)).to_degrees();
-        let alineado = cancha((lugar, th), (B, 180.0), pelota, Vec2::ZERO);
-        let corrido = cancha((lugar + dir.perp() * 0.08, th), (B, 180.0), pelota, Vec2::ZERO);
-        let mut t = t + 3;
-        for vuelta in 1..=3 {
-            let c = correr_p(&mut d, &alineado, t, 1);
-            assert_eq!(de(&c, 0), choice(0, SkillId::ShootPush, desp.objetivo), "vuelta {vuelta}");
-            let c = correr_p(&mut d, &corrido, t + 1, 1);
-            assert_eq!(de(&c, 0), choice(0, SkillId::ApproachAligned, desp.objetivo), "vuelta {vuelta}");
+        let c = correr_p(d, &cancha((lugar, th), (B, 180.0), pelota, Vec2::ZERO), t, 1);
+        assert_eq!(de(&c, 0), choice(0, SkillId::ShootPush, desp.objetivo));
+        let c = correr_p(d, &cancha((lugar + dir.perp() * 0.08, th), (B, 180.0), pelota, Vec2::ZERO), t + 1, 1);
+        assert_eq!(de(&c, 0), choice(0, SkillId::ApproachAligned, desp.objetivo));
+    }
+
+    #[test]
+    fn a_despegue_that_oscillates_fails_at_once() {
+        // Cuatro idas y vueltas en un segundo, aunque la pelota avance 1 cm en cada una por la
+        // pared: el despegue falla sin esperar los 8 s, y la pelota queda fuera de juego (D15).
+        let mut d = pases(opciones(true));
+        let (mut t, mut pelota, desp) = hasta_el_despegue(&mut d);
+        let dir = (desp.objetivo - pelota).normalize();
+        for _ in 0..4 {
+            pelota += dir * 0.01;
+            oscilar(&mut d, t, pelota, &desp);
             t += 2;
         }
-        correr_p(&mut d, &alineado, t, 1);
+        correr_p(&mut d, &cancha((A, 0.0), (B, 180.0), pelota, Vec2::ZERO), t, 1);
         assert!(matches!(&d.estado, EstadoPelota::Fuera(f) if f.motivo == FueraDeJuego::Pegada), "{:?}", d.estado);
         assert_eq!(d.eventos.despegues_fallidos, 1);
-        assert!(t * 16 < 8_000, "antes de los 8 s");
+        // Las mismas cuatro, repartidas en más de un segundo (una cada 0.4 s): sigue.
+        let mut d = pases(opciones(true));
+        let (mut t, pelota, desp) = hasta_el_despegue(&mut d);
+        let dir = (desp.objetivo - pelota).normalize();
+        let lugar = ApproachAlignedSkill::new(desp.objetivo).staging_point(pelota).unwrap();
+        let th = f64::from(dir.y).atan2(f64::from(dir.x)).to_degrees();
+        let corrido = cancha((lugar + dir.perp() * 0.08, th), (B, 180.0), pelota, Vec2::ZERO);
+        for _ in 0..4 {
+            oscilar(&mut d, t, pelota, &desp);
+            correr_p(&mut d, &corrido, t + 2, 23);
+            t += 25;
+        }
+        assert!(matches!(d.estado, EstadoPelota::Despegue(_)), "{:?}", d.estado);
+        assert_eq!(d.eventos.despegues_fallidos, 0);
     }
 
     #[test]
@@ -2927,7 +2934,7 @@ mod tests {
 
     #[test]
     fn a_ball_that_rolls_away_from_the_receiver_is_not_chased() {
-        // Sin la regla 10: tras tocar a B, la pelota rueda despacio dentro del radio y B la
+        // Sin la regla 10 (retirada): tras tocar a B, la pelota rueda despacio dentro del radio y B la
         // espera; si se detiene fuera del radio, la recepción falla y la toma el rescate.
         let mut d = pases(opciones(true));
         let t = hasta_el_pase(&mut d);
@@ -2937,13 +2944,6 @@ mod tests {
         let afuera = B + Vec2::new(0.0, -0.30);
         correr_p(&mut d, &cancha((A, 0.0), (B, 180.0), afuera, Vec2::ZERO), t + 1, 30);
         assert!(matches!(d.estado, EstadoPelota::Suelta(_)), "{:?}", d.estado);
-        // Con la regla 10 (solo para el A/B), B va por ella.
-        let mut ent = entorno(false);
-        ent.regla10 = true;
-        let mut d = RoutineDecider::new(prueba::rutina(&prueba::pases()), opciones(true), ent);
-        let t = hasta_el_pase(&mut d);
-        let c = correr_p(&mut d, &cancha((A, 0.0), (B, 180.0), escapa, Vec2::new(0.0, -0.13)), t, 1);
-        assert_eq!(de(&c, 1), choice(1, SkillId::Intercept, escapa));
     }
 
     // ─── Triángulo: resincronización con tres robots ─────────────────────────
