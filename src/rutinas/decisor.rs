@@ -2107,9 +2107,22 @@ mod tests {
         mundo(&[(0, INICIO.x, INICIO.y, 0.0)])
     }
 
+    /// El reloj de los tests: el último dato de visión del mundo (sus robots se actualizan
+    /// al armarlo). Con el reloj de pared, un mundo reusado después de una tanda larga de
+    /// ticks envejecía más que `blind_stop_s` con la máquina cargada, y la rutina abortaba
+    /// por "dejó de verse".
+    fn ahora_de(w: &World) -> SystemTime {
+        w.get_blue_team_state()
+            .into_iter()
+            .chain(w.get_yellow_team_state())
+            .map(|r| r.last_update)
+            .max()
+            .unwrap_or_else(SystemTime::now)
+    }
+
     /// `n` ticks desde `t0` con el mundo `w`; las elecciones del último.
     fn correr(d: &mut RoutineDecider, w: &World, t0: u32, n: u32) -> Vec<SkillChoice> {
-        let ahora = SystemTime::now();
+        let ahora = ahora_de(w);
         let mut out = Vec::new();
         for t in t0..t0 + n {
             out = d.decidir(t, w, ahora);
@@ -2120,7 +2133,7 @@ mod tests {
     /// Corre con el robot quieto en el inicio hasta que arranca (inicio automático) y
     /// devuelve el tick del arranque.
     fn hasta_ejecutar(d: &mut RoutineDecider, w: &World) -> u32 {
-        let ahora = SystemTime::now();
+        let ahora = ahora_de(w);
         for t in 0..200 {
             d.decidir(t, w, ahora);
             if d.fase() == Fase::Ejecutando {
@@ -2302,11 +2315,24 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_world_does_not_age_with_the_wall_clock() {
+        // Regresión: con la máquina cargada, una tanda larga de ticks tardaba más que
+        // `blind_stop_s` (0.4 s), y el mismo mundo, reusado, parecía sin visión.
+        let w = en_inicio();
+        let mut d = decisor(IR, opciones(true));
+        let t0 = hasta_ejecutar(&mut d, &w);
+        std::thread::sleep(Duration::from_millis(500));
+        correr(&mut d, &w, t0 + 1, 5);
+        assert_eq!(d.causa(), None);
+        assert_eq!(d.fase(), Fase::Ejecutando);
+    }
+
+    #[test]
     fn a_robot_out_of_sight_aborts() {
         let mut d = decisor(IR, opciones(false));
         let w = en_inicio();
         correr(&mut d, &w, 0, 1);
-        d.decidir(1, &w, SystemTime::now() + Duration::from_secs(1));
+        d.decidir(1, &w, ahora_de(&w) + Duration::from_secs(1));
         assert_eq!(d.causa(), Some("el robot 0 dejó de verse"));
         assert_eq!(d.vista().frase, "Abortada: el robot 0 dejó de verse");
     }
@@ -2555,7 +2581,7 @@ mod tests {
 
     /// Corre `n` ticks y revisa que todas las elecciones sean de las permitidas.
     fn correr_p(d: &mut RoutineDecider, w: &World, t0: u32, n: u32) -> Vec<SkillChoice> {
-        let ahora = SystemTime::now();
+        let ahora = ahora_de(w);
         let mut out = Vec::new();
         for t in t0..t0 + n {
             out = d.decidir(t, w, ahora);
@@ -3001,7 +3027,7 @@ mod tests {
         // Visión y casi choque.
         let mut d = decisor(IR, opciones(false));
         correr(&mut d, &w, 0, 1);
-        d.decidir(1, &w, SystemTime::now() + Duration::from_secs(1));
+        d.decidir(1, &w, ahora_de(&w) + Duration::from_secs(1));
         casos.push((d, "el robot 0 dejó de verse", TipoAborto::RobotSinVision));
         let mut d = decisor(IR, opciones(false));
         correr(&mut d, &mundo(&[(0, INICIO.x, INICIO.y, 0.0), (2, INICIO.x + 0.08, INICIO.y, 0.0)]), 0, 1);
