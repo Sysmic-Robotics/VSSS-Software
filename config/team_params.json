@@ -115,6 +115,9 @@
     "quieto_deg": 3.0,
     "velocidad_real_pct": 60,
     "velocidad_sim_pct": 100,
-    "giro_max_rad_s": 12.0
+    "giro_max_rad_s": 12.0,
+    "pase_empuje_max_m": 0.15,
+    "reintentos_max": 3,
+    "recepcion_radio_m": 0.25
   }
 }

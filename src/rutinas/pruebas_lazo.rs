@@ -118,6 +118,8 @@ fn entorno(bidireccional: bool) -> Entorno {
         blind_stop_s: 0.4,
         spin_omega: 20.0,
         params: RutinasParams::default(),
+        alcance_m: 0.09,
+        pelota_lenta: 0.08,
     }
 }
 

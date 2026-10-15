@@ -1,0 +1,28 @@
+{
+  "nombre": "Pase de lado a lado",
+  "grupo": "con_pelota",
+  "descripcion": "A y B, uno en cada mitad, se pasan la pelota ida y vuelta y vuelven a su puesto después de pasar.",
+  "robots": { "min": 2, "max": 2 },
+  "pelota": { "marca": { "x": -0.28, "y": 0.00 } },
+  "repeticiones": 3,
+  "puestos": [
+    {
+      "nombre": "A",
+      "inicio": { "x": -0.40, "y": 0.00, "orientacion_deg": 0 },
+      "pasos": [
+        { "paso": "empujar", "a_puesto": "B" },
+        { "paso": "ir", "x": -0.40, "y": 0.00 },
+        { "paso": "recibir", "x": -0.40, "y": 0.00 }
+      ]
+    },
+    {
+      "nombre": "B",
+      "inicio": { "x": 0.40, "y": 0.00, "orientacion_deg": 180 },
+      "pasos": [
+        { "paso": "recibir", "x": 0.40, "y": 0.00 },
+        { "paso": "empujar", "a_puesto": "A" },
+        { "paso": "ir", "x": 0.40, "y": 0.00 }
+      ]
+    }
+  ]
+}

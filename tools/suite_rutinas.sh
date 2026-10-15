@@ -9,6 +9,9 @@
 # circuitos), FIRASIM_BIN (ruta al binario de FIRASim: si está definida y FIRASim no
 # corre, lo lanza), GUARDAR_CSV=1 (guarda el CSV de todas las corridas, comprimido).
 #
+# Las rutinas con pelota suman la columna de pases (logrados/intentados); su aceptación se
+# corre aparte: RUTINAS=pase_lado_a_lado tools/suite_rutinas.sh DIR.
+#
 # FIRASim tiene que estar en tiempo real (FIRASim-realtime.sh). No correr la GUI ni otro
 # engine a la vez: comandan los mismos robots. Por corrida quedan el resumen
 # (DIR/<id>_bdN.resumen.json) y la salida filtrada (.err); el CSV de partido, comprimido,
@@ -53,13 +56,15 @@ for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.resumen.json"))):
     j = json.load(open(p))
     modo = "bidireccional" if j["corrida"]["bidireccional"] else "frontal"
     err = [vp["error_medio_m"] for v in j["vueltas"] for vp in v["puestos"].values() if vp["error_medio_m"] is not None]
+    p = j.get("pases")
+    pases = f"{p['logrados']}/{p['intentados']}" if p else "-"
     filas.append((j["rutina"], modo, j["resultado"], j["vueltas_completas"], j["duracion_media_s"],
-                  sum(err) / len(err) if err else None, sum(j["escapes"].values()), j["causa"] or ""))
-print(f"{'rutina':<16} {'modo':<14} {'resultado':<11} {'vueltas':>7} {'s/vuelta':>8} {'err cm':>6} {'esc':>4}  causa")
-for r, m, res, n, d, e, esc, causa in filas:
+                  sum(err) / len(err) if err else None, sum(j["escapes"].values()), pases, j["causa"] or ""))
+print(f"{'rutina':<16} {'modo':<14} {'resultado':<11} {'vueltas':>7} {'s/vuelta':>8} {'err cm':>6} {'esc':>4} {'pases':>7}  causa")
+for r, m, res, n, d, e, esc, pases, causa in filas:
     d = f"{d:8.2f}" if d is not None else "       -"
     e = f"{e * 100:6.1f}" if e is not None else "     -"
-    print(f"{r:<16} {m:<14} {res:<11} {n:>7} {d} {e} {esc:>4}  {causa}")
+    print(f"{r:<16} {m:<14} {res:<11} {n:>7} {d} {e} {esc:>4} {pases:>7}  {causa}")
 PY
 echo "$fallas corridas con falla (criterio: 0); resultados en $OUT"
 [ $fallas -eq 0 ]

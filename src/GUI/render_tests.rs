@@ -237,21 +237,25 @@ fn tiny_skia_damage_stays_finite_with_moving_labels_and_non_finite_data() {
 #[test]
 fn routine_layer_damage_stays_finite_with_non_finite_robots() {
     use super::rutinas::DibujoRutina;
-    let rutina = crate::rutinas::prueba::rutina(&crate::rutinas::prueba::un_puesto(
+    let circuito = crate::rutinas::prueba::rutina(&crate::rutinas::prueba::un_puesto(
         r#"{ "paso": "ir", "x": 0.3, "y": -0.25, "orientacion_deg": 90 }, { "paso": "mirar", "x": 0.75, "y": 0.0 },
            { "paso": "girar", "sentido": "horario", "vueltas": 1 }, { "paso": "esperar", "tiempo_s": 2 },
            { "paso": "ir", "x": -0.3, "y": -0.25 }"#,
     ));
+    // También una rutina con pelota: pelota fantasma, notas "recibe" y flechas de pase.
+    let pases = crate::rutinas::prueba::rutina(&crate::rutinas::prueba::pases());
     let mut renderer = renderer_tiny_skia();
     let base = Cache::new();
     let trazas = Trazas::default();
     let mut anteriores: Option<Vec<Capa>> = None;
     for (i, (snap, _)) in fotos().iter().enumerate() {
+        let con_pelota = i % 2 == 1;
         let dibujo = DibujoRutina {
-            rutina: rutina.clone(),
+            rutina: if con_pelota { pases.clone() } else { circuito.clone() },
             asignacion: vec![(0, i as i32 % 3)],
-            en_curso: vec![(0, i)],
-            puestos: 1,
+            en_curso: vec![(0, i % 3)],
+            puestos: if con_pelota { 2 } else { 1 },
+            fantasma: con_pelota,
         };
         let capas = cuadro(&mut renderer, &base, snap, None, &trazas, Some(&dibujo));
         if let Some(prev) = &anteriores {

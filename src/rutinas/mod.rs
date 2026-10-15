@@ -70,6 +70,23 @@ pub(crate) mod prueba {
         )
     }
 
+    /// Pases entre dos robots: A en (−0.40, 0) y B en (0.40, 0), marca en (−0.28, 0). A le
+    /// pasa a B, vuelve y recibe; B recibe, le pasa a A y vuelve.
+    pub fn pases() -> String {
+        r#"{
+          "nombre": "Pases", "grupo": "con_pelota", "descripcion": "Para los tests.",
+          "robots": { "min": 2, "max": 2 },
+          "pelota": { "marca": { "x": -0.28, "y": 0.0 } },
+          "puestos": [
+            { "nombre": "A", "inicio": { "x": -0.40, "y": 0.0, "orientacion_deg": 0 },
+              "pasos": [ { "paso": "empujar", "a_puesto": "B" }, { "paso": "ir", "x": -0.40, "y": 0.0 }, { "paso": "recibir", "x": -0.40, "y": 0.0 } ] },
+            { "nombre": "B", "inicio": { "x": 0.40, "y": 0.0, "orientacion_deg": 180 },
+              "pasos": [ { "paso": "recibir", "x": 0.40, "y": 0.0 }, { "paso": "empujar", "a_puesto": "A" }, { "paso": "ir", "x": 0.40, "y": 0.0 } ] }
+          ]
+        }"#
+        .to_string()
+    }
+
     /// La rutina de `texto`, que debe ser válida.
     pub fn rutina(texto: &str) -> std::sync::Arc<super::Rutina> {
         let e = super::formato::cargar_texto(

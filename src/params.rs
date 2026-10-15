@@ -522,6 +522,14 @@ pub struct RutinasParams {
     /// Tope de giro de `girar` (rad/s): el del firmware, 450 mm/s por rueda sobre una vía
     /// de 75 mm. Se recalibra con la sysid.
     pub giro_max_rad_s: f64,
+    /// `empujar`: distancia máxima que el pasador avanza empujando antes de soltar (m).
+    /// Sin el corte, si ShootPush no suelta la pelota, la conduce hasta el receptor.
+    pub pase_empuje_max_m: f32,
+    /// Recepciones fallidas seguidas antes de abortar la rutina.
+    pub reintentos_max: u32,
+    /// `recibir`: el receptor solo va por la pelota cuando se detuvo a esta distancia o
+    /// menos de su punto (m); mientras rueda, la espera de frente.
+    pub recepcion_radio_m: f32,
 }
 
 impl Default for RutinasParams {
@@ -540,6 +548,9 @@ impl Default for RutinasParams {
             velocidad_real_pct: 60,
             velocidad_sim_pct: 100,
             giro_max_rad_s: 12.0,
+            pase_empuje_max_m: 0.15,
+            reintentos_max: 3,
+            recepcion_radio_m: 0.25,
         }
     }
 }
@@ -655,6 +666,21 @@ impl TeamParams {
             if v.is_nan() || v <= 0.0 {
                 return Err(format!("rutinas.{nombre} ({v}) debe ser mayor que cero"));
             }
+        }
+        if !(r.pase_empuje_max_m > 0.0 && r.pase_empuje_max_m <= 0.60) {
+            return Err(format!(
+                "rutinas.pase_empuje_max_m ({}) debe ser mayor que cero y a lo sumo 0.60 m",
+                r.pase_empuje_max_m
+            ));
+        }
+        if r.reintentos_max < 1 {
+            return Err("rutinas.reintentos_max (0) debe ser al menos 1".to_string());
+        }
+        if !(r.recepcion_radio_m > 0.0 && r.recepcion_radio_m <= 0.50) {
+            return Err(format!(
+                "rutinas.recepcion_radio_m ({}) debe ser mayor que cero y a lo sumo 0.50 m",
+                r.recepcion_radio_m
+            ));
         }
         Ok(())
     }
@@ -908,6 +934,24 @@ mod tests {
         assert!(err.contains("rutinas.tolerancia_m") && err.contains("arrival_threshold"), "{err}");
         // Igual a arrival_threshold vale.
         assert!(TeamParams::from_json(r#"{ "rutinas": { "tolerancia_m": 0.04 } }"#).is_ok());
+    }
+
+    #[test]
+    fn rutinas_pass_params_have_defaults_and_bounds() {
+        let p = TeamParams::from_json(r#"{ "rutinas": { "tolerancia_m": 0.05 } }"#).unwrap();
+        assert_eq!((p.rutinas.pase_empuje_max_m, p.rutinas.reintentos_max), (0.15, 3));
+        assert_eq!(p.rutinas.recepcion_radio_m, 0.25);
+        for (malo, campo) in [
+            (r#"{ "rutinas": { "recepcion_radio_m": 0.0 } }"#, "recepcion_radio_m"),
+            (r#"{ "rutinas": { "recepcion_radio_m": 0.6 } }"#, "recepcion_radio_m"),
+            (r#"{ "rutinas": { "reintentos_max": 0 } }"#, "reintentos_max"),
+            (r#"{ "rutinas": { "pase_empuje_max_m": 0.0 } }"#, "pase_empuje_max_m"),
+            (r#"{ "rutinas": { "pase_empuje_max_m": 0.7 } }"#, "pase_empuje_max_m"),
+        ] {
+            let err = TeamParams::from_json(malo).unwrap_err();
+            assert!(err.contains(campo), "{err}");
+        }
+        assert!(TeamParams::from_json(r#"{ "rutinas": { "pase_empuje_max_m": 0.6 } }"#).is_ok());
     }
 
     #[test]

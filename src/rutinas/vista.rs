@@ -47,6 +47,12 @@ pub enum Falta {
     Quieto { robot: i32 },
     /// Un robot sin puesto está demasiado cerca del recorrido de un puesto.
     CercaDelRecorrido { robot: i32, distancia: f32, puesto: String },
+    /// Con pelota: no hay una posición de la pelota.
+    PelotaNoSeVe,
+    /// Con pelota: la pelota está lejos de su marca.
+    PelotaFueraDeMarca { distancia: f32 },
+    /// Con pelota: en la marca, pero todavía rueda.
+    PelotaRueda,
 }
 
 impl Falta {
@@ -59,7 +65,17 @@ impl Falta {
             Falta::CercaDelRecorrido { robot, distancia, puesto } => {
                 format!("el robot {robot} está a {distancia:.2} m del recorrido de {puesto}")
             }
+            Falta::PelotaNoSeVe => "no se ve la pelota".to_string(),
+            Falta::PelotaFueraDeMarca { distancia } => {
+                format!("coloca la pelota en la marca: está a {distancia:.2} m")
+            }
+            Falta::PelotaRueda => "esperando que la pelota quede quieta en la marca".to_string(),
         }
+    }
+
+    /// Lo que falta es solo la pelota: esa espera no corre el tiempo de la preparación.
+    pub fn es_de_la_pelota(&self) -> bool {
+        matches!(self, Falta::PelotaNoSeVe | Falta::PelotaFueraDeMarca { .. } | Falta::PelotaRueda)
     }
 
     /// Causa de aborto cuando la preparación no termina en `t` segundos.
@@ -69,7 +85,10 @@ impl Falta {
             Falta::VaASuPuesto { robot, .. } => format!("el robot {robot} no llegó a su puesto en {t} s"),
             Falta::SeOrienta { robot } => format!("el robot {robot} no se orientó en su puesto en {t} s"),
             Falta::Quieto { robot } => format!("el robot {robot} no quedó quieto en su puesto en {t} s"),
-            Falta::CercaDelRecorrido { .. } => format!("no quedó lista en {t} s: {}", self.presente()),
+            Falta::CercaDelRecorrido { .. }
+            | Falta::PelotaNoSeVe
+            | Falta::PelotaFueraDeMarca { .. }
+            | Falta::PelotaRueda => format!("no quedó lista en {t} s: {}", self.presente()),
         }
     }
 }
@@ -223,6 +242,10 @@ mod tests {
         assert_eq!(c.presente(), "el robot 2 está a 0.12 m del recorrido de A");
         assert_eq!(c.vencida(33.3), "no quedó lista en 33.3 s: el robot 2 está a 0.12 m del recorrido de A");
         assert_eq!(frase_preparacion(None), "Lista: robots en su puesto y quietos");
+        let p = Falta::PelotaFueraDeMarca { distancia: 0.12 };
+        assert_eq!(frase_preparacion(Some(&p)), "Preparando: coloca la pelota en la marca: está a 0.12 m");
+        assert!(p.es_de_la_pelota() && !f.es_de_la_pelota());
+        assert_eq!(Falta::PelotaNoSeVe.presente(), "no se ve la pelota");
     }
 
     #[test]

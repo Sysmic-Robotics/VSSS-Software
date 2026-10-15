@@ -10,9 +10,12 @@
 //!    navegación (`AREA_CLEARANCE`);
 //! 5. tolerancias ≥ `motion.arrival_threshold`;
 //! 6. inicios a ≥ `distancia_minima_m` entre sí (regla del archivo; no aborta en vivo);
-//! 7. los pasos de las fases 2 y 3 y la pelota dejan la rutina "no disponible".
+//! 7. los pasos de la fase 2 dejan la rutina "no disponible";
+//! 8. rutinas con pelota: pelota, grupo y pasos juntos, todos los puestos en uso, pases
+//!    emparejados, la marca en la zona segura, fuera de las áreas y lejos de los inicios, y
+//!    líneas de pase sin tocar las áreas.
 
-use super::formato::{Accion, Duracion, Figura, Hacia, Rutina};
+use super::formato::{Accion, Duracion, Figura, Grupo, Hacia, Rutina};
 use crate::coach::{FIELD_HALF_X, FIELD_HALF_Y};
 use crate::params::{RutinasParams, params};
 use crate::skills::zones::{AREA_CLEARANCE, AreaRect, TRIANGLE_M, attack_sign_from_env};
@@ -292,21 +295,127 @@ pub fn validar(r: &Rutina, ctx: &ContextoValidacion) -> Vec<String> {
         }
     }
 
-    // 7. Lo que llega en fases posteriores.
+    // 7. Lo que llega en la fase 2.
     let mut reservados: Vec<(&'static str, u8)> = Vec::new();
     for paso in r.puestos.iter().flat_map(|a| &a.pasos) {
         let (tipo, fase) = (paso.accion.tipo(), paso.accion.fase());
-        if fase > 1 && !reservados.iter().any(|(t, _)| *t == tipo) {
+        if fase == 2 && !reservados.iter().any(|(t, _)| *t == tipo) {
             reservados.push((tipo, fase));
         }
     }
     for (tipo, fase) in reservados {
         razones.push(format!("no disponible: el paso `{tipo}` llega en la fase {fase}"));
     }
-    if r.pelota.is_some() {
-        razones.push("no disponible: las rutinas con pelota llegan en la fase 3".to_string());
-    }
+
+    // 8. Rutinas con pelota.
+    validar_pelota(r, ctx, &mut razones);
     razones
+}
+
+/// Reglas de las rutinas con pelota (regla 8).
+fn validar_pelota(r: &Rutina, ctx: &ContextoValidacion, razones: &mut Vec<String>) {
+    let pasos_con_pelota = r
+        .puestos
+        .iter()
+        .flat_map(|a| &a.pasos)
+        .any(|p| matches!(p.accion, Accion::Empujar { .. } | Accion::Recibir { .. }));
+    if pasos_con_pelota && r.pelota.is_none() {
+        razones.push("los pasos `empujar` y `recibir` necesitan `pelota`".to_string());
+    }
+    if (pasos_con_pelota || r.pelota.is_some()) && r.grupo != Grupo::ConPelota {
+        razones.push("la pelota y sus pasos van en el grupo `con_pelota`".to_string());
+    }
+    if r.grupo == Grupo::ConPelota && r.pelota.is_none() {
+        razones.push("el grupo `con_pelota` necesita `pelota`".to_string());
+    }
+    if !pasos_con_pelota && r.pelota.is_none() {
+        return;
+    }
+    if r.robots_min != r.robots_max {
+        razones.push(format!(
+            "las rutinas con pelota usan todos sus puestos: robots.min ({}) debe ser igual a robots.max ({})",
+            r.robots_min, r.robots_max
+        ));
+    }
+
+    // Emparejamiento: lo que cada puesto recibe contra lo que le pasan.
+    let vez = |n: usize| if n == 1 { "1 vez".to_string() } else { format!("{n} veces") };
+    for b in &r.puestos {
+        let recibe = b.pasos.iter().filter(|p| matches!(p.accion, Accion::Recibir { .. })).count();
+        let mut pasadores: Vec<&str> = Vec::new();
+        for a in &r.puestos {
+            for (i, p) in a.pasos.iter().enumerate() {
+                if let Accion::Empujar { hacia: Hacia::Puesto(n) } = &p.accion {
+                    if *n == b.nombre && a.nombre == b.nombre {
+                        razones.push(format!("puesto {}, paso {}: `a_puesto` {} es el mismo puesto", a.nombre, i + 1, n));
+                    } else if *n == b.nombre {
+                        pasadores.push(&a.nombre);
+                    }
+                }
+            }
+        }
+        let le_pasan = pasadores.len();
+        if le_pasan != recibe {
+            let mut unicos = pasadores.clone();
+            unicos.dedup();
+            razones.push(match unicos.as_slice() {
+                [] => format!("{} recibe {} y nadie le pasa la pelota", b.nombre, vez(recibe)),
+                [a] => format!("{a} le pasa {} a {} y {} recibe {}", vez(le_pasan), b.nombre, b.nombre, vez(recibe)),
+                _ => format!("a {} le pasan {} y recibe {}", b.nombre, vez(le_pasan), vez(recibe)),
+            });
+        }
+    }
+
+    // La marca.
+    let areas = [AreaRect::own(ctx.attack_sign), AreaRect::opp(ctx.attack_sign)];
+    if let Some(m) = r.pelota {
+        if let Some(motivo) = fuera_de_zona(m, ctx.params.zona_segura_m) {
+            razones.push(format!("la marca de la pelota: {motivo}"));
+        }
+        if let Some(ar) = areas.iter().find(|ar| ar.touches_with(m, AREA_CLEARANCE)) {
+            razones.push(format!(
+                "la marca de la pelota {} toca {} (holgura {:.2} m)",
+                punto(m),
+                nombre_area(ar),
+                AREA_CLEARANCE
+            ));
+        }
+        for a in &r.puestos {
+            let d = (m - a.inicio.pos).length();
+            if d < ctx.params.distancia_choque_m - EPS {
+                razones.push(format!(
+                    "la marca de la pelota está a {:.2} m del inicio de {} (mínimo {:.2})",
+                    d, a.nombre, ctx.params.distancia_choque_m
+                ));
+            }
+        }
+    }
+
+    // Líneas de pase: del origen de la pelota al objetivo, sin tocar las áreas (si los
+    // extremos ya tocan, lo dicen sus propias razones).
+    for pase in r.pases() {
+        let Some(objetivo) = pase.objetivo else { continue };
+        let toca_punto = |q: Vec2| areas.iter().any(|ar| ar.touches_with(q, AREA_CLEARANCE));
+        if toca_punto(objetivo) {
+            continue;
+        }
+        let (k, i) = pase.de;
+        let quien = match pase.receptor {
+            Some((j, _)) => format!("el pase de {} a {}", r.puestos[k].nombre, r.puestos[j].nombre),
+            None => format!("puesto {}, paso {}: el empuje hacia {}", r.puestos[k].nombre, i + 1, punto(objetivo)),
+        };
+        for o in pase.origenes.iter().filter(|o| !toca_punto(**o)) {
+            if let Some(ar) = areas.iter().find(|ar| tramo_toca(*o, objetivo, ar)) {
+                razones.push(format!(
+                    "{quien} desde {} toca {} (holgura {:.2} m)",
+                    punto(*o),
+                    nombre_area(ar),
+                    AREA_CLEARANCE
+                ));
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -443,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_steps_and_ball_are_not_available() {
+    fn phase_two_steps_are_not_available_and_ball_steps_are_checked() {
         let rs = razones(&un_puesto(
             r#"{ "paso": "seguir", "figura": "circulo", "centro": { "x": 0, "y": 0 }, "radio": 0.25, "periodo_s": 4, "vueltas": 2 },
                { "paso": "sincronizar", "barrera": "medio" },
@@ -453,13 +562,105 @@ mod tests {
         ));
         assert!(tiene(&rs, "no disponible: el paso `seguir` llega en la fase 2"), "{rs:?}");
         assert_eq!(rs.iter().filter(|r| r.contains("`sincronizar`")).count(), 1, "una vez por tipo: {rs:?}");
-        assert!(tiene(&rs, "no disponible: el paso `empujar` llega en la fase 3"), "{rs:?}");
-        assert!(tiene(&rs, "no disponible: el paso `recibir` llega en la fase 3"), "{rs:?}");
-        // Los campos de los reservados también se validan.
+        // Los pasos con pelota ya no están reservados: se validan con sus reglas.
+        assert!(!tiene(&rs, "fase 3"), "{rs:?}");
+        assert!(tiene(&rs, "los pasos `empujar` y `recibir` necesitan `pelota`"), "{rs:?}");
         assert!(tiene(&rs, "`a_puesto` B no es un puesto de la rutina"), "{rs:?}");
-        let pelota = un_puesto(r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#)
-            .replace("\"repeticiones\": 1,", "\"repeticiones\": 1, \"pelota\": { \"marca\": { \"x\": 0, \"y\": 0 } },");
-        assert!(tiene(&razones(&pelota), "las rutinas con pelota llegan en la fase 3"));
+    }
+
+    /// Rutina de pases de dos robots: marca, e inicio y pasos de A y de B.
+    fn dos_con_pelota(marca: (f32, f32), a: ((f32, f32), &str), b: ((f32, f32), &str)) -> String {
+        format!(
+            r#"{{
+              "nombre": "Pases", "grupo": "con_pelota", "descripcion": "Para los tests.",
+              "robots": {{ "min": 2, "max": 2 }},
+              "pelota": {{ "marca": {{ "x": {mx}, "y": {my} }} }},
+              "puestos": [
+                {{ "nombre": "A", "inicio": {{ "x": {ax}, "y": {ay}, "orientacion_deg": 0 }}, "pasos": [ {pa} ] }},
+                {{ "nombre": "B", "inicio": {{ "x": {bx}, "y": {by}, "orientacion_deg": 180 }}, "pasos": [ {pb} ] }}
+              ]
+            }}"#,
+            mx = marca.0,
+            my = marca.1,
+            ax = a.0.0,
+            ay = a.0.1,
+            pa = a.1,
+            bx = b.0.0,
+            by = b.0.1,
+            pb = b.1,
+        )
+    }
+
+    const A_PASA: &str = r#"{ "paso": "empujar", "a_puesto": "B" }, { "paso": "ir", "x": -0.40, "y": 0.0 }, { "paso": "recibir", "x": -0.40, "y": 0.0 }"#;
+    const B_PASA: &str = r#"{ "paso": "recibir", "x": 0.40, "y": 0.0 }, { "paso": "empujar", "a_puesto": "A" }, { "paso": "ir", "x": 0.40, "y": 0.0 }"#;
+
+    #[test]
+    fn a_ball_routine_like_the_included_one_is_valid() {
+        let rs = razones(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), A_PASA), ((0.40, 0.0), B_PASA)));
+        assert!(rs.is_empty(), "{rs:?}");
+    }
+
+    #[test]
+    fn ball_steps_need_the_ball_and_its_group() {
+        // Una coreografía con `recibir` y sin pelota.
+        let texto = un_puesto(r#"{ "paso": "recibir", "x": 0.2, "y": 0.1 }"#).replace("\"circuito\"", "\"coreografia\"");
+        let rs = razones(&texto);
+        assert!(tiene(&rs, "los pasos `empujar` y `recibir` necesitan `pelota`"), "{rs:?}");
+        assert!(tiene(&rs, "la pelota y sus pasos van en el grupo `con_pelota`"), "{rs:?}");
+        // El grupo con pelota sin pelota.
+        let rs = razones(&un_puesto(r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#).replace("\"circuito\"", "\"con_pelota\""));
+        assert!(tiene(&rs, "el grupo `con_pelota` necesita `pelota`"), "{rs:?}");
+        // Con pelota, todos los puestos en uso.
+        let rs = razones(
+            &dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), A_PASA), ((0.40, 0.0), B_PASA)).replace("\"min\": 2", "\"min\": 1"),
+        );
+        assert!(tiene(&rs, "robots.min (1) debe ser igual a robots.max (2)"), "{rs:?}");
+    }
+
+    #[test]
+    fn unpaired_passes_are_invalid() {
+        let dos_a_b = r#"{ "paso": "empujar", "a_puesto": "B" }, { "paso": "empujar", "a_puesto": "B" }, { "paso": "recibir", "x": -0.40, "y": 0.0 }"#;
+        let rs = razones(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), dos_a_b), ((0.40, 0.0), B_PASA)));
+        assert!(tiene(&rs, "A le pasa 2 veces a B y B recibe 1 vez"), "{rs:?}");
+        let a_si_mismo = r#"{ "paso": "empujar", "a_puesto": "A" }, { "paso": "recibir", "x": -0.40, "y": 0.0 }"#;
+        let rs = razones(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), a_si_mismo), ((0.40, 0.0), B_PASA)));
+        assert!(tiene(&rs, "puesto A, paso 1: `a_puesto` A es el mismo puesto"), "{rs:?}");
+    }
+
+    #[test]
+    fn the_ball_mark_must_not_sit_under_a_robot() {
+        let rs = razones(&dos_con_pelota((-0.35, 0.0), ((-0.40, 0.0), A_PASA), ((0.40, 0.0), B_PASA)));
+        assert!(tiene(&rs, "la marca de la pelota está a 0.05 m del inicio de A (mínimo 0.10)"), "{rs:?}");
+        let rs = razones(&dos_con_pelota((-0.62, 0.0), ((-0.40, 0.0), A_PASA), ((0.40, 0.0), B_PASA)));
+        assert!(tiene(&rs, "la marca de la pelota (-0.62, 0.00) toca el área izquierda"), "{rs:?}");
+    }
+
+    #[test]
+    fn passes_are_paired_in_order_with_their_origins() {
+        let r = crate::rutinas::prueba::rutina(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), A_PASA), ((0.40, 0.0), B_PASA)));
+        let pases = r.pases();
+        assert_eq!(pases.len(), 2);
+        // A (paso 1) le pasa a B (paso 1): la pelota sale de la marca en la primera vuelta y
+        // del último `recibir` de A desde la segunda.
+        assert_eq!(pases[0].de, (0, 0));
+        assert_eq!(pases[0].receptor, Some((1, 0)));
+        assert_eq!(pases[0].origenes, vec![Vec2::new(-0.28, 0.0), Vec2::new(-0.40, 0.0)]);
+        assert_eq!(pases[0].objetivo, Some(Vec2::new(0.40, 0.0)));
+        // B (paso 2) le pasa a A (paso 3) desde su `recibir`.
+        assert_eq!(pases[1].de, (1, 1));
+        assert_eq!(pases[1].receptor, Some((0, 2)));
+        assert_eq!(pases[1].origenes, vec![Vec2::new(0.40, 0.0)]);
+        assert_eq!(pases[1].objetivo, Some(Vec2::new(-0.40, 0.0)));
+    }
+
+    #[test]
+    fn a_pass_line_must_not_cross_an_area() {
+        // Ningún extremo toca el área, pero la recta pasa por delante del arco izquierdo.
+        let a = r#"{ "paso": "empujar", "a_puesto": "B" }"#;
+        let b = r#"{ "paso": "recibir", "x": -0.48, "y": -0.30 }"#;
+        let rs = razones(&dos_con_pelota((-0.48, 0.30), ((-0.30, 0.30), a), ((-0.30, -0.30), b)));
+        assert!(tiene(&rs, "el pase de A a B desde (-0.48, 0.30) toca el área izquierda"), "{rs:?}");
+        assert_eq!(rs.len(), 1, "solo la línea de pase: {rs:?}");
     }
 
     #[test]
@@ -481,6 +682,22 @@ mod tests {
                     assert_eq!((r.robots_min, r.robots_max), (1, 1), "{}", e.id);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_included_pass_routine_is_valid_on_both_sides() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/rutinas");
+        for lado in [1.0, -1.0] {
+            let entradas = crate::rutinas::formato::cargar_carpeta(&dir, &ContextoValidacion::por_defecto(lado)).unwrap();
+            let e = entradas.iter().find(|e| e.id == "pase_lado_a_lado").expect("pase_lado_a_lado incluida");
+            assert!(e.razones.is_empty(), "lado {lado}: {:?}", e.razones);
+            let r = e.valida().unwrap();
+            assert_eq!(r.grupo, crate::rutinas::Grupo::ConPelota);
+            assert_eq!((r.robots_min, r.robots_max), (2, 2));
+            let pases = r.pases();
+            assert_eq!(pases.len(), 2);
+            assert!(pases.iter().all(|p| p.receptor.is_some()), "los dos pases emparejados");
         }
     }
 

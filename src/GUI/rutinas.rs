@@ -6,11 +6,11 @@
 //! orden que mueve robots; las órdenes van por `GuiSetup.rutina_tx` al conmutador de
 //! `main`. El estado de la corrida llega en la foto (`LoopSnapshot::rutina`).
 
-use super::field::{Vista, ancho_texto, escribir, polilinea};
+use super::field::{BALL_RADIUS_M, Vista, ancho_texto, escribir, polilinea};
 use super::{DebugGui, Message, fonts, theme};
 use crate::control_loop::TickMode;
 use crate::params::params;
-use crate::rutinas::formato::{Accion, Duracion, Entrada, Grupo, Repeticiones, Rutina};
+use crate::rutinas::formato::{Accion, Duracion, Entrada, Grupo, Hacia, Repeticiones, Rutina};
 use crate::rutinas::vista::{Fase, RutinaVista, segundos, vueltas};
 use crate::rutinas::{ContextoValidacion, Eleccion, OpcionesCorrida, OrdenRutina, asignar};
 use crate::snapshot::LoopSnapshot;
@@ -266,6 +266,7 @@ impl DebugGui {
             asignacion: asignados.into_iter().enumerate().collect(),
             en_curso: Vec::new(),
             puestos: puestos.min(rutina.puestos.len()),
+            fantasma: rutina.pelota.is_some(),
             rutina,
         })
     }
@@ -501,6 +502,8 @@ pub struct DibujoRutina {
     pub en_curso: Vec<(usize, usize)>,
     /// Cuántos puestos dibujar.
     pub puestos: usize,
+    /// Dibujar la pelota fantasma en la marca (vista previa, preparación y lista).
+    pub fantasma: bool,
 }
 
 impl DibujoRutina {
@@ -510,6 +513,7 @@ impl DibujoRutina {
             asignacion: v.robots.iter().map(|r| (r.puesto, r.robot)).collect(),
             en_curso: v.robots.iter().filter_map(|r| r.paso.map(|p| (r.puesto, p))).collect(),
             puestos: v.robots.len().max(1).min(v.rutina.puestos.len()),
+            fantasma: v.rutina.pelota.is_some() && matches!(v.fase, Fase::Preparando | Fase::Lista),
         }
     }
 }
@@ -542,6 +546,26 @@ fn finito(p: Point) -> bool {
     p.x.is_finite() && p.y.is_finite()
 }
 
+/// Flecha punteada de un pase, con la punta llena.
+fn flecha_punteada(frame: &mut Frame, desde: Point, hasta: Point, color: Color) {
+    if !(finito(desde) && finito(hasta)) {
+        return;
+    }
+    let (dx, dy) = (hasta.x - desde.x, hasta.y - desde.y);
+    let largo = dx.hypot(dy);
+    if largo < 1.0 {
+        return;
+    }
+    let (ux, uy) = (dx / largo, dy / largo);
+    let punta = |giro: f32| {
+        let (s, c) = giro.sin_cos();
+        Point::new(hasta.x - 9.0 * (ux * c - uy * s), hasta.y - 9.0 * (ux * s + uy * c))
+    };
+    frame.stroke(&Path::line(desde, hasta), punteado(1.6, color));
+    frame.stroke(&Path::line(hasta, punta(0.5)), trazo(1.8, color));
+    frame.stroke(&Path::line(hasta, punta(-0.5)), trazo(1.8, color));
+}
+
 /// Nota corta de un paso sin traslación (`None` para `ir`).
 pub fn nota_de_paso(a: &Accion) -> Option<String> {
     match a {
@@ -550,6 +574,8 @@ pub fn nota_de_paso(a: &Accion) -> Option<String> {
         Accion::Girar { duracion: Duracion::Vueltas(v), .. } => Some(format!("gira {}", vueltas(*v).replace(" vueltas", " v").replace(" vuelta", " v"))),
         Accion::Girar { duracion: Duracion::Tiempo(t), .. } => Some(format!("gira {} s", segundos(*t))),
         Accion::Esperar { tiempo_s } => Some(format!("espera {} s", segundos(*tiempo_s))),
+        Accion::Empujar { hacia: Hacia::Puesto(n) } => Some(format!("pasa a {n}")),
+        Accion::Empujar { hacia: Hacia::Punto(_) } => Some("empuja".to_string()),
         otro => Some(otro.tipo().to_string()),
     }
 }
@@ -609,7 +635,11 @@ pub fn dibujar(frame: &mut Frame, vista: &Vista, d: &DibujoRutina, pose: impl Fn
                     let r = if actual { vista.px(0.03).max(6.0) } else { vista.px(0.015).max(3.0) };
                     frame.stroke(&Path::circle(q, r), trazo(if actual { 2.6 } else { 1.6 }, color));
                 }
-                nota(frame, dest, (i + 1).to_string(), color);
+                let t = match paso.accion {
+                    Accion::Recibir { .. } => format!("{} recibe", i + 1),
+                    _ => (i + 1).to_string(),
+                };
+                nota(frame, dest, t, color);
             } else {
                 if let Accion::Mirar { punto } = &paso.accion {
                     let (a, b) = (vista.a_pantalla(lugar), vista.a_pantalla(*punto));
@@ -620,6 +650,22 @@ pub fn dibujar(frame: &mut Frame, vista: &Vista, d: &DibujoRutina, pose: impl Fn
                 let t = format!("{} {}", i + 1, nota_de_paso(&paso.accion).unwrap_or_default());
                 nota(frame, lugar, t, color);
             }
+        }
+    }
+    // Con pelota: cada pase, del origen de la pelota al punto de recepción (con la misma
+    // función de emparejamiento que la validación), y la pelota fantasma en la marca.
+    for pase in d.rutina.pases() {
+        let en_uso = pase.de.0 < d.puestos && pase.receptor.is_none_or(|(j, _)| j < d.puestos);
+        if let (true, Some(o), Some(obj)) = (en_uso, pase.origenes.first(), pase.objetivo) {
+            flecha_punteada(frame, vista.a_pantalla(*o), vista.a_pantalla(obj), theme::alfa(theme::TIRO, 0.8));
+        }
+    }
+    if d.fantasma
+        && let Some(m) = d.rutina.pelota
+    {
+        let c = vista.a_pantalla(m);
+        if finito(c) {
+            frame.stroke(&Path::circle(c, vista.px(BALL_RADIUS_M).max(4.0)), punteado(1.6, theme::PELOTA));
         }
     }
     // Asignación: del robot a su puesto, con "A ← 1".
@@ -714,5 +760,21 @@ mod tests {
         assert_eq!(nota_de_paso(&a(r#"{ "paso": "esperar", "tiempo_s": 2 }"#)).as_deref(), Some("espera 2 s"));
         assert_eq!(nota_de_paso(&a(r#"{ "paso": "mirar", "x": 0, "y": 0 }"#)).as_deref(), Some("mira"));
         assert_eq!(nota_de_paso(&a(r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#)), None);
+        let pases = prueba::rutina(&prueba::pases());
+        assert_eq!(nota_de_paso(&pases.puestos[0].pasos[0].accion).as_deref(), Some("pasa a B"));
+    }
+
+    #[test]
+    fn the_ghost_ball_is_drawn_before_running_only() {
+        use crate::rutinas::RoutineDecider;
+        let rutina = prueba::rutina(&prueba::pases());
+        let d = RoutineDecider::vigente(rutina.clone(), OpcionesCorrida::por_defecto(&rutina, true), 0, 3);
+        let mut v = (**d.vista()).clone();
+        assert!(DibujoRutina::de_vista(&v).fantasma, "en la preparación");
+        v.fase = Fase::Ejecutando;
+        assert!(!DibujoRutina::de_vista(&v).fantasma, "no en la ejecución");
+        let sin_pelota = prueba::rutina(&prueba::un_puesto(r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#));
+        let v = RoutineDecider::vigente(sin_pelota.clone(), OpcionesCorrida::por_defecto(&sin_pelota, true), 0, 3);
+        assert!(!DibujoRutina::de_vista(v.vista()).fantasma);
     }
 }

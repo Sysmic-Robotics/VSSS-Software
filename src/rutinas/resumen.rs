@@ -45,6 +45,18 @@ pub struct Vuelta {
     /// Duración sin las pausas (s).
     pub duracion_s: f64,
     pub puestos: Vec<VueltaPuesto>,
+    /// Con pelota: (intentados, logrados) en la vuelta.
+    pub pases: Option<(u32, u32)>,
+}
+
+/// Pases de una corrida con pelota.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pases {
+    pub intentados: u32,
+    pub logrados: u32,
+    pub recuperaciones: u32,
+    /// (puesto que pasa, intentados, logrados), en el orden de los puestos.
+    pub por_puesto: Vec<(String, u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +75,8 @@ pub struct ResumenCorrida {
     pub preparacion_s: Option<f64>,
     /// Solo las vueltas completas.
     pub vueltas: Vec<Vuelta>,
+    /// Con pelota: los pases de toda la corrida (también los de la vuelta en que abortó).
+    pub pases: Option<Pases>,
 }
 
 fn r4(x: f64) -> f64 {
@@ -135,7 +149,12 @@ impl ResumenCorrida {
                         )
                     })
                     .collect();
-                json!({ "n": v.n, "duracion_s": r4(v.duracion_s), "puestos": puestos })
+                let mut vuelta = json!({ "n": v.n, "duracion_s": r4(v.duracion_s), "puestos": puestos });
+                if let Some((intentados, logrados)) = v.pases {
+                    vuelta["pases_intentados"] = json!(intentados);
+                    vuelta["pases_logrados"] = json!(logrados);
+                }
+                vuelta
             })
             .collect();
         let (media, min, max) = self.duraciones();
@@ -162,7 +181,19 @@ impl ResumenCorrida {
             "vueltas": vueltas,
             "escapes": escapes,
             "guardia": guardia,
-            "pases": Value::Null,
+            "pases": self.pases.as_ref().map_or(Value::Null, |p| {
+                let por_puesto: Map<String, Value> = p
+                    .por_puesto
+                    .iter()
+                    .map(|(n, i, l)| (n.clone(), json!({ "intentados": i, "logrados": l })))
+                    .collect();
+                json!({
+                    "intentados": p.intentados,
+                    "logrados": p.logrados,
+                    "recuperaciones": p.recuperaciones,
+                    "por_puesto": por_puesto,
+                })
+            }),
             "corrida": corrida,
         })
     }
@@ -270,9 +301,10 @@ mod tests {
             fase_aborto: Some(Fase::Ejecutando),
             preparacion_s: Some(3.2),
             vueltas: vec![
-                Vuelta { n: 1, duracion_s: 8.0, puestos: vec![vp(1, 0.01)] },
-                Vuelta { n: 2, duracion_s: 10.0, puestos: vec![vp(0, 0.03)] },
+                Vuelta { n: 1, duracion_s: 8.0, puestos: vec![vp(1, 0.01)], pases: None },
+                Vuelta { n: 2, duracion_s: 10.0, puestos: vec![vp(0, 0.03)], pases: None },
             ],
+            pases: None,
         }
     }
 
@@ -295,6 +327,28 @@ mod tests {
         assert!(j["pases"].is_null());
         assert_eq!(j["corrida"]["transporte"], "firasim");
         assert_eq!(j["repeticiones"], 3);
+    }
+
+    #[test]
+    fn json_has_the_passes_of_a_ball_routine() {
+        let mut r = resumen();
+        r.vueltas[0].pases = Some((2, 2));
+        r.vueltas[1].pases = Some((2, 1));
+        r.pases = Some(Pases {
+            intentados: 4,
+            logrados: 3,
+            recuperaciones: 1,
+            por_puesto: vec![("A".to_string(), 2, 2), ("B".to_string(), 2, 1)],
+        });
+        let j = r.a_json(json!({}));
+        assert_eq!(
+            j["pases"],
+            json!({ "intentados": 4, "logrados": 3, "recuperaciones": 1,
+                    "por_puesto": { "A": { "intentados": 2, "logrados": 2 }, "B": { "intentados": 2, "logrados": 1 } } })
+        );
+        assert_eq!((j["vueltas"][1]["pases_intentados"].clone(), j["vueltas"][1]["pases_logrados"].clone()), (json!(2), json!(1)));
+        // Sin pelota, las vueltas no traen pases.
+        assert!(resumen().a_json(json!({}))["vueltas"][0].get("pases_intentados").is_none());
     }
 
     #[test]

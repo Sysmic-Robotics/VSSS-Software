@@ -276,6 +276,76 @@ impl Rutina {
             (a, b) => format!("{a}–{b} robots"),
         }
     }
+
+    /// Los `empujar` de la rutina con su receptor y sus puntos. El n-ésimo `empujar` con
+    /// `a_puesto` B (en el orden de los puestos y de sus pasos) se empareja con el n-ésimo
+    /// `recibir` de B; la misma función sirve a la validación, al decisor y a la GUI.
+    pub fn pases(&self) -> Vec<Pase> {
+        let indice = |n: &str| self.puestos.iter().position(|p| p.nombre == n);
+        let recibir_de = |j: usize| -> Vec<usize> {
+            self.puestos[j]
+                .pasos
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.accion, Accion::Recibir { .. }))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let punto_recibir = |(j, i): (usize, usize)| match self.puestos[j].pasos[i].accion {
+            Accion::Recibir { punto } => punto,
+            _ => unreachable!("emparejado con un `recibir`"),
+        };
+        let mut usados: Vec<usize> = vec![0; self.puestos.len()];
+        let mut out = Vec::new();
+        for (k, puesto) in self.puestos.iter().enumerate() {
+            for (i, paso) in puesto.pasos.iter().enumerate() {
+                let Accion::Empujar { hacia } = &paso.accion else { continue };
+                let receptor = match hacia {
+                    Hacia::Puesto(n) => indice(n).filter(|j| *j != k).and_then(|j| {
+                        let r = recibir_de(j).get(usados[j]).map(|i| (j, *i));
+                        usados[j] += 1;
+                        r
+                    }),
+                    Hacia::Punto(_) => None,
+                };
+                let objetivo = match hacia {
+                    Hacia::Punto(p) => Some(*p),
+                    Hacia::Puesto(_) => receptor.map(punto_recibir),
+                };
+                // La pelota sale del último `recibir` del pasador antes del empuje, o de la
+                // marca en la primera vuelta; desde la segunda, del último `recibir` de la
+                // vuelta anterior.
+                let recibe = |p: &Paso| match p.accion {
+                    Accion::Recibir { punto } => Some(punto),
+                    _ => None,
+                };
+                let antes = puesto.pasos[..i].iter().rev().find_map(recibe);
+                let mut origenes: Vec<Vec2> = Vec::new();
+                match antes {
+                    Some(o) => origenes.push(o),
+                    None => {
+                        origenes.extend(self.pelota);
+                        origenes.extend(puesto.pasos[i..].iter().rev().find_map(recibe));
+                    }
+                }
+                out.push(Pase { de: (k, i), receptor, origenes, objetivo });
+            }
+        }
+        out
+    }
+}
+
+/// Un `empujar` de la rutina.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pase {
+    /// Puesto y paso del `empujar`.
+    pub de: (usize, usize),
+    /// Puesto y paso del `recibir` emparejado (`None` con `hacia` o si falta el `recibir`).
+    pub receptor: Option<(usize, usize)>,
+    /// De dónde puede salir la pelota: la marca o un punto de `recibir` del pasador.
+    pub origenes: Vec<Vec2>,
+    /// Hacia dónde: el punto de `hacia` o el del `recibir` emparejado.
+    pub objetivo: Option<Vec2>,
 }
 
 /// Distancia de `p` al tramo `a`–`b` (al punto si el tramo es nulo).
