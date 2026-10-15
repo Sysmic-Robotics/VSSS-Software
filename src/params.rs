@@ -525,11 +525,22 @@ pub struct RutinasParams {
     /// `empujar`: distancia máxima que el pasador avanza empujando antes de soltar (m).
     /// Sin el corte, si ShootPush no suelta la pelota, la conduce hasta el receptor.
     pub pase_empuje_max_m: f32,
-    /// Recepciones fallidas seguidas antes de abortar la rutina.
-    pub reintentos_max: u32,
     /// `recibir`: el receptor solo va por la pelota cuando se detuvo a esta distancia o
     /// menos de su punto (m); mientras rueda, la espera de frente.
     pub recepcion_radio_m: f32,
+    /// Con pelota: sin progreso (pase logrado, paso sin pelota terminado o vuelta cerrada)
+    /// durante este tiempo, la rutina se aborta (s). Las pausas reales no cuentan.
+    pub sin_progreso_s: f64,
+    /// Distancia a la pelota de los robots que no van por ella (rescate, despegue,
+    /// reposición) y la del perseguidor (m).
+    pub resguardo_m: f32,
+    /// Despegue: el mayor ángulo hacia adentro, desde la dirección a lo largo de la pared,
+    /// que se prueba para empujar la pelota pegada (grados).
+    pub despegue_max_deg: f32,
+    /// Rescate: el rescatador parte cuando la pelota suelta va más lenta que esto (m/s)...
+    pub rescate_vel_m_s: f32,
+    /// ... o cuando lleva este tiempo suelta, aunque siga rodando (s).
+    pub rescate_espera_s: f64,
 }
 
 impl Default for RutinasParams {
@@ -549,8 +560,12 @@ impl Default for RutinasParams {
             velocidad_sim_pct: 100,
             giro_max_rad_s: 12.0,
             pase_empuje_max_m: 0.15,
-            reintentos_max: 3,
             recepcion_radio_m: 0.25,
+            sin_progreso_s: 30.0,
+            resguardo_m: 0.30,
+            despegue_max_deg: 45.0,
+            rescate_vel_m_s: 0.15,
+            rescate_espera_s: 2.0,
         }
     }
 }
@@ -733,14 +748,35 @@ impl TeamParams {
                 r.pase_empuje_max_m
             ));
         }
-        if r.reintentos_max < 1 {
-            return Err("rutinas.reintentos_max (0) debe ser al menos 1".to_string());
-        }
         if !(r.recepcion_radio_m > 0.0 && r.recepcion_radio_m <= 0.50) {
             return Err(format!(
                 "rutinas.recepcion_radio_m ({}) debe ser mayor que cero y a lo sumo 0.50 m",
                 r.recepcion_radio_m
             ));
+        }
+        if !(5.0..=600.0).contains(&r.sin_progreso_s) {
+            return Err(format!("rutinas.sin_progreso_s ({}) debe estar entre 5 y 600 s", r.sin_progreso_s));
+        }
+        if !(r.resguardo_m >= r.distancia_minima_m && r.resguardo_m <= 0.60) {
+            return Err(format!(
+                "rutinas.resguardo_m ({}) debe estar entre distancia_minima_m ({}) y 0.60 m",
+                r.resguardo_m, r.distancia_minima_m
+            ));
+        }
+        if !(r.despegue_max_deg > 0.0 && r.despegue_max_deg <= 80.0) {
+            return Err(format!(
+                "rutinas.despegue_max_deg ({}) debe ser mayor que cero y a lo sumo 80°",
+                r.despegue_max_deg
+            ));
+        }
+        if !(r.rescate_vel_m_s > 0.0 && r.rescate_vel_m_s <= 0.60) {
+            return Err(format!(
+                "rutinas.rescate_vel_m_s ({}) debe ser mayor que cero y a lo sumo 0.60 m/s",
+                r.rescate_vel_m_s
+            ));
+        }
+        if !(0.0..=10.0).contains(&r.rescate_espera_s) {
+            return Err(format!("rutinas.rescate_espera_s ({}) debe estar entre 0 y 10 s", r.rescate_espera_s));
         }
         Ok(())
     }
@@ -1030,14 +1066,24 @@ mod tests {
     #[test]
     fn rutinas_pass_params_have_defaults_and_bounds() {
         let p = TeamParams::from_json(r#"{ "rutinas": { "tolerancia_m": 0.05 } }"#).unwrap();
-        assert_eq!((p.rutinas.pase_empuje_max_m, p.rutinas.reintentos_max), (0.15, 3));
-        assert_eq!(p.rutinas.recepcion_radio_m, 0.25);
+        assert_eq!((p.rutinas.pase_empuje_max_m, p.rutinas.recepcion_radio_m), (0.15, 0.25));
+        let r = &p.rutinas;
+        assert_eq!((r.sin_progreso_s, r.resguardo_m, r.despegue_max_deg), (30.0, 0.30, 45.0));
+        assert_eq!((r.rescate_vel_m_s, r.rescate_espera_s), (0.15, 2.0));
         for (malo, campo) in [
             (r#"{ "rutinas": { "recepcion_radio_m": 0.0 } }"#, "recepcion_radio_m"),
             (r#"{ "rutinas": { "recepcion_radio_m": 0.6 } }"#, "recepcion_radio_m"),
-            (r#"{ "rutinas": { "reintentos_max": 0 } }"#, "reintentos_max"),
             (r#"{ "rutinas": { "pase_empuje_max_m": 0.0 } }"#, "pase_empuje_max_m"),
             (r#"{ "rutinas": { "pase_empuje_max_m": 0.7 } }"#, "pase_empuje_max_m"),
+            (r#"{ "rutinas": { "sin_progreso_s": 4.0 } }"#, "sin_progreso_s"),
+            (r#"{ "rutinas": { "resguardo_m": 0.15 } }"#, "resguardo_m"),
+            (r#"{ "rutinas": { "resguardo_m": 0.7 } }"#, "resguardo_m"),
+            (r#"{ "rutinas": { "despegue_max_deg": 0.0 } }"#, "despegue_max_deg"),
+            (r#"{ "rutinas": { "despegue_max_deg": 85.0 } }"#, "despegue_max_deg"),
+            (r#"{ "rutinas": { "rescate_vel_m_s": 0.0 } }"#, "rescate_vel_m_s"),
+            (r#"{ "rutinas": { "rescate_espera_s": 11.0 } }"#, "rescate_espera_s"),
+            // Retirado: con deny_unknown_fields, el mensaje lo nombra.
+            (r#"{ "rutinas": { "reintentos_max": 3 } }"#, "reintentos_max"),
         ] {
             let err = TeamParams::from_json(malo).unwrap_err();
             assert!(err.contains(campo), "{err}");

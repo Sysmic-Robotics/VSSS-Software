@@ -15,6 +15,7 @@ pub mod asignacion;
 pub mod conmutador;
 pub mod decisor;
 pub mod formato;
+mod pelota;
 pub mod resumen;
 pub mod validacion;
 pub mod vista;
@@ -26,7 +27,7 @@ pub use asignacion::{Eleccion, asignar};
 pub use conmutador::{DecisorConRutinas, OrdenRutina};
 pub use decisor::{Entorno, OpcionesCorrida, OrdenCorrida, RoutineDecider, velocidad_valida};
 pub use formato::{Entrada, Grupo, Repeticiones, Rutina, buscar, cargar_carpeta, carpeta};
-pub use resumen::{Resultado, ResumenCorrida, TipoAborto};
+pub use resumen::{Eventos, Resultado, ResumenCorrida, TipoAborto};
 pub use validacion::ContextoValidacion;
 pub use vista::{Fase, RutinaVista};
 
@@ -82,6 +83,25 @@ pub(crate) mod prueba {
               "pasos": [ { "paso": "empujar", "a_puesto": "B" }, { "paso": "ir", "x": -0.40, "y": 0.0 }, { "paso": "recibir", "x": -0.40, "y": 0.0 } ] },
             { "nombre": "B", "inicio": { "x": 0.40, "y": 0.0, "orientacion_deg": 180 },
               "pasos": [ { "paso": "recibir", "x": 0.40, "y": 0.0 }, { "paso": "empujar", "a_puesto": "A" }, { "paso": "ir", "x": 0.40, "y": 0.0 } ] }
+          ]
+        }"#
+        .to_string()
+    }
+
+    /// Triángulo de pases de tres robots: A (−0.40, −0.25) → B (0.00, 0.30) → C (0.40, −0.25)
+    /// → A, con la marca delante de A. Cada uno recibe en su inicio y vuelve tras pasar.
+    pub fn triangulo() -> String {
+        r#"{
+          "nombre": "Triángulo de pases", "grupo": "con_pelota", "descripcion": "Para los tests.",
+          "robots": { "min": 3, "max": 3 },
+          "pelota": { "marca": { "x": -0.32, "y": -0.14 } },
+          "puestos": [
+            { "nombre": "A", "inicio": { "x": -0.40, "y": -0.25, "orientacion_deg": 54 },
+              "pasos": [ { "paso": "empujar", "a_puesto": "B" }, { "paso": "ir", "x": -0.40, "y": -0.25 }, { "paso": "recibir", "x": -0.40, "y": -0.25 } ] },
+            { "nombre": "B", "inicio": { "x": 0.0, "y": 0.30, "orientacion_deg": -54 },
+              "pasos": [ { "paso": "recibir", "x": 0.0, "y": 0.30 }, { "paso": "empujar", "a_puesto": "C" }, { "paso": "ir", "x": 0.0, "y": 0.30 } ] },
+            { "nombre": "C", "inicio": { "x": 0.40, "y": -0.25, "orientacion_deg": 180 },
+              "pasos": [ { "paso": "recibir", "x": 0.40, "y": -0.25 }, { "paso": "empujar", "a_puesto": "A" }, { "paso": "ir", "x": 0.40, "y": -0.25 } ] }
           ]
         }"#
         .to_string()

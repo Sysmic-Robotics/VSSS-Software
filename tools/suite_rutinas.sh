@@ -12,10 +12,12 @@
 # frontal en ese orden y en bidireccional en el inverso; la corrida se llama <id>_bdN_vPCT.
 # Sin VELOCIDADES, la velocidad por defecto de la simulación, 100 %).
 #
-# Falla: en los circuitos, toda corrida que no se completa. En las rutinas con pelota, solo
-# el aborto por tiempo vencido o sin tipo: se clasifica por el campo `tipo_aborto` del
-# resumen, no por la frase. Las rutinas con pelota suman la columna de pases
-# (logrados/intentados); su aceptación se corre aparte:
+# Falla: en los circuitos, toda corrida que no se completa. En las rutinas con pelota, todo
+# aborto que no sea externo (usuario, HALT, STOP, parada, corte sin visión): las situaciones
+# de juego se resuelven sin abortar. Se clasifica por el campo `tipo_aborto` del resumen, no
+# por la frase. Las rutinas con pelota suman las columnas de pases (logrados/intentados),
+# rescates (recuperaciones + cambios de rol), despegues y reposiciones; su aceptación se
+# corre aparte:
 #   RUTINAS=pase_lado_a_lado VELOCIDADES="100 60" tools/suite_rutinas.sh DIR
 #
 # FIRASim tiene que estar en tiempo real (FIRASim-realtime.sh). No correr la GUI ni otro
@@ -62,6 +64,7 @@ done
 
 python3 - "$OUT" "$errores" <<'PY'
 import glob, json, os, sys
+EXTERNOS = {"usuario", "halt", "stop", "parada", "corte_sin_vision"}
 filas, fallas = [], int(sys.argv[2])
 for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.resumen.json"))):
     j = json.load(open(p))
@@ -72,18 +75,25 @@ for p in sorted(glob.glob(os.path.join(sys.argv[1], "*.resumen.json"))):
     if j["resultado"] in ("completada", "detenida"):
         falla = False
     elif p is not None:
-        falla = j.get("tipo_aborto") in (None, "tiempo_vencido")
+        falla = j.get("tipo_aborto") not in EXTERNOS
     else:
         falla = True
+    ev = j.get("eventos") or {}
+    if p is not None:
+        resc = str(p["recuperaciones"] + ev.get("cambios_de_rol", 0))
+        desp, repo = str(ev.get("despegues", "-")), str(ev.get("reposiciones", "-"))
+    else:
+        resc = desp = repo = "-"
     fallas += falla
     filas.append((j["rutina"], modo, j["velocidad_pct"], j["resultado"], j["vueltas_completas"], j["duracion_media_s"],
-                  sum(err) / len(err) if err else None, sum(j["escapes"].values()), pases,
+                  sum(err) / len(err) if err else None, sum(j["escapes"].values()), pases, resc, desp, repo,
                   "sí" if falla else "", j.get("tipo_aborto") or "", j["causa"] or ""))
-print(f"{'rutina':<16} {'modo':<14} {'vel':>4} {'resultado':<11} {'vueltas':>7} {'s/vuelta':>8} {'err cm':>6} {'esc':>4} {'pases':>7} {'falla':>5}  {'tipo':<18} causa")
-for r, m, vel, res, n, d, e, esc, pases, falla, tipo, causa in filas:
+print(f"{'rutina':<16} {'modo':<14} {'vel':>4} {'resultado':<11} {'vueltas':>7} {'s/vuelta':>8} {'err cm':>6} {'esc':>4} "
+      f"{'pases':>7} {'resc':>4} {'desp':>4} {'repo':>4} {'falla':>5}  {'tipo':<18} causa")
+for r, m, vel, res, n, d, e, esc, pases, resc, desp, repo, falla, tipo, causa in filas:
     d = f"{d:8.2f}" if d is not None else "       -"
     e = f"{e * 100:6.1f}" if e is not None else "     -"
-    print(f"{r:<16} {m:<14} {vel:>3}% {res:<11} {n:>7} {d} {e} {esc:>4} {pases:>7} {falla:>5}  {tipo:<18} {causa}")
-print(f"{fallas} corridas con falla (criterio: 0; con pelota, solo tiempo vencido o sin tipo); resultados en {sys.argv[1]}")
+    print(f"{r:<16} {m:<14} {vel:>3}% {res:<11} {n:>7} {d} {e} {esc:>4} {pases:>7} {resc:>4} {desp:>4} {repo:>4} {falla:>5}  {tipo:<18} {causa}")
+print(f"{fallas} corridas con falla (criterio: 0; con pelota, todo aborto no externo); resultados en {sys.argv[1]}")
 sys.exit(1 if fallas else 0)
 PY

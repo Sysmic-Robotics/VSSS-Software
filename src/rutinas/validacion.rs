@@ -340,6 +340,7 @@ fn validar_pelota(r: &Rutina, ctx: &ContextoValidacion, razones: &mut Vec<String
 
     // Emparejamiento: lo que cada puesto recibe contra lo que le pasan.
     let vez = |n: usize| if n == 1 { "1 vez".to_string() } else { format!("{n} veces") };
+    let antes = razones.len();
     for b in &r.puestos {
         let recibe = b.pasos.iter().filter(|p| matches!(p.accion, Accion::Recibir { .. })).count();
         let mut pasadores: Vec<&str> = Vec::new();
@@ -364,6 +365,14 @@ fn validar_pelota(r: &Rutina, ctx: &ContextoValidacion, razones: &mut Vec<String
                 _ => format!("a {} le pasan {} y recibe {}", b.nombre, vez(le_pasan), vez(recibe)),
             });
         }
+    }
+
+    // La secuencia de la pelota (regla 5), con el emparejamiento ya bien: si no, el corte
+    // repetiría lo mismo con otras palabras.
+    if razones.len() == antes
+        && let Err(corte) = r.secuencia_pelota()
+    {
+        razones.push(corte);
     }
 
     // La marca.
@@ -636,6 +645,45 @@ mod tests {
     }
 
     #[test]
+    fn the_ball_sequence_follows_the_ball() {
+        use crate::rutinas::formato::AccionPelota;
+        let par = crate::rutinas::prueba::rutina(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), A_PASA), ((0.40, 0.0), B_PASA)));
+        assert_eq!(
+            par.secuencia_pelota(),
+            Ok(vec![
+                AccionPelota { actor: (0, 0), receptor: Some((1, 0)) },
+                AccionPelota { actor: (1, 1), receptor: Some((0, 2)) },
+            ])
+        );
+        let tri = crate::rutinas::prueba::rutina(&crate::rutinas::prueba::triangulo());
+        let actores: Vec<_> = tri.secuencia_pelota().unwrap().iter().map(|a| (a.actor, a.receptor)).collect();
+        assert_eq!(actores, vec![((0, 0), Some((1, 0))), ((1, 1), Some((2, 0))), ((2, 1), Some((0, 2)))]);
+        // Sin pasos con pelota, la secuencia vacía.
+        let circuito = crate::rutinas::prueba::rutina(&un_puesto(r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#));
+        assert_eq!(circuito.secuencia_pelota(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_broken_ball_sequence_is_invalid() {
+        // A pasa dos veces seguidas a B, que le devuelve la pelota entre medio: A tendría que
+        // recibir antes de su segundo pase.
+        let a = r#"{ "paso": "empujar", "a_puesto": "B" }, { "paso": "empujar", "a_puesto": "B" }, { "paso": "recibir", "x": -0.40, "y": 0.0 }, { "paso": "recibir", "x": -0.40, "y": 0.1 }"#;
+        let b = r#"{ "paso": "recibir", "x": 0.40, "y": 0.0 }, { "paso": "empujar", "a_puesto": "A" }, { "paso": "recibir", "x": 0.40, "y": 0.1 }, { "paso": "empujar", "a_puesto": "A" }"#;
+        let rs = razones(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), a), ((0.40, 0.0), b)));
+        assert!(tiene(&rs, "la secuencia de la pelota se corta en el paso 2 de A: A tiene que recibir antes de pasar"), "{rs:?}");
+        // Los dos empiezan pasando.
+        let a = r#"{ "paso": "empujar", "a_puesto": "B" }, { "paso": "recibir", "x": -0.40, "y": 0.0 }"#;
+        let b = r#"{ "paso": "empujar", "a_puesto": "A" }, { "paso": "recibir", "x": 0.40, "y": 0.0 }"#;
+        let rs = razones(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), a), ((0.40, 0.0), b)));
+        assert!(tiene(&rs, "A y B empiezan con la pelota; solo uno puede"), "{rs:?}");
+        // Ninguno empieza pasando.
+        let a = r#"{ "paso": "recibir", "x": -0.40, "y": 0.0 }, { "paso": "empujar", "a_puesto": "B" }"#;
+        let b = r#"{ "paso": "recibir", "x": 0.40, "y": 0.0 }, { "paso": "empujar", "a_puesto": "A" }"#;
+        let rs = razones(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), a), ((0.40, 0.0), b)));
+        assert!(tiene(&rs, "ningún puesto empieza con la pelota"), "{rs:?}");
+    }
+
+    #[test]
     fn passes_are_paired_in_order_with_their_origins() {
         let r = crate::rutinas::prueba::rutina(&dos_con_pelota((-0.28, 0.0), ((-0.40, 0.0), A_PASA), ((0.40, 0.0), B_PASA)));
         let pases = r.pases();
@@ -656,8 +704,9 @@ mod tests {
     #[test]
     fn a_pass_line_must_not_cross_an_area() {
         // Ningún extremo toca el área, pero la recta pasa por delante del arco izquierdo.
-        let a = r#"{ "paso": "empujar", "a_puesto": "B" }"#;
-        let b = r#"{ "paso": "recibir", "x": -0.48, "y": -0.30 }"#;
+        // (B le devuelve la pelota por una recta legal, para que la secuencia cierre.)
+        let a = r#"{ "paso": "empujar", "a_puesto": "B" }, { "paso": "recibir", "x": -0.30, "y": 0.30 }"#;
+        let b = r#"{ "paso": "recibir", "x": -0.48, "y": -0.30 }, { "paso": "empujar", "a_puesto": "A" }"#;
         let rs = razones(&dos_con_pelota((-0.48, 0.30), ((-0.30, 0.30), a), ((-0.30, -0.30), b)));
         assert!(tiene(&rs, "el pase de A a B desde (-0.48, 0.30) toca el área izquierda"), "{rs:?}");
         assert_eq!(rs.len(), 1, "solo la línea de pase: {rs:?}");

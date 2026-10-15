@@ -117,8 +117,12 @@
     "velocidad_sim_pct": 100,
     "giro_max_rad_s": 12.0,
     "pase_empuje_max_m": 0.15,
-    "reintentos_max": 3,
-    "recepcion_radio_m": 0.25
+    "recepcion_radio_m": 0.25,
+    "sin_progreso_s": 30.0,
+    "resguardo_m": 0.30,
+    "despegue_max_deg": 45.0,
+    "rescate_vel_m_s": 0.15,
+    "rescate_espera_s": 2.0
   },
   "manual": {
     "velocidad_real_m_s": 0.3,

@@ -174,6 +174,12 @@ pub fn frase_ejecucion(rep: u32, reps: Repeticiones, paso: usize, total: usize, 
     format!("{}, paso {} de {total}: el robot {robot} {que}", vuelta_de(rep, reps), paso + 1)
 }
 
+/// Frase de la pelota fuera de la secuencia (rescate, despegue, reposición o pausa):
+/// "Vuelta 2 de 5: el robot 1 va por la pelota suelta".
+pub fn frase_pelota(rep: u32, reps: Repeticiones, que: &str) -> String {
+    format!("{}: {que}", vuelta_de(rep, reps))
+}
+
 /// Frase de la pausa: "Pausada en la vuelta 2, paso 3 de 8".
 pub fn frase_pausa(rep: u32, paso: usize, total: usize) -> String {
     format!("Pausada en la vuelta {rep}, paso {} de {total}", paso + 1)

@@ -120,6 +120,7 @@ fn entorno(bidireccional: bool) -> Entorno {
         params: RutinasParams::default(),
         alcance_m: 0.09,
         pelota_lenta: 0.08,
+        regla10: false,
     }
 }
 

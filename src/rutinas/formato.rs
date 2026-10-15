@@ -12,6 +12,7 @@
 
 use super::validacion::{ContextoValidacion, validar};
 use glam::Vec2;
+use std::collections::HashMap;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -200,6 +201,11 @@ impl Accion {
         }
     }
 
+    /// Si el paso es con pelota (`empujar` o `recibir`).
+    pub fn con_pelota(&self) -> bool {
+        matches!(self, Accion::Empujar { .. } | Accion::Recibir { .. })
+    }
+
     /// Fase de implementación en la que el paso se ejecuta (1, 2 o 3).
     pub fn fase(&self) -> u8 {
         match self {
@@ -280,6 +286,90 @@ impl Rutina {
     /// Los `empujar` de la rutina con su receptor y sus puntos. El n-ésimo `empujar` con
     /// `a_puesto` B (en el orden de los puestos y de sus pasos) se empareja con el n-ésimo
     /// `recibir` de B; la misma función sirve a la validación, al decisor y a la GUI.
+    /// La secuencia de la pelota de una vuelta: se la sigue desde el **tenedor inicial** (el
+    /// único puesto cuyo primer paso con pelota es `empujar`); tras un `empujar a_puesto B`
+    /// la tiene B en su `recibir` emparejado, y tras un `empujar hacia` queda suelta y la
+    /// vuelta termina. Al terminar, la pelota la tiene el tenedor inicial o quedó suelta. La
+    /// misma función para la validación, el decisor y la GUI. `Err` con la frase del primer
+    /// corte; sin pasos con pelota, la secuencia vacía.
+    pub fn secuencia_pelota(&self) -> Result<Vec<AccionPelota>, String> {
+        let nombre = |k: usize| self.puestos[k].nombre.as_str();
+        let pasos: Vec<Vec<usize>> = self
+            .puestos
+            .iter()
+            .map(|p| {
+                p.pasos.iter().enumerate().filter(|(_, x)| x.accion.con_pelota()).map(|(i, _)| i).collect()
+            })
+            .collect();
+        let empuja = |k: usize, i: usize| matches!(self.puestos[k].pasos[i].accion, Accion::Empujar { .. });
+        if pasos.iter().all(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
+        let empiezan: Vec<usize> = (0..pasos.len()).filter(|&k| pasos[k].first().is_some_and(|&i| empuja(k, i))).collect();
+        let inicial = match empiezan.as_slice() {
+            [k] => *k,
+            [] => return Err("ningún puesto empieza con la pelota: el primer paso con pelota de uno tiene que ser `empujar`".to_string()),
+            varios => {
+                let n: Vec<&str> = varios.iter().map(|&k| nombre(k)).collect();
+                return Err(format!("{} empiezan con la pelota; solo uno puede", n.join(" y ")));
+            }
+        };
+        let receptor_de: HashMap<(usize, usize), Option<(usize, usize)>> =
+            self.pases().into_iter().map(|p| (p.de, p.receptor)).collect();
+        let mut sig = vec![0usize; pasos.len()];
+        let (mut h, mut suelta) = (inicial, false);
+        let mut out = Vec::new();
+        while let Some(&i) = pasos[h].get(sig[h]) {
+            if !empuja(h, i) {
+                return Err(format!(
+                    "la secuencia de la pelota se corta en el paso {} de {}: {} tiene la pelota y le toca recibir",
+                    i + 1,
+                    nombre(h),
+                    nombre(h)
+                ));
+            }
+            sig[h] += 1;
+            let receptor = receptor_de.get(&(h, i)).copied().flatten();
+            out.push(AccionPelota { actor: (h, i), receptor });
+            let Accion::Empujar { hacia } = &self.puestos[h].pasos[i].accion else { unreachable!() };
+            match (hacia, receptor) {
+                (Hacia::Punto(_), _) => {
+                    suelta = true;
+                    break;
+                }
+                (Hacia::Puesto(n), None) => {
+                    return Err(format!("la secuencia de la pelota se corta: {} le pasa a {n}, que no tiene `recibir`", nombre(h)));
+                }
+                (Hacia::Puesto(_), Some((b, ib))) => match pasos[b].get(sig[b]) {
+                    Some(&j) if j == ib => {
+                        sig[b] += 1;
+                        h = b;
+                    }
+                    Some(&j) => {
+                        return Err(format!(
+                            "la secuencia de la pelota se corta en el paso {} de {}: {} tiene que recibir antes de pasar",
+                            j + 1,
+                            nombre(b),
+                            nombre(b)
+                        ));
+                    }
+                    None => unreachable!("el `recibir` emparejado es un paso con pelota de {}", nombre(b)),
+                },
+            }
+        }
+        if let Some((k, &i)) = (0..pasos.len()).find_map(|k| pasos[k].get(sig[k]).map(|i| (k, i))) {
+            return Err(format!("la secuencia de la pelota no llega al paso {} de {}", i + 1, nombre(k)));
+        }
+        if !suelta && h != inicial {
+            return Err(format!(
+                "al terminar la vuelta la pelota la tiene {} y la vuelta empieza con {}",
+                nombre(h),
+                nombre(inicial)
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn pases(&self) -> Vec<Pase> {
         let indice = |n: &str| self.puestos.iter().position(|p| p.nombre == n);
         let recibir_de = |j: usize| -> Vec<usize> {
@@ -333,6 +423,15 @@ impl Rutina {
         }
         out
     }
+}
+
+/// Una acción con pelota de la secuencia de la vuelta (D4 de `rutinas-pelota-resiliente`):
+/// el `empujar` (puesto, paso) y, si es a un puesto, el `recibir` emparejado, donde la pelota
+/// cambia de dueño.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccionPelota {
+    pub actor: (usize, usize),
+    pub receptor: Option<(usize, usize)>,
 }
 
 /// Un `empujar` de la rutina.

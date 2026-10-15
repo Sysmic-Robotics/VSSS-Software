@@ -47,20 +47,12 @@ pub enum TipoAborto {
     Asignacion,
     /// Un paso de una fase posterior (la validación no deja cargar esas rutinas).
     PasoNoDisponible,
-    /// `rutinas.reintentos_max` recepciones fallidas seguidas.
-    LimiteReintentos,
-    /// La pelota quedó en la mitad del que pasó.
-    MitadRival,
-    /// La pelota quedó en un arco.
-    EnArco,
-    /// La pelota quedó en un área.
-    EnArea,
-    /// No hay lugar detrás de la pelota para el `empujar`.
-    SinLugar,
+    /// Con pelota: sin progreso en `rutinas.sin_progreso_s` (el vigilante).
+    SinProgreso,
 }
 
 impl TipoAborto {
-    pub const TODOS: [TipoAborto; 17] = [
+    pub const TODOS: [TipoAborto; 13] = [
         TipoAborto::TiempoVencido,
         TipoAborto::RobotSinVision,
         TipoAborto::Choque,
@@ -73,11 +65,7 @@ impl TipoAborto {
         TipoAborto::Teleport,
         TipoAborto::Asignacion,
         TipoAborto::PasoNoDisponible,
-        TipoAborto::LimiteReintentos,
-        TipoAborto::MitadRival,
-        TipoAborto::EnArco,
-        TipoAborto::EnArea,
-        TipoAborto::SinLugar,
+        TipoAborto::SinProgreso,
     ];
 
     /// El valor de `tipo_aborto` en el JSON del resumen.
@@ -95,11 +83,7 @@ impl TipoAborto {
             TipoAborto::Teleport => "teleport",
             TipoAborto::Asignacion => "asignacion",
             TipoAborto::PasoNoDisponible => "paso_no_disponible",
-            TipoAborto::LimiteReintentos => "limite_reintentos",
-            TipoAborto::MitadRival => "mitad_rival",
-            TipoAborto::EnArco => "en_arco",
-            TipoAborto::EnArea => "en_area",
-            TipoAborto::SinLugar => "sin_lugar",
+            TipoAborto::SinProgreso => "sin_progreso",
         }
     }
 }
@@ -140,6 +124,23 @@ pub struct Pases {
     pub por_puesto: Vec<(String, u32, u32)>,
 }
 
+/// Lo que resolvió una corrida con pelota sin abortar (D13).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Eventos {
+    /// Rescates que hizo un robot distinto del receptor del pase que falló.
+    pub cambios_de_rol: u32,
+    pub despegues: u32,
+    /// Despegues que no alejaron la pelota de la pared, o que vencieron su tiempo.
+    pub despegues_fallidos: u32,
+    /// Pelotas fuera de juego repuestas en la marca (simulación).
+    pub reposiciones: u32,
+    /// Pausas por pelota fuera de juego (real) y su duración total (s).
+    pub pausas: u32,
+    pub pausa_s: f64,
+    /// Tiempos vencidos de pasos con pelota y rescatadores cambiados por tiempo.
+    pub replanificaciones: u32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumenCorrida {
     pub rutina: String,
@@ -160,6 +161,8 @@ pub struct ResumenCorrida {
     pub vueltas: Vec<Vuelta>,
     /// Con pelota: los pases de toda la corrida (también los de la vuelta en que abortó).
     pub pases: Option<Pases>,
+    /// Con pelota: lo que se resolvió sin abortar.
+    pub eventos: Option<Eventos>,
 }
 
 fn r4(x: f64) -> f64 {
@@ -278,6 +281,17 @@ impl ResumenCorrida {
                     "por_puesto": por_puesto,
                 })
             }),
+            "eventos": self.eventos.as_ref().map_or(Value::Null, |e| {
+                json!({
+                    "cambios_de_rol": e.cambios_de_rol,
+                    "despegues": e.despegues,
+                    "despegues_fallidos": e.despegues_fallidos,
+                    "reposiciones": e.reposiciones,
+                    "pausas": e.pausas,
+                    "pausa_s": r4(e.pausa_s),
+                    "replanificaciones": e.replanificaciones,
+                })
+            }),
             "corrida": corrida,
         })
     }
@@ -390,6 +404,7 @@ mod tests {
                 Vuelta { n: 2, duracion_s: 10.0, puestos: vec![vp(0, 0.03)], pases: None },
             ],
             pases: None,
+            eventos: None,
         }
     }
 
@@ -445,6 +460,26 @@ mod tests {
         assert_eq!((j["vueltas"][1]["pases_intentados"].clone(), j["vueltas"][1]["pases_logrados"].clone()), (json!(2), json!(1)));
         // Sin pelota, las vueltas no traen pases.
         assert!(resumen().a_json(json!({}))["vueltas"][0].get("pases_intentados").is_none());
+    }
+
+    #[test]
+    fn json_has_the_events_of_a_ball_routine() {
+        let mut r = resumen();
+        assert!(r.a_json(json!({}))["eventos"].is_null(), "sin pelota, null");
+        r.eventos = Some(Eventos {
+            cambios_de_rol: 2,
+            despegues: 1,
+            despegues_fallidos: 0,
+            reposiciones: 3,
+            pausas: 1,
+            pausa_s: 12.345678,
+            replanificaciones: 4,
+        });
+        assert_eq!(
+            r.a_json(json!({}))["eventos"],
+            json!({ "cambios_de_rol": 2, "despegues": 1, "despegues_fallidos": 0, "reposiciones": 3,
+                    "pausas": 1, "pausa_s": 12.3457, "replanificaciones": 4 })
+        );
     }
 
     #[test]
