@@ -4,6 +4,23 @@ Motor de control en Rust para robots de fútbol **VSS/VSSS (Very Small Size Socc
 
 ---
 
+## Cómo iniciar
+
+Para una demo, sin conocer el software:
+
+1. Abre una terminal en esta carpeta y corre `tools/iniciar.sh`. Primero compila (la primera vez tarda varios minutos).
+2. Elige en el menú:
+   - **Simulador:** abre FIRASim, si no está abierto, y la interfaz. Los robots azules juegan solos; los amarillos quedan quietos.
+   - **Robots reales:** primero comprueba que llegue la visión de la cámara, que esté conectada la base station y que la cámara vea a nuestros robots. Si algo falla, dice qué hacer. Los robots empiezan a jugar apenas se abre la interfaz.
+   - **Una rutina por consola:** circuitos y bailes de `config/rutinas/`, en el simulador o con los robots reales (al 60 % de velocidad por defecto).
+3. **La barra espaciadora es la parada de emergencia:** detiene a todos los robots. Funciona con la ventana de la interfaz activa. En una rutina por consola, se detiene con Ctrl+C.
+
+Sin menú: `tools/iniciar.sh sim`, `tools/iniciar.sh real` o `tools/iniciar.sh rutina triangulo sim`. Con `--frontal`, los robots van solo de frente (por defecto usan las dos caras). Al principio de `tools/iniciar.sh` se cambian la ruta de FIRASim, el equipo y el ruido de cámara del simulador.
+
+Para tener un ícono en el escritorio y en el menú de aplicaciones: `tools/instalar_acceso.sh` (Ubuntu y WSL; `--quitar` lo borra).
+
+---
+
 ## Requisitos
 
 - **Rust** stable 1.70+
@@ -46,6 +63,7 @@ cargo run --release                  # main headless (coach decide) — default 
 VSSL_DEBUG_GUI=1 cargo run --release # main con GUI Iced
 cargo run --bin scenario --release   # banco "editar y correr" para 1 skill, GUI siempre on, CSV opcional a logs/
 cargo run --bin skill_test --release -- --help   # probador CLI (modo skill o vw)
+cargo run --bin comprobar_vision --release       # ¿llega la visión y ve a nuestros robots? (lo usa tools/iniciar.sh)
 cargo test                           # suite completa (lib + bin + doctests)
 cargo clippy                         # lint
 cargo fmt                            # formato
