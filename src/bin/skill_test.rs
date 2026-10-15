@@ -19,7 +19,7 @@ use rustengine::radio::{
     base_station::SLOT_COUNT,
     base_station::{build_frame_from_vw, clamp_vw, radio_slot},
 };
-use rustengine::rutinas::resumen::{Resultado, ResumenCorrida, corrida_json, escribir_resumen, junto_al_log};
+use rustengine::rutinas::resumen::{Resultado, ResumenCorrida, TipoAborto, corrida_json, escribir_resumen, junto_al_log};
 use rustengine::rutinas::{
     ContextoValidacion, Eleccion, OpcionesCorrida, OrdenCorrida, Repeticiones, RoutineDecider, RutinaVista,
     velocidad_valida,
@@ -1312,7 +1312,7 @@ impl TickDecider for DecisorDeConsola {
             self.rutina.ordenar(OrdenCorrida::Abortar);
         }
         if self.tope.is_some_and(|t| ctx.tick >= t) {
-            self.rutina.abortar("tiempo máximo de la corrida");
+            self.rutina.abortar(TipoAborto::TiempoVencido, "tiempo máximo de la corrida");
         }
     }
 

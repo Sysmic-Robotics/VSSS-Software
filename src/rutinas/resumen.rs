@@ -23,6 +23,87 @@ impl Resultado {
     }
 }
 
+/// Tipo de la causa con que se cerró una corrida que no se completó. Es un dato: la suite y
+/// los informes clasifican por él, y la frase (`causa`) queda para mostrar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TipoAborto {
+    /// Un paso, la recuperación, la preparación o la corrida superó su tiempo máximo.
+    TiempoVencido,
+    /// Un robot asignado dejó de verse.
+    RobotSinVision,
+    /// Dos robots propios quedaron a menos de `distancia_choque_m`.
+    Choque,
+    /// El usuario la abortó o, en bucle, la detuvo.
+    Usuario,
+    Halt,
+    Stop,
+    Parada,
+    CorteSinVision,
+    /// Un robot asignado pasó a manual o a skill de la GUI.
+    Manual,
+    /// La GUI teletransportó algo durante la ejecución o la pausa.
+    Teleport,
+    /// No se pudieron asignar robots a los puestos.
+    Asignacion,
+    /// Un paso de una fase posterior (la validación no deja cargar esas rutinas).
+    PasoNoDisponible,
+    /// `rutinas.reintentos_max` recepciones fallidas seguidas.
+    LimiteReintentos,
+    /// La pelota quedó en la mitad del que pasó.
+    MitadRival,
+    /// La pelota quedó en un arco.
+    EnArco,
+    /// La pelota quedó en un área.
+    EnArea,
+    /// No hay lugar detrás de la pelota para el `empujar`.
+    SinLugar,
+}
+
+impl TipoAborto {
+    pub const TODOS: [TipoAborto; 17] = [
+        TipoAborto::TiempoVencido,
+        TipoAborto::RobotSinVision,
+        TipoAborto::Choque,
+        TipoAborto::Usuario,
+        TipoAborto::Halt,
+        TipoAborto::Stop,
+        TipoAborto::Parada,
+        TipoAborto::CorteSinVision,
+        TipoAborto::Manual,
+        TipoAborto::Teleport,
+        TipoAborto::Asignacion,
+        TipoAborto::PasoNoDisponible,
+        TipoAborto::LimiteReintentos,
+        TipoAborto::MitadRival,
+        TipoAborto::EnArco,
+        TipoAborto::EnArea,
+        TipoAborto::SinLugar,
+    ];
+
+    /// El valor de `tipo_aborto` en el JSON del resumen.
+    pub fn etiqueta(self) -> &'static str {
+        match self {
+            TipoAborto::TiempoVencido => "tiempo_vencido",
+            TipoAborto::RobotSinVision => "robot_sin_vision",
+            TipoAborto::Choque => "choque",
+            TipoAborto::Usuario => "usuario",
+            TipoAborto::Halt => "halt",
+            TipoAborto::Stop => "stop",
+            TipoAborto::Parada => "parada",
+            TipoAborto::CorteSinVision => "corte_sin_vision",
+            TipoAborto::Manual => "manual",
+            TipoAborto::Teleport => "teleport",
+            TipoAborto::Asignacion => "asignacion",
+            TipoAborto::PasoNoDisponible => "paso_no_disponible",
+            TipoAborto::LimiteReintentos => "limite_reintentos",
+            TipoAborto::MitadRival => "mitad_rival",
+            TipoAborto::EnArco => "en_arco",
+            TipoAborto::EnArea => "en_area",
+            TipoAborto::SinLugar => "sin_lugar",
+        }
+    }
+}
+
 /// Un puesto en una vuelta completa.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VueltaPuesto {
@@ -69,6 +150,8 @@ pub struct ResumenCorrida {
     pub asignacion: Vec<(String, i32)>,
     pub resultado: Resultado,
     pub causa: Option<String>,
+    /// El tipo de la causa, como dato (`None` si se completó).
+    pub tipo_aborto: Option<TipoAborto>,
     /// Fase en la que se abortó.
     pub fase_aborto: Option<Fase>,
     /// De Preparar a Iniciar (s), si llegó a empezar.
@@ -172,6 +255,7 @@ impl ResumenCorrida {
             "asignacion": asignacion,
             "resultado": self.resultado.etiqueta(),
             "causa": self.causa,
+            "tipo_aborto": self.tipo_aborto.map(TipoAborto::etiqueta),
             "fase_aborto": self.fase_aborto.map(Fase::etiqueta),
             "preparacion_s": self.preparacion_s.map(r4),
             "vueltas_completas": self.vueltas.len(),
@@ -298,6 +382,7 @@ mod tests {
             asignacion: vec![("A".to_string(), 1)],
             resultado: Resultado::Abortada,
             causa: Some("el robot 1 dejó de verse".to_string()),
+            tipo_aborto: Some(TipoAborto::RobotSinVision),
             fase_aborto: Some(Fase::Ejecutando),
             preparacion_s: Some(3.2),
             vueltas: vec![
@@ -306,6 +391,16 @@ mod tests {
             ],
             pases: None,
         }
+    }
+
+    #[test]
+    fn abort_type_labels_are_unique_snake_case() {
+        let etiquetas: Vec<&str> = TipoAborto::TODOS.iter().map(|t| t.etiqueta()).collect();
+        let mut unicas = etiquetas.clone();
+        unicas.sort();
+        unicas.dedup();
+        assert_eq!(unicas.len(), etiquetas.len(), "{etiquetas:?}");
+        assert!(etiquetas.iter().all(|e| e.chars().all(|c| c.is_ascii_lowercase() || c == '_')), "{etiquetas:?}");
     }
 
     #[test]
@@ -320,6 +415,7 @@ mod tests {
         let j = resumen().a_json(json!({ "transporte": "firasim" }));
         assert_eq!(j["resultado"], "abortada");
         assert_eq!(j["fase_aborto"], "ejecutando");
+        assert_eq!(j["tipo_aborto"], "robot_sin_vision");
         assert_eq!(j["vueltas_completas"], 2);
         assert_eq!(j["asignacion"]["A"], 1);
         assert_eq!(j["vueltas"][1]["puestos"]["A"]["error_max_m"], 0.06);

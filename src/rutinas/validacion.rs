@@ -59,7 +59,7 @@ fn punto(p: Vec2) -> String {
     format!("({:.2}, {:.2})", p.x, p.y)
 }
 
-fn nombre_area(a: &AreaRect) -> &'static str {
+pub(super) fn nombre_area(a: &AreaRect) -> &'static str {
     if a.side < 0.0 { "el área izquierda" } else { "el área derecha" }
 }
 

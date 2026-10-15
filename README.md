@@ -452,16 +452,24 @@ skill de la GUI) sobre un robot asignado, y el teleport de la GUI durante la eje
 - `empujar`: ApproachAligned hasta quedar detrás de la pelota y alineado, y ShootPush hacia el
   punto de recepción. Termina cuando ShootPush la suelta o cuando el pasador avanzó
   `rutinas.pase_empuje_max_m` (0.15 m) empujando hacia el objetivo; sin ese corte, conduciría
-  la pelota hasta el receptor.
-- `recibir`: Mark en su punto, mirando a la pelota, mientras rueda o está lejos; solo va por
-  ella (Intercept) cuando se detuvo a `rutinas.recepcion_radio_m` (0.25 m) o menos de su punto,
-  hasta **controlarla** (a ≤ `skills.intercept_reach_radius` y más lenta que
-  `skills.intercept_min_ball_speed`, 3 ticks seguidos). No sale al encuentro de la pelota ni la
-  persigue. El tiempo máximo cuenta desde el pase.
+  la pelota hasta el receptor. Si no hay lugar detrás de la pelota (el `staging_point` de
+  ApproachAligned queda recortado contra la pared, o el robot tocaría un área aun a
+  `approach_pos_tol` de él), se aborta enseguida ("no hay lugar detrás de la pelota para
+  pasarla a B: está contra la pared").
+- `recibir`: Mark mirando a la pelota mientras rueda o está lejos; solo va por ella (Intercept)
+  cuando se detuvo a `rutinas.recepcion_radio_m` (0.25 m) o menos de su punto, hasta
+  **controlarla** (a ≤ `skills.intercept_reach_radius` y más lenta que
+  `skills.intercept_min_ball_speed`, 3 ticks seguidos). Espera en su punto o, mientras la
+  pelota viene hacia él (a `intercept_min_ball_speed` o más), se corre sobre su línea (la
+  perpendicular al pase) hasta donde va a cruzarla: no más de 0.25 m de su punto y sin tocar
+  las áreas. No sale al encuentro de la pelota. Después del contacto o de que la pelota cruce su
+  línea, va por ella aunque ruede, si está dentro de los 0.25 m y a menos de 0.3 m/s (se le
+  escapa tras pegar en una esquina). El tiempo máximo cuenta desde el pase.
 - La recepción falla si la pelota se detiene fuera del radio o se vence el tiempo: el pase
-  cuenta como intentado y no logrado, y el receptor la recupera en su punto (ApproachAligned +
-  ShootPush) y sigue con su propio pase. Solo recupera en su mitad: si la pelota quedó en la
-  otra, la rutina se aborta ("la pelota quedó en la mitad de A"). Con `rutinas.reintentos_max`
+  cuenta como intentado y no logrado, y el receptor controla la pelota donde quedó (Intercept)
+  y sigue con su propio pase desde ahí. Si la pelota quedó en la otra mitad, en un arco o en un
+  área, la rutina se aborta enseguida ("la pelota quedó en la mitad de A", "… en el arco
+  derecho", "… en el área derecha"). Con `rutinas.reintentos_max`
   (3) recepciones fallidas seguidas, se aborta ("el robot 1 no controló la pelota en 3 pases
   seguidos"); un pase logrado reinicia la cuenta.
 - **La pelota en la preparación:** en simulación se coloca sola en la marca. Con el robot real,
@@ -495,11 +503,18 @@ resumen. Código de salida: 0 completada, 2 abortada, 1 error o rutina inválida
 **Registro.** El CSV de partido suma `rutina, rutina_fase, puesto, repeticion, paso, accion`. El
 resumen por corrida (JSON junto al CSV: `<log>.resumen.json` por consola,
 `<VSSL_MATCH_LOG>.rutina-<n>-<id>.json` con la GUI) trae resultado y causa, tiempos por vuelta,
-error respecto del recorrido ideal, escapes e intervenciones del guardia.
+error respecto del recorrido ideal, escapes e intervenciones del guardia. Si no se completó,
+`tipo_aborto` da el tipo de la causa como dato (`tiempo_vencido`, `choque`, `usuario`,
+`limite_reintentos`, `mitad_rival`, `en_arco`, `en_area`, `sin_lugar`, …); la frase de `causa`
+es solo para mostrar.
 `python3 tools/rutina_comparar.py real.csv sim.csv` da MEE y DTW por vuelta (sim↔real).
 `tools/suite_rutinas.sh DIR` es la aceptación de los circuitos en FIRASim (10 vueltas, ruido,
-los dos modos). La de los pases es `RUTINAS=pase_lado_a_lado tools/suite_rutinas.sh DIR`: la
-tabla suma la tasa de pases (logrados/intentados).
+los dos modos; falla toda corrida que no se completa). La de los pases es
+`RUTINAS=pase_lado_a_lado VELOCIDADES="100 60" tools/suite_rutinas.sh DIR`: cada modo al 100 % y
+al 60 %, intercalados, y la tabla suma la velocidad y la tasa de pases (logrados/intentados).
+En una rutina con pelota solo falla el aborto por tiempo vencido o sin tipo (por `tipo_aborto`,
+no por la frase): en FIRASim la pelota casi no frena, y cero abortos es el objetivo de la
+cancha real.
 
 ## Árbitro y pelota parada (`src/coach/referee.rs`, `src/coach/plays.rs`)
 
@@ -831,7 +846,7 @@ cargo test --bin skill_test      # parser del CLI, perfiles, corte de seguridad 
 python3 -m unittest discover -s tools -p 'test_*.py'   # sysid, lectura de los CSV, medición del lazo, métricas de partido y comparación de rutinas (27 tests)
 ```
 
-**735 tests de Rust** (más 27 de Python: sysid, lectura de los CSV, medición del lazo, métricas de partido y comparación de rutinas) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, tope de frenado, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración), foto del lazo para la GUI (publicar nunca espera, temporización, fuente de cada comando, consultar el estado de la skill no cambia los comandos, contadores de visión) y GUI (vista y orientación, regla y área del reglamento, parches del Anexo 1, frases de la barra de estado y de las filas, teclado del modo manual, contraste AA, fuentes tabulares, y la cancha dibujada con tiny-skia con datos no finitos) y parada segura (ceros al terminar, también con un pánico, señales, GUI supervisada, tick sin comandos y corte sin visión) y depuración por tick (comandos idénticos con la exportación, coach, navegación, guardia, columnas del CSV de partido, capas, panel "Por qué" y teleport arrastrando) y rutinas (formato y validación, asignación, quietud, pasos, cada causa de aborto, perfil de velocidad con la restauración exacta y el coach nunca escalado, conmutador de la GUI con pánico atrapado, los cinco circuitos de punta a punta en la planta, columnas del CSV, resumen, pestaña y capa U, y el modo rutina del CLI; y los pases: validación y emparejamiento, empuje con corte, recepción, reintento y tope, la pelota en la preparación y la pelota fantasma).
+**742 tests de Rust** (más 27 de Python: sysid, lectura de los CSV, medición del lazo, métricas de partido y comparación de rutinas) cubriendo: UVF, motion (ley de seguimiento de heading, rampa, tope de frenado, y una planta diferencial de test con límite de aceleración por rueda y latencia), recuperación de atasco (con la gracia al arrancar desde el reposo), rodeo de la pelota y de las áreas por la tangente, ZoneGuard (con el arco del área), PID, Environment, radio (cinemática inversa + frames + golden tests del contrato base station + ruedas de FIRASim + teleport en grados), skills (catálogo, reinicio al cambiar de skill, BlockLine, ShootPush/Clear desde la línea de empuje y con la puerta de giro, SpinKick, GoalKeep, ApproachAligned), observation/coach, world, tracker, vision, control_loop (FixedSkillDecider, CoachDecider frame-skip, orden de los reflejos, HALT/STOP del árbitro y parada de emergencia, frame de la base en cero), skill_log (CsvLogger + row-builder compartido, frame de la base entre comillas), sysid (perfiles dentro de la cancha y con pausas; capa de actuador real: tope por rueda, zona muerta, retardo y primer orden, ganancias, descuento de FIRASim, estado por robot, validación del archivo de calibración), foto del lazo para la GUI (publicar nunca espera, temporización, fuente de cada comando, consultar el estado de la skill no cambia los comandos, contadores de visión) y GUI (vista y orientación, regla y área del reglamento, parches del Anexo 1, frases de la barra de estado y de las filas, teclado del modo manual, contraste AA, fuentes tabulares, y la cancha dibujada con tiny-skia con datos no finitos) y parada segura (ceros al terminar, también con un pánico, señales, GUI supervisada, tick sin comandos y corte sin visión) y depuración por tick (comandos idénticos con la exportación, coach, navegación, guardia, columnas del CSV de partido, capas, panel "Por qué" y teleport arrastrando) y rutinas (formato y validación, asignación, quietud, pasos, cada causa de aborto, perfil de velocidad con la restauración exacta y el coach nunca escalado, conmutador de la GUI con pánico atrapado, los cinco circuitos de punta a punta en la planta, columnas del CSV, resumen, pestaña y capa U, y el modo rutina del CLI; y los pases: validación y emparejamiento, empuje con corte, recepción, reintento y tope, la pelota en la preparación y la pelota fantasma).
 
 ### Plotting de runs (`tools/plot_run.py`)
 

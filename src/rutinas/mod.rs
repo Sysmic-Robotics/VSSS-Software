@@ -26,7 +26,7 @@ pub use asignacion::{Eleccion, asignar};
 pub use conmutador::{DecisorConRutinas, OrdenRutina};
 pub use decisor::{Entorno, OpcionesCorrida, OrdenCorrida, RoutineDecider, velocidad_valida};
 pub use formato::{Entrada, Grupo, Repeticiones, Rutina, buscar, cargar_carpeta, carpeta};
-pub use resumen::{Resultado, ResumenCorrida};
+pub use resumen::{Resultado, ResumenCorrida, TipoAborto};
 pub use validacion::ContextoValidacion;
 pub use vista::{Fase, RutinaVista};
 
