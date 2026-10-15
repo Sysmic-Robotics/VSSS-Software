@@ -12,6 +12,16 @@ use crate::snapshot::{CommandSource, OwnRobotView};
 use iced::widget::{Column, progress_bar, row, text};
 use iced::{Alignment, Element, Length};
 
+/// La nota sin depuración del coach: con el coach en pausa y sin rutina, lo dice en
+/// vez de que el coach no explica sus decisiones (`coach-pausa`).
+pub fn nota_sin_depuracion(coach_en_pausa: bool) -> &'static str {
+    if coach_en_pausa {
+        "el coach está en pausa: los robots libres quedan quietos"
+    } else {
+        "Este coach no explica sus decisiones."
+    }
+}
+
 /// Lo que hace el robot con su skill, para el título ("se está alineando").
 fn haciendo(skill: SkillId) -> &'static str {
     match skill {
@@ -198,7 +208,8 @@ impl DebugGui {
         let coach = self.snap.debug.as_ref().and_then(|d| d.coach.as_ref());
         let Some(coach) = coach.filter(|_| propio) else {
             if propio {
-                col = col.push(nota("Este coach no explica sus decisiones."));
+                let pausa = self.coach_en_pausa() && self.snap.rutina.is_none();
+                col = col.push(nota(nota_sin_depuracion(pausa)));
             }
             return col.into();
         };
@@ -369,6 +380,13 @@ mod tests {
                 duelos: r,
             },
         }
+    }
+
+    #[test]
+    fn paused_coach_note_replaces_the_no_debug_note() {
+        assert_eq!(nota_sin_depuracion(true), "el coach está en pausa: los robots libres quedan quietos");
+        assert!(!nota_sin_depuracion(true).contains("no explica"));
+        assert_eq!(nota_sin_depuracion(false), "Este coach no explica sus decisiones.");
     }
 
     #[test]

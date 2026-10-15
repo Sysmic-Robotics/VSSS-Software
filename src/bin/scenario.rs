@@ -183,6 +183,7 @@ fn run_bench(
         teleport_tx: None,
         rutina_tx: None, // las rutinas se lanzan desde main con GUI
         estop,
+        coach_pausa: None, // una skill fija: no hay coach que pausar
         run: GUI::RunInfo::from_env(
             transport,
             vision,

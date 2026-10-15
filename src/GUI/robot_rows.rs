@@ -34,9 +34,11 @@ pub fn nombre_rol(rol: Role) -> &'static str {
 }
 
 /// Texto al lado del nombre: el rol (o la fuente del comando si no es el coach) y la
-/// posición de radio.
-pub fn al_lado(vista: Option<&OwnRobotView>, radio: Option<usize>) -> String {
+/// posición de radio. `pausa`: el coach está en pausa y no hay rutina, así que lo que
+/// manda el decisor es el Hold de la pausa (`coach-pausa`).
+pub fn al_lado(vista: Option<&OwnRobotView>, radio: Option<usize>, pausa: bool) -> String {
     let quien = vista.and_then(|v| match v.source {
+        Some(CommandSource::Coach) if pausa => Some("quieto, coach en pausa"),
         Some(CommandSource::Coach) => v.role.map(nombre_rol),
         Some(CommandSource::GuiSkill) => Some("skill de la GUI"),
         Some(CommandSource::Manual) => Some("control manual"),
@@ -100,8 +102,15 @@ pub fn avisos_robot(
     out
 }
 
-/// Datos de la fila del robot propio `id`.
-pub fn datos_fila(id: i32, run: &RunInfo, snap: &LoopSnapshot, skill_warning: Option<&str>) -> DatosFila {
+/// Datos de la fila del robot propio `id`. `coach_en_pausa`: el interruptor del coach
+/// (la fila lo dice solo sin rutina en la foto).
+pub fn datos_fila(
+    id: i32,
+    run: &RunInfo,
+    snap: &LoopSnapshot,
+    skill_warning: Option<&str>,
+    coach_en_pausa: bool,
+) -> DatosFila {
     let vista = snap.own_robot(id);
     let robot = snap.robot(run.own_team, id);
     let skill = vista.and_then(|v| {
@@ -127,7 +136,7 @@ pub fn datos_fila(id: i32, run: &RunInfo, snap: &LoopSnapshot, skill_warning: Op
         .map(|(v, w)| par(v, w));
     DatosFila {
         titulo: format!("Robot {id}"),
-        al_lado: al_lado(vista, run.radio_slot(id)),
+        al_lado: al_lado(vista, run.radio_slot(id), coach_en_pausa && snap.rutina.is_none()),
         skill,
         cara,
         pedido,
@@ -170,7 +179,7 @@ impl DebugGui {
             let aviso_skill = (seleccionado && self.active_skill.is_some())
                 .then_some(self.snap.skill_warning.as_deref())
                 .flatten();
-            let d = datos_fila(id, &self.run, &self.snap, aviso_skill);
+            let d = datos_fila(id, &self.run, &self.snap, aviso_skill, self.coach_en_pausa());
             filas = filas
                 .push(horizontal_rule(1).style(theme::filete))
                 .push(self.fila_robot(id, d, seleccionado));
@@ -328,7 +337,7 @@ mod tests {
             robots: vec![robot(0, 0, 0.0)],
             ..LoopSnapshot::default()
         };
-        let d = datos_fila(0, &run_info_de_prueba(), &snap, None);
+        let d = datos_fila(0, &run_info_de_prueba(), &snap, None, false);
         assert_eq!(d.titulo, "Robot 0");
         assert_eq!(d.al_lado, "atacante");
         assert_eq!(d.skill.as_deref(), Some("ApproachAligned, 72 %"));
@@ -339,13 +348,45 @@ mod tests {
     }
 
     #[test]
+    fn paused_coach_says_so_only_without_a_routine() {
+        use crate::rutinas::vista::{Fase, RutinaVista};
+        let mut snap = LoopSnapshot {
+            own: vec![vista(0, CommandSource::Manual), vista(1, CommandSource::Coach), vista(2, CommandSource::Halt)],
+            robots: vec![robot(0, 1, 0.0)],
+            ..LoopSnapshot::default()
+        };
+        let run = run_info_de_prueba();
+        assert_eq!(datos_fila(1, &run, &snap, None, true).al_lado, "quieto, coach en pausa");
+        assert_eq!(datos_fila(0, &run, &snap, None, true).al_lado, "control manual");
+        assert_eq!(datos_fila(2, &run, &snap, None, true).al_lado, "detenido");
+        assert_ne!(datos_fila(1, &run, &snap, None, false).al_lado, "quieto, coach en pausa");
+        let rutina = crate::rutinas::prueba::rutina(&crate::rutinas::prueba::un_puesto(
+            r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#,
+        ));
+        for fase in [Fase::Preparando, Fase::Ejecutando] {
+            snap.rutina = Some(std::sync::Arc::new(RutinaVista {
+                rutina: rutina.clone(),
+                fase,
+                frase: String::new(),
+                velocidad_pct: 100,
+                repeticion: 0,
+                repeticiones: crate::rutinas::Repeticiones::Veces(1),
+                robots: Vec::new(),
+                resumen: None,
+            }));
+            let d = datos_fila(1, &run, &snap, None, true);
+            assert!(!d.al_lado.contains("coach en pausa"), "{fase:?}: {}", d.al_lado);
+        }
+    }
+
+    #[test]
     fn manual_control_replaces_the_role_and_shows_no_skill() {
         let snap = LoopSnapshot {
             own: vec![vista(0, CommandSource::Coach), vista(1, CommandSource::Manual)],
             robots: vec![robot(0, 1, 0.0)],
             ..LoopSnapshot::default()
         };
-        let d = datos_fila(1, &run_info_de_prueba(), &snap, None);
+        let d = datos_fila(1, &run_info_de_prueba(), &snap, None, false);
         assert_eq!(d.al_lado, "control manual");
         assert_eq!(d.skill, None);
     }
@@ -362,7 +403,7 @@ mod tests {
             own: vec![v],
             ..LoopSnapshot::default()
         };
-        assert_eq!(datos_fila(1, &run, &snap, None).al_lado, "apoyo, radio 0");
+        assert_eq!(datos_fila(1, &run, &snap, None, false).al_lado, "apoyo, radio 0");
     }
 
     #[test]
@@ -371,10 +412,10 @@ mod tests {
             robots: vec![robot(0, 2, 2.3)],
             ..LoopSnapshot::default()
         };
-        let d = datos_fila(2, &run_info_de_prueba(), &snap, None);
+        let d = datos_fila(2, &run_info_de_prueba(), &snap, None, false);
         assert!(d.avisos.contains(&"no lo vemos hace 2.3 s".to_string()), "{:?}", d.avisos);
         assert_eq!(d.medido, None);
-        let d = datos_fila(1, &run_info_de_prueba(), &snap, None);
+        let d = datos_fila(1, &run_info_de_prueba(), &snap, None, false);
         assert!(d.avisos.contains(&"no lo vemos".to_string()));
     }
 
@@ -390,7 +431,7 @@ mod tests {
             robots: vec![robot(0, 0, 0.0)],
             ..LoopSnapshot::default()
         };
-        let d = datos_fila(0, &run_info_de_prueba(), &snap, None);
+        let d = datos_fila(0, &run_info_de_prueba(), &snap, None, false);
         assert!(d.avisos.contains(&"v recortada al tope".to_string()));
         assert_eq!(d.pedido.as_deref(), Some("1.50 m/s, 0.00 rad/s"));
     }
@@ -404,7 +445,7 @@ mod tests {
             robots: vec![robot(0, 1, 0.0)],
             ..LoopSnapshot::default()
         };
-        let d = datos_fila(1, &run_info_de_prueba(), &snap, Some("la skill no corre: x"));
+        let d = datos_fila(1, &run_info_de_prueba(), &snap, Some("la skill no corre: x"), false);
         assert!(d.avisos.contains(&"escapando de un atasco".to_string()));
         assert!(d.avisos.contains(&"la skill no corre: x".to_string()));
         assert_eq!(d.al_lado, "skill de la GUI");

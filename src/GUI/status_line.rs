@@ -148,13 +148,54 @@ impl Salud {
     }
 }
 
+/// Los robots de los dos jugadores del modo manual `(equipo, id)`, para sus frases.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VistaJugadores {
+    pub j1: (i32, i32),
+    pub j2: Option<(i32, i32)>,
+}
+
+/// Frases del modo manual: una por jugador, con su robot y sus teclas (el equipo, si el
+/// robot del jugador 1 es rival), y cómo salir.
+pub fn frases_manual(j: VistaJugadores, own_team: i32) -> Vec<String> {
+    let robot = |(team, id): (i32, i32)| {
+        if team == own_team {
+            format!("robot {id}")
+        } else {
+            format!("robot {} {id}", if team == 0 { "azul" } else { "amarillo" })
+        }
+    };
+    vec![
+        format!("Jugador 1, {}: W, A, S y D para mover, E para el giro corto", robot(j.j1)),
+        match j.j2 {
+            Some(r) => format!("Jugador 2, {}: flechas para mover, Enter para el giro corto", robot(r)),
+            None => "Jugador 2: Shift y click en un robot para jugar".to_string(),
+        },
+        "Esc sale del modo manual".to_string(),
+    ]
+}
+
+/// La frase del coach: en pausa, lo dice y va destacada (no es anormal).
+fn frase_coach(nombre: &str, en_pausa: bool) -> Frase {
+    if en_pausa {
+        Frase {
+            texto: format!("{nombre} en pausa: los robots libres quedan quietos"),
+            alerta: false,
+            destacada: true,
+        }
+    } else {
+        Frase::normal(nombre)
+    }
+}
+
 /// Frases de la barra, en orden: contexto (modo, coach, árbitro, modo manual, parada
 /// y configuraciones anormales) y después la salud.
 pub fn frases_estado(
     run: &RunInfo,
     snap: &LoopSnapshot,
     tasas: &Tasas,
-    manual: Option<u32>,
+    manual: Option<VistaJugadores>,
+    coach_en_pausa: bool,
 ) -> Vec<Frase> {
     let mut out = Vec::new();
 
@@ -170,12 +211,12 @@ pub fn frases_estado(
     }
     out.push(Frase::normal(texto));
 
-    out.push(Frase::normal(match run.coach {
-        CoachKind::Heuristic => "coach heurístico".to_string(),
-        CoachKind::RuleBased => "coach por reglas".to_string(),
-        CoachKind::Off => "sin coach".to_string(),
-        CoachKind::Fixed(skill) => format!("skill fija: {skill:?}"),
-    }));
+    out.push(match run.coach {
+        CoachKind::Heuristic => frase_coach("coach heurístico", coach_en_pausa),
+        CoachKind::RuleBased => frase_coach("coach por reglas", coach_en_pausa),
+        CoachKind::Off => Frase::normal("sin coach"),
+        CoachKind::Fixed(skill) => Frase::normal(format!("skill fija: {skill:?}")),
+    });
 
     out.push(match snap.referee {
         None => Frase::normal("sin árbitro"),
@@ -195,12 +236,12 @@ pub fn frases_estado(
         }
     });
 
-    if let Some(id) = manual {
-        out.push(Frase {
-            texto: format!("Modo manual: las teclas mueven el robot {id}, Esc para salir"),
+    if let Some(j) = manual {
+        out.extend(frases_manual(j, run.own_team).into_iter().map(|texto| Frase {
+            texto,
             alerta: false,
             destacada: true,
-        });
+        }));
     }
     if snap.estop {
         out.push(Frase::alerta_si("Parada de emergencia: todos en cero", true));
@@ -264,12 +305,30 @@ pub fn frases_estado(
     out
 }
 
+/// Texto del interruptor del coach.
+pub fn texto_boton_coach(en_pausa: bool) -> &'static str {
+    if en_pausa { "Coach: en pausa (P)" } else { "Coach: activo (P)" }
+}
+
 impl DebugGui {
+    /// Interruptor del coach, inmediatamente a la izquierda de "Detener todo".
+    fn boton_coach(&self) -> Element<'_, Message> {
+        let en_pausa = self.coach_en_pausa();
+        button(text(texto_boton_coach(en_pausa)).size(theme::TXT))
+            .padding([6, 12])
+            .style(theme::boton_opcion(en_pausa))
+            .on_press(Message::ToggleCoach)
+            .into()
+    }
+
     /// Franja de hoja a todo el ancho: título, frases (pasan a otra línea si no
     /// entran) y "Detener todo".
     pub(super) fn vista_estado(&self) -> Element<'_, Message> {
-        let manual = self.manual_enabled.then_some(self.selected_robot);
-        let frases = frases_estado(&self.run, &self.snap, &self.salud.tasas(), manual);
+        let manual = self.manual_enabled.then(|| VistaJugadores {
+            j1: self.robot_j1(),
+            j2: self.robot_j2,
+        });
+        let frases = frases_estado(&self.run, &self.snap, &self.salud.tasas(), manual, self.coach_en_pausa());
 
         let mut fila = Row::new()
             .spacing(theme::SP_LG + 8.0)
@@ -304,7 +363,9 @@ impl DebugGui {
         container(
             // El container afloja los límites: a un hijo `Fill` de una fila, iced le
             // pasa `min = max`, y `Wrapping` se los pasaría a cada frase.
-            row![container(fila.wrap()).width(Length::Fill), parada]
+            row![container(fila.wrap()).width(Length::Fill)]
+                .push_maybe(self.coach_pausa.is_some().then(|| self.boton_coach()))
+                .push(parada)
                 .spacing(theme::SP_LG)
                 .align_y(Alignment::Center),
         )
@@ -418,7 +479,7 @@ mod tests {
         let mut run = run_info_de_prueba();
         run.bidirectional = true;
         run.noise_proxy = true;
-        let f = frases_estado(&run, &snap_sano(), &tasas_sanas(), None);
+        let f = frases_estado(&run, &snap_sano(), &tasas_sanas(), None, false);
         let t = textos(&f);
         assert!(t.contains(&"Simulación en FIRASim, modo bidireccional, ruido de cámara activo"), "{t:?}");
         assert!(t.contains(&"coach heurístico"));
@@ -436,7 +497,7 @@ mod tests {
         run.vision_source = VisionSource::SslVision;
         let mut t = tasas_sanas();
         t.velocidad_sim = None;
-        let f = frases_estado(&run, &snap_sano(), &t, None);
+        let f = frases_estado(&run, &snap_sano(), &t, None, false);
         assert_eq!(f[0].texto, "Robots reales por la base, modo frontal");
         assert!(!textos(&f).iter().any(|x| x.contains("FIRASim")));
     }
@@ -445,7 +506,7 @@ mod tests {
     fn late_simulator_is_an_alert() {
         let mut t = tasas_sanas();
         t.velocidad_sim = Some(0.928);
-        let f = frases_estado(&run_info_de_prueba(), &snap_sano(), &t, None);
+        let f = frases_estado(&run_info_de_prueba(), &snap_sano(), &t, None, false);
         let sim = f.iter().find(|x| x.texto.starts_with("FIRASim")).unwrap();
         assert_eq!(sim.texto, "FIRASim corre al 93 % del tiempo real");
         assert!(sim.alerta);
@@ -455,7 +516,7 @@ mod tests {
     fn radio_down_is_an_alert() {
         let mut snap = snap_sano();
         snap.radio.last_ok = Some(false);
-        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
         assert!(f.iter().any(|x| x.texto == "La radio no está enviando" && x.alerta));
     }
 
@@ -464,7 +525,7 @@ mod tests {
         let mut run = run_info_de_prueba();
         run.vision_source = VisionSource::SslVision;
         run.noise_proxy = true;
-        let f = frases_estado(&run, &snap_sano(), &tasas_sanas(), None);
+        let f = frases_estado(&run, &snap_sano(), &tasas_sanas(), None, false);
         assert!(f.iter().any(|x| x.alerta && x.texto.contains("cámara real")));
         assert!(!f[0].texto.contains("ruido"), "con la cámara real no es el ruido del simulador");
     }
@@ -473,7 +534,7 @@ mod tests {
     fn tracker_off_is_an_alert() {
         let mut run = run_info_de_prueba();
         run.tracker_on = false;
-        let f = frases_estado(&run, &snap_sano(), &tasas_sanas(), None);
+        let f = frases_estado(&run, &snap_sano(), &tasas_sanas(), None, false);
         assert!(f.iter().any(|x| x.alerta && x.texto.contains("Kalman")));
     }
 
@@ -481,11 +542,11 @@ mod tests {
     fn stop_halt_and_estop() {
         let mut snap = snap_sano();
         snap.referee = Some(RefereeView { foul: Foul::Stop, seq: 2 });
-        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
         assert!(f.iter().any(|x| x.texto == "Árbitro: STOP, solo corrigen orientación" && !x.alerta));
         snap.referee = Some(RefereeView { foul: Foul::Halt, seq: 3 });
         snap.estop = true;
-        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
         assert!(f.iter().any(|x| x.texto == "Árbitro: HALT, todos detenidos" && x.alerta));
         assert!(f.iter().any(|x| x.texto == "Parada de emergencia: todos en cero" && x.alerta));
     }
@@ -494,19 +555,61 @@ mod tests {
     fn the_blind_cut_is_an_alert() {
         const FRASE: &str = "Sin visión de nuestros robots: equipo detenido";
         let mut snap = snap_sano();
-        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
         assert!(!f.iter().any(|x| x.texto == FRASE), "en juego no aparece");
         snap.mode = TickMode::SinVision;
-        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
         assert!(f.iter().any(|x| x.texto == FRASE && x.alerta));
     }
 
     #[test]
     fn manual_mode_is_highlighted_not_an_alert() {
-        let f = frases_estado(&run_info_de_prueba(), &snap_sano(), &tasas_sanas(), Some(1));
-        let m = f.iter().find(|x| x.texto.starts_with("Modo manual")).unwrap();
-        assert_eq!(m.texto, "Modo manual: las teclas mueven el robot 1, Esc para salir");
-        assert!(m.destacada && !m.alerta);
+        let j = VistaJugadores { j1: (0, 1), j2: None };
+        let f = frases_estado(&run_info_de_prueba(), &snap_sano(), &tasas_sanas(), Some(j), false);
+        let manual: Vec<&Frase> = f.iter().filter(|x| x.destacada).collect();
+        let t: Vec<&str> = manual.iter().map(|x| x.texto.as_str()).collect();
+        assert_eq!(
+            t,
+            [
+                "Jugador 1, robot 1: W, A, S y D para mover, E para el giro corto",
+                "Jugador 2: Shift y click en un robot para jugar",
+                "Esc sale del modo manual",
+            ]
+        );
+        assert!(manual.iter().all(|x| !x.alerta));
+    }
+
+    #[test]
+    fn two_players_and_a_rival_robot() {
+        let j = VistaJugadores { j1: (0, 1), j2: Some((0, 2)) };
+        assert_eq!(
+            frases_manual(j, 0)[..2],
+            [
+                "Jugador 1, robot 1: W, A, S y D para mover, E para el giro corto".to_string(),
+                "Jugador 2, robot 2: flechas para mover, Enter para el giro corto".to_string(),
+            ]
+        );
+        let rival = VistaJugadores { j1: (1, 1), j2: None };
+        assert_eq!(
+            frases_manual(rival, 0)[0],
+            "Jugador 1, robot amarillo 1: W, A, S y D para mover, E para el giro corto"
+        );
+        let f = frases_estado(&run_info_de_prueba(), &snap_sano(), &tasas_sanas(), None, false);
+        assert!(!f.iter().any(|x| x.texto.starts_with("Jugador")), "sin modo manual no hay frases");
+    }
+
+    #[test]
+    fn paused_coach_is_highlighted_not_an_alert() {
+        let f = frases_estado(&run_info_de_prueba(), &snap_sano(), &tasas_sanas(), None, true);
+        let c = f.iter().find(|x| x.texto.starts_with("coach")).unwrap();
+        assert_eq!(c.texto, "coach heurístico en pausa: los robots libres quedan quietos");
+        assert!(c.destacada && !c.alerta);
+        let mut run = run_info_de_prueba();
+        run.coach = CoachKind::RuleBased;
+        let f = frases_estado(&run, &snap_sano(), &tasas_sanas(), None, true);
+        assert!(textos(&f).contains(&"coach por reglas en pausa: los robots libres quedan quietos"));
+        assert_eq!(texto_boton_coach(true), "Coach: en pausa (P)");
+        assert_eq!(texto_boton_coach(false), "Coach: activo (P)");
     }
 
     #[test]
@@ -515,7 +618,7 @@ mod tests {
         snap.timing.hz = 58.0;
         let mut t = tasas_sanas();
         t.perdidas = Some(0.03);
-        let f = frases_estado(&run_info_de_prueba(), &snap, &t, None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &t, None, false);
         assert!(f.iter().any(|x| x.texto.starts_with("Lazo 58.0 Hz") && x.alerta));
         assert!(f.iter().any(|x| x.texto == "Pierde el 3.0 % de los cuadros" && x.alerta));
     }
@@ -524,7 +627,7 @@ mod tests {
     fn latency_when_known() {
         let mut snap = snap_sano();
         snap.vision.latency_ms = Some(92.4);
-        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
         assert!(textos(&f).contains(&"Visión 60 cuadros/s, 92 ms"));
     }
 
@@ -532,7 +635,7 @@ mod tests {
     fn no_vision() {
         let mut snap = snap_sano();
         snap.vision.frames = 0;
-        let f = frases_estado(&run_info_de_prueba(), &snap, &Tasas::default(), None);
+        let f = frases_estado(&run_info_de_prueba(), &snap, &Tasas::default(), None, false);
         assert!(f.iter().any(|x| x.texto == "Sin visión" && x.alerta));
     }
 
@@ -540,7 +643,7 @@ mod tests {
     fn no_text_uses_middle_dots_or_warning_signs() {
         let mut snap = snap_sano();
         snap.estop = true;
-        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), Some(0));
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), Some(VistaJugadores { j1: (0, 0), j2: Some((0, 1)) }), true);
         assert!(f.iter().all(|x| !x.texto.contains('·') && !x.texto.contains('⚠')));
     }
 }

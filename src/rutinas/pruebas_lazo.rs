@@ -593,3 +593,205 @@ fn the_included_circuits_complete_in_the_test_plant() {
 /// volver (medido al 100 %, en los dos modos).
 const ERROR_MAX_CORDURA_M: f64 = 0.25;
 
+
+// ─── Coach en pausa y robot manual (control-manual-doble) ───────────────────
+
+/// Decisor de base espía de tres robots: GoTo para los ids 0–2, y anota los ticks.
+struct EspiaTres {
+    ticks: Arc<Mutex<Vec<u32>>>,
+}
+
+impl TickDecider for EspiaTres {
+    fn decide(&mut self, tick: u32, _world: &World) -> Vec<SkillChoice> {
+        self.ticks.lock().unwrap().push(tick);
+        (0..3)
+            .map(|id| SkillChoice { robot_id: id, skill_id: SkillId::GoTo, target: Vec2::new(0.2, 0.1 * id as f32) })
+            .collect()
+    }
+
+    fn role(&self, _robot_id: i32) -> Option<Role> {
+        Some(Role::Support)
+    }
+}
+
+/// Los tres robots propios vistos: el 0 en el inicio de `prueba::un_puesto`, los otros
+/// lejos de su recorrido y de las áreas.
+fn tres_robots() -> World {
+    let mut w = World::new(3, 3);
+    for (id, p) in [(0, INICIO), (1, Vec2::new(-0.2, 0.3)), (2, Vec2::new(0.4, 0.3))] {
+        w.update_robot(id, 0, p, 0.0, Vec2::ZERO, 0.0);
+    }
+    w.update_ball(Vec2::new(0.0, -0.9), Vec2::ZERO);
+    w
+}
+
+/// El conmutador de `main` con el interruptor del coach.
+struct ConPausa {
+    lazo: Lazo,
+    d: DecisorConRutinas,
+    tx: mpsc::Sender<OrdenRutina>,
+    ticks: Arc<Mutex<Vec<u32>>>,
+    pausa: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConPausa {
+    fn nuevo(en_pausa: bool) -> Self {
+        let (tx, rx) = mpsc::channel(8);
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let pausa = Arc::new(std::sync::atomic::AtomicBool::new(en_pausa));
+        let d = DecisorConRutinas::new(Box::new(EspiaTres { ticks: ticks.clone() }), rx, 0, 3)
+            .con_pausa(pausa.clone());
+        Self { lazo: Lazo::new(false), d, tx, ticks, pausa }
+    }
+
+    /// Un tick de juego: comandos y elecciones aplicadas.
+    fn tick(&mut self) -> (Vec<MotionCommand>, Vec<SkillChoice>) {
+        self.lazo.paso(TickMode::Play, false, false, &tres_robots(), &mut self.d)
+    }
+
+    fn decisiones(&self) -> usize {
+        self.ticks.lock().unwrap().len()
+    }
+
+    fn pausar(&self, en_pausa: bool) {
+        self.pausa.store(en_pausa, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn manual(&mut self, id: i32, vx: f64) {
+        let m = ManualCommand { team: 0, id, vx, vy: 0.0, omega: 0.0 };
+        self.lazo.manual.insert((0, id), (m, self.lazo.tick));
+    }
+}
+
+fn skill_de(elecciones: &[SkillChoice], id: i32) -> Option<SkillId> {
+    elecciones.iter().find(|e| e.robot_id == id).map(|e| e.skill_id)
+}
+
+fn comando_de(cmds: &[MotionCommand], id: i32) -> MotionCommand {
+    cmds.iter().find(|c| c.id == id && c.team == 0).expect("comando del robot").clone()
+}
+
+fn rapidez(c: &MotionCommand) -> f64 {
+    c.vx.hypot(c.vy)
+}
+
+#[test]
+fn paused_coach_is_not_consulted_and_every_seen_robot_holds() {
+    let mut c = ConPausa::nuevo(true);
+    for _ in 0..5 {
+        let (cmds, elecciones) = c.tick();
+        for id in 0..3 {
+            assert_eq!(skill_de(&elecciones, id), Some(SkillId::Hold), "robot {id}");
+        }
+        assert!(all_zero(&cmds), "{cmds:?}");
+    }
+    assert_eq!(c.decisiones(), 0, "en pausa el coach no se consulta");
+    assert_eq!(c.d.role(0), None);
+    assert!(c.d.coach_debug().is_none());
+    // Reanudar: desde el tick siguiente decide el coach.
+    c.pausar(false);
+    let (_, elecciones) = c.tick();
+    assert_eq!(c.decisiones(), 1);
+    assert_eq!(skill_de(&elecciones, 1), Some(SkillId::GoTo));
+    assert_eq!(c.d.role(0), Some(Role::Support));
+}
+
+#[test]
+fn gui_skill_and_manual_still_work_while_paused() {
+    let mut c = ConPausa::nuevo(true);
+    c.manual(0, 0.2);
+    let skill = GuiSkillCommand { team: 0, id: 1, skill_id: SkillId::GoTo, target: Vec2::new(0.3, 0.3), spin_omega: 20.0 };
+    c.lazo.gui.insert((0, 1), (skill, c.lazo.tick));
+    for _ in 0..3 {
+        let (cmds, elecciones) = c.tick();
+        assert_eq!(comando_de(&cmds, 0).vx, 0.2, "el manual pasa");
+        assert_eq!(skill_de(&elecciones, 1), Some(SkillId::GoTo), "la skill de la GUI corre");
+        assert_eq!(skill_de(&elecciones, 2), Some(SkillId::Hold), "el robot libre, quieto");
+    }
+    assert_eq!(c.decisiones(), 0);
+}
+
+#[test]
+fn a_routine_runs_while_paused_and_closing_leaves_everyone_holding() {
+    let mut c = ConPausa::nuevo(true);
+    let rutina = prueba::rutina(&prueba::un_puesto(r#"{ "paso": "esperar", "tiempo_s": 0.3 }"#));
+    c.tx.try_send(OrdenRutina::Preparar { rutina, opciones: opciones(100, true) }).unwrap();
+    let mut termino = false;
+    for _ in 0..300 {
+        c.tick();
+        if c.d.fase() == Some(Fase::Terminada) {
+            termino = true;
+            break;
+        }
+    }
+    assert!(termino, "la rutina corre igual con el coach en pausa: {:?}", c.d.fase());
+    c.tx.try_send(OrdenRutina::Cerrar).unwrap();
+    c.tick();
+    assert_eq!(c.d.fase(), None);
+    let (cmds, elecciones) = c.tick();
+    for id in 0..3 {
+        assert_eq!(skill_de(&elecciones, id), Some(SkillId::Hold), "robot {id}");
+    }
+    assert!(all_zero(&cmds));
+    assert_eq!(c.decisiones(), 0, "el coach no se consultó en toda la corrida");
+}
+
+#[test]
+fn active_coach_holds_the_manual_robot_from_the_next_tick() {
+    let mut c = ConPausa::nuevo(false);
+    c.tick();
+    c.manual(1, 0.25);
+    let (cmds, elecciones) = c.tick();
+    assert_eq!(skill_de(&elecciones, 1), Some(SkillId::GoTo), "en el tick N todavía no lo sabe");
+    assert_eq!(comando_de(&cmds, 1).vx, 0.25);
+    for _ in 0..3 {
+        let (cmds, elecciones) = c.tick();
+        assert_eq!(skill_de(&elecciones, 1), Some(SkillId::Hold), "desde N + 1, Hold por dentro");
+        assert_eq!(comando_de(&cmds, 1).vx, 0.25, "lo enviado es el manual");
+        assert_eq!(skill_de(&elecciones, 0), Some(SkillId::GoTo), "los otros siguen con el coach");
+        assert_eq!(skill_de(&elecciones, 2), Some(SkillId::GoTo));
+    }
+    assert!(c.decisiones() >= 5, "el coach sigue decidiendo");
+}
+
+#[test]
+fn releasing_the_manual_restarts_the_coach_skill_ramp() {
+    let mut c = ConPausa::nuevo(false);
+    for _ in 0..3 {
+        c.tick();
+    }
+    c.manual(1, 0.25);
+    for _ in 0..15 {
+        c.tick();
+    }
+    c.lazo.manual.clear();
+    // Un tick más con Hold (los intervenidos son del tick anterior) y vuelve el coach.
+    let (cmds, elecciones) = c.tick();
+    assert_eq!(skill_de(&elecciones, 1), Some(SkillId::Hold));
+    assert_eq!(rapidez(&comando_de(&cmds, 1)), 0.0);
+    let (cmds, elecciones) = c.tick();
+    assert_eq!(skill_de(&elecciones, 1), Some(SkillId::GoTo));
+    let (v0, v1) = (rapidez(&comando_de(&cmds, 0)), rapidez(&comando_de(&cmds, 1)));
+    assert!(v0 > 0.1, "el robot 0 lleva rato en GoTo: {v0}");
+    assert!(v1 < 0.05, "el robot 1 arranca con la rampa desde cero: {v1}");
+}
+
+#[test]
+fn the_pause_shows_also_in_ticks_without_decide() {
+    // Desde el arranque, aunque los primeros ticks sean de corte sin visión.
+    let c = ConPausa::nuevo(true);
+    assert_eq!(c.d.role(0), None, "antes del primer tick");
+    // Pausar durante una parada (HALT): el lazo no llama a decide.
+    let mut c = ConPausa::nuevo(false);
+    c.tick();
+    assert_eq!(c.d.role(0), Some(Role::Support));
+    c.pausar(true);
+    c.lazo.paso(TickMode::Halt, true, false, &tres_robots(), &mut c.d);
+    assert_eq!(c.d.role(0), None, "en pausa durante la parada");
+    c.lazo.paso(TickMode::SinVision, false, false, &tres_robots(), &mut c.d);
+    assert_eq!(c.d.role(0), None, "y en el corte sin visión");
+    assert_eq!(c.decisiones(), 1, "el coach no se consultó en esos ticks");
+    c.pausar(false);
+    c.lazo.paso(TickMode::Halt, false, false, &tres_robots(), &mut c.d);
+    assert_eq!(c.d.role(0), Some(Role::Support), "al reanudar, otra vez el coach");
+}

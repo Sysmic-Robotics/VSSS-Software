@@ -555,6 +555,64 @@ impl Default for RutinasParams {
     }
 }
 
+/// Control manual de la GUI (`gui-manual-control`): topes de velocidad por transporte y
+/// el giro corto de los jugadores. Las velocidades son a la vez el valor de arranque y el
+/// tope de la GUI; las aceleraciones de la rampa son constantes de la GUI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ManualParams {
+    /// Velocidad lineal máxima con la base station (m/s): 0.30 + 3·0.0375 = 0.41 m/s por
+    /// rueda, bajo el tope de 450 mm/s del firmware.
+    pub velocidad_real_m_s: f64,
+    /// Velocidad lineal máxima en simulación (m/s).
+    pub velocidad_sim_m_s: f64,
+    /// Velocidad angular máxima del giro con A/D o las flechas (rad/s).
+    pub giro_rad_s: f64,
+    /// Giro corto (E o Enter): velocidad angular (rad/s), la del firmware en giro puro.
+    pub spin_rad_s: f64,
+    /// Giro corto: duración del pulso (s).
+    pub spin_s: f64,
+}
+
+impl Default for ManualParams {
+    fn default() -> Self {
+        Self {
+            velocidad_real_m_s: 0.30,
+            velocidad_sim_m_s: 0.50,
+            giro_rad_s: 3.0,
+            spin_rad_s: 12.0,
+            spin_s: 0.3,
+        }
+    }
+}
+
+impl ManualParams {
+    /// Rangos: velocidades en (0, 1.5] m/s; giros en (0, 12.5] rad/s, bajo el tope del
+    /// frame de 720 °/s; el pulso en (0, 1] s.
+    pub fn validate(&self) -> Result<(), String> {
+        let rangos = [
+            ("velocidad_real_m_s", self.velocidad_real_m_s, 1.5, "m/s"),
+            ("velocidad_sim_m_s", self.velocidad_sim_m_s, 1.5, "m/s"),
+            ("giro_rad_s", self.giro_rad_s, 12.5, "rad/s"),
+            ("spin_rad_s", self.spin_rad_s, 12.5, "rad/s"),
+            ("spin_s", self.spin_s, 1.0, "s"),
+        ];
+        for (nombre, v, max, unidad) in rangos {
+            if !(v > 0.0 && v <= max) {
+                return Err(format!(
+                    "manual.{nombre} ({v}) debe ser mayor que cero y a lo sumo {max} {unidad}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Tope (y arranque) de la velocidad lineal según el transporte.
+    pub fn velocidad_m_s(&self, base_station: bool) -> f64 {
+        if base_station { self.velocidad_real_m_s } else { self.velocidad_sim_m_s }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TeamParams {
@@ -565,6 +623,7 @@ pub struct TeamParams {
     pub sim: SimRobotParams,
     pub vision: VisionParams,
     pub rutinas: RutinasParams,
+    pub manual: ManualParams,
 }
 
 static PARAMS: OnceLock<TeamParams> = OnceLock::new();
@@ -583,6 +642,7 @@ impl TeamParams {
         p.robot.validate()?;
         p.validate_tolerances()?;
         p.validate_rutinas()?;
+        p.manual.validate()?;
         if p.vision.blind_stop_s <= 0.0 {
             return Err(format!(
                 "vision.blind_stop_s ({}) debe ser mayor que cero: es el tiempo sin ver robots \
@@ -923,6 +983,37 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH);
         let p = TeamParams::from_file(&path).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(p.rutinas, d, "el JSON del repo trae los valores por defecto");
+    }
+
+    #[test]
+    fn manual_defaults_repo_file_and_missing_section() {
+        let d = ManualParams::default();
+        assert_eq!((d.velocidad_real_m_s, d.velocidad_sim_m_s), (0.30, 0.50));
+        assert_eq!((d.giro_rad_s, d.spin_rad_s, d.spin_s), (3.0, 12.0, 0.3));
+        assert_eq!((d.velocidad_m_s(true), d.velocidad_m_s(false)), (0.30, 0.50));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH);
+        let p = TeamParams::from_file(&path).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(p.manual, d, "el JSON del repo trae los valores por defecto");
+        let sin = TeamParams::from_json(r#"{ "rutinas": { "tolerancia_m": 0.05 } }"#).unwrap();
+        assert_eq!(sin.manual, d, "sin la sección, los valores por defecto");
+    }
+
+    #[test]
+    fn manual_ranges_name_their_key() {
+        for (json, clave) in [
+            (r#"{ "manual": { "velocidad_real_m_s": 0.0 } }"#, "manual.velocidad_real_m_s"),
+            (r#"{ "manual": { "velocidad_sim_m_s": 1.6 } }"#, "manual.velocidad_sim_m_s"),
+            (r#"{ "manual": { "giro_rad_s": -1.0 } }"#, "manual.giro_rad_s"),
+            (r#"{ "manual": { "spin_rad_s": 20.0 } }"#, "manual.spin_rad_s"),
+            (r#"{ "manual": { "spin_s": 0.0 } }"#, "manual.spin_s"),
+            (r#"{ "manual": { "spin_s": 1.5 } }"#, "manual.spin_s"),
+        ] {
+            let err = TeamParams::from_json(json).unwrap_err();
+            assert!(err.contains(clave) && err.contains("a lo sumo"), "{json}: {err}");
+        }
+        let bordes = r#"{ "manual": { "velocidad_real_m_s": 1.5, "spin_rad_s": 12.5, "spin_s": 1.0 } }"#;
+        assert!(TeamParams::from_json(bordes).is_ok());
+        assert!(TeamParams::from_json(r#"{ "manual": { "marco": "mundo" } }"#).is_err());
     }
 
     #[test]

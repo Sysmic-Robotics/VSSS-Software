@@ -29,6 +29,48 @@ impl CoachKind {
     }
 }
 
+impl CoachKind {
+    /// Hay un coach que se puede pausar (`coach-pausa`): el heurístico o el de reglas.
+    pub fn se_puede_pausar(self) -> bool {
+        matches!(self, CoachKind::Heuristic | CoachKind::RuleBased)
+    }
+}
+
+/// Variable que hace partir la GUI con el coach en pausa (`coach-pausa`).
+pub const COACH_PAUSA_ENV: &str = "VSSL_COACH_PAUSA";
+
+/// `VSSL_COACH_PAUSA`, sin mayúsculas ni espacios: `1`, `true` u `on` → en pausa;
+/// `0`, `false`, `off`, vacía o ausente → activo. Otro valor es un error, con la frase
+/// de los valores aceptados: con un error de tipeo, el coach no debe jugar.
+pub fn coach_pausa_de(valor: Option<&str>) -> Result<bool, String> {
+    let v = valor.unwrap_or("").trim().to_ascii_lowercase();
+    match v.as_str() {
+        "1" | "true" | "on" => Ok(true),
+        "" | "0" | "false" | "off" => Ok(false),
+        _ => Err(format!(
+            "{COACH_PAUSA_ENV}='{}' no vale: usa 1, true u on (coach en pausa), o 0, false u off (activo)",
+            valor.unwrap_or("")
+        )),
+    }
+}
+
+/// `coach_pausa_de` con lo que dio `std::env::var`: un valor que no es texto válido
+/// tampoco arranca (no se toma como ausente, que dejaría jugar al coach).
+pub fn coach_pausa_de_var(var: Result<String, std::env::VarError>) -> Result<bool, String> {
+    match var {
+        Ok(v) => coach_pausa_de(Some(&v)),
+        Err(std::env::VarError::NotPresent) => coach_pausa_de(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{COACH_PAUSA_ENV} no es texto válido: usa 1, true u on (coach en pausa), o 0, false u off (activo)"
+        )),
+    }
+}
+
+/// `coach_pausa_de` con el entorno.
+pub fn coach_pausa_from_env() -> Result<bool, String> {
+    coach_pausa_de_var(std::env::var(COACH_PAUSA_ENV))
+}
+
 /// Configuración de la corrida.
 #[derive(Debug, Clone)]
 pub struct RunInfo {
@@ -117,6 +159,32 @@ pub(crate) fn run_info_de_prueba() -> RunInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coach_pause_values() {
+        for v in ["1", "true", "on", " TRUE ", "On"] {
+            assert_eq!(coach_pausa_de(Some(v)), Ok(true), "{v:?}");
+        }
+        for v in [None, Some(""), Some("0"), Some("false"), Some("OFF"), Some(" 0 ")] {
+            assert_eq!(coach_pausa_de(v), Ok(false), "{v:?}");
+        }
+        let err = coach_pausa_de(Some("si")).unwrap_err();
+        assert!(err.contains("VSSL_COACH_PAUSA='si'") && err.contains("1, true u on"), "{err}");
+        assert_eq!(coach_pausa_de(Some("of f")).map_err(|_| ()), Err(()), "solo se recortan los extremos");
+        use std::os::unix::ffi::OsStringExt;
+        let no_texto = std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0xff]));
+        assert!(coach_pausa_de_var(Err(no_texto)).is_err(), "un valor que no es texto no arranca");
+        assert_eq!(coach_pausa_de_var(Err(std::env::VarError::NotPresent)), Ok(false));
+        assert_eq!(coach_pausa_de_var(Ok("1".to_string())), Ok(true));
+    }
+
+    #[test]
+    fn only_a_real_coach_can_be_paused() {
+        assert!(CoachKind::Heuristic.se_puede_pausar());
+        assert!(CoachKind::RuleBased.se_puede_pausar());
+        assert!(!CoachKind::Off.se_puede_pausar());
+        assert!(!CoachKind::Fixed(SkillId::GoTo).se_puede_pausar());
+    }
 
     #[test]
     fn radio_slot_only_with_the_base_station() {

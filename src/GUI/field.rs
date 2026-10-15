@@ -29,7 +29,7 @@ use crate::radio::TeleportItem;
 use crate::snapshot::{LoopSnapshot, RobotView};
 use glam::Vec2;
 use iced::widget::canvas::{self, Cache, Frame, Path, Stroke};
-use iced::{Color, Point, Rectangle, Renderer, Size, Theme, mouse};
+use iced::{Color, Point, Rectangle, Renderer, Size, Theme, keyboard, mouse};
 use std::collections::{BTreeMap, HashSet};
 
 /// Ancho de las paredes vistas desde arriba (2.5 cm, reglamento).
@@ -321,10 +321,19 @@ pub struct FieldCanvas<'a> {
     pub sim: bool,
     /// Rutina de la capa U: la activa o la elegida (vista previa).
     pub rutina: Option<super::rutinas::DibujoRutina>,
+    /// Modo manual: el click corto sobre un robot propio lo asigna a un jugador, y se
+    /// dibujan las marcas de los jugadores (el jugador 1 es `selected`).
+    pub modo_manual: bool,
+    /// Robot del jugador 2.
+    pub jugador2: Option<(i32, i32)>,
+    /// Ids propios válidos: `0..num_robots`.
+    pub num_robots: usize,
 }
 
 /// Un arrastre de menos de esto (px) es un click.
 const CLICK_PX: f32 = 4.0;
+/// Trazo del anillo del jugador 2 (px).
+const ANILLO_J2: &[f32] = &[5.0, 4.0];
 
 /// Lo que se puede arrastrar para teletransportar (solo en simulación).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -347,6 +356,19 @@ pub fn arrastrable_en(snap: &LoopSnapshot, mundo: Vec2, radio_pelota: f32) -> Op
         .filter(|r| (r.position - mundo).length() <= tag::ROBOT_HALF_M)
         .min_by(|a, b| (a.position - mundo).length().total_cmp(&(b.position - mundo).length()))
         .map(|r| Arrastrable::Robot { team: r.team, id: r.id, pos: r.position, theta: r.orientation as f32 })
+}
+
+/// El robot propio bajo el click, para asignarlo a un jugador: activo, con id en
+/// `0..num_robots` y a menos de su medio lado; el más cercano. La pelota no cuenta, así
+/// que con la pelota pegada a la cara el click elige el robot.
+pub fn robot_propio_en(snap: &LoopSnapshot, mundo: Vec2, own_team: i32, num_robots: usize) -> Option<i32> {
+    snap.robots
+        .iter()
+        .filter(|r| r.team == own_team && r.active && pose_finita(r))
+        .filter(|r| r.id >= 0 && (r.id as usize) < num_robots)
+        .filter(|r| (r.position - mundo).length() <= tag::ROBOT_HALF_M)
+        .min_by(|a, b| (a.position - mundo).length().total_cmp(&(b.position - mundo).length()))
+        .map(|r| r.id)
 }
 
 /// El teleport al soltar: mover (botón izquierdo) u orientar hacia `mundo` (derecho).
@@ -384,6 +406,9 @@ pub struct Arrastre {
 #[derive(Debug, Default)]
 pub struct EstadoCancha {
     arrastre: Option<Arrastre>,
+    /// Shift, de los eventos de teclado que llegan al canvas en orden con los del mouse
+    /// (el de una suscripción podría llegar después del click).
+    shift: bool,
 }
 
 impl canvas::Program<Message> for FieldCanvas<'_> {
@@ -398,8 +423,13 @@ impl canvas::Program<Message> for FieldCanvas<'_> {
     ) -> (canvas::event::Status, Option<Message>) {
         use canvas::event::Status;
         let vista = Vista::new(bounds.size(), self.orientacion);
-        let canvas::Event::Mouse(evento) = event else {
-            return (Status::Ignored, None);
+        let evento = match event {
+            canvas::Event::Mouse(evento) => evento,
+            canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
+                state.shift = m.shift();
+                return (Status::Ignored, None);
+            }
+            _ => return (Status::Ignored, None),
         };
         match evento {
             mouse::Event::ButtonPressed(boton @ (mouse::Button::Left | mouse::Button::Right)) => {
@@ -417,7 +447,7 @@ impl canvas::Program<Message> for FieldCanvas<'_> {
                     return (Status::Captured, None);
                 }
                 if !orientar && en_cancha(mundo) {
-                    return (Status::Captured, Some(Message::FieldClicked(mundo)));
+                    return (Status::Captured, self.click(state, mundo));
                 }
             }
             mouse::Event::CursorMoved { .. } => {
@@ -430,9 +460,10 @@ impl canvas::Program<Message> for FieldCanvas<'_> {
                 if let Some(a) = state.arrastre.take() {
                     let movido = (a.actual.x - a.inicio.x).hypot(a.actual.y - a.inicio.y);
                     if movido < CLICK_PX {
-                        // Click corto: lo de siempre (fijar el target de la skill de la GUI).
+                        // Click corto: lo de siempre (asignar un robot en el modo manual, o
+                        // fijar el target de la skill de la GUI).
                         let mundo = vista.a_mundo(a.inicio);
-                        let click = (!a.orientar && en_cancha(mundo)).then_some(Message::FieldClicked(mundo));
+                        let click = (!a.orientar && en_cancha(mundo)).then(|| self.click(state, mundo)).flatten();
                         return (Status::Captured, click);
                     }
                     let mensaje = teleport_al_soltar(a.que, a.orientar, vista.a_mundo(a.actual))
@@ -699,6 +730,30 @@ fn dibujar_regla(frame: &mut Frame, vista: &Vista, trazos: bool) {
 }
 
 impl FieldCanvas<'_> {
+    /// Lo que hace un click (corto) izquierdo en `mundo`: dentro del modo manual, asignar
+    /// el robot propio bajo el cursor (nada si no hay uno); fuera, fijar el target.
+    fn click(&self, state: &EstadoCancha, mundo: Vec2) -> Option<Message> {
+        if !self.modo_manual {
+            return Some(Message::FieldClicked(mundo));
+        }
+        robot_propio_en(self.snap, mundo, self.own_team, self.num_robots)
+            .map(|id| Message::ClicRobot { id, shift: state.shift })
+    }
+
+    /// El rótulo del jugador que maneja el robot, solo con el modo manual activo.
+    fn jugador_de(&self, team: i32, id: i32) -> Option<&'static str> {
+        if !self.modo_manual {
+            return None;
+        }
+        if self.selected == Some((team, id)) {
+            Some("J1")
+        } else if self.jugador2 == Some((team, id)) {
+            Some("J2")
+        } else {
+            None
+        }
+    }
+
     fn dibujar_objetos(&self, frame: &mut Frame, vista: &Vista, trazos: bool) {
         let a_pantalla = |p: Vec2| vista.a_pantalla(p);
         let visibles = self
@@ -731,6 +786,29 @@ impl FieldCanvas<'_> {
                         .with_width(1.6)
                         .with_color(theme::alfa(theme::CAL, 0.8)),
                 );
+            }
+            if let Some(jugador) = self.jugador_de(r.team, r.id) {
+                if jugador == "J2" {
+                    // El jugador 2 se distingue por la forma: anillo punteado de cal.
+                    frame.stroke(
+                        &Path::circle(c, vista.px(SELECTION_RADIUS_M)),
+                        Stroke {
+                            line_dash: canvas::LineDash { segments: ANILLO_J2, offset: 0 },
+                            ..Stroke::default().with_width(1.6).with_color(theme::alfa(theme::CAL, 0.8))
+                        },
+                    );
+                }
+                // Abajo del robot, donde la capa Skills no dibuja nada para un manual.
+                let ancho = ancho_texto(jugador, theme::TXT_CHICO);
+                let rotulo_jugador = canvas::Text {
+                    content: jugador.to_string(),
+                    position: Point::new(c.x - ancho / 2.0, c.y + vista.px(SELECTION_RADIUS_M) + 2.0),
+                    color: theme::CAL,
+                    size: theme::TXT_CHICO.into(),
+                    font: fonts::TITULO,
+                    ..canvas::Text::default()
+                };
+                escribir(frame, rotulo_jugador, trazos);
             }
             let texto = canvas::Text {
                 content: rotulo(r.team == self.own_team, r.id, self.radio_slots),
@@ -960,5 +1038,186 @@ mod tests {
         let pelota = Arrastrable::Pelota { pos: Vec2::ZERO };
         assert!(teleport_al_soltar(pelota, true, Vec2::ONE).is_none(), "la pelota no se orienta");
         assert!(matches!(teleport_al_soltar(pelota, false, Vec2::new(0.2, 0.1)), Some(TeleportItem::Ball { vx, vy, .. }) if vx == 0.0 && vy == 0.0));
+    }
+
+    // ─── Click sobre un robot en el modo manual (control-manual-doble) ───────
+
+    fn robot_en(team: i32, id: i32, x: f32, y: f32) -> RobotView {
+        RobotView {
+            team,
+            id,
+            position: Vec2::new(x, y),
+            orientation: 0.0,
+            velocity: Vec2::ZERO,
+            angular_velocity: 0.0,
+            active: true,
+            age_s: 0.0,
+        }
+    }
+
+    /// Robots propios 0 y 2, un rival, un propio con id fuera de la planilla, y la
+    /// pelota pegada a la cara del robot 2.
+    fn foto_jugadores() -> LoopSnapshot {
+        LoopSnapshot {
+            robots: vec![
+                robot_en(0, 0, -0.3, 0.0),
+                robot_en(0, 2, 0.2, 0.2),
+                robot_en(0, 5, 0.0, -0.4),
+                robot_en(1, 1, 0.4, -0.2),
+            ],
+            ball: Some(crate::snapshot::BallView { position: Vec2::new(0.2 + 0.06, 0.2), velocity: Vec2::ZERO }),
+            ..LoopSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn own_robot_under_the_click() {
+        let s = foto_jugadores();
+        assert_eq!(robot_propio_en(&s, Vec2::new(0.21, 0.2), 0, 3), Some(2), "la pelota pegada no cuenta");
+        assert_eq!(robot_propio_en(&s, Vec2::new(-0.3, 0.02), 0, 3), Some(0));
+        assert_eq!(robot_propio_en(&s, Vec2::new(0.4, -0.2), 0, 3), None, "rival");
+        assert_eq!(robot_propio_en(&s, Vec2::new(0.0, -0.4), 0, 3), None, "id fuera de la planilla");
+        assert_eq!(robot_propio_en(&s, Vec2::new(0.0, 0.3), 0, 3), None, "en el vacío");
+    }
+
+    /// Eventos sintéticos al `update` de la cancha; devuelve el último mensaje.
+    fn eventos(cancha: &FieldCanvas<'_>, estado: &mut EstadoCancha, lista: &[(canvas::Event, Point)]) -> Option<Message> {
+        let bounds = Rectangle::with_size(size());
+        let mut ultimo = None;
+        for (evento, p) in lista {
+            let (_, m) = canvas::Program::update(cancha, estado, evento.clone(), bounds, mouse::Cursor::Available(*p));
+            if m.is_some() {
+                ultimo = m;
+            }
+        }
+        ultimo
+    }
+
+    fn apretar() -> canvas::Event {
+        canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+    }
+
+    fn soltar() -> canvas::Event {
+        canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+    }
+
+    fn mover(p: Point) -> canvas::Event {
+        canvas::Event::Mouse(mouse::Event::CursorMoved { position: p })
+    }
+
+    fn shift(on: bool) -> canvas::Event {
+        let m = if on { keyboard::Modifiers::SHIFT } else { keyboard::Modifiers::empty() };
+        canvas::Event::Keyboard(keyboard::Event::ModifiersChanged(m))
+    }
+
+    #[test]
+    fn short_click_assigns_a_player_inside_manual_mode() {
+        let snap = foto_jugadores();
+        let (base, capas, trazas) = (Cache::new(), HashSet::new(), Trazas::default());
+        for sim in [true, false] {
+            let cancha = FieldCanvas {
+                snap: &snap,
+                base: &base,
+                fieltro: Fieltro::Verde,
+                orientacion: OrientacionVista::Normal,
+                marcas: MarcasRobot::Anexo1,
+                own_team: 0,
+                selected: Some((0, 0)),
+                skill_target: None,
+                radio_slots: None,
+                capas: &capas,
+                trazas: &trazas,
+                sim,
+                rutina: None,
+                modo_manual: true,
+                jugador2: None,
+                num_robots: 3,
+            };
+            let vista = Vista::new(size(), OrientacionVista::Normal);
+            let p = vista.a_pantalla(Vec2::new(0.2, 0.2));
+            let mut estado = EstadoCancha::default();
+            let m = eventos(&cancha, &mut estado, &[(apretar(), p), (soltar(), p)]);
+            assert!(matches!(m, Some(Message::ClicRobot { id: 2, shift: false })), "sim = {sim}: {m:?}");
+
+            let m = eventos(&cancha, &mut estado, &[(shift(true), p), (apretar(), p), (soltar(), p)]);
+            assert!(matches!(m, Some(Message::ClicRobot { id: 2, shift: true })), "sim = {sim}: {m:?}");
+            let m = eventos(&cancha, &mut estado, &[(shift(false), p), (apretar(), p), (soltar(), p)]);
+            assert!(matches!(m, Some(Message::ClicRobot { id: 2, shift: false })), "sim = {sim}: {m:?}");
+
+            let rival = vista.a_pantalla(Vec2::new(0.4, -0.2));
+            let vacio = vista.a_pantalla(Vec2::new(0.0, 0.3));
+            for q in [rival, vacio] {
+                let m = eventos(&cancha, &mut estado, &[(apretar(), q), (soltar(), q)]);
+                assert!(m.is_none(), "sim = {sim}: ni target ni asignación: {m:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn outside_manual_the_click_sets_the_target_and_a_drag_teleports() {
+        let snap = foto_jugadores();
+        let (base, capas, trazas) = (Cache::new(), HashSet::new(), Trazas::default());
+        let mut cancha = FieldCanvas {
+            snap: &snap,
+            base: &base,
+            fieltro: Fieltro::Verde,
+            orientacion: OrientacionVista::Normal,
+            marcas: MarcasRobot::Anexo1,
+            own_team: 0,
+            selected: Some((0, 0)),
+            skill_target: None,
+            radio_slots: None,
+            capas: &capas,
+            trazas: &trazas,
+            sim: true,
+            rutina: None,
+            modo_manual: false,
+            jugador2: None,
+            num_robots: 3,
+        };
+        let vista = Vista::new(size(), OrientacionVista::Normal);
+        let p = vista.a_pantalla(Vec2::new(-0.3, 0.0));
+        let mut estado = EstadoCancha::default();
+        let m = eventos(&cancha, &mut estado, &[(apretar(), p), (soltar(), p)]);
+        assert!(matches!(m, Some(Message::FieldClicked(_))), "{m:?}");
+        // El arrastre sigue siendo teleport, también en el modo manual.
+        for manual in [false, true] {
+            cancha.modo_manual = manual;
+            let lejos = Point::new(p.x + 40.0, p.y);
+            let m = eventos(&cancha, &mut estado, &[(apretar(), p), (mover(lejos), lejos), (soltar(), lejos)]);
+            assert!(matches!(m, Some(Message::TeleportArrastre(_))), "manual = {manual}: {m:?}");
+        }
+    }
+
+    #[test]
+    fn player_labels_only_inside_manual_mode() {
+        let snap = foto_jugadores();
+        let (base, capas, trazas) = (Cache::new(), HashSet::new(), Trazas::default());
+        let mut cancha = FieldCanvas {
+            snap: &snap,
+            base: &base,
+            fieltro: Fieltro::Verde,
+            orientacion: OrientacionVista::Normal,
+            marcas: MarcasRobot::Anexo1,
+            own_team: 0,
+            selected: Some((0, 0)),
+            skill_target: None,
+            radio_slots: None,
+            capas: &capas,
+            trazas: &trazas,
+            sim: true,
+            rutina: None,
+            modo_manual: true,
+            jugador2: Some((0, 1)),
+            num_robots: 3,
+        };
+        assert_eq!(cancha.jugador_de(0, 0), Some("J1"));
+        assert_eq!(cancha.jugador_de(0, 1), Some("J2"));
+        assert_eq!(cancha.jugador_de(0, 2), None);
+        assert_eq!(cancha.jugador_de(1, 1), None, "el mismo id en el otro equipo");
+        cancha.modo_manual = false;
+        for (t, id) in [(0, 0), (0, 1), (0, 2), (1, 1)] {
+            assert_eq!(cancha.jugador_de(t, id), None, "fuera del modo manual no se marca nada");
+        }
     }
 }

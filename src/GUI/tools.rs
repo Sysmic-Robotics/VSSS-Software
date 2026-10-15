@@ -5,12 +5,26 @@
 use super::field::{Fieltro, OrientacionVista};
 use super::tag::MarcasRobot;
 use super::{
-    DebugGui, FrameMode, Message, SKILL_GROUPS, fonts, keeper_warning, skill_help, theme,
+    DebugGui, Message, SKILL_GROUPS, aviso_arquero_manual, fonts, keeper_warning, skill_help,
+    texto_ninguna, theme,
 };
 use iced::widget::{
     Column, Row, button, column, horizontal_rule, row, slider, text, text_input,
 };
 use iced::{Alignment, Element, Length};
+
+/// El valor de un slider para su campo, con 3 decimales sin pasarse de `max`: en el
+/// extremo, el redondeo podría quedar arriba del tope y la escala no se aplicaría.
+pub fn texto_slider(v: f64, max: f64) -> String {
+    let t = format!("{v:.3}");
+    if t.parse::<f64>().is_ok_and(|x| x > max) { format!("{max}") } else { t }
+}
+
+/// Con el modo manual activo, Parámetros va sin sliders: uno bajo el cursor tomaría las
+/// flechas del jugador 2 y cambiaría el valor en silencio (PID, aceleraciones, escalas).
+pub fn sliders_visibles(modo_manual: bool) -> bool {
+    !modo_manual
+}
 
 /// Título de una sección dentro de una pestaña.
 fn titulo(t: impl ToString) -> Element<'static, Message> {
@@ -70,7 +84,7 @@ impl DebugGui {
 
         let max_id = self.run.num_robots.saturating_sub(1) as u32;
         let robot = row![
-            text("robot").size(theme::TXT_CHICO).style(theme::gris),
+            text("jugador 1, robot").size(theme::TXT_CHICO).style(theme::gris),
             opcion("−", false, Message::SelectRobot(self.selected_robot.saturating_sub(1))),
             text(self.selected_robot.to_string()).size(theme::TXT),
             opcion("+", false, Message::SelectRobot((self.selected_robot + 1).min(max_id))),
@@ -87,32 +101,46 @@ impl DebugGui {
         ]
         .spacing(theme::SP_SM)
         .align_y(Alignment::Center);
-
-        let marco = row![
-            text("marco").size(theme::TXT_CHICO).style(theme::gris),
-            opcion("robot", self.manual_frame == FrameMode::Robot, Message::SetFrame(FrameMode::Robot)),
-            opcion("mundo", self.manual_frame == FrameMode::World, Message::SetFrame(FrameMode::World)),
-        ]
-        .spacing(theme::SP_SM)
-        .align_y(Alignment::Center);
-
-        let ayuda = match self.manual_frame {
-            FrameMode::World => {
-                "W y S mueven en y, A y D en x, Q y E giran. Esc sale del modo manual."
-            }
-            FrameMode::Robot => "W y S avanzan y retroceden, A y D giran. Esc sale del modo manual.",
+        let jugador2: Element<'_, Message> = match self.robot_j2 {
+            Some((_, id)) => row![
+                text(format!("jugador 2, robot {id}")).size(theme::TXT_CHICO).style(theme::gris),
+                opcion("soltar", false, Message::SoltarJugador2),
+            ]
+            .spacing(theme::SP_SM)
+            .align_y(Alignment::Center)
+            .into(),
+            None => nota("Jugador 2: Shift y click en un robot propio."),
         };
 
         let rutina_en_curso = self.snap.rutina.as_ref().is_some_and(|v| v.fase.activa());
+        let arquero = self.manual_enabled.then(|| {
+            aviso_arquero_manual(&self.robots_jugadores(), self.run.own_team, self.keeper_id, self.coach_activo())
+        });
         column![
             titulo("Control manual"),
             entrar,
             robot,
             equipo,
-            marco,
-            nota(ayuda),
+            jugador2,
+            nota("Jugador 1: W y S avanzan y retroceden, A y D giran, E da el giro corto hacia la pelota."),
+            nota(
+                "Jugador 2: flecha arriba y flecha abajo avanzan y retroceden, izquierda y derecha \
+                 giran, Enter da el giro corto."
+            ),
+            nota("En la cancha, click elige el robot del jugador 1, y Shift y click el del jugador 2. Esc sale del modo manual."),
+            nota(
+                "Antes de manejar, un click en la cancha: con el foco en un campo de texto, las \
+                 teclas van al campo."
+            ),
+            nota(format!(
+                "Velocidad máxima: {} m/s ({}).",
+                super::format::num(self.tope_lin as f32, 2),
+                if self.run.is_base_station() { "robots reales" } else { "simulación" }
+            )),
             nota("Espacio detiene todo, en cualquier modo."),
         ]
+        .push_maybe(self.coach_pausa.is_some().then(|| nota("P pausa o activa el coach.")))
+        .push_maybe(arquero.flatten().map(|aviso| text(aviso).size(theme::TXT_CHICO).style(theme::alerta)))
         .push_maybe(rutina_en_curso.then(|| {
             text("Hay una rutina en curso: tomar en manual un robot asignado la aborta.")
                 .size(theme::TXT_CHICO)
@@ -127,11 +155,8 @@ impl DebugGui {
             "Skill para el robot {}",
             self.selected_robot
         )));
-        col = col.push(opcion(
-            "ninguna (coach)",
-            self.active_skill.is_none(),
-            Message::SelectSkill(None),
-        ));
+        let (ninguna, ayuda_ninguna) = texto_ninguna(self.coach_en_pausa());
+        col = col.push(opcion(ninguna, self.active_skill.is_none(), Message::SelectSkill(None)));
         for (grupo, skills) in SKILL_GROUPS {
             col = col.push(nota(grupo));
             let mut fila = Row::new().spacing(theme::SP_XS);
@@ -144,7 +169,8 @@ impl DebugGui {
             }
             col = col.push(fila.wrap());
         }
-        col = col.push(text(skill_help(self.active_skill)).size(theme::TXT_CHICO));
+        let ayuda = if self.active_skill.is_none() { ayuda_ninguna } else { skill_help(self.active_skill) };
+        col = col.push(text(ayuda).size(theme::TXT_CHICO));
         // Aviso del lazo (fuente de verdad: `World`) cuando la skill no corre.
         if self.active_skill.is_some()
             && let Some(aviso) = &self.snap.skill_warning
@@ -241,7 +267,10 @@ impl DebugGui {
         .spacing(theme::SP_SM);
 
         // Parámetro: etiqueta, valor en vivo, entrada de texto y slider. El slider
-        // siempre da un valor dentro de rango; la entrada conserva la validación.
+        // siempre da un valor dentro de rango; la entrada conserva la validación. Con el
+        // modo manual activo no hay sliders: uno bajo el cursor tomaría las flechas del
+        // jugador 2 y cambiaría el valor en silencio.
+        let con_slider = sliders_visibles(self.manual_enabled);
         let param = |etiqueta: &'static str,
                      valor: f64,
                      texto: &str,
@@ -261,8 +290,8 @@ impl DebugGui {
                 ]
                 .spacing(theme::SP_SM)
                 .align_y(Alignment::Center),
-                slider(min..=max, valor, move |v| msg(format!("{v:.3}"))).step(paso),
             ]
+            .push_maybe(con_slider.then(|| slider(min..=max, valor, move |v| msg(texto_slider(v, max))).step(paso)))
             .spacing(theme::SP_XS)
         };
 
@@ -270,8 +299,8 @@ impl DebugGui {
             vista,
             separador(),
             titulo("Control manual"),
-            param("velocidad (m/s)", self.manual_lin_ms, &self.manual_lin_str, 0.0, 1.5, 0.05, Message::ManualLinChanged),
-            param("giro (rad/s)", self.manual_ang_rads, &self.manual_ang_str, 0.0, 12.0, 0.25, Message::ManualAngChanged),
+            param("velocidad (m/s)", self.manual_lin_ms, &self.manual_lin_str, 0.0, self.tope_lin, 0.01, Message::ManualLinChanged),
+            param("giro (rad/s)", self.manual_ang_rads, &self.manual_ang_str, 0.0, self.tope_ang, 0.05, Message::ManualAngChanged),
             param("aceleración (m/s²)", self.manual_lin_accel, &self.manual_lin_accel_str, 0.0, 6.0, 0.1, Message::ManualLinAccelChanged),
             param("aceleración de giro (rad/s²)", self.manual_ang_accel, &self.manual_ang_accel_str, 0.0, 30.0, 0.5, Message::ManualAngAccelChanged),
             separador(),
@@ -300,5 +329,23 @@ impl DebugGui {
         ]
         .spacing(theme::SP_SM)
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slider_text_never_passes_the_ceiling() {
+        assert_eq!(texto_slider(0.2675, 0.2675), "0.2675", "el redondeo daría 0.268");
+        assert_eq!(texto_slider(0.12345, 0.3), "0.123");
+        assert_eq!(texto_slider(0.3, 0.3), "0.300");
+    }
+
+    #[test]
+    fn no_sliders_while_driving() {
+        assert!(sliders_visibles(false));
+        assert!(!sliders_visibles(true));
     }
 }

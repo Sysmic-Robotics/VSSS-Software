@@ -15,6 +15,7 @@ mod field;
 mod fonts;
 mod format;
 mod inspector;
+mod jugadores;
 mod keys;
 mod por_que;
 #[cfg(test)]
@@ -31,7 +32,8 @@ pub use run_info::{CoachKind, RunInfo};
 
 use charts::MuestraSenal;
 use field::{Fieltro, FieldCanvas, OrientacionVista};
-use keys::{AccionTecla, Layer, Tecla};
+use jugadores::{EstadoJugador, Escalas, RobotJugador};
+use keys::{AccionTecla, EventoTeclado, Jugador, Layer, Tecla};
 use status_line::Salud;
 use tag::MarcasRobot;
 
@@ -55,11 +57,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// Velocidad lineal máx (m/s) por defecto del control manual (ajustable en la GUI).
-const MANUAL_LIN_MS_DEFAULT: f64 = 0.5;
-/// Velocidad angular máx (rad/s) por defecto del control manual (ajustable en la GUI).
-/// Convención: giro positivo → CCW (omega > 0), alineada con la skill Spin del catálogo.
-const MANUAL_ANG_RADS_DEFAULT: f64 = 3.0;
+// Las velocidades máximas del control manual (arranque y tope, por transporte) y el
+// giro corto salen de `team_params.json` → `manual`. Giro positivo → CCW (omega > 0).
 /// Aceleración lineal máx de la rampa del control manual (m/s²).
 const MANUAL_LIN_ACCEL: f64 = 2.0;
 /// Aceleración angular máx de la rampa del control manual (rad/s²).
@@ -83,7 +82,7 @@ const PID_KI_DEFAULT: f64 = 0.08;
 const PID_KD_DEFAULT: f64 = 0.20;
 
 /// Conjunto de parámetros de tuning, serializable a JSON para presets.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TuningPreset {
     pub lin_ms: f64,
     pub ang_rads: f64,
@@ -95,55 +94,30 @@ pub struct TuningPreset {
     pub kd: f64,
 }
 
-/// Marco de referencia del control manual.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameMode {
-    /// W/S = ±Y mundo, A/D = ±X mundo, Q/E = giro.
-    World,
-    /// W/S = adelante/atrás según heading, A/D = giro (arcade drive).
-    Robot,
+/// Recorta un preset al tope del transporte y lo valida como los campos: escalas
+/// finitas en `[0, tope]` (por encima, el tope), aceleraciones y giro de Spin finitos y
+/// mayores que cero, y PID finito y no negativo. Un valor inválido conserva el actual.
+pub fn preset_valido(p: &TuningPreset, actual: &TuningPreset, tope_lin: f64, tope_ang: f64) -> TuningPreset {
+    let escala = |v: f64, actual: f64, tope: f64| {
+        if v.is_finite() && v >= 0.0 { v.min(tope) } else { actual }
+    };
+    let positivo = |v: f64, actual: f64| if v.is_finite() && v > 0.0 { v } else { actual };
+    let no_negativo = |v: f64, actual: f64| if v.is_finite() && v >= 0.0 { v } else { actual };
+    TuningPreset {
+        lin_ms: escala(p.lin_ms, actual.lin_ms, tope_lin),
+        ang_rads: escala(p.ang_rads, actual.ang_rads, tope_ang),
+        lin_accel: positivo(p.lin_accel, actual.lin_accel),
+        ang_accel: positivo(p.ang_accel, actual.ang_accel),
+        spin_omega: positivo(p.spin_omega, actual.spin_omega),
+        kp: no_negativo(p.kp, actual.kp),
+        ki: no_negativo(p.ki, actual.ki),
+        kd: no_negativo(p.kd, actual.kd),
+    }
 }
 
-/// Traduce las teclas presionadas al comando objetivo en **marco mundo**
-/// `(vx, vy, omega)`, según el modo de marco, las escalas y la orientación `theta`
-/// del robot (rad). Función pura y testeable (θ explícito).
-///
-/// - `World`: W/S = ±Y mundo, A/D = ±X mundo, Q/E = giro CCW/CW.
-/// - `Robot`: W/S = adelante/atrás según heading (`vx=v_fwd·cosθ`, `vy=v_fwd·sinθ`),
-///   A/D = giro (arcade drive). Q/E también giran (equivalentes a A/D).
-pub fn manual_world_target(
-    keys: &HashSet<char>,
-    frame: FrameMode,
-    lin: f64,
-    ang: f64,
-    theta: f64,
-) -> (f64, f64, f64) {
-    let axis = |pos: char, neg: char, scale: f64| -> f64 {
-        let mut v = 0.0;
-        if keys.contains(&pos) {
-            v += scale;
-        }
-        if keys.contains(&neg) {
-            v -= scale;
-        }
-        v
-    };
-
-    match frame {
-        FrameMode::World => {
-            let vx = axis('d', 'a', lin);
-            let vy = axis('w', 's', lin);
-            let omega = axis('q', 'e', ang);
-            (vx, vy, omega)
-        }
-        FrameMode::Robot => {
-            let v_fwd = axis('w', 's', lin);
-            // A/D giran (arcade); Q/E también, sumados.
-            let omega = axis('a', 'd', ang) + axis('q', 'e', ang);
-            let (c, s) = (theta.cos(), theta.sin());
-            (v_fwd * c, v_fwd * s, omega)
-        }
-    }
+/// Una escala del manual escrita en su campo: válida si es finita y está en `[0, tope]`.
+pub fn escala_valida(texto: &str, tope: f64) -> Option<f64> {
+    texto.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0 && *v <= tope)
 }
 
 /// Rampa por componente: acerca `current` a `target` sin pasarlo, con paso máximo
@@ -200,6 +174,26 @@ const SKILL_GROUPS: [(&str, &[SkillId]); 4] = [
     ),
     ("Quieto", &[SkillId::Hold]),
 ];
+
+/// El botón "ninguna" de la sección Skills y su ayuda: con el coach en pausa, el robot
+/// sin skill queda quieto (`coach-pausa`).
+pub fn texto_ninguna(coach_en_pausa: bool) -> (&'static str, &'static str) {
+    if coach_en_pausa {
+        (
+            "ninguna (quieto)",
+            "Ninguna: el coach está en pausa y el robot queda quieto. Elige una skill y haz click en la cancha.",
+        )
+    } else {
+        ("ninguna (coach)", skill_help(None))
+    }
+}
+
+/// Aviso de Herramientas cuando un jugador maneja al arquero del coach con el coach
+/// activo (`coach-pausa`): el coach no lo reemplaza y el arco queda solo.
+pub fn aviso_arquero_manual(jugadores: &[Option<(i32, i32)>], own_team: i32, keeper_id: i32, coach_activo: bool) -> Option<String> {
+    (coach_activo && jugadores.contains(&Some((own_team, keeper_id))))
+        .then(|| format!("el robot {keeper_id} es el arquero del coach: el arco queda solo"))
+}
 
 /// Línea de ayuda de la skill activa: qué significa el click para esa skill (el
 /// `target` de `SkillCatalog::tick`) o que no se usa. `None` = sin skill (coach).
@@ -367,19 +361,22 @@ pub enum Message {
     LazoTerminado,
     /// Nuevo tamaño de la ventana.
     Resized(Size),
-    /// Tecla apretada (ver `keys::ruta_tecla`).
-    Tecla(Tecla),
-    /// Letra soltada.
-    TeclaSoltada(char),
+    /// Teclado y foco de la ventana (ver `keys::evento_de` y `keys::ruta_tecla`).
+    Teclado(EventoTeclado),
     /// Tick rápido que recomputa y envía el comando manual o la skill de la GUI.
     ManualTick,
     SelectTab(Tab),
-    /// Click en una fila: un robot propio.
+    /// Click en una fila: un robot propio (con Shift en el modo manual, el jugador 2).
     SelectRow(u32),
     SelectRobot(u32),
     SelectTeam(u32),
     ToggleManual(bool),
-    SetFrame(FrameMode),
+    /// Click corto sobre un robot propio en la cancha, dentro del modo manual.
+    ClicRobot { id: i32, shift: bool },
+    /// Suelta al jugador 2.
+    SoltarJugador2,
+    /// Alterna el coach entre activo y en pausa (botón de la barra).
+    ToggleCoach,
     ManualLinChanged(String),
     ManualAngChanged(String),
     ManualLinAccelChanged(String),
@@ -463,6 +460,9 @@ pub struct GuiSetup {
     pub rutina_tx: Option<mpsc::Sender<OrdenRutina>>,
     /// Flag de parada de emergencia compartido con el lazo.
     pub estop: Arc<AtomicBool>,
+    /// Interruptor del coach (en pausa = `true`), compartido con el conmutador de `main`.
+    /// `None` sin coach que pausar (`VSSL_COACH=none`, `scenario`): no hay interruptor.
+    pub coach_pausa: Option<Arc<AtomicBool>>,
     /// Configuración de la corrida (solo lectura).
     pub run: RunInfo,
 }
@@ -484,12 +484,23 @@ pub struct DebugGui {
     cache_base: Cache,
     /// Capas pedidas por tecla. Fase 2: la cancha las dibuja; en esta fase no hay.
     capas: HashSet<Layer>,
-    // Robot seleccionado (herramientas, Inspector, gráficos, marca en la cancha).
+    // Robot seleccionado (herramientas, Inspector, gráficos, marca en la cancha). Es
+    // también el robot del jugador 1 en el modo manual.
     selected_robot: u32,
     selected_team: u32,
-    // Control manual.
+    // Control manual: dos jugadores.
     manual_enabled: bool,
-    manual_frame: FrameMode,
+    /// Robot del jugador 2: propio, o ninguno.
+    robot_j2: Option<RobotJugador>,
+    /// Rampa y giro corto de cada jugador (`Jugador::indice`).
+    jugadores: [EstadoJugador; 2],
+    /// Teclas apretadas (de los dos jugadores y P).
+    teclas: HashSet<Tecla>,
+    /// Shift apretado, para Shift y click en una fila (la cancha lleva el suyo).
+    shift: bool,
+    /// Topes (y arranque) de las escalas del manual según el transporte.
+    tope_lin: f64,
+    tope_ang: f64,
     manual_lin_ms: f64,
     manual_ang_rads: f64,
     manual_lin_str: String,
@@ -498,10 +509,9 @@ pub struct DebugGui {
     manual_ang_accel: f64,
     manual_lin_accel_str: String,
     manual_ang_accel_str: String,
-    /// Último comando (vx, vy, omega) enviado: base de la rampa de aceleración.
-    applied_cmd: (f64, f64, f64),
-    keys: HashSet<char>,
     manual_tx: Option<mpsc::Sender<ManualCommand>>,
+    /// Interruptor del coach (ver `GuiSetup::coach_pausa`).
+    coach_pausa: Option<Arc<AtomicBool>>,
     // Skills de la GUI.
     active_skill: Option<SkillId>,
     /// Target de la skill activa (m, marco mundo), fijado con click.
@@ -556,6 +566,9 @@ impl DebugGui {
     fn new(setup: GuiSetup) -> (Self, Task<Message>) {
         let own_goal = own_goal_center(setup.run.defend_left);
         let selected_team = setup.run.own_team.max(0) as u32;
+        let manual = &crate::params::params().manual;
+        let tope_lin = manual.velocidad_m_s(setup.run.is_base_station());
+        let tope_ang = manual.giro_rad_s;
         let rutinas = rutinas::EstadoRutinas::new(
             setup.rutina_tx,
             setup.run.own_team,
@@ -579,18 +592,22 @@ impl DebugGui {
                 selected_robot: 0,
                 selected_team,
                 manual_enabled: false,
-                manual_frame: FrameMode::Robot,
-                manual_lin_ms: MANUAL_LIN_MS_DEFAULT,
-                manual_ang_rads: MANUAL_ANG_RADS_DEFAULT,
-                manual_lin_str: format!("{MANUAL_LIN_MS_DEFAULT}"),
-                manual_ang_str: format!("{MANUAL_ANG_RADS_DEFAULT}"),
+                robot_j2: None,
+                jugadores: Default::default(),
+                teclas: HashSet::new(),
+                shift: false,
+                tope_lin,
+                tope_ang,
+                manual_lin_ms: tope_lin,
+                manual_ang_rads: tope_ang,
+                manual_lin_str: format!("{tope_lin}"),
+                manual_ang_str: format!("{tope_ang}"),
                 manual_lin_accel: MANUAL_LIN_ACCEL,
                 manual_ang_accel: MANUAL_ANG_ACCEL,
                 manual_lin_accel_str: format!("{MANUAL_LIN_ACCEL}"),
                 manual_ang_accel_str: format!("{MANUAL_ANG_ACCEL}"),
-                applied_cmd: (0.0, 0.0, 0.0),
-                keys: HashSet::new(),
                 manual_tx: setup.manual_tx,
+                coach_pausa: setup.coach_pausa,
                 active_skill: None,
                 skill_target: Vec2::ZERO,
                 skill_tx: setup.skill_tx,
@@ -661,18 +678,7 @@ impl DebugGui {
                 self.ancho = size.width;
                 self.alto = size.height;
             }
-            Message::Tecla(t) => match keys::ruta_tecla(t, self.manual_enabled) {
-                AccionTecla::Parada => self.estop.store(true, Ordering::Relaxed),
-                AccionTecla::SalirManual => self.set_manual(false),
-                AccionTecla::Mover(c) => {
-                    self.keys.insert(c);
-                }
-                AccionTecla::Capa(capa) => self.alternar_capa(capa),
-                AccionTecla::Nada => {}
-            },
-            Message::TeclaSoltada(c) => {
-                self.keys.remove(&c);
-            }
+            Message::Teclado(evento) => self.teclado(evento),
             Message::ManualTick => self.manual_tick(),
             Message::ToggleCapa(capa) => self.alternar_capa(capa),
             Message::TeleportArrastre(items) => {
@@ -682,41 +688,32 @@ impl DebugGui {
             }
             Message::SelectTab(t) => self.tab = t,
             Message::SelectRow(id) => {
-                let team = self.run.own_team.max(0) as u32;
-                if (team, id) != (self.selected_team, self.selected_robot) {
-                    self.selected_team = team;
-                    self.selected_robot = id;
-                    self.clear_telemetry();
-                }
+                let robot = (self.run.own_team, id as i32);
+                let jugador = if self.manual_enabled && self.shift { Jugador::Dos } else { Jugador::Uno };
+                self.asignar(jugador, robot);
             }
-            Message::SelectRobot(id) => {
-                if id != self.selected_robot {
-                    self.selected_robot = id;
-                    self.clear_telemetry();
-                }
-            }
-            Message::SelectTeam(team) => {
-                if team != self.selected_team {
-                    self.selected_team = team;
-                    self.clear_telemetry();
-                }
-            }
+            Message::SelectRobot(id) => self.asignar(Jugador::Uno, (self.selected_team as i32, id as i32)),
+            Message::SelectTeam(team) => self.asignar(Jugador::Uno, (team as i32, self.selected_robot as i32)),
             Message::ToggleManual(on) => self.set_manual(on),
-            Message::SetFrame(f) => self.manual_frame = f,
+            Message::ClicRobot { id, shift } => {
+                if self.manual_enabled {
+                    let jugador = if shift { Jugador::Dos } else { Jugador::Uno };
+                    self.asignar(jugador, (self.run.own_team, id));
+                }
+            }
+            Message::SoltarJugador2 => {
+                let antes = (self.robot_j1(), self.robot_j2);
+                self.reasignar(antes, (antes.0, None));
+            }
+            Message::ToggleCoach => self.alternar_coach(),
             Message::ManualLinChanged(s) => {
-                if let Ok(v) = s.parse::<f64>()
-                    && v.is_finite()
-                    && v >= 0.0
-                {
+                if let Some(v) = escala_valida(&s, self.tope_lin) {
                     self.manual_lin_ms = v;
                 }
                 self.manual_lin_str = s;
             }
             Message::ManualAngChanged(s) => {
-                if let Ok(v) = s.parse::<f64>()
-                    && v.is_finite()
-                    && v >= 0.0
-                {
+                if let Some(v) = escala_valida(&s, self.tope_ang) {
                     self.manual_ang_rads = v;
                 }
                 self.manual_ang_str = s;
@@ -741,8 +738,9 @@ impl DebugGui {
             }
             Message::SelectSkill(skill) => self.active_skill = skill,
             Message::FieldClicked(mundo) => {
-                // El click fija el target de la skill activa (si hay).
-                if self.active_skill.is_some() {
+                // El click fija el target de la skill activa (si hay). Dentro del modo
+                // manual la cancha no lo emite: el click asigna robots a los jugadores.
+                if self.active_skill.is_some() && !self.manual_enabled {
                     self.skill_target = mundo;
                 }
             }
@@ -858,9 +856,6 @@ impl DebugGui {
         Task::none()
     }
 
-    /// Entra o sale del modo manual. Al salir se vacían las teclas y la rampa (para no
-    /// arrancar con inercia la próxima vez); el lazo frena al robot cuando el comando
-    /// manual expira.
     /// Enciende o apaga una capa de esta fase (la V, de la fase 4, no tiene efecto).
     fn alternar_capa(&mut self, capa: Layer) {
         if !capas::CAPAS.contains(&capa) {
@@ -871,50 +866,184 @@ impl DebugGui {
         }
     }
 
+    /// Entra o sale del modo manual. Al salir, cada robot manejado recibe un comando cero
+    /// (en FIRASim, un robot que deja de recibir comandos sigue a su última velocidad) y
+    /// se vacían las teclas, las rampas y los giros. Las asignaciones quedan. Una skill de
+    /// la GUI elegida no se envía durante el modo manual y vuelve al salir, sobre el robot
+    /// seleccionado (el del jugador 1), como antes de los dos jugadores.
     fn set_manual(&mut self, on: bool) {
+        if !on && self.manual_enabled {
+            for robot in self.robots_jugadores().into_iter().flatten() {
+                self.enviar_cero(robot);
+            }
+        }
         self.manual_enabled = on;
-        if !on {
-            self.keys.clear();
-            self.applied_cmd = (0.0, 0.0, 0.0);
+        self.teclas.clear();
+        for j in &mut self.jugadores {
+            j.soltar();
         }
     }
 
-    /// Mientras el modo manual está activo, recomputa el objetivo, aplica la rampa y
-    /// reenvía (también cero al soltar las teclas). Si no, streamea la skill de la GUI.
+    /// Robot del jugador 1: el seleccionado.
+    fn robot_j1(&self) -> RobotJugador {
+        (self.selected_team as i32, self.selected_robot as i32)
+    }
+
+    /// Robots de los dos jugadores, por `Jugador::indice`.
+    fn robots_jugadores(&self) -> [Option<RobotJugador>; 2] {
+        [Some(self.robot_j1()), self.robot_j2]
+    }
+
+    /// Asigna `robot` a `jugador` con la regla "un robot, un jugador".
+    fn asignar(&mut self, jugador: Jugador, robot: RobotJugador) {
+        let antes = (self.robot_j1(), self.robot_j2);
+        let despues = jugadores::asignar(antes.0, antes.1, jugador, robot);
+        self.reasignar(antes, despues);
+    }
+
+    /// Aplica las asignaciones nuevas. Con el modo manual activo, cada robot que se queda
+    /// sin jugador recibe un comando cero y el jugador que cambió de robot arranca con la
+    /// rampa en cero. Fuera del modo manual no se envía nada: un cero marcaría al robot
+    /// como intervenido (aborta una rutina).
+    fn reasignar(&mut self, antes: (RobotJugador, Option<RobotJugador>), despues: (RobotJugador, Option<RobotJugador>)) {
+        if self.manual_enabled {
+            for robot in jugadores::soltados(antes, despues) {
+                self.enviar_cero(robot);
+            }
+            if antes.0 != despues.0 {
+                self.jugadores[Jugador::Uno.indice()].soltar();
+            }
+            if antes.1 != despues.1 {
+                self.jugadores[Jugador::Dos.indice()].soltar();
+            }
+        }
+        if despues.0 != antes.0 {
+            self.selected_team = despues.0.0.max(0) as u32;
+            self.selected_robot = despues.0.1.max(0) as u32;
+            self.clear_telemetry();
+        }
+        self.robot_j2 = despues.1;
+    }
+
+    /// Un `ManualCommand` cero para `robot`, en el mismo `update`.
+    fn enviar_cero(&self, (team, id): RobotJugador) {
+        if let Some(tx) = &self.manual_tx {
+            let _ = tx.try_send(ManualCommand { team, id, vx: 0.0, vy: 0.0, omega: 0.0 });
+        }
+    }
+
+    /// El coach está en pausa (solo si hay interruptor).
+    fn coach_en_pausa(&self) -> bool {
+        self.coach_pausa.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// Hay un coach activo que decide (con interruptor y sin pausa).
+    fn coach_activo(&self) -> bool {
+        self.coach_pausa.as_ref().is_some_and(|f| !f.load(Ordering::Relaxed))
+    }
+
+    fn alternar_coach(&mut self) {
+        if let Some(f) = &self.coach_pausa {
+            f.fetch_xor(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Una tecla, un "soltar", Shift o la pérdida de foco.
+    fn teclado(&mut self, evento: EventoTeclado) {
+        match evento {
+            EventoTeclado::Apretada(t) => match keys::ruta_tecla(t, self.manual_enabled) {
+                AccionTecla::Parada => {
+                    self.estop.store(true, Ordering::Relaxed);
+                    for j in &mut self.jugadores {
+                        j.soltar();
+                    }
+                }
+                AccionTecla::SalirManual => self.set_manual(false),
+                AccionTecla::AlternarCoach => {
+                    // Por flanco: la autorrepetición no la alterna otra vez.
+                    if self.teclas.insert(t) {
+                        self.alternar_coach();
+                    }
+                }
+                AccionTecla::Mover { tecla, .. } => {
+                    self.teclas.insert(tecla);
+                }
+                AccionTecla::Giro(jugador) => {
+                    if self.teclas.insert(t) {
+                        self.intentar_giro(jugador);
+                    }
+                }
+                AccionTecla::Capa(capa) => self.alternar_capa(capa),
+                AccionTecla::Nada => {}
+            },
+            EventoTeclado::Soltada(t) => {
+                self.teclas.remove(&t);
+            }
+            EventoTeclado::Shift(s) => self.shift = s,
+            EventoTeclado::FocoPerdido => {
+                self.teclas.clear();
+                self.shift = false;
+                for j in &mut self.jugadores {
+                    j.soltar();
+                }
+            }
+        }
+    }
+
+    /// Empieza el giro corto del jugador si se puede: con robot visible, en juego y sin
+    /// la parada. El sentido sale de la pelota de la foto (su última posición conocida).
+    fn intentar_giro(&mut self, jugador: Jugador) {
+        let Some((team, id)) = self.robots_jugadores()[jugador.indice()] else {
+            return;
+        };
+        let modo = jugadores::modo_juego(self.snap.mode, self.estop_activa());
+        let robot = self.snap.robot(team, id).copied();
+        let (Some(robot), Some(pelota)) = (robot.filter(|r| robot_rows::visible(Some(r))), self.snap.ball) else {
+            return;
+        };
+        if modo != jugadores::ModoJuego::Juego {
+            return;
+        }
+        let arco = jugadores::arco_atacado(team, self.run.own_team, self.own_goal);
+        let signo = jugadores::sentido_giro(robot.position, pelota.position, arco);
+        let m = &crate::params::params().manual;
+        self.jugadores[jugador.indice()].iniciar_giro(
+            signo * m.spin_rad_s,
+            Instant::now(),
+            Duration::from_secs_f64(m.spin_s),
+        );
+    }
+
+    /// Mientras el modo manual está activo, manda el comando de cada jugador con robot,
+    /// con su rampa (también cero al soltar las teclas). Si no, streamea la skill de la GUI.
     fn manual_tick(&mut self) {
+        if self.manual_enabled && self.manual_tx.is_some() {
+            let modo = jugadores::modo_juego(self.snap.mode, self.estop_activa());
+            let escalas = Escalas {
+                lin: self.manual_lin_ms,
+                ang: self.manual_ang_rads,
+                paso_lin: self.manual_lin_accel * MANUAL_TICK_DT,
+                paso_ang: self.manual_ang_accel * MANUAL_TICK_DT,
+            };
+            let ahora = Instant::now();
+            for jugador in Jugador::AMBOS {
+                let Some((team, id)) = self.robots_jugadores()[jugador.indice()] else {
+                    continue;
+                };
+                // θ de la foto aunque el robot no se vea: la misma que usa el lazo.
+                let theta = self.snap.robot(team, id).map(|r| r.orientation).unwrap_or(0.0);
+                let intencion = jugadores::intencion(&self.teclas, jugador);
+                let (vx, vy, omega) =
+                    self.jugadores[jugador.indice()].paso(intencion, &escalas, theta, ahora, modo);
+                if let Some(tx) = &self.manual_tx {
+                    let _ = tx.try_send(ManualCommand { team, id, vx, vy, omega });
+                }
+            }
+        }
         let robot = self
             .snap
             .robot(self.selected_team as i32, self.selected_robot as i32)
             .copied();
-        if self.manual_enabled
-            && let Some(tx) = &self.manual_tx
-        {
-            // Orientación del robot seleccionado (para el marco robot).
-            let theta = robot.map(|r| r.orientation).unwrap_or(0.0);
-            let (tx_v, ty_v, tw_v) = manual_world_target(
-                &self.keys,
-                self.manual_frame,
-                self.manual_lin_ms,
-                self.manual_ang_rads,
-                theta,
-            );
-            let lin_step = self.manual_lin_accel * MANUAL_TICK_DT;
-            let ang_step = self.manual_ang_accel * MANUAL_TICK_DT;
-            let (cx, cy, co) = self.applied_cmd;
-            self.applied_cmd = (
-                slew(cx, tx_v, lin_step),
-                slew(cy, ty_v, lin_step),
-                slew(co, tw_v, ang_step),
-            );
-            let (vx, vy, omega) = self.applied_cmd;
-            let _ = tx.try_send(ManualCommand {
-                team: self.selected_team as i32,
-                id: self.selected_robot as i32,
-                vx,
-                vy,
-                omega,
-            });
-        }
         if !self.manual_enabled
             && let (Some(skill), Some(tx)) = (self.active_skill, &self.skill_tx)
         {
@@ -1013,7 +1142,14 @@ impl DebugGui {
 
     /// Serializa el tuning actual al archivo `preset_name` (JSON).
     fn save_preset(&self) -> Result<(), String> {
-        let preset = TuningPreset {
+        let preset = self.preset_actual();
+        let json = serde_json::to_string_pretty(&preset).map_err(|e| e.to_string())?;
+        std::fs::write(&self.preset_name, json).map_err(|e| e.to_string())
+    }
+
+    /// El tuning vigente, como preset.
+    fn preset_actual(&self) -> TuningPreset {
+        TuningPreset {
             lin_ms: self.manual_lin_ms,
             ang_rads: self.manual_ang_rads,
             lin_accel: self.manual_lin_accel,
@@ -1022,15 +1158,20 @@ impl DebugGui {
             kp: self.pid_kp,
             ki: self.pid_ki,
             kd: self.pid_kd,
-        };
-        let json = serde_json::to_string_pretty(&preset).map_err(|e| e.to_string())?;
-        std::fs::write(&self.preset_name, json).map_err(|e| e.to_string())
+        }
     }
 
-    /// Carga el tuning desde `preset_name` (no envía el PID; el caller decide).
+    /// Carga el tuning desde `preset_name` (no envía el PID; el caller decide). Pasa por
+    /// la misma validación que los campos, con las escalas recortadas al tope.
     fn load_preset(&mut self) -> Result<(), String> {
         let data = std::fs::read_to_string(&self.preset_name).map_err(|e| e.to_string())?;
-        let p: TuningPreset = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        let leido: TuningPreset = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+        self.aplicar_preset(&leido);
+        Ok(())
+    }
+
+    fn aplicar_preset(&mut self, leido: &TuningPreset) {
+        let p = preset_valido(leido, &self.preset_actual(), self.tope_lin, self.tope_ang);
         self.manual_lin_ms = p.lin_ms;
         self.manual_lin_str = format!("{}", p.lin_ms);
         self.manual_ang_rads = p.ang_rads;
@@ -1047,7 +1188,6 @@ impl DebugGui {
         self.pid_ki_str = format!("{}", p.ki);
         self.pid_kd = p.kd;
         self.pid_kd_str = format!("{}", p.kd);
-        Ok(())
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1067,10 +1207,10 @@ impl DebugGui {
             }),
         );
         let tamano = iced::window::resize_events().map(|(_id, size)| Message::Resized(size));
-        let teclas = iced::keyboard::on_key_press(|key, _mods| keys::tecla_de(&key).map(Message::Tecla));
-        let sueltas = iced::keyboard::on_key_release(|key, _mods| match keys::tecla_de(&key) {
-            Some(Tecla::Letra(c)) => Some(Message::TeclaSoltada(c)),
-            _ => None,
+        // Todo el teclado y el foco por una sola suscripción: también ve los eventos que
+        // capturó un widget, para no perder nunca un "soltar" (`keys::evento_de`).
+        let teclado = iced::event::listen_with(|evento, estado, _ventana| {
+            keys::evento_de(&evento, estado == iced::event::Status::Captured).map(Message::Teclado)
         });
         // El tick del manual y de la skill de la GUI solo hace falta mientras hay algo
         // que enviar: cada mensaje redibuja la ventana, y un tick permanente de 30 Hz
@@ -1080,7 +1220,7 @@ impl DebugGui {
         } else {
             Subscription::none()
         };
-        Subscription::batch([fotos, tamano, teclas, sueltas, manual_tick])
+        Subscription::batch([fotos, tamano, teclado, manual_tick])
     }
 
     fn vista_cancha(&self) -> Element<'_, Message> {
@@ -1100,6 +1240,9 @@ impl DebugGui {
             trazas: &self.trazas,
             sim: !self.run.is_base_station(),
             rutina: self.dibujo_rutina(),
+            modo_manual: self.manual_enabled,
+            jugador2: self.robot_j2,
+            num_robots: self.run.num_robots,
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -1274,69 +1417,372 @@ mod tests {
         );
     }
 
-    /// 1.4 — Mapeo marco mundo determinista y escalado.
-    #[test]
-    fn world_frame_mapping_is_deterministic_and_scaled() {
-        let lin = MANUAL_LIN_MS_DEFAULT;
-        let ang = MANUAL_ANG_RADS_DEFAULT;
-
-        // Avance (W): +Y = lin, sin giro.
-        let mut keys = HashSet::new();
-        keys.insert('w');
-        let (vx, vy, omega) = manual_world_target(&keys, FrameMode::World, lin, ang, 0.0);
-        assert_eq!(vx, 0.0);
-        assert_eq!(vy, lin);
-        assert_eq!(omega, 0.0);
-
-        // Escala distinta afecta la magnitud.
-        let (_, vy2, _) = manual_world_target(&keys, FrameMode::World, 1.2, ang, 0.0);
-        assert_eq!(vy2, 1.2);
-
-        // Q → CCW (omega > 0).
-        let mut k = HashSet::new();
-        k.insert('q');
-        assert!(manual_world_target(&k, FrameMode::World, lin, ang, 0.0).2 > 0.0);
-
-        // Teclas opuestas se cancelan; sin teclas = freno.
-        let mut opp = HashSet::new();
-        for c in ['w', 's', 'a', 'd'] {
-            opp.insert(c);
-        }
-        assert_eq!(
-            manual_world_target(&opp, FrameMode::World, lin, ang, 0.0),
-            (0.0, 0.0, 0.0)
-        );
-        assert_eq!(
-            manual_world_target(&HashSet::new(), FrameMode::World, lin, ang, 0.0),
-            (0.0, 0.0, 0.0)
-        );
+    /// Una GUI de prueba, con el canal manual y el interruptor del coach.
+    fn gui_de_prueba() -> (DebugGui, mpsc::Receiver<ManualCommand>, Arc<AtomicBool>) {
+        let (g, manual_rx, _skills, pausa) = gui_con_skills();
+        (g, manual_rx, pausa)
     }
 
-    /// 2.3 — Marco robot: avance según heading, A/D giran, sin NaN.
+    /// Como `gui_de_prueba`, con el canal de las skills de la GUI.
+    fn gui_con_skills()
+    -> (DebugGui, mpsc::Receiver<ManualCommand>, mpsc::Receiver<GuiSkillCommand>, Arc<AtomicBool>) {
+        let (_fotos, snapshot_rx) = crate::snapshot::snapshot_channel();
+        let (manual_tx, manual_rx) = mpsc::channel(64);
+        let (skill_tx, skill_rx) = mpsc::channel(64);
+        let pausa = Arc::new(AtomicBool::new(false));
+        let setup = GuiSetup {
+            snapshot_rx,
+            manual_tx: Some(manual_tx),
+            skill_tx: Some(skill_tx),
+            pid_tx: None,
+            teleport_tx: None,
+            rutina_tx: None,
+            estop: Arc::new(AtomicBool::new(false)),
+            coach_pausa: Some(pausa.clone()),
+            run: run_info::run_info_de_prueba(),
+        };
+        (DebugGui::new(setup).0, manual_rx, skill_rx, pausa)
+    }
+
+    fn recibidos(rx: &mut mpsc::Receiver<ManualCommand>) -> Vec<ManualCommand> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn tecla(g: &mut DebugGui, t: Tecla) {
+        let _ = g.update(Message::Teclado(EventoTeclado::Apretada(t)));
+    }
+
+    fn es_cero(c: &ManualCommand) -> bool {
+        c.vx == 0.0 && c.vy == 0.0 && c.omega == 0.0
+    }
+
     #[test]
-    fn robot_frame_converts_forward_by_heading() {
-        let lin = 0.5;
-        let ang = 3.0;
-        let mut w = HashSet::new();
-        w.insert('w');
+    fn leaving_manual_sends_one_zero_per_driven_robot() {
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::ClicRobot { id: 1, shift: true });
+        assert_eq!(g.robot_j2, Some((0, 1)));
+        recibidos(&mut rx);
+        tecla(&mut g, Tecla::Escape);
+        assert!(!g.manual_enabled);
+        let ceros = recibidos(&mut rx);
+        let ids: Vec<i32> = ceros.iter().map(|c| c.id).collect();
+        assert_eq!(ids, [0, 1], "un cero por robot manejado, sin un ManualTick");
+        assert!(ceros.iter().all(es_cero));
+        assert_eq!(g.robot_j2, Some((0, 1)), "las asignaciones quedan");
 
-        // θ = 0 → avanza en +X.
-        let (vx, vy, _) = manual_world_target(&w, FrameMode::Robot, lin, ang, 0.0);
-        assert!((vx - 0.5).abs() < 1e-9);
-        assert!(vy.abs() < 1e-9);
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::ToggleManual(false));
+        assert_eq!(recibidos(&mut rx).len(), 2, "con el botón, lo mismo");
+    }
 
-        // θ = π/2 → avanza en +Y.
-        let (vx2, vy2, _) =
-            manual_world_target(&w, FrameMode::Robot, lin, ang, std::f64::consts::FRAC_PI_2);
-        assert!(vx2.abs() < 1e-9);
-        assert!((vy2 - 0.5).abs() < 1e-9);
+    #[test]
+    fn changing_robot_inside_manual_zeroes_the_previous_one() {
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::SelectRow(2));
+        let c = recibidos(&mut rx);
+        assert_eq!(c.len(), 1);
+        assert!(c[0].id == 0 && es_cero(&c[0]), "{c:?}");
+        assert_eq!(g.selected_robot, 2);
+        let _ = g.update(Message::ClicRobot { id: 1, shift: true });
+        let _ = g.update(Message::SoltarJugador2);
+        let c = recibidos(&mut rx);
+        assert!(c.len() == 1 && c[0].id == 1 && es_cero(&c[0]), "soltar al jugador 2: {c:?}");
+        assert_eq!(g.robot_j2, None);
+    }
 
-        // A gira (omega > 0); todo finito.
-        let mut a = HashSet::new();
-        a.insert('a');
-        let (rx, ry, romega) = manual_world_target(&a, FrameMode::Robot, lin, ang, 1.234);
-        assert!(rx.is_finite() && ry.is_finite() && romega.is_finite());
-        assert!(romega > 0.0);
+    #[test]
+    fn outside_manual_selection_sends_nothing() {
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::ClicRobot { id: 1, shift: true });
+        let _ = g.update(Message::ToggleManual(false));
+        recibidos(&mut rx);
+        for m in [
+            Message::SelectRow(2),
+            Message::SelectRobot(0),
+            Message::SelectTeam(1),
+            Message::SelectTeam(0),
+            Message::SoltarJugador2,
+            Message::ClicRobot { id: 2, shift: false },
+        ] {
+            let _ = g.update(m);
+        }
+        assert!(recibidos(&mut rx).is_empty(), "un cero marcaría al robot como intervenido");
+        assert_eq!(g.robot_j2, None, "soltar sí cambia la asignación");
+        assert_eq!(g.selected_robot, 0, "el click en la cancha fuera del manual no selecciona");
+    }
+
+    #[test]
+    fn shift_assigns_player_two_and_focus_loss_releases_it() {
+        let (mut g, _rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::Teclado(EventoTeclado::Shift(true)));
+        let _ = g.update(Message::SelectRow(1));
+        assert_eq!((g.selected_robot, g.robot_j2), (0, Some((0, 1))), "Shift y click en la fila");
+        let _ = g.update(Message::SelectRow(0));
+        assert_eq!(g.robot_j2, Some((0, 1)), "Shift sobre el robot del jugador 1: nada");
+        let _ = g.update(Message::Teclado(EventoTeclado::FocoPerdido));
+        let _ = g.update(Message::SelectRow(2));
+        assert_eq!((g.selected_robot, g.robot_j2), (2, Some((0, 1))), "sin Shift: el jugador 1");
+        let _ = g.update(Message::SelectRow(1));
+        assert_eq!((g.selected_robot, g.robot_j2), (1, None), "el 1 le quita el robot al 2");
+    }
+
+    #[test]
+    fn both_players_drive_at_once() {
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::ClicRobot { id: 2, shift: true });
+        recibidos(&mut rx);
+        tecla(&mut g, Tecla::Letra('w'));
+        tecla(&mut g, Tecla::Flecha(keys::Flecha::Arriba));
+        let _ = g.update(Message::ManualTick);
+        let c = recibidos(&mut rx);
+        assert_eq!(c.iter().map(|c| c.id).collect::<Vec<_>>(), [0, 2]);
+        assert!(c.iter().all(|c| c.vx > 0.0 && c.omega == 0.0), "los dos avanzan: {c:?}");
+        let _ = g.update(Message::Teclado(EventoTeclado::Soltada(Tecla::Letra('w'))));
+        for _ in 0..30 {
+            let _ = g.update(Message::ManualTick);
+        }
+        let ultimos = recibidos(&mut rx);
+        let (j1, j2): (Vec<_>, Vec<_>) = ultimos.iter().partition(|c| c.id == 0);
+        assert!(es_cero(j1.last().unwrap()), "el 1 soltó y frenó");
+        assert!(j2.last().unwrap().vx > 0.0, "el 2 sigue");
+    }
+
+    #[test]
+    fn the_stop_resets_both_ramps() {
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::ClicRobot { id: 1, shift: true });
+        tecla(&mut g, Tecla::Letra('w'));
+        tecla(&mut g, Tecla::Flecha(keys::Flecha::Arriba));
+        for _ in 0..30 {
+            let _ = g.update(Message::ManualTick);
+        }
+        tecla(&mut g, Tecla::Espacio);
+        assert!(g.estop_activa());
+        let _ = g.update(Message::ManualTick);
+        let _ = g.update(Message::ToggleEstop);
+        recibidos(&mut rx);
+        let _ = g.update(Message::ManualTick);
+        let c = recibidos(&mut rx);
+        let paso = g.manual_lin_accel * MANUAL_TICK_DT;
+        assert_eq!(c.iter().map(|c| c.id).collect::<Vec<_>>(), [0, 1]);
+        assert!(c.iter().all(|c| (c.vx - paso).abs() < 1e-9), "al soltar la parada, los dos desde cero: {c:?}");
+    }
+
+    #[test]
+    fn focus_loss_releases_keys_ramps_and_the_spin() {
+        use crate::control_loop::TickMode;
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::ClicRobot { id: 1, shift: true });
+        tecla(&mut g, Tecla::Flecha(keys::Flecha::Arriba));
+        for _ in 0..10 {
+            let _ = g.update(Message::ManualTick);
+        }
+        assert!(recibidos(&mut rx).iter().any(|c| c.id == 1 && c.vx > 0.0));
+        g.snap = foto_giro(TickMode::Play, 0.0);
+        tecla(&mut g, Tecla::Letra('e'));
+        assert!(g.jugadores[0].girando());
+        let _ = g.update(Message::Teclado(EventoTeclado::Shift(true)));
+        let _ = g.update(Message::Teclado(EventoTeclado::FocoPerdido));
+        assert!(g.teclas.is_empty() && !g.shift);
+        assert!(!g.jugadores[0].girando(), "el giro se corta");
+        for _ in 0..3 {
+            let _ = g.update(Message::ManualTick);
+            let c = recibidos(&mut rx);
+            assert!(c.iter().all(es_cero), "sin avance hasta volver a apretar: {c:?}");
+        }
+    }
+
+    #[test]
+    fn leaving_manual_resumes_the_gui_skill_only_on_player_one() {
+        let (mut g, mut rx, mut skills, _) = gui_con_skills();
+        let _ = g.update(Message::SelectSkill(Some(SkillId::GoTo)));
+        let _ = g.update(Message::ManualTick);
+        assert_eq!(std::iter::from_fn(|| skills.try_recv().ok()).count(), 1, "la skill corre");
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::ClicRobot { id: 1, shift: true });
+        let _ = g.update(Message::ManualTick);
+        assert_eq!(std::iter::from_fn(|| skills.try_recv().ok()).count(), 0, "en el modo manual no se envía");
+        recibidos(&mut rx);
+        tecla(&mut g, Tecla::Escape);
+        let ceros = recibidos(&mut rx);
+        assert_eq!(ceros.iter().map(|c| c.id).collect::<Vec<_>>(), [0, 1], "primero los ceros");
+        let _ = g.update(Message::ManualTick);
+        let enviadas: Vec<GuiSkillCommand> = std::iter::from_fn(|| skills.try_recv().ok()).collect();
+        assert_eq!(enviadas.iter().map(|s| s.id).collect::<Vec<_>>(), [0], "solo el robot del jugador 1");
+    }
+
+    #[test]
+    fn p_toggles_the_coach_once_per_press() {
+        let (mut g, _rx, pausa) = gui_de_prueba();
+        for _ in 0..5 {
+            tecla(&mut g, Tecla::Letra('p'));
+        }
+        assert!(pausa.load(Ordering::Relaxed), "la autorrepetición no la alterna otra vez");
+        let _ = g.update(Message::Teclado(EventoTeclado::Soltada(Tecla::Letra('p'))));
+        tecla(&mut g, Tecla::Letra('p'));
+        assert!(!pausa.load(Ordering::Relaxed));
+        let _ = g.update(Message::ToggleCoach);
+        assert!(g.coach_en_pausa() && !g.coach_activo());
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::Teclado(EventoTeclado::Soltada(Tecla::Letra('p'))));
+        tecla(&mut g, Tecla::Letra('p'));
+        assert!(!g.coach_en_pausa(), "P también dentro del modo manual");
+    }
+
+    /// Una foto con el robot 0 visible en el origen y la pelota a su derecha (atacando
+    /// hacia +X, porque `run_info_de_prueba` defiende la izquierda).
+    fn foto_giro(modo: crate::control_loop::TickMode, edad_s: f32) -> Arc<LoopSnapshot> {
+        let robot = crate::snapshot::RobotView {
+            team: 0,
+            id: 0,
+            position: Vec2::ZERO,
+            orientation: 0.0,
+            velocity: Vec2::ZERO,
+            angular_velocity: 0.0,
+            active: true,
+            age_s: edad_s,
+        };
+        Arc::new(LoopSnapshot {
+            mode: modo,
+            robots: vec![robot],
+            ball: Some(crate::snapshot::BallView { position: Vec2::new(0.0, -0.06), velocity: Vec2::ZERO }),
+            ..LoopSnapshot::default()
+        })
+    }
+
+    #[test]
+    fn short_spin_starts_on_the_press_edge_toward_the_rival_goal() {
+        use crate::control_loop::TickMode;
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        g.snap = foto_giro(TickMode::Play, 0.0);
+        tecla(&mut g, Tecla::Letra('e'));
+        assert!(g.jugadores[0].girando());
+        let _ = g.update(Message::ManualTick);
+        let c = recibidos(&mut rx);
+        assert_eq!((c[0].vx, c[0].vy), (0.0, 0.0));
+        assert_eq!(c[0].omega, crate::params::params().manual.spin_rad_s, "pelota a la derecha: CCW");
+        // La autorrepetición no reinicia el pulso.
+        let antes = g.jugadores[0].clone();
+        tecla(&mut g, Tecla::Letra('e'));
+        assert_eq!(g.jugadores[0], antes);
+    }
+
+    #[test]
+    fn no_short_spin_out_of_play_or_without_the_robot_in_sight() {
+        use crate::control_loop::TickMode;
+        for (modo, edad, motivo) in [
+            (TickMode::Stop, 0.0, "STOP"),
+            (TickMode::SinVision, 0.0, "corte sin visión"),
+            (TickMode::Play, 2.0, "robot sin visión"),
+        ] {
+            let (mut g, _rx, _) = gui_de_prueba();
+            let _ = g.update(Message::ToggleManual(true));
+            g.snap = foto_giro(modo, edad);
+            tecla(&mut g, Tecla::Letra('e'));
+            assert!(!g.jugadores[0].girando(), "{motivo}");
+        }
+        let (mut g, _rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        g.snap = foto_giro(TickMode::Play, 0.0);
+        tecla(&mut g, Tecla::Espacio);
+        tecla(&mut g, Tecla::Letra('e'));
+        assert!(!g.jugadores[0].girando(), "con la parada");
+        let (mut g, _rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        g.snap = foto_giro(TickMode::Play, 0.0);
+        tecla(&mut g, Tecla::Enter);
+        assert!(!g.jugadores[1].girando(), "el jugador 2 sin robot");
+    }
+
+    #[test]
+    fn player_two_spins_with_enter() {
+        use crate::control_loop::TickMode;
+        let (mut g, mut rx, _) = gui_de_prueba();
+        let _ = g.update(Message::ToggleManual(true));
+        let _ = g.update(Message::SelectRow(2));
+        let _ = g.update(Message::ClicRobot { id: 0, shift: true });
+        assert_eq!(g.robot_j2, Some((0, 0)));
+        g.snap = foto_giro(TickMode::Play, 0.0);
+        recibidos(&mut rx);
+        tecla(&mut g, Tecla::Enter);
+        assert!(g.jugadores[1].girando() && !g.jugadores[0].girando());
+        let _ = g.update(Message::ManualTick);
+        let c = recibidos(&mut rx);
+        let j2 = c.iter().find(|c| c.id == 0).expect("el robot del jugador 2");
+        assert_eq!((j2.vx, j2.vy), (0.0, 0.0));
+        assert_eq!(j2.omega, crate::params::params().manual.spin_rad_s, "pelota a la derecha: CCW");
+    }
+
+    #[test]
+    fn manual_scales_come_from_params_with_a_ceiling() {
+        let (mut g, _rx, _) = gui_de_prueba();
+        let tope = crate::params::params().manual.velocidad_sim_m_s;
+        assert_eq!((g.tope_lin, g.manual_lin_ms), (tope, tope), "FIRASim: el tope de simulación");
+        let _ = g.update(Message::ManualLinChanged("0.2".to_string()));
+        assert_eq!(g.manual_lin_ms, 0.2);
+        let _ = g.update(Message::ManualLinChanged(format!("{}", tope + 0.3)));
+        assert_eq!(g.manual_lin_ms, 0.2, "por encima del tope se ignora");
+        let _ = g.update(Message::ManualLinChanged("x".to_string()));
+        assert_eq!(g.manual_lin_ms, 0.2);
+        assert_eq!(escala_valida("0.3", 0.3), Some(0.3));
+        assert_eq!(escala_valida("-0.1", 0.3), None);
+        assert_eq!(escala_valida("NaN", 0.3), None);
+    }
+
+    #[test]
+    fn presets_are_validated_and_clamped() {
+        let actual = TuningPreset {
+            lin_ms: 0.2,
+            ang_rads: 2.0,
+            lin_accel: 2.0,
+            ang_accel: 12.0,
+            spin_omega: 20.0,
+            kp: 3.0,
+            ki: 0.08,
+            kd: 0.2,
+        };
+        let de_sim = TuningPreset { lin_ms: 0.5, ang_rads: 4.0, ..actual.clone() };
+        let p = preset_valido(&de_sim, &actual, 0.3, 3.0);
+        assert_eq!((p.lin_ms, p.ang_rads), (0.3, 3.0), "recortado al tope");
+        let malo = TuningPreset {
+            lin_ms: -1.0,
+            ang_rads: f64::NAN,
+            lin_accel: 0.0,
+            ang_accel: -3.0,
+            spin_omega: 0.0,
+            kp: -1.0,
+            ki: f64::INFINITY,
+            kd: 0.5,
+        };
+        let p = preset_valido(&malo, &actual, 0.3, 3.0);
+        assert_eq!(p, TuningPreset { kd: 0.5, ..actual }, "lo inválido conserva lo anterior");
+    }
+
+    #[test]
+    fn none_skill_text_follows_the_pause() {
+        assert_eq!(texto_ninguna(false).0, "ninguna (coach)");
+        assert_eq!(texto_ninguna(true).0, "ninguna (quieto)");
+        assert!(texto_ninguna(true).1.contains("queda quieto"));
+    }
+
+    #[test]
+    fn warning_when_a_player_drives_the_coach_keeper() {
+        let j = [Some((0, 0)), Some((0, 2))];
+        assert_eq!(
+            aviso_arquero_manual(&j, 0, 2, true).as_deref(),
+            Some("el robot 2 es el arquero del coach: el arco queda solo")
+        );
+        assert_eq!(aviso_arquero_manual(&j, 0, 2, false), None, "con el coach en pausa no");
+        assert_eq!(aviso_arquero_manual(&[Some((0, 0)), None], 0, 2, true), None);
+        assert_eq!(aviso_arquero_manual(&[Some((1, 2)), None], 0, 2, true), None, "rival");
     }
 
     /// 3.5 — La rampa no sobrepasa, converge y decae hacia cero.

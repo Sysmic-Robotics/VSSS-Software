@@ -179,6 +179,12 @@ fn cuadro(
         trazas,
         sim: true,
         rutina: rutina.cloned(),
+        // Con los dos jugadores: el anillo punteado y los rótulos J1 y J2 se dibujan en los
+        // cuadros en que esos robots tienen pose finita, y los otros cuadros traen poses no
+        // finitas: el daño debe seguir finito en los dos casos.
+        modo_manual: true,
+        jugador2: Some((0, 2)),
+        num_robots: 3,
     };
     renderer.clear();
     let geometrias = canvas::Program::<super::Message>::draw(
@@ -343,13 +349,13 @@ fn rows_and_status_bar_text_have_no_nan_with_non_finite_data() {
     };
     let mut textos: Vec<String> = Vec::new();
     for id in 0..3 {
-        let fila = robot_rows::datos_fila(id, &run, snap, None);
+        let fila = robot_rows::datos_fila(id, &run, snap, None, false);
         textos.extend([fila.titulo, fila.al_lado]);
         textos.extend(fila.skill.into_iter().chain(fila.pedido).chain(fila.medido));
         textos.extend(fila.avisos);
     }
     textos.push(robot_rows::linea_rivales(snap, 0, 3));
-    textos.extend(frases_estado(&run, snap, &tasas, None).into_iter().map(|f| f.texto));
+    textos.extend(frases_estado(&run, snap, &tasas, None, false).into_iter().map(|f| f.texto));
     // Así escribe Rust un f32 no finito: "NaN", "inf" y "-inf".
     for t in &textos {
         let no_finito = t
@@ -358,5 +364,5 @@ fn rows_and_status_bar_text_have_no_nan_with_non_finite_data() {
         assert!(!no_finito, "texto con un no finito: {t}");
     }
     // El robot 2 tiene la velocidad en NaN: su medido se omite.
-    assert!(robot_rows::datos_fila(2, &run, snap, None).medido.is_none());
+    assert!(robot_rows::datos_fila(2, &run, snap, None, false).medido.is_none());
 }

@@ -98,18 +98,33 @@ fn main() {
     // Lo activan una señal (SIGINT, SIGTERM, SIGHUP) o el cierre de la GUI: el lazo para
     // con ceros antes de que termine el proceso (`rustengine::parada`).
     let shutdown = Arc::new(AtomicBool::new(false));
-    if std::env::var("VSSL_DEBUG_GUI").unwrap_or_default() == "1" {
-        run_with_gui(shutdown);
+    // `VSSL_COACH_PAUSA`, antes de abrir nada ni mandar algo a los robots: un valor
+    // inválido, o la pausa sin la interfaz (nadie podría reanudar), no arranca.
+    let pausa = GUI::run_info::coach_pausa_from_env().unwrap_or_else(|e| {
+        eprintln!("[main] ✗ {e}");
+        std::process::exit(1);
+    });
+    let con_gui = std::env::var("VSSL_DEBUG_GUI").unwrap_or_default() == "1";
+    if pausa && !con_gui {
+        eprintln!(
+            "[main] ✗ {} solo vale con la interfaz (VSSL_DEBUG_GUI=1): sin ella nadie puede \
+             reanudar el coach. Para correr sin coach, VSSL_COACH=none.",
+            GUI::run_info::COACH_PAUSA_ENV
+        );
+        std::process::exit(1);
+    }
+    if con_gui {
+        run_with_gui(shutdown, pausa);
     } else {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(None, shutdown));
+        rt.block_on(async_main(None, None, shutdown));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Modo debug: GUI en el hilo principal, tokio en background
 // ─────────────────────────────────────────────────────────────────────────────
-fn run_with_gui(shutdown: Arc<AtomicBool>) {
+fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool) {
     // Foto de cada tick, lazo → GUI (canal de "último valor": nunca frena el lazo).
     let (snapshot_tx, snapshot_rx) = rustengine::snapshot::snapshot_channel();
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
@@ -128,13 +143,24 @@ fn run_with_gui(shutdown: Arc<AtomicBool>) {
         NUM_ROBOTS,
         GUI::CoachKind::from_env(),
     );
+    // Interruptor del coach, compartido con el conmutador: solo si hay un coach que pausar.
+    let coach_pausa = if run.coach.se_puede_pausar() {
+        Some(Arc::new(AtomicBool::new(pausa)))
+    } else {
+        if pausa {
+            eprintln!("[main] {} no tiene efecto sin coach (VSSL_COACH=none)", GUI::run_info::COACH_PAUSA_ENV);
+        }
+        None
+    };
 
     let estop_loop = estop.clone();
     let shutdown_loop = shutdown.clone();
+    let coach_pausa_loop = coach_pausa.clone();
     let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(
             Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx, rutina_rx)),
+            coach_pausa_loop,
             shutdown_loop,
         ));
     });
@@ -147,6 +173,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>) {
         teleport_tx: Some(teleport_tx),
         rutina_tx: Some(rutina_tx),
         estop,
+        coach_pausa,
         run,
     };
     // Al cerrarse la ventana (o con un pánico), espera la parada del lazo antes de salir.
@@ -176,7 +203,11 @@ type GuiChannelBundle = (
     mpsc::Receiver<OrdenRutina>,
 );
 
-async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<AtomicBool>) {
+async fn async_main(
+    gui_channels: Option<GuiChannelBundle>,
+    coach_pausa: Option<Arc<AtomicBool>>,
+    shutdown: Arc<AtomicBool>,
+) {
     if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
         eprintln!("[main] no pude registrar las señales de terminación: {e}");
     }
@@ -227,7 +258,18 @@ async fn async_main(gui_channels: Option<GuiChannelBundle>, shutdown: Arc<Atomic
         None => (None, None),
     };
     let decider: Box<dyn TickDecider> = match rutina_rx {
-        Some(rx) => Box::new(DecisorConRutinas::new(base, rx, own_team, NUM_ROBOTS)),
+        Some(rx) => {
+            let conmutador = DecisorConRutinas::new(base, rx, own_team, NUM_ROBOTS);
+            match coach_pausa {
+                Some(flag) => {
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("[main] el coach parte en pausa ({})", GUI::run_info::COACH_PAUSA_ENV);
+                    }
+                    Box::new(conmutador.con_pausa(flag))
+                }
+                None => Box::new(conmutador),
+            }
+        }
         None => base,
     };
 

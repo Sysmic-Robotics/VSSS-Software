@@ -5,11 +5,14 @@
 #   tools/iniciar.sh                           menú
 #   tools/iniciar.sh sim                       FIRASim (si no está abierto) y la interfaz
 #   tools/iniciar.sh real                      comprueba cámara y base, y abre la interfaz
+#   tools/iniciar.sh sim --sin-coach           la interfaz parte con el coach en pausa
+#                                              (también con real; P o el botón lo activan)
 #   tools/iniciar.sh rutina [ID] [sim|real] [PCT]
 #                                              una rutina de config/rutinas/ por consola
 #
-# Opciones: --frontal (robots solo de frente), --pausa (espera Enter antes de cerrar la
-# ventana; la usa el acceso directo de tools/instalar_acceso.sh), --ayuda.
+# Opciones: --frontal (robots solo de frente), --sin-coach (el coach parte en pausa: los
+# robots libres quedan quietos), --pausa (espera Enter antes de cerrar la ventana; la usa
+# el acceso directo de tools/instalar_acceso.sh), --ayuda.
 # Las variables VSSL_* que ya estén definidas se respetan (README, "Variables de entorno").
 
 # ── Configuración ─────────────────────────────────────────────────────────────
@@ -22,6 +25,9 @@ EQUIPO=${VSSL_TEAM_COLOR:-blue}
 BIDIRECCIONAL=${VSSL_BIDIRECTIONAL:-1}
 # 1: ruido de cámara en el simulador, como con la cámara real.
 RUIDO_SIM=${VSSL_VISION_NOISE:-1}
+# 1: la interfaz parte con el coach en pausa (los robots libres quedan quietos hasta
+# activarlo con P o con el botón de la barra). Lo mismo que --sin-coach.
+SIN_COACH=${VSSL_COACH_PAUSA:-0}
 # Puerto de la base station. Vacío: el único /dev/ttyUSB* o /dev/ttyACM* que haya.
 PUERTO_BASE=${VSSL_BASESTATION_DEVICE:-}
 # Velocidad por defecto de las rutinas con los robots reales (%).
@@ -49,13 +55,26 @@ al_salir() {
 trap al_salir EXIT
 
 ayuda() {
-  decir "Uso: tools/iniciar.sh [sim | real | rutina [ID] [sim|real] [PCT]] [--frontal]" \
+  decir "Uso: tools/iniciar.sh [sim | real | rutina [ID] [sim|real] [PCT]] [--frontal] [--sin-coach]" \
     "  sin argumentos: un menú." \
     "  sim      abre FIRASim (si no está abierto) y la interfaz." \
     "  real     comprueba la cámara y la base station, y abre la interfaz." \
     "  rutina   corre una rutina de config/rutinas/ por consola." \
-    "  --frontal  robots solo de frente (por defecto, de dos caras)."
+    "  --frontal  robots solo de frente (por defecto, de dos caras)." \
+    "  --sin-coach  con sim o real: el coach parte en pausa (P o el botón de la barra lo activan)."
 }
+
+# --pausa y --ayuda antes de validar el entorno: que la ayuda salga y que la ventana del
+# acceso directo espere aunque una variable no valga.
+for a in "$@"; do
+  case $a in
+    --pausa) PAUSA=1 ;;
+    -h | --help | --ayuda)
+      ayuda
+      exit 0
+      ;;
+  esac
+done
 
 # ── Entorno ───────────────────────────────────────────────────────────────────
 if grep -qi microsoft /proc/version 2>/dev/null; then
@@ -77,6 +96,21 @@ case $BIDIRECCIONAL in
   1 | true | on) BIDIRECCIONAL=1 ;;
   *) BIDIRECCIONAL=0 ;;
 esac
+# Con las mismas reglas que la interfaz (en minúsculas y sin espacios en los extremos): un
+# valor desconocido no abre nada, para que un error de tipeo no ponga a jugar a los robots.
+v=${SIN_COACH,,}
+v=${v#"${v%%[![:space:]]*}"}
+v=${v%"${v##*[![:space:]]}"}
+case $v in
+  1 | true | on) SIN_COACH=1 ;;
+  "" | 0 | false | off) SIN_COACH=0 ;;
+  *) fallar "✗ VSSL_COACH_PAUSA='$SIN_COACH' no vale: usa 1 (coach en pausa) o 0 (activo)." ;;
+esac
+
+# El coach parte en pausa, y hay coach que pausar (con VSSL_COACH=none no lo hay).
+parte_en_pausa() {
+  [ "$SIN_COACH" = 1 ] && [ "${VSSL_COACH:-}" != none ]
+}
 
 texto_modo() {
   local equipo=azul caras="de dos caras"
@@ -215,7 +249,7 @@ comprobar_real() {
 
 correr_interfaz() {
   env "$@" VSSL_DEBUG_GUI=1 VSSL_TEAM_COLOR="$EQUIPO" VSSL_BIDIRECTIONAL="$BIDIRECCIONAL" \
-    target/release/rustengine >"$LOG" 2>&1
+    VSSL_COACH_PAUSA="$SIN_COACH" target/release/rustengine >"$LOG" 2>&1
   local codigo=$?
   if [ $codigo -eq 0 ]; then
     decir "La interfaz se cerró."
@@ -231,8 +265,11 @@ modo_sim() {
   sin_otro_programa
   compilar
   abrir_firasim
-  decir "" "Abriendo la interfaz con el simulador. $(texto_modo)" \
-    "Barra espaciadora: detiene a todos los robots (con la ventana de la interfaz activa)." \
+  decir "" "Abriendo la interfaz con el simulador. $(texto_modo)"
+  if parte_en_pausa; then
+    decir "El coach parte en pausa: los robots libres quedan quietos. Tecla P o el botón de la barra para activarlo."
+  fi
+  decir "Barra espaciadora: detiene a todos los robots (con la ventana de la interfaz activa)." \
     "Para salir, cierra la ventana."
   correr_interfaz VSSL_VISION_SOURCE=firasim VSSL_RADIO_TARGET=firasim VSSL_VISION_NOISE="$RUIDO_SIM"
 }
@@ -241,9 +278,14 @@ modo_real() {
   sin_otro_programa
   compilar
   comprobar_real
-  decir "" "Todo listo para los robots reales. $(texto_modo)" \
-    "⚠ Los robots empiezan a jugar apenas se abre la interfaz." \
-    "⚠ La barra espaciadora es la parada de emergencia: detiene a todos los robots." \
+  decir "" "Todo listo para los robots reales. $(texto_modo)"
+  if parte_en_pausa; then
+    decir "El coach parte en pausa: los robots libres quedan quietos." \
+      "⚠ Al activar el coach (tecla P o el botón de la barra), empiezan a jugar."
+  else
+    decir "⚠ Los robots empiezan a jugar apenas se abre la interfaz."
+  fi
+  decir "⚠ La barra espaciadora es la parada de emergencia: detiene a todos los robots." \
     "  La ventana de la interfaz tiene que estar activa: haz click en ella primero." \
     "  También sirve el botón «Detener todo». Para seguir: «Soltar la parada»." \
     "⚠ Si el programa se cuelga, levanta los robots o desenchufa la base station."
@@ -255,6 +297,7 @@ modo_real() {
 modo_rutina() {
   local id=${1:-} donde=${2:-} velocidad=${3:-} lineas=() linea
   sin_otro_programa
+  [ "$SIN_COACH" = 1 ] && decir "La rutina por consola no usa el coach: --sin-coach no cambia nada."
   compilar
   if [ -z "$id" ]; then
     mapfile -t lineas < <(target/release/skill_test --listar-rutinas 2>/dev/null | sed -n 's/^  ✓ //p')
@@ -321,10 +364,19 @@ menu() {
   local opcion
   decir "VSSS Sysmic. $(texto_modo)" "¿Qué quieres abrir?"
   PS3="Escribe el número y presiona Enter: "
-  select opcion in "Simulador" "Robots reales" "Una rutina por consola" "Salir"; do
+  select opcion in "Simulador" "Simulador sin coach" "Robots reales" "Robots reales sin coach" \
+    "Una rutina por consola" "Salir"; do
     case $opcion in
       Simulador) modo_sim ;;
+      "Simulador sin coach")
+        SIN_COACH=1
+        modo_sim
+        ;;
       "Robots reales") modo_real ;;
+      "Robots reales sin coach")
+        SIN_COACH=1
+        modo_real
+        ;;
       "Una rutina por consola") modo_rutina ;;
       Salir) ;;
       *)
@@ -341,6 +393,7 @@ args=()
 for a in "$@"; do
   case $a in
     --frontal) BIDIRECCIONAL=0 ;;
+    --sin-coach) SIN_COACH=1 ;;
     --pausa) PAUSA=1 ;;
     -h | --help | --ayuda)
       ayuda
