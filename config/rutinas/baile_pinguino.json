@@ -1,50 +1,182 @@
 {
   "nombre": "Baile del pingüino",
   "grupo": "coreografia",
-  "descripcion": "Mira a una diagonal, a la otra, da una vuelta, avanza y vuelve a su lugar. Movimientos grandes para que se lean bien. Con 1 a 3 robots en línea.",
-  "robots": { "min": 1, "max": 3 },
+  "descripcion": "Gira a una diagonal, a la otra, vuelve al frente, da una vuelta, avanza y vuelve. Solo giros y avances largos.",
+  "robots": {
+    "min": 1,
+    "max": 3
+  },
   "repeticiones": 4,
   "puestos": [
     {
       "nombre": "A",
-      "inicio": { "x": -0.20, "y": 0.30, "orientacion_deg": 0 },
+      "inicio": {
+        "x": -0.2,
+        "y": 0.3,
+        "orientacion_deg": 0
+      },
       "pasos": [
-        { "paso": "mirar", "x": 0.00, "y": 0.50 },
-        { "paso": "esperar", "tiempo_s": 0.5 },
-        { "paso": "mirar", "x": 0.00, "y": 0.10 },
-        { "paso": "esperar", "tiempo_s": 0.5 },
-        { "paso": "girar", "sentido": "antihorario", "vueltas": 1 },
-        { "paso": "ir", "x": 0.10, "y": 0.30 },
-        { "paso": "ir", "x": -0.20, "y": 0.30, "orientacion_deg": 0 },
-        { "paso": "esperar", "tiempo_s": 0.5 }
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 0.125
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        },
+        {
+          "paso": "girar",
+          "sentido": "horario",
+          "vueltas": 0.25
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        },
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 0.125
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.3
+        },
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 1
+        },
+        {
+          "paso": "ir",
+          "x": 0.1,
+          "y": 0.3
+        },
+        {
+          "paso": "ir",
+          "x": -0.2,
+          "y": 0.3,
+          "orientacion_deg": 0
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        }
       ]
     },
     {
       "nombre": "B",
-      "inicio": { "x": -0.20, "y": 0.00, "orientacion_deg": 0 },
+      "inicio": {
+        "x": -0.2,
+        "y": 0.0,
+        "orientacion_deg": 0
+      },
       "pasos": [
-        { "paso": "mirar", "x": 0.00, "y": 0.20 },
-        { "paso": "esperar", "tiempo_s": 0.5 },
-        { "paso": "mirar", "x": 0.00, "y": -0.20 },
-        { "paso": "esperar", "tiempo_s": 0.5 },
-        { "paso": "girar", "sentido": "antihorario", "vueltas": 1 },
-        { "paso": "ir", "x": 0.10, "y": 0.00 },
-        { "paso": "ir", "x": -0.20, "y": 0.00, "orientacion_deg": 0 },
-        { "paso": "esperar", "tiempo_s": 0.5 }
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 0.125
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        },
+        {
+          "paso": "girar",
+          "sentido": "horario",
+          "vueltas": 0.25
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        },
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 0.125
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.3
+        },
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 1
+        },
+        {
+          "paso": "ir",
+          "x": 0.1,
+          "y": 0.0
+        },
+        {
+          "paso": "ir",
+          "x": -0.2,
+          "y": 0.0,
+          "orientacion_deg": 0
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        }
       ]
     },
     {
       "nombre": "C",
-      "inicio": { "x": -0.20, "y": -0.30, "orientacion_deg": 0 },
+      "inicio": {
+        "x": -0.2,
+        "y": -0.3,
+        "orientacion_deg": 0
+      },
       "pasos": [
-        { "paso": "mirar", "x": 0.00, "y": -0.10 },
-        { "paso": "esperar", "tiempo_s": 0.5 },
-        { "paso": "mirar", "x": 0.00, "y": -0.50 },
-        { "paso": "esperar", "tiempo_s": 0.5 },
-        { "paso": "girar", "sentido": "antihorario", "vueltas": 1 },
-        { "paso": "ir", "x": 0.10, "y": -0.30 },
-        { "paso": "ir", "x": -0.20, "y": -0.30, "orientacion_deg": 0 },
-        { "paso": "esperar", "tiempo_s": 0.5 }
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 0.125
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        },
+        {
+          "paso": "girar",
+          "sentido": "horario",
+          "vueltas": 0.25
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        },
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 0.125
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.3
+        },
+        {
+          "paso": "girar",
+          "sentido": "antihorario",
+          "vueltas": 1
+        },
+        {
+          "paso": "ir",
+          "x": 0.1,
+          "y": -0.3
+        },
+        {
+          "paso": "ir",
+          "x": -0.2,
+          "y": -0.3,
+          "orientacion_deg": 0
+        },
+        {
+          "paso": "esperar",
+          "tiempo_s": 0.5
+        }
       ]
     }
   ]

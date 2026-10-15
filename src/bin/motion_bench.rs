@@ -27,13 +27,15 @@
 //!   solo de las repeticiones que fallan.
 
 use glam::Vec2;
+use protobuf::Message;
 use rustengine::coach::{RefereeCommand, SharedReferee, SkillChoice};
 use rustengine::coach::referee::{REFEREE_ADDR_DEFAULT, REFEREE_ADDR_ENV, apply_command};
 use rustengine::control_loop::{ControlLoopConfig, TickDecider, TickRecord, run_control_loop};
 use rustengine::motion::{Motion, MotionConfig};
 use rustengine::params::params;
+use rustengine::protos::fira_packet::Environment;
 use rustengine::radio::{FIRASimClient, RadioTarget, TeleportItem};
-use rustengine::skills::zones::AreaRect;
+use rustengine::skills::zones::{AccionGuardia, AreaRect};
 use rustengine::skills::{
     ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, SkillConfig, SkillId, clear_direction,
 };
@@ -43,7 +45,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Fase de un guion: skill, target y duración (s).
 type Phase = (SkillId, (f32, f32), f64);
@@ -107,6 +109,8 @@ struct Case {
 }
 
 const FAR: (f32, f32) = (0.6, 0.5);
+/// Punto legal junto al área propia de los casos de llegada rápida.
+const NEAR_AREA: (f32, f32) = (-0.495, 0.268);
 const OWN_GOAL: Vec2 = Vec2::new(-0.75, 0.0);
 /// Salto de pose entre dos ticks que solo explica una falla del simulador (m).
 const POSE_JUMP_M: f32 = 0.3;
@@ -179,6 +183,13 @@ const CASES: &[Case] = &[
     // pelota frente al arco deja el staging de Clear dentro del área con la dirección pedida.
     c("goto_around_area", SkillId::GoTo, (-0.66, 0.45), (-0.66, -0.45, 90.0), FAR, 8.0, 0.08, Goal::ArriveNoArea),
     c("blockline_across_area", SkillId::BlockLine, (-0.75, 0.0), (-0.66, -0.45, 90.0), (-0.45, 0.40), 8.0, 0.05, Goal::ArriveNoArea),
+    // Llegada rápida a un punto legal junto al área (el de bloqueo con la pelota en
+    // (−0.15, 0.63)): sin el tope de frenado, llegaba caliente, el guardia frenaba en seco
+    // y la pose estimada se pasaba al área. El GoTo rápido separa motion de la skill; el
+    // lento es el control.
+    c("blockline_fast_near_area", SkillId::BlockLine, (-0.75, 0.0), (0.16, 0.56, 90.0), (-0.15, 0.63), 5.0, 0.05, Goal::ArriveNoArea),
+    c("goto_fast_near_area", SkillId::GoTo, NEAR_AREA, (0.16, 0.56, 90.0), FAR, 5.0, 0.05, Goal::ArriveNoArea),
+    c("goto_slow_near_area", SkillId::GoTo, NEAR_AREA, (-0.25, 0.40, 180.0), FAR, 5.0, 0.05, Goal::ArriveNoArea),
     c("clear_own_arc", SkillId::Clear, (0.2, 0.45), (-0.2, 0.3, 0.0), (-0.45, 0.0), 6.0, 0.0, Goal::ClearKick { min_prog: 0.10, max_dir: 30.0 }),
     c("spin_20", SkillId::Spin, (1.0, 0.0), (0.0, 0.0, 0.0), FAR, 3.0, 0.0, Goal::Spin),
     c("spin_cw", SkillId::Spin, (-1.0, 0.0), (0.0, 0.0, 0.0), FAR, 3.0, 0.0, Goal::Spin),
@@ -210,7 +221,7 @@ const SUITE: &[&str] = &[
     "b2_blockline_open", "b2_blockline_corner", "b2_blockline_center", "goalkeep_keeper",
     "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
     "mark_point", "hold_still", "b1a_hold_in_area", "goto_around_area", "blockline_across_area",
-    "clear_own_arc",
+    "clear_own_arc", "blockline_fast_near_area", "goto_fast_near_area", "goto_slow_near_area",
 ];
 
 /// Suite rápida, un caso por skill (alias `suite-rapida`): para cada change.
@@ -254,6 +265,10 @@ struct Row {
     escaping: bool,
     /// Fase del guion vigente en el tick.
     phase: usize,
+    /// Guardia en el tick: 0 nada, 1 frenó, 2 lo sacó del área.
+    guard: u8,
+    /// Pose real de FIRASim (x, y, θ), si había un cuadro reciente de la visión directa.
+    real: Option<(f32, f32, f64)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -264,7 +279,84 @@ struct Metrics {
     escape_ticks: usize,
     area_ticks: usize,
     max_pen: f32,
+    /// Todas las filas tienen pose real: el criterio de área se juzga con ella.
+    area_real: bool,
+    area_ticks_real: usize,
+    max_pen_real: f32,
+    guard_brake_ticks: usize,
+    guard_exit_ticks: usize,
+    /// Mayor avance más allá del destino (m), con la pose estimada y con la real.
+    overshoot_est: Option<f32>,
+    overshoot_real: Option<f32>,
     ball_disp: f32,
+}
+
+/// Una pose real vale para el tick si el último cuadro de FIRASim tiene menos que esto.
+const VERDAD_MAX_EDAD: Duration = Duration::from_millis(100);
+
+/// Último cuadro de la visión directa de FIRASim (sin el proxy de ruido ni el estimador del
+/// engine): las poses reales de los robots azules por id e instante de llegada.
+#[derive(Clone, Debug, Default)]
+struct Verdad {
+    llegada: Option<Instant>,
+    azules: Vec<(u32, Vec2, f64)>,
+}
+
+impl Verdad {
+    /// Pose real del azul `id` si el cuadro es de hace menos de `VERDAD_MAX_EDAD`.
+    fn pose(&self, id: u32, ahora: Instant) -> Option<(f32, f32, f64)> {
+        let llegada = self.llegada?;
+        if ahora.saturating_duration_since(llegada) >= VERDAD_MAX_EDAD {
+            return None;
+        }
+        self.azules.iter().find(|(i, ..)| *i == id).map(|&(_, p, th)| (p.x, p.y, th))
+    }
+}
+
+/// Poses de los robots azules de un paquete de visión de FIRASim, en metros y radianes y
+/// sin transformar (el marco que ve el engine). `None` si no es un `Environment` con cuadro.
+fn azules_de(data: &[u8]) -> Option<Vec<(u32, Vec2, f64)>> {
+    let env = Environment::parse_from_bytes(data).ok()?;
+    let frame = env.frame.as_ref()?;
+    Some(frame.robots_blue.iter().map(|r| (r.robot_id, Vec2::new(r.x as f32, r.y as f32), r.orientation)).collect())
+}
+
+/// Escucha en paralelo la visión directa de FIRASim (el multicast que lee el engine, con
+/// reuso de dirección y puerto) y guarda el último cuadro. Si el socket no se puede abrir,
+/// lo avisa una vez y el bench sigue sin pose real.
+fn escuchar_verdad() -> Arc<Mutex<Verdad>> {
+    let verdad = Arc::new(Mutex::new(Verdad::default()));
+    match socket_verdad() {
+        Ok(sock) => {
+            let v = verdad.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n) = sock.recv(&mut buf).await {
+                    if let Some(azules) = azules_de(&buf[..n]) {
+                        *v.lock().unwrap() = Verdad { llegada: Some(Instant::now()), azules };
+                    }
+                }
+            });
+        }
+        Err(e) => eprintln!("[motion_bench] sin la visión directa de FIRASim ({e}): el criterio de área usa la pose estimada"),
+    }
+    verdad
+}
+
+fn socket_verdad() -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let source = VisionSource::FiraSim;
+    let group: std::net::Ipv4Addr = source.multicast_ip().parse().map_err(std::io::Error::other)?;
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], source.port()));
+    socket.bind(&addr.into())?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    std_socket.join_multicast_v4(&group, &std::net::Ipv4Addr::UNSPECIFIED)?;
+    tokio::net::UdpSocket::from_std(std_socket)
 }
 
 fn phases(case: &Case) -> Vec<Phase> {
@@ -385,6 +477,14 @@ fn metrics(case: &Case, rows: &[Row], bidirectional: bool) -> Metrics {
             m.area_ticks += 1;
             m.max_pen = m.max_pen.max(r.x.abs() - 0.56);
         }
+        if let Some((x, y, _)) = r.real
+            && area.touches(Vec2::new(x, y))
+        {
+            m.area_ticks_real += 1;
+            m.max_pen_real = m.max_pen_real.max(x.abs() - 0.56);
+        }
+        m.guard_brake_ticks += (r.guard == 1) as usize;
+        m.guard_exit_ticks += (r.guard == 2) as usize;
         if m.arrived.is_none() && arrived(case, r, bidirectional) {
             m.arrived = Some(r.t - rows[0].t);
             m.path = path;
@@ -398,7 +498,31 @@ fn metrics(case: &Case, rows: &[Row], bidirectional: bool) -> Metrics {
     if let (Some(a), Some(b)) = (rows.first(), rows.last()) {
         m.ball_disp = (Vec2::new(b.bx, b.by) - Vec2::new(a.bx, a.by)).length();
     }
+    m.area_real = !rows.is_empty() && rows.iter().all(|r| r.real.is_some());
+    m.overshoot_est = overshoot(case, rows, |r| Some(Vec2::new(r.x, r.y)));
+    if m.area_real {
+        m.overshoot_real = overshoot(case, rows, |r| r.real.map(|(x, y, _)| Vec2::new(x, y)));
+    }
     m
+}
+
+/// Pasada: mayor avance (m) más allá del destino a lo largo de la dirección inicio →
+/// destino, con la pose que da `pose`. Solo en los casos de una fase sin árbitro con GoTo,
+/// Mark o BlockLine (el punto de bloqueo de la primera fila); `None` en los demás o si el
+/// destino está a menos de 0.05 m del inicio.
+fn overshoot(case: &Case, rows: &[Row], pose: impl Fn(&Row) -> Option<Vec2>) -> Option<f32> {
+    let fixed = matches!(case.skill, SkillId::GoTo | SkillId::Mark | SkillId::BlockLine);
+    if !fixed || !case.then.is_empty() || !case.referee.is_empty() {
+        return None;
+    }
+    let first = rows.first()?;
+    let dest = reference(case, first)?;
+    let dir = dest - pose(first)?;
+    if dir.length() < 0.05 {
+        return None;
+    }
+    let u = dir.normalize();
+    rows.iter().filter_map(&pose).map(|p| (p - dest).dot(u)).reduce(f32::max)
 }
 
 /// Tiro en la última fase del guion: (progreso máximo de la pelota hacia el objetivo (m),
@@ -441,6 +565,12 @@ fn kick_against(case: &Case, rows: &[Row], want: Vec2) -> (f32, Option<f32>, f32
     (d0 - best, dir, disp)
 }
 
+/// Ticks en el área con los que se juzga "no entra": con la pose real si todas las filas la
+/// tienen, si no con la estimada.
+fn area_touched(m: &Metrics) -> usize {
+    if m.area_real { m.area_ticks_real } else { m.area_ticks }
+}
+
 /// Criterio de éxito del caso (`None` si no tiene).
 fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Option<bool> {
     let kick_ok = |min_prog: f32, max_dir: f32| {
@@ -452,9 +582,9 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
         Goal::ArriveNoArea => {
             let area = AreaRect::own(1.0);
             let legal = rows.iter().all(|r| reference(case, r).is_none_or(|q| !area.touches(q)));
-            m.arrived.is_some() && m.area_ticks == 0 && legal
+            m.arrived.is_some() && area_touched(m) == 0 && legal
         }
-        Goal::NoArea => m.area_ticks == 0,
+        Goal::NoArea => area_touched(m) == 0,
         Goal::Kick { min_prog, max_dir } => kick_ok(min_prog, max_dir),
         Goal::ClearKick { min_prog, max_dir } => {
             let (b0, target) = kick_start(case, rows);
@@ -594,6 +724,20 @@ fn skill_rates(cases: &[&&Case], results: &[Value], repeat: u32) -> Vec<(SkillId
         .collect()
 }
 
+/// Desacuerdos de área del caso `name` entre la pose estimada y la real, sobre las
+/// repeticiones válidas juzgadas con la real: (fantasmas, ocultas, juzgadas).
+fn disagreements(results: &[Value], name: &str, repeat: u32) -> (usize, usize, usize) {
+    let real: Vec<&Value> = results
+        .iter()
+        .filter(|v| is_valid(v) && v["case"] == json!(name) && v["area_ref"] == json!("real"))
+        .filter(|v| v["rep"].as_u64().is_some_and(|r| r < repeat as u64))
+        .collect();
+    let touched = |v: &Value, k: &str| v[k].as_u64().unwrap_or(0) > 0;
+    let ghost = real.iter().filter(|v| touched(v, "area_ticks") && !touched(v, "area_ticks_real")).count();
+    let hidden = real.iter().filter(|v| !touched(v, "area_ticks") && touched(v, "area_ticks_real")).count();
+    (ghost, hidden, real.len())
+}
+
 /// Pares (caso, repetición) que ya tienen un resultado válido.
 fn done_set(results: &[Value]) -> HashSet<(String, u64)> {
     results
@@ -616,7 +760,12 @@ impl TickDecider for ScriptDecider {
     }
 }
 
-async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedReferee>) -> Result<Vec<Row>, String> {
+async fn run_case(
+    case: &Case,
+    pose: (f32, f32, f32),
+    referee: Option<SharedReferee>,
+    verdad: &Arc<Mutex<Verdad>>,
+) -> Result<Vec<Row>, String> {
     let client = FIRASimClient::new("127.0.0.1", 20011).await.map_err(|e| e.to_string())?;
     let rid = robot_id(case);
     let mut items: Vec<TeleportItem> = (0u32..2)
@@ -648,6 +797,7 @@ async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedRefe
     let timeline = case.referee;
     let sender = if timeline.is_empty() { None } else { Some(referee_sender()?) };
     let (mut sent, mut t0) = (0usize, None::<f64>);
+    let verdad = verdad.clone();
     let hook = Box::new(move |rec: &TickRecord<'_>| {
         let Some(r) = test_robot(rec.world, rid) else { return };
         // El reloj de la línea de tiempo arranca en la primera fila (robot visible), el
@@ -666,6 +816,12 @@ async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedRefe
         let k = rec.commands.iter().position(|c| c.id == rid as i32 && c.team == 0);
         let (vx, vy, w) = k.map(|k| (rec.commands[k].vx, rec.commands[k].vy, rec.commands[k].omega)).unwrap_or_default();
         let escaping = k.and_then(|k| rec.escaping.get(k).copied()).unwrap_or(false);
+        let guard = match rec.debug.and_then(|d| d.robot(rid as i32)).and_then(|r| r.guardia).and_then(|g| g.accion) {
+            Some(AccionGuardia::Frena) => 1,
+            Some(AccionGuardia::Saca) => 2,
+            None => 0,
+        };
+        let real = verdad.lock().unwrap().pose(rid, Instant::now());
         sink.lock().unwrap().push(Row {
             t: rec.t_ms as f64 / 1000.0,
             x: r.position.x,
@@ -679,6 +835,8 @@ async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedRefe
             escaping,
             // `rec.tick` ya cuenta el tick en curso; el decider lo vio como `tick - 1`.
             phase: phase_at(&script, rec.tick.saturating_sub(1)),
+            guard,
+            real,
         });
     });
     let cfg = ControlLoopConfig {
@@ -689,7 +847,8 @@ async fn run_case(case: &Case, pose: (f32, f32, f32), referee: Option<SharedRefe
         max_ticks: Some((total_dur(case) * 60.0).round() as u32),
         vision_timeout: Some(Duration::from_secs(3)),
         referee,
-        exportar_depuracion: false,
+        // La depuración del tick trae lo que hizo el guardia (no cambia ningún comando).
+        exportar_depuracion: true,
     };
     let decider = Box::new(ScriptDecider { case: *case, robot_id: rid as i32 });
     run_control_loop(cfg, decider, Some(hook), None, Arc::new(AtomicBool::new(false)))
@@ -709,15 +868,19 @@ fn referee_sender() -> Result<(std::net::UdpSocket, std::net::SocketAddr), Strin
     Ok((sock, addr))
 }
 
+const CSV_HEADER: &str =
+    "t,x,y,theta,ball_x,ball_y,cmd_vx,cmd_vy,cmd_omega,v_body,escaping,guard,real_x,real_y,real_theta";
+
 fn write_csv(path: &str, rows: &[Row]) -> std::io::Result<()> {
     let mut f = std::fs::File::create(path)?;
-    writeln!(f, "t,x,y,theta,ball_x,ball_y,cmd_vx,cmd_vy,cmd_omega,v_body,escaping")?;
+    writeln!(f, "{CSV_HEADER}")?;
     for r in rows {
         let vb = r.vx * r.th.cos() + r.vy * r.th.sin();
+        let real = r.real.map_or(",,".to_string(), |(x, y, th)| format!("{x:.4},{y:.4},{th:.4}"));
         writeln!(
             f,
-            "{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{}",
-            r.t, r.x, r.y, r.th, r.bx, r.by, r.vx, r.vy, r.w, vb, r.escaping as u8
+            "{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{real}",
+            r.t, r.x, r.y, r.th, r.bx, r.by, r.vx, r.vy, r.w, vb, r.escaping as u8, r.guard
         )?;
     }
     Ok(())
@@ -804,6 +967,7 @@ async fn main() {
     if referee.is_some() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
+    let verdad = escuchar_verdad();
 
     for case in &selected {
         for rep in 0..repeat {
@@ -814,7 +978,7 @@ async fn main() {
             let mut attempt = 0;
             let line = loop {
                 let shared = if case.referee.is_empty() { None } else { referee.clone() };
-                let res = run_case(case, pose, shared).await;
+                let res = run_case(case, pose, shared, &verdad).await;
                 let reason = match &res {
                     Ok(rows) => infra_reason(rows).map(str::to_string),
                     Err(e) => Some(e.clone()),
@@ -852,7 +1016,13 @@ async fn main() {
                 "case": case.name, "rep": rep, "infra": false, "success": ok,
                 "arrived": m.arrived.is_some(), "t_arrive": m.arrived,
                 "path": m.path, "turn_deg": m.turn_deg.round(), "escape_ticks": m.escape_ticks,
-                "area_ticks": m.area_ticks, "max_pen": m.max_pen, "ball_disp": m.ball_disp,
+                "area_ticks": m.area_ticks, "max_pen": m.max_pen,
+                "area_ref": if m.area_real { "real" } else { "estimada" },
+                "area_ticks_real": m.area_real.then_some(m.area_ticks_real),
+                "max_pen_real": m.area_real.then_some(m.max_pen_real),
+                "guard_brake_ticks": m.guard_brake_ticks, "guard_exit_ticks": m.guard_exit_ticks,
+                "overshoot_est": m.overshoot_est, "overshoot_real": m.overshoot_real,
+                "ball_disp": m.ball_disp,
                 "ball_prog": prog, "ball_dir_deg": dir.map(f32::round),
                 "start": [x0, y0, deg0.round()],
                 "final": [last.x, last.y, last.th.to_degrees().round()],
@@ -891,6 +1061,18 @@ async fn main() {
         println!("\néxito por skill ({repeat} repeticiones, bidireccional={bidirectional}):");
         for (skill, k, n) in by_skill {
             println!("  {:16} éxito {k}/{n}", format!("{skill:?}"));
+        }
+    }
+    let with_real: Vec<(&str, (usize, usize, usize))> = judged
+        .iter()
+        .filter(|c| matches!(c.goal, Goal::ArriveNoArea | Goal::NoArea))
+        .map(|c| (c.name, disagreements(&results, c.name, repeat)))
+        .filter(|(_, d)| d.2 > 0)
+        .collect();
+    if !with_real.is_empty() {
+        println!("\nárea con la pose real (fantasmas: la estimada tocó y la real no; ocultas: al revés):");
+        for (name, (ghost, hidden, n)) in with_real {
+            println!("  {name:24} fantasmas {ghost} · ocultas {hidden} · juzgadas con la real {n}");
         }
     }
     let lost = results.iter().filter(|v| v["infra"] == json!(true)).count();
@@ -1288,5 +1470,141 @@ mod tests {
         assert_eq!(names.len(), CASES.len());
         assert!(NAV.iter().chain(SKILL_CASES).chain(REFEREE_CASES).chain(SUITE).all(|n| CASES.iter().any(|c| c.name == *n)));
         assert!(SKILL_CASES.iter().all(|n| case(n).goal != Goal::None));
+    }
+
+    // ── Pose real de FIRASim ──────────────────────────────────────────────
+
+    #[test]
+    fn firasim_vision_gives_the_real_pose() {
+        use rustengine::protos::fira_common::{Frame, Robot};
+        let mut robot = Robot::new();
+        robot.robot_id = 1;
+        robot.x = 0.2;
+        robot.y = -0.1;
+        robot.orientation = 0.5;
+        let mut frame = Frame::new();
+        frame.robots_blue.push(robot);
+        let mut env = Environment::new();
+        env.frame = protobuf::MessageField::some(frame);
+        let azules = azules_de(&env.write_to_bytes().unwrap()).expect("cuadro");
+        let t0 = Instant::now();
+        let v = Verdad { llegada: Some(t0), azules };
+        let (x, y, th) = v.pose(1, t0).expect("azul 1");
+        assert!((x - 0.2).abs() < 1e-6 && (y + 0.1).abs() < 1e-6 && (th - 0.5).abs() < 1e-9);
+        assert!(v.pose(0, t0).is_none(), "el azul 0 no está en el cuadro");
+        assert!(azules_de(&Environment::new().write_to_bytes().unwrap()).is_none(), "sin cuadro");
+    }
+
+    #[test]
+    fn an_old_frame_gives_no_real_pose() {
+        let t0 = Instant::now();
+        let v = Verdad { llegada: Some(t0), azules: vec![(0, Vec2::new(0.1, 0.2), 0.0)] };
+        assert!(v.pose(0, t0 + Duration::from_millis(50)).is_some());
+        assert!(v.pose(0, t0 + Duration::from_millis(150)).is_none());
+        assert!(Verdad::default().pose(0, t0).is_none());
+    }
+
+    /// Llegada a `NEAR_AREA` desde arriba: la pose estimada se pasa al área 3 ticks y la
+    /// real queda afuera.
+    fn ghost_rows() -> Vec<Row> {
+        let mut rows: Vec<Row> = [(0.0, 0.16, 0.56), (0.5, -0.20, 0.40), (0.9, -0.45, 0.29)]
+            .iter()
+            .map(|&(t, x, y)| row(t, x, y, 0.0))
+            .collect();
+        for k in 0..3 {
+            rows.push(Row { real: Some((-0.49, 0.27, 0.0)), ..row(1.0 + 0.02 * k as f64, -0.58, 0.27, 0.0) });
+        }
+        rows.push(row(1.5, -0.495, 0.268, 0.0));
+        for r in &mut rows {
+            if r.real.is_none() {
+                r.real = Some((r.x, r.y, r.th));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn a_ghost_entry_is_judged_with_the_real_pose() {
+        let c = case("goto_fast_near_area");
+        let rows = ghost_rows();
+        let m = metrics(&c, &rows, false);
+        assert!(m.area_real);
+        assert_eq!((m.area_ticks, m.area_ticks_real), (3, 0));
+        assert!(m.max_pen > 0.0 && m.max_pen_real == 0.0);
+        assert_eq!(success(&c, &rows, &m, false), Some(true), "la real no tocó el área");
+        // Sin pose real en una fila, se juzga con la estimada.
+        let mut partial = rows.clone();
+        partial[1].real = None;
+        let m = metrics(&c, &partial, false);
+        assert!(!m.area_real);
+        assert_eq!(success(&c, &partial, &m, false), Some(false));
+    }
+
+    #[test]
+    fn the_guard_ticks_are_counted() {
+        let mut rows = vec![row(0.0, 0.0, 0.0, 0.0); 5];
+        rows[1].guard = 1;
+        rows[2].guard = 1;
+        rows[3].guard = 2;
+        let m = metrics(&case("goto_fwd"), &rows, false);
+        assert_eq!((m.guard_brake_ticks, m.guard_exit_ticks), (2, 1));
+    }
+
+    #[test]
+    fn overshoot_is_measured_along_the_trip() {
+        // goto_fwd: de (−0.4, 0) a (0.3, 0); llega hasta 0.34 y vuelve.
+        let xs = [-0.4, 0.0, 0.25, 0.34, 0.32, 0.30];
+        let rows: Vec<Row> = xs.iter().enumerate().map(|(k, &x)| row(k as f64 * 0.2, x, 0.0, 0.0)).collect();
+        let m = metrics(&case("goto_fwd"), &rows, false);
+        assert!((m.overshoot_est.unwrap() - 0.04).abs() < 1e-6, "{:?}", m.overshoot_est);
+        assert_eq!(m.overshoot_real, None, "sin pose real");
+        // Con árbitro, o con una skill sin destino fijo, no aplica.
+        assert_eq!(metrics(&case("halt_game_on"), &rows, false).overshoot_est, None);
+        assert_eq!(metrics(&case("face_90"), &rows, false).overshoot_est, None);
+        // La real, si todas las filas la tienen.
+        let real: Vec<Row> = rows.iter().map(|r| Row { real: Some((r.x - 0.01, r.y, r.th)), ..*r }).collect();
+        let m = metrics(&case("goto_fwd"), &real, false);
+        assert!((m.overshoot_real.unwrap() - 0.03).abs() < 1e-6, "{:?}", m.overshoot_real);
+    }
+
+    #[test]
+    fn area_disagreements_count_ghosts_and_hidden_entries() {
+        let rep = |r: u64, est: u64, real: Option<u64>| {
+            json!({ "case": "goto_fast_near_area", "rep": r, "infra": false, "success": true,
+                    "area_ticks": est, "area_ticks_real": real,
+                    "area_ref": if real.is_some() { "real" } else { "estimada" } })
+        };
+        let results = vec![rep(0, 3, Some(0)), rep(1, 0, Some(2)), rep(2, 4, None), rep(3, 0, Some(0))];
+        assert_eq!(disagreements(&results, "goto_fast_near_area", 20), (1, 1, 3));
+    }
+
+    #[test]
+    fn the_csv_carries_the_guard_and_the_real_pose() {
+        let path = std::env::temp_dir().join(format!("motion_bench_csv_{}.csv", std::process::id()));
+        let rows = vec![
+            Row { guard: 1, ..row(0.0, 0.1, 0.2, 0.0) },
+            Row { real: Some((0.1, 0.2, 0.3)), ..row(0.016, 0.1, 0.2, 0.0) },
+        ];
+        write_csv(path.to_str().unwrap(), &rows).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], CSV_HEADER);
+        assert!(CSV_HEADER.ends_with(",escaping,guard,real_x,real_y,real_theta"));
+        assert!(lines[1].ends_with(",0,1,,,"), "{}", lines[1]);
+        assert!(lines[2].ends_with(",0,0,0.1000,0.2000,0.3000"), "{}", lines[2]);
+        assert!(lines.iter().all(|l| l.split(',').count() == CSV_HEADER.split(',').count()));
+    }
+
+    #[test]
+    fn fast_arrival_cases_are_in_the_full_suite() {
+        let names = ["blockline_fast_near_area", "goto_fast_near_area", "goto_slow_near_area"];
+        assert!(names.iter().all(|n| SUITE.contains(n) && !SUITE_QUICK.contains(n)));
+        assert!(names.iter().all(|n| case(n).goal == Goal::ArriveNoArea));
+        // El punto de bloqueo con la pelota del caso es el destino de los dos GoTo.
+        let c = case("blockline_fast_near_area");
+        let p = BlockLineSkill::new(Vec2::new(c.target.0, c.target.1)).block_point(Vec2::new(c.ball.0, c.ball.1)).unwrap();
+        assert!((p - Vec2::new(NEAR_AREA.0, NEAR_AREA.1)).length() < 0.01, "{p:?}");
+        assert!(!AreaRect::own(1.0).touches(p));
     }
 }

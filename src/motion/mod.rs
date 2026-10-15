@@ -383,6 +383,9 @@ impl Motion {
         let normalized = (d_profile / self.config.brake_distance).clamp(0.0, 1.0) as f64;
         let v_profile = self.config.min_linear_speed
             + normalized * (self.config.max_linear_speed - self.config.min_linear_speed);
+        // El perfil no pide frenar más de lo que deja la rampa (llega al umbral detenido).
+        let v_profile =
+            v_profile.min(self.velocidad_frenable(d_profile).max(self.config.min_linear_speed));
         let v = self.ramp(key, dir * v_profile * err.cos().max(0.0));
         let nav = NavDebug {
             destino: move_target,
@@ -416,6 +419,13 @@ impl Motion {
         let v = v_target.clamp(prev - dv, prev + dv);
         prev_by_robot.insert(key, v);
         v
+    }
+
+    /// Velocidad (m/s) desde la que, frenando a `max_linear_accel` (lo que deja la rampa),
+    /// el robot llega detenido al umbral de llegada estando a `d` del destino.
+    fn velocidad_frenable(&self, d: f32) -> f64 {
+        let resto = (d - self.config.arrival_threshold).max(0.0) as f64;
+        (2.0 * self.config.max_linear_accel * resto).sqrt()
     }
 
     /// Reinicia el estado de control de un robot (PID de heading, rampa del avance y lado
@@ -855,6 +865,57 @@ mod tests {
         motion.reset_robot(0, 0);
         let v = v_body(&motion.move_and_face(&r, target, target, &world, 3.0, 0.0, 0.0));
         assert!(v <= motion.config.max_linear_accel * CONTROL_DT + 1e-12, "v={v}");
+    }
+
+    // ── Frenado alcanzable ────────────────────────────────────────────────
+
+    #[test]
+    fn the_profile_never_asks_to_brake_harder_than_the_ramp() {
+        // Robot ideal (ejecuta el comando sin retardo) en un GoTo de 0.8 m: el perfil
+        // lineal pedía 0.72 m/s a 0.16 m del destino, más de lo que la rampa deja frenar.
+        // Lejos del umbral, el comando sigue la curva de frenado con un paso de rampa de
+        // margen (el robot avanza un tick con el comando anterior); cerca, la curva se
+        // empina y la discretización pesa más, así que ahí se mira la llegada.
+        let motion = Motion::new();
+        let world = world_far_ball();
+        let target = Vec2::new(0.4, 0.0);
+        let dv = motion.config.max_linear_accel * CONTROL_DT;
+        let mut x = -0.4f32;
+        let mut v_llegada = None;
+        for k in 0..600 {
+            let d = target.x - x;
+            let v = v_body(&motion.move_and_face(&robot(x, 0.0, 0.0), target, target, &world, 3.0, 0.0, 0.0));
+            if d < motion.config.arrival_threshold {
+                break;
+            }
+            let tope = motion.velocidad_frenable(d).max(motion.config.min_linear_speed);
+            if d >= 0.2 {
+                assert!(v <= tope + dv + 1e-9, "tick {k}: v={v:.3} a {d:.3} m (tope {tope:.3})");
+            }
+            v_llegada = Some(v);
+            x += (v * CONTROL_DT) as f32;
+        }
+        // Con el tope llega al umbral a 0.12 m/s; con el perfil lineal solo, a 0.43.
+        let v = v_llegada.expect("sin ticks");
+        assert!(x < target.x, "se pasó: x={x}");
+        assert!(v <= 0.15, "llegó al umbral a {v:.3} m/s");
+    }
+
+    #[test]
+    fn a_long_goto_does_not_overshoot() {
+        // Planta con latencia y límite de aceleración por rueda: sin el tope de frenado, el
+        // robot llegaba caliente y se pasaba 0.062 m (frontal) y 0.057 m (bidireccional);
+        // con el tope, 0.012 m.
+        let target = Vec2::new(0.4, 0.0);
+        for case in [
+            Case::new(SkillId::GoTo, target, (-0.4, 0.0, 0.0), FAR_BALL),
+            Case::new(SkillId::GoTo, target, (-0.4, 0.0, 0.0), FAR_BALL).bidirectional(),
+        ] {
+            let trace = run(&case);
+            assert!(trace.first_within(target, 0.05).is_some(), "no llegó");
+            let pasada = trace.steps.iter().map(|s| s.x - target.x).fold(f32::MIN, f32::max);
+            assert!(pasada < 0.03, "se pasó {pasada:.3} m");
+        }
     }
 
     // ── Con la planta diferencial (repro de la investigación del 2026-10-03) ──
