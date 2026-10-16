@@ -171,6 +171,15 @@ pub fn shoot_push_feasible_now(robot_pos: Vec2, ball: Vec2, target: Vec2) -> boo
 const ORBIT_STEP: f32 = 30.0 * std::f32::consts::PI / 180.0;
 /// Separación de los puntos con que se revisa que un arco de la órbita quede en la cancha.
 const ORBIT_CHECK_STEP: f32 = 10.0 * std::f32::consts::PI / 180.0;
+/// En frontal, a menos de esto de la pelota (m) la órbita no gira: girando en el lugar, la
+/// esquina (media diagonal 0.053 m) más el radio de la pelota (0.021 m) llegan a 0.074 m.
+/// Con 2.6 cm de margen.
+const ORBIT_NO_TURN: f32 = 0.10;
+/// Pasillo que barre el cuerpo al avanzar por su eje sin girar (m): medio robot (0.0375)
+/// más el radio de la pelota (0.021), con margen. Fuera de él, la pelota no se toca.
+const BODY_CORRIDOR: f32 = 0.065;
+/// Destino del avance recto, por el eje (m): por encima del umbral de llegada de motion.
+const STRAIGHT_STEP: f32 = 0.06;
 /// Ya en la órbita, sigue en ella hasta este margen por fuera del radio (m). Sin esto, al
 /// pasar justo por fuera volvería al rodeo de la navegación, que lo lleva de nuevo hacia la
 /// pelota, y entraría y saldría de la órbita.
@@ -308,6 +317,16 @@ impl Skill for ApproachAlignedSkill {
         let orbit = self.orbit_point(robot.position, ball, self.orbit_side);
         self.orbit_side = orbit.map(|(_, side)| side);
         if let Some((point, _)) = orbit {
+            let rel = robot.position - ball;
+            if !self.bidirectional && rel.length() < ORBIT_NO_TURN {
+                // En frontal, pegado a la pelota no gira (la barrería con la esquina): avanza o
+                // retrocede por su eje. Con la pelota en el pasillo del cuerpo, alejándose de
+                // ella; si no, hacia el punto de la órbita.
+                let axis = Vec2::new(robot.orientation.cos() as f32, robot.orientation.sin() as f32);
+                let toward = if axis.perp_dot(rel).abs() < BODY_CORRIDOR { rel } else { point - robot.position };
+                let sign = if axis.dot(toward) >= 0.0 { 1.0 } else { -1.0 };
+                return motion.move_direct(robot, robot.position + axis * sign * STRAIGHT_STEP);
+            }
             return motion.move_and_face(robot, point, ball, world, self.kp, self.ki, self.kd);
         }
         let dist = (staging - robot.position).length();
@@ -1398,6 +1417,27 @@ mod tests {
         assert_eq!(skill.orbit_side, None);
     }
 
+    #[test]
+    fn frontal_orbit_does_not_turn_near_the_ball() {
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let aim = Vec2::new(0.75, 0.0);
+        let tick = |pose: (f32, f32, f32), motion: &Motion| {
+            orbit_skill(aim).tick(&robot_at(pose.0, pose.1, pose.2), &world, motion)
+        };
+        // Mirando a la pelota (en el pasillo del cuerpo): retrocede por el eje, alejándose.
+        let c = tick((0.068, 0.0, 180.0), &Motion::new());
+        assert_eq!(c.omega, 0.0);
+        assert!(c.vx > 0.05 && c.vy.abs() < 1e-6, "{c:?}");
+        // De costado (fuera del pasillo): por el eje, hacia el lado de la órbita (horario, −x).
+        let c = tick((0.0, -0.068, 0.0), &Motion::new());
+        assert_eq!(c.omega, 0.0);
+        assert!(c.vx < -0.05 && c.vy.abs() < 1e-6, "{c:?}");
+        // Desde 0.10 m ya gira para seguir la órbita; en bidireccional, nunca el avance recto.
+        assert_ne!(tick((0.0, -0.11, 0.0), &Motion::new()).omega, 0.0);
+        assert_ne!(tick((0.068, 0.0, 180.0), &bidir_motion()).omega, 0.0);
+    }
+
     /// Distancia del centro de la pelota al cuadrado del robot (0 si está adentro).
     fn ball_to_body(x: f32, y: f32, th: f64, ball: Vec2) -> f32 {
         let d = ball - Vec2::new(x, y);
@@ -1409,35 +1449,43 @@ mod tests {
 
     #[test]
     fn approach_touching_the_ball_orbits_without_contact() {
-        // Planta diferencial con latencia, pelota fija: arrancando a 0.075 m (1.6 cm entre
-        // la cara y la pelota), el cuerpo nunca toca la pelota y llega al staging.
+        // Planta diferencial con latencia, pelota fija. Arrancando a 0.075 m (1.6 cm entre la
+        // cara y la pelota) y a 0.068 m (el peor jitter del banco), con el heading ±10°: el
+        // cuerpo nunca toca la pelota y llega al staging. En frontal, girar en el lugar a
+        // menos de 0.074 m la golpeaba con la esquina.
         use crate::motion::test_plant::{run, Case};
         use crate::skills::SkillId;
         let cases = [
-            ("costado", Vec2::ZERO, (0.0, -0.075, 0.0)),
-            ("delante", Vec2::ZERO, (0.075, 0.0, 180.0)),
-            ("banda", Vec2::new(0.0, -0.45), (0.075, -0.45, 90.0)),
+            ("costado", Vec2::ZERO, Vec2::new(0.0, -1.0), 0.0),
+            ("delante", Vec2::ZERO, Vec2::new(1.0, 0.0), 180.0),
+            ("banda", Vec2::new(0.0, -0.45), Vec2::new(1.0, 0.0), 90.0),
         ];
+        let mut fallas = Vec::new();
         for bidirectional in [false, true] {
-            for (name, ball, pose) in cases {
-                let mut case = Case::new(SkillId::ApproachAligned, Vec2::new(0.75, 0.0), pose, ball);
-                case.motion.bidirectional = bidirectional;
-                let trace = run(&case);
-                let gap = trace
-                    .steps
-                    .iter()
-                    .map(|s| ball_to_body(s.x, s.y, s.th, ball))
-                    .fold(f32::MAX, f32::min);
-                assert!(gap > 0.0214, "{name} (bidir {bidirectional}): la pelota a {gap:.4} m del cuerpo");
-                let last = trace.last();
-                let escapes = trace.steps.iter().filter(|s| s.escaping).count();
-                assert!(
-                    trace.steps.iter().any(|s| s.done),
-                    "{name} (bidir {bidirectional}): no llega en 6 s; termina en ({:.3}, {:.3}, {:.0}°), {escapes} ticks escapando",
-                    last.x, last.y, last.th.to_degrees()
-                );
+            for (name, ball, dir, deg) in cases {
+                for dist in [0.068, 0.075] {
+                    for dh in [-10.0, 0.0, 10.0] {
+                        let start = ball + dir * dist;
+                        let pose = (start.x, start.y, deg + dh);
+                        let mut case = Case::new(SkillId::ApproachAligned, Vec2::new(0.75, 0.0), pose, ball);
+                        case.motion.bidirectional = bidirectional;
+                        let trace = run(&case);
+                        let gap = trace
+                            .steps
+                            .iter()
+                            .map(|s| ball_to_body(s.x, s.y, s.th, ball))
+                            .fold(f32::MAX, f32::min);
+                        let llega = trace.steps.iter().any(|s| s.done);
+                        if gap <= 0.0214 || !llega {
+                            fallas.push(format!(
+                                "{name} bidir={bidirectional} {dist} m {dh:+}°: pelota a {gap:.4} m del cuerpo, llega={llega}"
+                            ));
+                        }
+                    }
+                }
             }
         }
+        assert!(fallas.is_empty(), "{}", fallas.join("\n"));
     }
 
     #[test]
