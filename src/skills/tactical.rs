@@ -16,10 +16,13 @@
 //! | Intercept        | (ignorado)         | va al punto de intercepción predicho (usa velocidad filtrada de la pelota) |
 //! | BlockLine        | arco propio        | se ubica sobre la línea pelota→arco propio a distancia fija del arco |
 
-use super::{clamp_to_logical_field, is_inside_logical_field, stop_cmd, Skill};
+use super::{
+    clamp_to_logical_field, is_inside_logical_field, stop_cmd, Skill, LOGICAL_FIELD_HALF_X,
+    LOGICAL_FIELD_HALF_Y,
+};
 use crate::motion::{Motion, MotionCommand, MotionConfig};
 use crate::params::params;
-use crate::skills::zones::{AreaRect, AREA_CLEARANCE};
+use crate::skills::zones::{AreaRect, AREA_CLEARANCE, ROBOT_HALF};
 use crate::world::{RobotState, World};
 use glam::Vec2;
 
@@ -161,9 +164,25 @@ pub fn shoot_push_feasible_now(robot_pos: Vec2, ball: Vec2, target: Vec2) -> boo
 //  ApproachAligned
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Paso de la órbita de ApproachAligned por el arco (rad). Sobre el radio, la cuerda pasa
+/// a r·cos 15° de la pelota (0.145 m con r = 0.15), fuera de la holgura de la navegación.
+/// Desde más adentro, hasta r·cos 30° (0.13 m), el camino al punto se aleja de la pelota
+/// todo el tiempo, y el punto queda a 0.075 m o más: nunca por debajo del umbral de llegada.
+const ORBIT_STEP: f32 = 30.0 * std::f32::consts::PI / 180.0;
+/// Separación de los puntos con que se revisa que un arco de la órbita quede en la cancha.
+const ORBIT_CHECK_STEP: f32 = 10.0 * std::f32::consts::PI / 180.0;
+/// Ya en la órbita, sigue en ella hasta este margen por fuera del radio (m). Sin esto, al
+/// pasar justo por fuera volvería al rodeo de la navegación, que lo lleva de nuevo hacia la
+/// pelota, y entraría y saldría de la órbita.
+const ORBIT_EXIT_MARGIN: f32 = 0.05;
+
 /// Llega a un punto de *staging* detrás de la pelota, sobre la línea
 /// pelota→objetivo, y termina alineado con esa línea (con la cara que requiera
 /// menos giro). Es el paso previo obligado de `ShootPush`.
+///
+/// Cerca de la pelota y sin estar detrás de ella, primero la rodea en órbita: navega a
+/// puntos del arco de radio `orbit_radius`, 30° más adelante, hasta quedar detrás. Rodearla
+/// a la distancia en que está (lo que hace la navegación dentro de su holgura) la arrastra.
 pub struct ApproachAlignedSkill {
     pub aim_point: Vec2,
     /// Distancia del staging detrás de la pelota (m).
@@ -174,6 +193,12 @@ pub struct ApproachAlignedSkill {
     pub angle_tol: f64,
     /// Radio desde el que el robot ya empieza a mirar a la pelota (m).
     pub pre_align_radius: f32,
+    /// Radio de la órbita alrededor de la pelota (m); 0 la apaga.
+    pub orbit_radius: f32,
+    /// A este ángulo (rad) o menos de la dirección "detrás", va directo al staging.
+    pub orbit_angle: f32,
+    /// Lado de la órbita en curso (+1 antihorario, −1 horario); `None` fuera de ella.
+    orbit_side: Option<f32>,
     /// Modo del motion con el que corre (en `tick` se toma del `Motion`): en frontal,
     /// `is_done` exige el frente; con dos caras, cualquiera de las dos.
     pub bidirectional: bool,
@@ -191,6 +216,9 @@ impl ApproachAlignedSkill {
             pos_tol: p.approach_pos_tol,
             angle_tol: p.approach_angle_tol,
             pre_align_radius: p.approach_pre_align_radius,
+            orbit_radius: p.approach_orbit_radius,
+            orbit_angle: p.approach_orbit_angle,
+            orbit_side: None,
             bidirectional: MotionConfig::from_env().bidirectional,
             kp: CONTROL_KP,
             ki: CONTROL_KI,
@@ -223,6 +251,51 @@ impl ApproachAlignedSkill {
         }
         Some(clamp_to_logical_field(ball - dir * 0.08))
     }
+
+    /// Punto al que navega la órbita y su lado (+1 antihorario, −1 horario), o `None` si
+    /// va directo al staging: órbita apagada, lejos de la pelota, ya detrás de ella o sin
+    /// un arco que quede en la cancha. `side` es el lado de la órbita en curso, que se
+    /// mantiene mientras su arco sirva.
+    pub fn orbit_point(&self, robot: Vec2, ball: Vec2, side: Option<f32>) -> Option<(Vec2, f32)> {
+        use std::f32::consts::TAU;
+        let r = self.orbit_radius;
+        let dir = self.line_dir(ball)?;
+        let rel = robot - ball;
+        let dist = rel.length();
+        let reach = if side.is_some() { r + ORBIT_EXIT_MARGIN } else { r };
+        if r <= 0.0 || dist >= reach || dist < 1e-4 {
+            return None;
+        }
+        let from = rel.y.atan2(rel.x);
+        // Ángulo antihorario desde la posición del robot hasta "detrás", en [0, 2π).
+        let ccw = ((-dir.y).atan2(-dir.x) - from).rem_euclid(TAU);
+        if ccw.min(TAU - ccw) <= self.orbit_angle {
+            return None;
+        }
+        let arc = |s: f32| if s > 0.0 { ccw } else { TAU - ccw };
+        let fits = |s: f32| orbit_arc_fits(ball, r, from, s, arc(s));
+        let side = match side.filter(|&s| fits(s)) {
+            Some(s) => s,
+            // El más corto que sirva; a igual largo, el antihorario.
+            None => {
+                let short = if ccw <= TAU - ccw { 1.0 } else { -1.0 };
+                [short, -short].into_iter().find(|&s| fits(s))?
+            }
+        };
+        let a = from + side * ORBIT_STEP.min(arc(side));
+        Some((ball + Vec2::new(a.cos(), a.sin()) * r, side))
+    }
+}
+
+/// Si el arco de radio `r` alrededor de la pelota, desde el ángulo `from` y `arc` rad en
+/// el sentido `side`, queda en el campo lógico con medio robot de margen.
+fn orbit_arc_fits(ball: Vec2, r: f32, from: f32, side: f32, arc: f32) -> bool {
+    let n = (arc / ORBIT_CHECK_STEP).ceil() as usize;
+    (0..=n).all(|i| {
+        let a = from + side * (i as f32 * ORBIT_CHECK_STEP).min(arc);
+        let p = ball + Vec2::new(a.cos(), a.sin()) * r;
+        p.x.abs() <= LOGICAL_FIELD_HALF_X - ROBOT_HALF && p.y.abs() <= LOGICAL_FIELD_HALF_Y - ROBOT_HALF
+    })
 }
 
 impl Skill for ApproachAlignedSkill {
@@ -232,6 +305,11 @@ impl Skill for ApproachAlignedSkill {
         let (Some(dir), Some(staging)) = (self.line_dir(ball), self.staging_point(ball)) else {
             return stop_cmd(robot);
         };
+        let orbit = self.orbit_point(robot.position, ball, self.orbit_side);
+        self.orbit_side = orbit.map(|(_, side)| side);
+        if let Some((point, _)) = orbit {
+            return motion.move_and_face(robot, point, ball, world, self.kp, self.ki, self.kd);
+        }
         let dist = (staging - robot.position).length();
 
         if dist <= self.pos_tol {
@@ -264,6 +342,10 @@ impl Skill for ApproachAlignedSkill {
 
     fn current_target(&self, world: &World) -> Option<Vec2> {
         self.staging_point(world.get_ball_state().position)
+    }
+
+    fn reset(&mut self) {
+        self.orbit_side = None;
     }
 
     fn status(&self, robot: &RobotState, world: &World) -> SkillStatus {
@@ -1216,6 +1298,146 @@ mod tests {
             cmd.omega.abs() > 0.5 && cmd.omega.abs() <= motion.config.max_angular_speed + 1e-9,
             "gira hacia el rodeo lateral: {cmd:?}"
         );
+    }
+
+    fn orbit_skill(aim: Vec2) -> ApproachAlignedSkill {
+        let mut s = ApproachAlignedSkill::new(aim);
+        s.orbit_radius = 0.15;
+        s.orbit_angle = 0.785;
+        s
+    }
+
+    fn polar(center: Vec2, r: f32, deg: f32) -> Vec2 {
+        center + Vec2::new(deg.to_radians().cos(), deg.to_radians().sin()) * r
+    }
+
+    #[test]
+    fn orbit_backs_off_then_follows_the_short_arc() {
+        let s = orbit_skill(Vec2::new(0.75, 0.0));
+        let ball = Vec2::ZERO;
+        // Pegado al costado (a −90°, "detrás" a 180°): el punto del arco 30° más cerca de
+        // "detrás", por el lado horario (90° contra 270°).
+        let robot = Vec2::new(0.0, -0.075);
+        let (p, side) = s.orbit_point(robot, ball, None).unwrap();
+        assert!((p - polar(ball, 0.15, -120.0)).length() < 1e-5, "{p:?}");
+        assert_eq!(side, -1.0);
+        // El camino hasta el punto se aleja de la pelota todo el tiempo (sin tocarla).
+        let steps = (0..=20).map(|i| robot.lerp(p, i as f32 / 20.0).length());
+        assert!(steps.collect::<Vec<_>>().windows(2).all(|w| w[1] > w[0]));
+        // Desde 0.13 m (r·cos 30°), el punto queda a 0.075 m o más: no "llega" nunca.
+        let (p, _) = s.orbit_point(Vec2::new(0.0, -0.13), ball, None).unwrap();
+        assert!((p - Vec2::new(0.0, -0.13)).length() >= 0.0749, "{p:?}");
+        // Detrás (a 30° de "detrás") o lejos: directo al staging.
+        assert!(s.orbit_point(polar(ball, 0.075, 150.0), ball, None).is_none());
+        assert!(s.orbit_point(Vec2::new(0.30, 0.0), ball, None).is_none());
+        // Justo delante, los dos arcos miden 180°: el antihorario.
+        assert_eq!(s.orbit_point(Vec2::new(0.075, 0.0), ball, None).unwrap().1, 1.0);
+        // Con radio 0, nunca.
+        let mut off = orbit_skill(Vec2::new(0.75, 0.0));
+        off.orbit_radius = 0.0;
+        assert!(off.orbit_point(Vec2::new(0.0, -0.075), ball, None).is_none());
+    }
+
+    #[test]
+    fn orbit_picks_the_side_that_stays_in_the_field() {
+        // Junto a la banda: "detrás" a 211°; el arco corto (149°, horario) pasa por la banda.
+        let s = orbit_skill(Vec2::new(0.75, 0.0));
+        let ball = Vec2::new(0.0, -0.45);
+        let (_, side) = s.orbit_point(Vec2::new(0.075, -0.45), ball, None).unwrap();
+        assert_eq!(side, 1.0, "rodea por el lado de la cancha");
+        // En la esquina ningún arco entra: directo al staging, como sin órbita.
+        let corner = Vec2::new(0.66, -0.56);
+        assert!(s.orbit_point(polar(corner, 0.075, 135.0), corner, None).is_none());
+    }
+
+    #[test]
+    fn orbit_keeps_its_side_and_radius_until_it_ends() {
+        let s = orbit_skill(Vec2::new(0.75, 0.0));
+        let ball = Vec2::ZERO;
+        // A −90°, el lado antihorario en curso (270°, por la cancha) se mantiene.
+        let (p, side) = s.orbit_point(Vec2::new(0.0, -0.15), ball, Some(1.0)).unwrap();
+        assert_eq!(side, 1.0);
+        assert!((p - polar(ball, 0.15, -60.0)).length() < 1e-5, "{p:?}");
+        // Ya en la órbita, sigue a 0.17 m; sin órbita en curso, a 0.17 m no entra.
+        assert!(s.orbit_point(Vec2::new(0.0, -0.17), ball, Some(-1.0)).is_some());
+        assert!(s.orbit_point(Vec2::new(0.0, -0.17), ball, None).is_none());
+        // La órbita termina detrás de la pelota aunque venga en curso.
+        assert!(s.orbit_point(polar(ball, 0.15, 150.0), ball, Some(-1.0)).is_none());
+    }
+
+    #[test]
+    fn orbit_changes_nothing_outside_it_and_reset_clears_the_side() {
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let aim = Vec2::new(0.75, 0.0);
+        let probe = orbit_skill(aim);
+        let mut outside = 0;
+        for r in [0.05_f32, 0.075, 0.10, 0.14, 0.16, 0.25, 0.40] {
+            for deg in (0..360).step_by(15) {
+                let pos = polar(Vec2::ZERO, r, deg as f32);
+                let robot = robot_at(pos.x, pos.y, deg as f32 + 90.0);
+                let (mut on, mut off) = (orbit_skill(aim), orbit_skill(aim));
+                off.orbit_radius = 0.0;
+                let (m_on, m_off) = (bidir_motion(), bidir_motion());
+                let (c_on, c_off) = (on.tick(&robot, &world, &m_on), off.tick(&robot, &world, &m_off));
+                assert_eq!(on.status(&robot, &world), off.status(&robot, &world), "r={r} {deg}°");
+                assert_eq!(on.is_done(&robot, &world), off.is_done(&robot, &world));
+                assert_eq!(on.current_target(&world), off.current_target(&world));
+                if probe.orbit_point(pos, Vec2::ZERO, None).is_none() {
+                    outside += 1;
+                    assert_eq!((c_on.vx, c_on.vy, c_on.omega), (c_off.vx, c_off.vy, c_off.omega), "r={r} {deg}°");
+                }
+            }
+        }
+        assert!(outside > 80, "la grilla cubre la zona sin órbita: {outside}");
+        // `reset` borra el lado de la órbita en curso.
+        let mut skill = orbit_skill(aim);
+        skill.tick(&robot_at(0.0, -0.075, 0.0), &world, &bidir_motion());
+        assert_eq!(skill.orbit_side, Some(-1.0));
+        skill.reset();
+        assert_eq!(skill.orbit_side, None);
+    }
+
+    /// Distancia del centro de la pelota al cuadrado del robot (0 si está adentro).
+    fn ball_to_body(x: f32, y: f32, th: f64, ball: Vec2) -> f32 {
+        let d = ball - Vec2::new(x, y);
+        let (s, c) = (th as f32).sin_cos();
+        let local = Vec2::new(c * d.x + s * d.y, -s * d.x + c * d.y);
+        let half = 0.0375;
+        Vec2::new((local.x.abs() - half).max(0.0), (local.y.abs() - half).max(0.0)).length()
+    }
+
+    #[test]
+    fn approach_touching_the_ball_orbits_without_contact() {
+        // Planta diferencial con latencia, pelota fija: arrancando a 0.075 m (1.6 cm entre
+        // la cara y la pelota), el cuerpo nunca toca la pelota y llega al staging.
+        use crate::motion::test_plant::{run, Case};
+        use crate::skills::SkillId;
+        let cases = [
+            ("costado", Vec2::ZERO, (0.0, -0.075, 0.0)),
+            ("delante", Vec2::ZERO, (0.075, 0.0, 180.0)),
+            ("banda", Vec2::new(0.0, -0.45), (0.075, -0.45, 90.0)),
+        ];
+        for bidirectional in [false, true] {
+            for (name, ball, pose) in cases {
+                let mut case = Case::new(SkillId::ApproachAligned, Vec2::new(0.75, 0.0), pose, ball);
+                case.motion.bidirectional = bidirectional;
+                let trace = run(&case);
+                let gap = trace
+                    .steps
+                    .iter()
+                    .map(|s| ball_to_body(s.x, s.y, s.th, ball))
+                    .fold(f32::MAX, f32::min);
+                assert!(gap > 0.0214, "{name} (bidir {bidirectional}): la pelota a {gap:.4} m del cuerpo");
+                let last = trace.last();
+                let escapes = trace.steps.iter().filter(|s| s.escaping).count();
+                assert!(
+                    trace.steps.iter().any(|s| s.done),
+                    "{name} (bidir {bidirectional}): no llega en 6 s; termina en ({:.3}, {:.3}, {:.0}°), {escapes} ticks escapando",
+                    last.x, last.y, last.th.to_degrees()
+                );
+            }
+        }
     }
 
     #[test]

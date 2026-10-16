@@ -5,7 +5,7 @@
 #   tools/suite_skills.sh [rapida|completa] DIR
 #
 #   rapida    un caso por skill (13 casos), ~50 min con 20 repeticiones: para cada change.
-#   completa  32 casos, ~2 h con 20 repeticiones: para hitos (motion, torneo, sysid).
+#   completa  43 casos, ~3 h con 20 repeticiones: para hitos (motion, torneo, sysid).
 #
 # Variables: REPEAT (repeticiones, 20 por defecto), FIRASIM_BIN (ruta al binario de
 # FIRASim: si está definida, el script lo relanza cuando se cae).

@@ -41,6 +41,8 @@
     "approach_pos_tol": 0.05,
     "approach_angle_tol": 0.15,
     "approach_pre_align_radius": 0.25,
+    "approach_orbit_radius": 0.15,
+    "approach_orbit_angle": 0.785,
     "shoot_push_overshoot": 0.25,
     "shoot_lose_radius": 0.3,
     "shoot_behind_tol": 0.03,

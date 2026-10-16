@@ -18,7 +18,7 @@
 //! la cancha. Imprime una línea JSON por repetición y al final los resúmenes.
 //!
 //! - `--repeat N`: N repeticiones por caso; la 0 con la pose del caso y las demás con un
-//!   jitter determinista (±0.02 m, ±10°).
+//!   jitter determinista (±0.02 m, o el del caso, y ±10°).
 //! - `--out FILE`: agrega cada repetición a un JSONL y, al relanzar con el mismo archivo,
 //!   salta las que ya tienen resultado (reanudar tras una caída de FIRASim).
 //! - Falla de infraestructura (FIRASim caído, sin datos, física explotada): no cuenta en la
@@ -80,6 +80,9 @@ enum Goal {
     ArriveFacingBall,
     /// Llega sin mover la pelota más de 0.03 m (GoTo con la pelota en el camino: A4).
     ArriveNoBallPush,
+    /// Llega y la pelota termina a lo sumo a esta distancia (m) de donde empezó
+    /// (`ball_disp`): ApproachAligned arrancando pegado a la pelota.
+    ArriveBallPushMax(f32),
     /// Árbitro: en la ventana HALT/STOP la traslación comandada es cero (en HALT también
     /// `omega`) y el robot no se desplaza después de frenar (desde 1.0 s); al salir, cumple el objetivo
     /// de su skill (`arrived`) sin escapes en los primeros 0.5 s.
@@ -106,6 +109,8 @@ struct Case {
     /// Línea de tiempo del árbitro: (s desde el inicio del caso, comando de texto). Se
     /// envía por UDP al listener real (`run_referee_listener`) que corre en el bench.
     referee: &'static [(f64, &'static str)],
+    /// Jitter de posición de las repeticiones (± m por eje).
+    jitter_m: f32,
 }
 
 const FAR: (f32, f32) = (0.6, 0.5);
@@ -125,7 +130,14 @@ const KICK_SPIN: Goal = Goal::Kick { min_prog: 0.10, max_dir: 45.0 };
 
 #[allow(clippy::too_many_arguments)]
 const fn c(name: &'static str, skill: SkillId, target: (f32, f32), robot: (f32, f32, f32), ball: (f32, f32), dur: f64, tol: f32, goal: Goal) -> Case {
-    Case { name, skill, target, robot, ball, ball_vel: (0.0, 0.0), dur, tol, goal, then: &[], referee: &[] }
+    Case { name, skill, target, robot, ball, ball_vel: (0.0, 0.0), dur, tol, goal, then: &[], referee: &[], jitter_m: 0.02 }
+}
+
+/// ApproachAligned con el robot pegado a la pelota (0.075 m entre centros, 1.6 cm entre la
+/// cara y la pelota) y sin estar detrás: con ±0.02 m de jitter podría aparecer encima de la
+/// pelota y FIRASim la movería al teletransportar.
+const fn pegado(name: &'static str, robot: (f32, f32, f32), ball: (f32, f32)) -> Case {
+    Case { jitter_m: 0.005, ..c(name, SkillId::ApproachAligned, (0.75, 0.0), robot, ball, 8.0, 0.0, Goal::ArriveBallPushMax(0.05)) }
 }
 
 #[rustfmt::skip]
@@ -159,6 +171,11 @@ const CASES: &[Case] = &[
     c("b3_shoot_crossed125", SkillId::ShootPush, (0.75, 0.0), (-0.12, 0.02, -125.0), (0.0, 0.0), 3.0, 0.0, Goal::Kick { min_prog: 0.30, max_dir: 30.0 }),
     c("approach_front", SkillId::ApproachAligned, (0.75, 0.0), (0.3, 0.05, 180.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("approach_side", SkillId::ApproachAligned, (0.75, 0.0), (-0.1, -0.35, 90.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
+    // Pegado a la pelota: al rodearla a la distancia en que estaba, la arrastraba a la pared.
+    // Junto a la banda, el arco corto (149°) sale de la cancha: rodea por el otro (211°).
+    pegado("approach_pegado_costado", (0.0, -0.075, 0.0), (0.0, 0.0)),
+    pegado("approach_pegado_delante", (0.075, 0.0, 180.0), (0.0, 0.0)),
+    pegado("approach_pegado_banda", (0.075, -0.45, 90.0), (0.0, -0.45)),
     c("mark_point", SkillId::Mark, (-0.3, 0.0), (0.2, -0.3, 0.0), (0.3, 0.3), 6.0, 0.08, Goal::ArriveFacingBall),
     c("intercept_static", SkillId::Intercept, (0.0, 0.0), (-0.4, -0.3, 0.0), (0.2, 0.2), 6.0, 0.09, ARRIVE),
     // La pelota arranca rodando (teleport con velocidad) y cruza la cancha hacia abajo.
@@ -222,6 +239,7 @@ const SUITE: &[&str] = &[
     "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
     "mark_point", "hold_still", "b1a_hold_in_area", "goto_around_area", "blockline_across_area",
     "clear_own_arc", "blockline_fast_near_area", "goto_fast_near_area", "goto_slow_near_area",
+    "approach_pegado_costado", "approach_pegado_delante", "approach_pegado_banda",
 ];
 
 /// Suite rápida, un caso por skill (alias `suite-rapida`): para cada change.
@@ -394,7 +412,7 @@ fn test_robot(world: &World, rid: u32) -> Option<&rustengine::world::RobotState>
 }
 
 /// Pose inicial de la repetición `rep`: la del caso en la 0 y, en las demás, perturbada con
-/// un jitter determinista (±0.02 m en x e y, ±10° de heading) sembrado con el nombre y `rep`.
+/// un jitter determinista (±`jitter_m` en x e y, ±10° de heading) sembrado con el nombre y `rep`.
 fn start_pose(case: &Case, rep: u32) -> (f32, f32, f32) {
     let (x, y, deg) = case.robot;
     if rep == 0 {
@@ -408,7 +426,7 @@ fn start_pose(case: &Case, rep: u32) -> (f32, f32, f32) {
         s ^= s << 5;
         s as f32 / u32::MAX as f32 * 2.0 - 1.0
     };
-    (x + 0.02 * u(), y + 0.02 * u(), deg + 10.0 * u())
+    (x + case.jitter_m * u(), y + case.jitter_m * u(), deg + 10.0 * u())
 }
 
 /// Motivo por el que las filas de una repetición no sirven para juzgar a la skill (falla de
@@ -615,6 +633,7 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
             let pushed = rows.iter().map(|r| (Vec2::new(r.bx, r.by) - b0).length()).fold(0.0f32, f32::max);
             m.arrived.is_some() && pushed < 0.03
         }
+        Goal::ArriveBallPushMax(max) => m.arrived.is_some() && m.ball_disp <= max,
         Goal::None => return None,
     })
 }
@@ -1236,6 +1255,30 @@ mod tests {
             assert!((x - c.robot.0).abs() <= 0.02 && (y - c.robot.1).abs() <= 0.02);
             assert!((deg - c.robot.2).abs() <= 10.0);
         }
+    }
+
+    #[test]
+    fn touching_approach_cases_have_a_small_jitter_and_measure_the_ball() {
+        let c = case("approach_pegado_costado");
+        let ball = Vec2::new(c.ball.0, c.ball.1);
+        for rep in 1..20 {
+            let (x, y, deg) = start_pose(&c, rep);
+            assert!((x - c.robot.0).abs() <= 0.005 && (y - c.robot.1).abs() <= 0.005);
+            assert!((deg - c.robot.2).abs() <= 10.0);
+            assert!((Vec2::new(x, y) - ball).length() > 0.065, "rep {rep}: encima de la pelota");
+        }
+        // Éxito: llega y la pelota se mueve 0.05 m o menos.
+        let rows = [row(0.0, 0.0, -0.075, 0.0)];
+        let with = |arrived: Option<f64>, ball_disp: f32| Metrics { arrived, ball_disp, ..Default::default() };
+        assert_eq!(success(&c, &rows, &with(Some(2.0), 0.12), false), Some(false), "la arrastró");
+        assert_eq!(success(&c, &rows, &with(Some(2.0), 0.02), false), Some(true));
+        assert_eq!(success(&c, &rows, &with(None, 0.0), false), Some(false), "no llega");
+        for n in ["approach_pegado_costado", "approach_pegado_delante", "approach_pegado_banda"] {
+            assert!(SUITE.contains(&n), "{n} falta en la suite completa");
+            assert_eq!(case(n).goal, Goal::ArriveBallPushMax(0.05));
+            assert!(!SUITE_QUICK.contains(&n));
+        }
+        assert_eq!(SUITE.len(), 43);
     }
 
     #[test]

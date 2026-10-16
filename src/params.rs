@@ -205,6 +205,13 @@ pub struct SkillParams {
     pub approach_angle_tol: f64,
     /// ApproachAligned: radio desde el que ya mira a la pelota (m).
     pub approach_pre_align_radius: f32,
+    /// ApproachAligned: radio de la órbita (m). Más cerca de la pelota y sin estar detrás
+    /// de ella, se aleja hasta este radio y la rodea por el arco antes de ir al staging,
+    /// para no arrastrarla. 0 la apaga.
+    pub approach_orbit_radius: f32,
+    /// ApproachAligned: a este ángulo (rad) o menos de la dirección "detrás" de la pelota,
+    /// el robot ya está detrás y va directo al staging, sin órbita.
+    pub approach_orbit_angle: f32,
     /// ShootPush: cuánto más allá de la pelota apunta el movimiento (m).
     pub shoot_push_overshoot: f32,
     /// ShootPush: distancia robot–pelota desde la que deja de ser factible (m).
@@ -260,6 +267,8 @@ impl Default for SkillParams {
             approach_pos_tol: 0.05,
             approach_angle_tol: 0.15,
             approach_pre_align_radius: 0.25,
+            approach_orbit_radius: 0.15,
+            approach_orbit_angle: 0.785,
             shoot_push_overshoot: 0.25,
             shoot_lose_radius: 0.30,
             shoot_behind_tol: 0.03,
@@ -695,6 +704,22 @@ impl TeamParams {
                 s.shoot_lateral_tol, s.approach_pos_tol
             ));
         }
+        // La órbita va por fuera de la holgura de la pelota de la navegación, con margen:
+        // si no, la navegación rodea por su cuenta y el cuerpo vuelve a tocar la pelota.
+        let orbit_min = crate::motion::avoid::BALL_CLEARANCE + 0.03;
+        let r = s.approach_orbit_radius;
+        if r != 0.0 && !(orbit_min - 1e-6..=0.30).contains(&r) {
+            return Err(format!(
+                "skills.approach_orbit_radius ({r}) debe ser 0 (sin órbita) o estar entre \
+                 {orbit_min:.2} y 0.30 m"
+            ));
+        }
+        let a = s.approach_orbit_angle;
+        if !(a > 0.17 && a <= 1.571) {
+            return Err(format!(
+                "skills.approach_orbit_angle ({a}) debe estar entre 0.17 y 1.571 rad (de 10° a 90°)"
+            ));
+        }
         Ok(())
     }
 
@@ -997,6 +1022,33 @@ mod tests {
         assert!(err.contains("arrival_threshold") && err.contains("spin_pos_tol"), "{err}");
         let d = TeamParams::default();
         assert!(d.motion.arrival_threshold < d.skills.spin_pos_tol);
+    }
+
+    #[test]
+    fn approach_orbit_defaults_and_ranges() {
+        let d = SkillParams::default();
+        assert_eq!((d.approach_orbit_radius, d.approach_orbit_angle), (0.15, 0.785));
+        let repo = TeamParams::from_file(Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH)).unwrap();
+        assert_eq!(repo.skills, d, "el JSON del repo trae los valores por defecto");
+        // Sin órbita (0) y los bordes valen: el inferior es la holgura de la pelota + 0.03.
+        for ok in [
+            r#"{ "skills": { "approach_orbit_radius": 0.0 } }"#,
+            r#"{ "skills": { "approach_orbit_radius": 0.12 } }"#,
+            r#"{ "skills": { "approach_orbit_radius": 0.30 } }"#,
+            r#"{ "skills": { "approach_orbit_angle": 1.571 } }"#,
+        ] {
+            assert!(TeamParams::from_json(ok).is_ok(), "{ok}");
+        }
+        for (json, key) in [
+            (r#"{ "skills": { "approach_orbit_radius": 0.10 } }"#, "approach_orbit_radius"),
+            (r#"{ "skills": { "approach_orbit_radius": 0.31 } }"#, "approach_orbit_radius"),
+            (r#"{ "skills": { "approach_orbit_radius": -0.15 } }"#, "approach_orbit_radius"),
+            (r#"{ "skills": { "approach_orbit_angle": 0.17 } }"#, "approach_orbit_angle"),
+            (r#"{ "skills": { "approach_orbit_angle": 1.6 } }"#, "approach_orbit_angle"),
+        ] {
+            let err = TeamParams::from_json(json).unwrap_err();
+            assert!(err.contains(key), "{json}: {err}");
+        }
     }
 
     #[test]
