@@ -87,11 +87,8 @@ pub struct CoachParams {
     /// Distancia (m) a la que se aparta un jugador de campo de una pelota que juega
     /// el arquero, y mínima del punto de apoyo a la pelota.
     pub standoff_from_ball: f32,
-    /// Cuánto se ubica el apoyo detrás de la pelota (hacia nuestro arco) cuando el
-    /// equipo ataca (m): chico = ofensivo, grande = conservador.
-    pub support_depth: f32,
-    /// Desplazamiento lateral del apoyo como receptor de pase, al carril contrario del
-    /// striker y a la par de la pelota (m).
+    /// Desplazamiento lateral del apoyo cuando el equipo ataca: se ofrece en el carril
+    /// contrario al striker, 0.25 m adelante de la pelota, como receptor de segunda pelota (m).
     pub pass_receiver_offset: f32,
     /// Presión: con un rival encima de la pelota, el striker va a disputarla solo si
     /// está a menos de esto de ella (m); más lejos espera sobre la línea pelota–arco
@@ -140,7 +137,6 @@ impl Default for CoachParams {
             stall_kick_max_s: 3.0,
             spin_ban_s: 2.0,
             standoff_from_ball: 0.30,
-            support_depth: 0.30,
             pass_receiver_offset: 0.35,
             press_distance: 0.60,
             gk_engage_margin: 0.05,
@@ -925,13 +921,13 @@ mod tests {
     #[test]
     fn style_ranges_file_matches_coach_defaults() {
         // Cada clave de config/style_ranges.json es un parámetro numérico del coach y
-        // el default del código cae dentro de su rango (los 20 de estilo del TDP más el
-        // receptor de pase).
+        // el default del código cae dentro de su rango (los 20 de estilo del TDP, con el
+        // receptor de pase en lugar de la profundidad del apoyo, que dejó de usarse).
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(CoachParams::STYLE_RANGES_PATH);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
         let ranges = CoachParams::default().check_style_ranges(&text).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(ranges.len(), 21, "la lista blanca de estilo tiene 21 parámetros");
-        assert!(ranges.contains_key("press_distance") && ranges.contains_key("support_depth"));
+        assert_eq!(ranges.len(), 20, "la lista blanca de estilo tiene 20 parámetros");
+        assert!(ranges.contains_key("press_distance") && ranges.contains_key("pass_receiver_offset"));
         // Y también lo cumple el JSON del repo.
         let repo = TeamParams::from_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH)).unwrap();
         repo.coach.check_style_ranges(&text).unwrap_or_else(|e| panic!("{e}"));

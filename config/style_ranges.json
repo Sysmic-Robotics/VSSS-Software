@@ -14,7 +14,6 @@
   "push_stall_s": [0.5, 3.0],
   "spin_ban_s": [1.0, 4.0],
   "standoff_from_ball": [0.2, 0.4],
-  "support_depth": [0.1, 0.5],
   "press_distance": [0.15, 0.6],
   "mark_distance": [0.1, 0.45],
   "pass_receiver_offset": [0.2, 0.45],
