@@ -999,6 +999,14 @@ impl Coach for HeuristicCoach {
         if play != self.current_play {
             self.committed = [None; 3];
             self.push_stall = Stall::None;
+            // Pelota parada: los roles se reparten de cero, sin la histéresis que protege
+            // al atacante anterior. Si no, el robot que queda junto a la pelota podía seguir
+            // de apoyo y retroceder a cubrir la línea mientras el atacante venía de lejos: en
+            // los free balls de nuestra mitad ganábamos el primer toque el 27 % de las veces
+            // y 6 de 22 terminaban en gol en contra.
+            if play.is_set_piece() {
+                self.striker_id = None;
+            }
             self.current_play = play;
         }
         match play {
@@ -1824,6 +1832,40 @@ mod tests {
             choice_of(&ch, striker_id).skill_id,
             SkillId::ApproachAligned | SkillId::ShootPush | SkillId::Intercept | SkillId::Clear
         ));
+    }
+
+    #[test]
+    fn free_ball_striker_is_the_robot_next_to_the_ball_not_the_previous_one() {
+        use crate::coach::referee::{Foul, Quadrant, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = coach(); // azul, ataca +x
+        c.set_referee(shared.clone());
+        // Juego abierto en campo rival: el atacante es el robot 0.
+        let open = obs(
+            Vec2::new(0.35, -0.30),
+            Vec2::ZERO,
+            [Vec2::new(0.25, -0.30), Vec2::new(-0.20, 0.30), Vec2::new(-0.68, 0.0)],
+        );
+        c.decide(&open);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        // Free ball en Q2 (nuestra mitad): el robot 1 quedó junto a la cruz y el 0 lejos.
+        apply_command(&shared, RefereeCommand { foul: Foul::FreeBall, quadrant: Quadrant::Q2, ..RefereeCommand::GAME_ON });
+        let fb = obs(
+            Vec2::new(-0.375, 0.40),
+            Vec2::ZERO,
+            [Vec2::new(0.25, -0.30), Vec2::new(-0.575, 0.40), Vec2::new(-0.68, 0.0)],
+        );
+        let ch = c.decide(&fb);
+        assert_eq!(c.role_of(1), Some(Role::Striker), "el que está junto a la pelota");
+        assert_eq!(choice_of(&ch, 1).target, Vec2::new(-0.575, 0.40));
+        // Al silbato juega la pelota él (no retrocede a cubrir la línea).
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        let ch = c.decide(&fb);
+        assert_eq!(c.role_of(1), Some(Role::Striker));
+        assert!(matches!(
+            choice_of(&ch, 1).skill_id,
+            SkillId::ApproachAligned | SkillId::ShootPush | SkillId::Clear | SkillId::SpinKick
+        ), "{:?}", choice_of(&ch, 1));
     }
 
     #[test]
