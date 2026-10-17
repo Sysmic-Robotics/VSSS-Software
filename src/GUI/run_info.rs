@@ -171,9 +171,13 @@ mod tests {
         let err = coach_pausa_de(Some("si")).unwrap_err();
         assert!(err.contains("VSSL_COACH_PAUSA='si'") && err.contains("1, true u on"), "{err}");
         assert_eq!(coach_pausa_de(Some("of f")).map_err(|_| ()), Err(()), "solo se recortan los extremos");
-        use std::os::unix::ffi::OsStringExt;
-        let no_texto = std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0xff]));
-        assert!(coach_pausa_de_var(Err(no_texto)).is_err(), "un valor que no es texto no arranca");
+        // Un valor que no es texto solo se puede construir así en Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let no_texto = std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0xff]));
+            assert!(coach_pausa_de_var(Err(no_texto)).is_err(), "un valor que no es texto no arranca");
+        }
         assert_eq!(coach_pausa_de_var(Err(std::env::VarError::NotPresent)), Ok(false));
         assert_eq!(coach_pausa_de_var(Ok("1".to_string())), Ok(true));
     }
