@@ -453,13 +453,14 @@ impl Args {
                         "intercept" => SkillId::Intercept,
                         "blockline" => SkillId::BlockLine,
                         "goalkeep" => SkillId::GoalKeep,
+                        "railkeeper" => SkillId::RailKeeper,
                         "clear" => SkillId::Clear,
                         "spinkick" => SkillId::SpinKick,
                         "mark" => SkillId::Mark,
                         "hold" => SkillId::Hold,
                         other => {
                             return Err(format!(
-                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep|clear|spinkick|mark|hold)"
+                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep|railkeeper|clear|spinkick|mark|hold)"
                             ));
                         }
                     });
@@ -693,6 +694,7 @@ impl Args {
                         | SkillId::ShootPush
                         | SkillId::BlockLine
                         | SkillId::GoalKeep
+                        | SkillId::RailKeeper
                         | SkillId::Clear
                         | SkillId::SpinKick
                         | SkillId::Mark

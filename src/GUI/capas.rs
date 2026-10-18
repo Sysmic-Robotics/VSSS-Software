@@ -156,6 +156,7 @@ pub fn accion(skill: SkillId) -> &'static str {
         SkillId::SpinKick => "patea girando",
         SkillId::Mark => "marca",
         SkillId::Hold => "espera",
+        SkillId::RailKeeper => "ataja en el riel",
     }
 }
 

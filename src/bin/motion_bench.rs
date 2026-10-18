@@ -13,7 +13,8 @@
 //! cargo run --release --bin motion_bench -- skills --repeat 20 --out r.jsonl --csv-dir csv --csv-failures-only
 //! ```
 //!
-//! El robot de prueba es el azul 0 (defiende la izquierda), salvo en los casos de GoalKeep,
+//! El robot de prueba es el azul 0 (defiende la izquierda), salvo en los casos de arquero
+//! (GoalKeep y RailKeeper),
 //! donde es el arquero de los parámetros (`coach.keeper_id`); los otros cinco quedan fuera de
 //! la cancha. Imprime una línea JSON por repetición y al final los resúmenes.
 //!
@@ -37,7 +38,8 @@ use rustengine::protos::fira_packet::Environment;
 use rustengine::radio::{FIRASimClient, RadioTarget, TeleportItem};
 use rustengine::skills::zones::{AccionGuardia, AreaRect};
 use rustengine::skills::{
-    ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, SkillConfig, SkillId, clear_direction,
+    ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, RailKeeperSkill, SkillConfig, SkillId,
+    clear_direction,
 };
 use rustengine::vision::VisionSource;
 use rustengine::world::World;
@@ -71,6 +73,10 @@ enum Goal {
     NoSidePush,
     /// Arquero en su punto de defensa mirando a la pelota.
     Keeper,
+    /// RailKeeper en su punto del riel (el que elige la skill) y orientado a lo largo de él.
+    RailSpot,
+    /// La pelota nunca entra entera a la boca del arco propio (tiro atajado).
+    Save,
     /// Spin: desde 1.0 s, velocidad angular medida con el signo de `target.x` y magnitud
     /// ≥ 80 % de `SkillConfig::default().spin_omega`; traslación ≤ 0.03 m en todo el caso.
     Spin,
@@ -109,9 +115,19 @@ struct Case {
 }
 
 const FAR: (f32, f32) = (0.6, 0.5);
+/// Tiros del banco del arquero (m/s): desde (−0.25, 0.25) al palo de abajo, desde
+/// (−0.15, −0.40) al palo de abajo por fuera del arquero, desde (−0.20, 0.05) al centro, y
+/// la pelota rodando por la línea de gol desde la esquina (−0.73, 0.45) hacia la boca.
+const SHOT_FAR_POST: (f32, f32) = (-0.70, -0.52);
+const SHOT_NEAR_POST: (f32, f32) = (-0.74, 0.31);
+const SHOT_CENTER: (f32, f32) = (-0.80, -0.06);
+const LINE_ROLL: (f32, f32) = (0.0, -0.45);
 /// Punto legal junto al área propia de los casos de llegada rápida.
 const NEAR_AREA: (f32, f32) = (-0.495, 0.268);
 const OWN_GOAL: Vec2 = Vec2::new(-0.75, 0.0);
+/// Radio de la pelota y mitad de la boca del arco (m), para el criterio de tiro atajado.
+const BALL_RADIUS: f32 = 0.021;
+const GOAL_HALF_Y: f32 = 0.20;
 /// Salto de pose entre dos ticks que solo explica una falla del simulador (m).
 const POSE_JUMP_M: f32 = 0.3;
 /// Reintentos de una repetición que falló por infraestructura.
@@ -195,6 +211,19 @@ const CASES: &[Case] = &[
     c("spin_cw", SkillId::Spin, (-1.0, 0.0), (0.0, 0.0, 0.0), FAR, 3.0, 0.0, Goal::Spin),
     c("hold_still", SkillId::Hold, (0.0, 0.0), (0.2, -0.2, 30.0), FAR, 3.0, 0.0, Goal::Still),
     c("goalkeep_keeper", SkillId::GoalKeep, (-0.75, 0.0), (-0.4, 0.2, 0.0), (0.0, -0.15), 5.0, 0.0, Goal::Keeper),
+    c("railkeeper_keeper", SkillId::RailKeeper, (-0.75, 0.0), (-0.4, 0.2, 0.0), (0.0, -0.15), 5.0, 0.0, Goal::RailSpot),
+    // Banco de tiros al arco (sin atacante): el arquero parte del centro de su línea y la
+    // pelota sale lanzada hacia la boca. Mismos tiros con RailKeeper (rk_) y GoalKeep (gk_).
+    // `line_roll`: la pelota rueda por la línea de gol desde la esquina hacia la boca, el caso
+    // de 22 de 41 goles en contra en los registros.
+    Case { ball_vel: SHOT_FAR_POST, ..c("rk_shot_far_post", SkillId::RailKeeper, (-0.75, 0.0), (-0.70, 0.0, 90.0), (-0.25, 0.25), 3.0, 0.0, Goal::Save) },
+    Case { ball_vel: SHOT_NEAR_POST, ..c("rk_shot_near_post", SkillId::RailKeeper, (-0.75, 0.0), (-0.70, 0.0, 90.0), (-0.15, -0.40), 3.0, 0.0, Goal::Save) },
+    Case { ball_vel: SHOT_CENTER, ..c("rk_shot_center", SkillId::RailKeeper, (-0.75, 0.0), (-0.70, 0.0, 90.0), (-0.20, 0.05), 3.0, 0.0, Goal::Save) },
+    Case { ball_vel: LINE_ROLL, ..c("rk_line_roll", SkillId::RailKeeper, (-0.75, 0.0), (-0.70, 0.0, 90.0), (-0.73, 0.45), 4.0, 0.0, Goal::Save) },
+    Case { ball_vel: SHOT_FAR_POST, ..c("gk_shot_far_post", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.25, 0.25), 3.0, 0.0, Goal::Save) },
+    Case { ball_vel: SHOT_NEAR_POST, ..c("gk_shot_near_post", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.15, -0.40), 3.0, 0.0, Goal::Save) },
+    Case { ball_vel: SHOT_CENTER, ..c("gk_shot_center", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.20, 0.05), 3.0, 0.0, Goal::Save) },
+    Case { ball_vel: LINE_ROLL, ..c("gk_line_roll", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.73, 0.45), 4.0, 0.0, Goal::Save) },
     // Árbitro por texto: HALT a velocidad de crucero; HALT y STOP con un jugador de campo
     // dentro del área propia (sin el árbitro, el `ZoneGuard` lo sacaría).
     Case {
@@ -219,6 +248,7 @@ const SUITE: &[&str] = &[
     "b3_shoot_side25", "b3_shoot_behind", "b3_shoot_crossed90", "b3_shoot_crossed125",
     "intercept_static", "intercept_moving",
     "b2_blockline_open", "b2_blockline_corner", "b2_blockline_center", "goalkeep_keeper",
+    "railkeeper_keeper", "rk_shot_far_post", "rk_shot_near_post", "rk_shot_center", "rk_line_roll",
     "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
     "mark_point", "hold_still", "b1a_hold_in_area", "goto_around_area", "blockline_across_area",
     "clear_own_arc", "blockline_fast_near_area", "goto_fast_near_area", "goto_slow_near_area",
@@ -228,7 +258,13 @@ const SUITE: &[&str] = &[
 const SUITE_QUICK: &[&str] = &[
     "goto_side", "face_90", "chase_fwd", "spin_20", "approach_side", "b3_shoot_behind",
     "intercept_moving", "b2_blockline_open", "goalkeep_keeper", "clear_lateral",
-    "spinkick_wall", "mark_point", "hold_still",
+    "spinkick_wall", "mark_point", "hold_still", "railkeeper_keeper",
+];
+
+/// Banco del arquero (alias `arquero`): los dos arqueros en su punto y los mismos tiros con cada uno.
+const KEEPER_CASES: &[&str] = &[
+    "goalkeep_keeper", "railkeeper_keeper", "rk_shot_far_post", "rk_shot_near_post", "rk_shot_center",
+    "rk_line_roll", "gk_shot_far_post", "gk_shot_near_post", "gk_shot_center", "gk_line_roll",
 ];
 
 /// Casos del árbitro (alias `referee` en la línea de comandos).
@@ -385,7 +421,7 @@ fn phase_at(case: &Case, tick: u32) -> usize {
 /// Robot de prueba: el arquero en los casos de GoalKeep (el `ZoneGuard` solo a él lo deja
 /// entrar al área propia) y el azul 0 en el resto.
 fn robot_id(case: &Case) -> u32 {
-    if case.skill == SkillId::GoalKeep { params().coach.keeper_id as u32 } else { 0 }
+    if matches!(case.skill, SkillId::GoalKeep | SkillId::RailKeeper) { params().coach.keeper_id as u32 } else { 0 }
 }
 
 /// Estado del robot de prueba (azul `rid`) en el `World`, cuya firma es `(id, equipo)`.
@@ -602,6 +638,15 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
             (spot - p).length() <= params().motion.arrival_threshold + 0.01
                 && heading_err(Vec2::new(last.bx, last.by) - p, last.th, bidirectional).to_degrees() <= 20.0
         }
+        Goal::RailSpot => {
+            let last = rows.last()?;
+            let rk = RailKeeperSkill::new(OWN_GOAL);
+            let (y, _) = rk.target_y(Vec2::new(last.bx, last.by), Vec2::ZERO, &[]);
+            let p = Vec2::new(last.x, last.y);
+            (Vec2::new(rk.rail_x(), y) - p).length() <= params().motion.arrival_threshold + 0.01
+                && heading_err(Vec2::Y, last.th, true).to_degrees() <= 20.0
+        }
+        Goal::Save => !rows.iter().any(|r| r.bx < OWN_GOAL.x - BALL_RADIUS && r.by.abs() < GOAL_HALF_Y),
         Goal::Referee => referee_ok(case, rows, bidirectional),
         Goal::Spin => spin_ok(case, rows),
         Goal::Still => still_ok(rows),
@@ -929,6 +974,7 @@ async fn main() {
     let referee_alias = names.iter().any(|n| n == "referee");
     let suite = names.iter().any(|n| n == "suite");
     let suite_quick = names.iter().any(|n| n == "suite-rapida");
+    let keeper_alias = names.iter().any(|n| n == "arquero");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
@@ -937,6 +983,7 @@ async fn main() {
                 || (referee_alias && REFEREE_CASES.contains(&c.name))
                 || (suite && SUITE.contains(&c.name))
                 || (suite_quick && SUITE_QUICK.contains(&c.name))
+                || (keeper_alias && KEEPER_CASES.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {

@@ -104,6 +104,9 @@ pub struct CoachParams {
     /// Arquero: una pelota que avanza hacia la boca de nuestro arco a más de esto (m/s) se
     /// bloquea desde la línea, no se despeja. Grande (p. ej. 9.9) = desactivado.
     pub gk_block_incoming_speed: f32,
+    /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
+    /// él, con anticipación) en vez de `GoalKeep`.
+    pub gk_rail: bool,
 }
 
 impl Default for CoachParams {
@@ -143,6 +146,7 @@ impl Default for CoachParams {
             gk_engage_opp_dist: 0.20,
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
+            gk_rail: true,
         }
     }
 }
@@ -247,6 +251,20 @@ pub struct SkillParams {
     pub spin_release_ball_speed: f32,
     /// SpinKick: tiempo máximo girando antes de darse por terminada (s).
     pub spin_max_time_s: f32,
+    /// RailKeeper: distancia del riel (centro del robot) a la línea de gol (m).
+    pub keeper_depth: f32,
+    /// RailKeeper: velocidad lateral pedida por metro de error en y (1/s).
+    pub keeper_gain: f64,
+    /// RailKeeper: horizonte para tratar como tiro una pelota que viene al arco (s).
+    pub keeper_horizon_s: f32,
+    /// RailKeeper: adelanto con que extrapola la pelota (latencia de visión y reacción, s).
+    pub keeper_lead_s: f32,
+    /// RailKeeper: desvío del riel desde el que vuelve con la navegación normal (m).
+    pub keeper_rail_tol: f32,
+    /// RailKeeper: distancia rival–pelota desde la que anticipa el empuje del rival (m).
+    pub keeper_contact_dist: f32,
+    /// RailKeeper: cuánto más allá de la pelota apunta al barrerla de la boca del arco (m).
+    pub keeper_sweep: f32,
 }
 
 impl Default for SkillParams {
@@ -276,6 +294,13 @@ impl Default for SkillParams {
             spin_pos_tol: 0.05,
             spin_release_ball_speed: 0.4,
             spin_max_time_s: 1.0,
+            keeper_depth: 0.05,
+            keeper_gain: 8.0,
+            keeper_horizon_s: 1.5,
+            keeper_lead_s: 0.10,
+            keeper_rail_tol: 0.06,
+            keeper_contact_dist: 0.12,
+            keeper_sweep: 0.10,
         }
     }
 }

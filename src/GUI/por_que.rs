@@ -38,6 +38,7 @@ fn haciendo(skill: SkillId) -> &'static str {
         SkillId::SpinKick => "patea girando",
         SkillId::Mark => "está marcando",
         SkillId::Hold => "está esperando",
+        SkillId::RailKeeper => "cuida el arco desde el riel",
     }
 }
 

@@ -169,6 +169,7 @@ const SKILL_GROUPS: [(&str, &[SkillId]); 4] = [
             SkillId::Intercept,
             SkillId::BlockLine,
             SkillId::GoalKeep,
+            SkillId::RailKeeper,
             SkillId::Mark,
         ],
     ),
@@ -230,6 +231,10 @@ pub fn skill_help(skill: Option<SkillId>) -> &'static str {
             "el click no se usa: arquero en la línea del arco propio (VSSL_SIDE). Solo el \
              robot coach.keeper_id puede entrar al área."
         }
+        Some(SkillId::RailKeeper) => {
+            "el click no se usa: arquero sobre un riel a 5 cm del arco propio, orientado a lo \
+             largo de él, anticipando el empuje rival (VSSL_SIDE). Solo coach.keeper_id entra al área."
+        }
         Some(SkillId::Mark) => "click = dónde pararse; queda mirando a la pelota.",
         Some(SkillId::Hold) => "el click no se usa: quieto (sin avance ni giro).",
     }
@@ -253,7 +258,7 @@ pub fn own_goal_center(defend_left: bool) -> Vec2 {
 pub fn effective_skill_target(skill: SkillId, click: Vec2, robot_x_m: f32, own_goal: Vec2) -> Vec2 {
     match skill {
         SkillId::Spin => spin_relative_target(click.x, robot_x_m),
-        SkillId::BlockLine | SkillId::GoalKeep => own_goal,
+        SkillId::BlockLine | SkillId::GoalKeep | SkillId::RailKeeper => own_goal,
         _ => click,
     }
 }
@@ -263,7 +268,7 @@ pub fn effective_skill_target(skill: SkillId, click: Vec2, robot_x_m: f32, own_g
 /// que usa su lado) y ninguno en las que lo ignoran (`ChaseBall`, `Intercept`, `Hold`).
 pub fn skill_marker(skill: SkillId, click: Vec2, own_goal: Vec2) -> Option<Vec2> {
     match skill {
-        SkillId::BlockLine | SkillId::GoalKeep => Some(own_goal),
+        SkillId::BlockLine | SkillId::GoalKeep | SkillId::RailKeeper => Some(own_goal),
         s if s.uses_target() || s.uses_target_sign() => Some(click),
         _ => None,
     }
@@ -277,7 +282,7 @@ pub fn keeper_warning(
     selected_robot: u32,
     keeper_id: i32,
 ) -> Option<String> {
-    (skill == Some(SkillId::GoalKeep) && selected_robot as i32 != keeper_id).then(|| {
+    (matches!(skill, Some(SkillId::GoalKeep | SkillId::RailKeeper)) && selected_robot as i32 != keeper_id).then(|| {
         format!(
             "este robot no es el arquero (keeper_id = {keeper_id} en team_params.json): \
              el guardia no lo deja entrar al área"

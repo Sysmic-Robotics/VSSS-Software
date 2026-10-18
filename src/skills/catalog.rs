@@ -25,8 +25,8 @@
 use crate::motion::{Motion, MotionCommand};
 use crate::skills::{
     ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, ClearSkill, DefendGoalLineSkill,
-    FacePointSkill, GoToSkill, InterceptSkill, MarkSkill, ShootPushSkill, Skill, SkillConfig,
-    SkillStatus, SpinKickSkill, SpinSkill, StopSkill,
+    FacePointSkill, GoToSkill, InterceptSkill, MarkSkill, RailKeeperSkill, ShootPushSkill, Skill,
+    SkillConfig, SkillStatus, SpinKickSkill, SpinSkill, StopSkill,
 };
 use crate::world::{RobotState, World};
 use glam::Vec2;
@@ -67,12 +67,15 @@ pub enum SkillId {
     Mark = 11,
     /// Quieto (STOP/HALT del árbitro). `target` ignorado.
     Hold = 12,
+    /// Arquero sobre un riel cerca del arco, orientado a lo largo de él, con anticipación
+    /// del empuje rival (`skills::keeper`). `target` = centro del arco propio.
+    RailKeeper = 13,
 }
 
 impl SkillId {
     /// Cantidad de skills en el catálogo. Este es el tamaño del action space
     /// discreto que la policy debe respetar.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
 
     /// Construye una `SkillId` a partir del entero que emite la policy.
     /// Retorna `None` si el id está fuera del rango del catálogo.
@@ -91,6 +94,7 @@ impl SkillId {
             10 => Some(Self::SpinKick),
             11 => Some(Self::Mark),
             12 => Some(Self::Hold),
+            13 => Some(Self::RailKeeper),
             _ => None,
         }
     }
@@ -114,6 +118,7 @@ impl SkillId {
                 | SkillId::Clear
                 | SkillId::SpinKick
                 | SkillId::Mark
+                | SkillId::RailKeeper
         )
     }
 
@@ -151,6 +156,7 @@ pub struct SkillCatalog {
     spin_kick: Vec<SpinKickSkill>,
     mark: Vec<MarkSkill>,
     hold: Vec<StopSkill>,
+    rail_keeper: Vec<RailKeeperSkill>,
     /// Última skill despachada por robot: al cambiar, se reinicia el estado de control
     /// de motion de ese robot (PID de heading, rampa del avance).
     last_skill: Vec<Option<SkillId>>,
@@ -201,6 +207,9 @@ impl SkillCatalog {
             .collect();
         let mark = (0..num_robots).map(|_| MarkSkill::new(Vec2::ZERO)).collect();
         let hold = (0..num_robots).map(|_| StopSkill::new()).collect();
+        let rail_keeper = (0..num_robots)
+            .map(|_| RailKeeperSkill::new(Vec2::new(-0.75, 0.0)))
+            .collect();
         Self {
             go_to,
             face_point,
@@ -215,6 +224,7 @@ impl SkillCatalog {
             spin_kick,
             mark,
             hold,
+            rail_keeper,
             last_skill: vec![None; num_robots],
             config,
         }
@@ -243,6 +253,7 @@ impl SkillCatalog {
             SkillId::SpinKick => &mut self.spin_kick[robot_id],
             SkillId::Mark => &mut self.mark[robot_id],
             SkillId::Hold => &mut self.hold[robot_id],
+            SkillId::RailKeeper => &mut self.rail_keeper[robot_id],
         }
     }
 
@@ -299,6 +310,11 @@ impl SkillCatalog {
                 s.status(robot, world)
             }
             SkillId::Hold => self.hold[robot_id].status(robot, world),
+            SkillId::RailKeeper => {
+                let s = &mut self.rail_keeper[robot_id];
+                s.set_own_goal(target);
+                s.status(robot, world)
+            }
         }
     }
 
@@ -439,6 +455,11 @@ impl SkillCatalog {
                 skill.tick(robot, world, motion)
             }
             SkillId::Hold => self.hold[robot_id].tick(robot, world, motion),
+            SkillId::RailKeeper => {
+                let skill = &mut self.rail_keeper[robot_id];
+                skill.set_own_goal(target);
+                skill.tick(robot, world, motion)
+            }
         }
     }
 }
@@ -483,6 +504,7 @@ mod tests {
             SkillId::SpinKick,
             SkillId::Mark,
             SkillId::Hold,
+            SkillId::RailKeeper,
         ];
         assert_eq!(known.len(), SkillId::COUNT);
         for (i, id) in known.iter().enumerate() {

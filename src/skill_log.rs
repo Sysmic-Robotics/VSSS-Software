@@ -162,6 +162,7 @@ pub fn skill_label(s: Option<SkillId>) -> &'static str {
         Some(SkillId::SpinKick) => "spinkick",
         Some(SkillId::Mark) => "mark",
         Some(SkillId::Hold) => "hold",
+        Some(SkillId::RailKeeper) => "railkeeper",
         None => "",
     }
 }
@@ -240,6 +241,7 @@ impl SkillLogCtx {
                 | SkillId::Clear
                 | SkillId::SpinKick
                 | SkillId::Mark
+                | SkillId::RailKeeper
         );
 
         // Pelota (siempre en modo skill: la necesitan las mediciones de contacto)
