@@ -879,7 +879,8 @@ impl HeuristicCoach {
         // despeja solo el 6 % del tiempo), alineándose mientras la pelota lenta entraba. Con
         // esta regla los goles en contra bajaron de 1,00 a 0,75 por partido (36 partidos).
         // (Se probó también ceder la pelota a un rival en contacto si el arquero no estaba
-        // listo para pegarle: los goles en contra subieron de 0,83 a 1,19 y se descartó.)
+        // listo para pegarle: los goles en contra subieron de 0,83 a 1,19 y se descartó; con
+        // RailKeeper quedó sin diferencia, 0,69 contra 0,58 y cara a cara −0,12 ± 0,27.)
         let incoming = self.ball_heads_into_own_goal(ball, ball_vel);
         // Pelota entre el riel y la línea de gol: Clear no tiene dónde ponerse detrás (el
         // arquero la rodeaba por delante y dejaba la boca libre: 22 de 41 goles en contra);
