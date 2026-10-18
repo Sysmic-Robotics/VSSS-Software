@@ -9,14 +9,15 @@
 //!   `TickRecord` y el contexto coinciden.
 //! - `format_human_summary`: línea humana corta para el print rate-limited a stderr (NO CSV).
 
-use crate::coach::Role;
-use crate::coach::debug::Trabada;
+use crate::coach::adaptation::Lane;
+use crate::coach::debug::{TipoObjetivo, Trabada};
+use crate::coach::{Play, Role};
 use crate::control_loop::TickRecord;
 use crate::motion::avoid::Rodeado;
 use crate::radio::base_station::{SLOT_COUNT, build_frame_from_vw, command_to_vw};
 use crate::radio::{RadioTarget, TeamColor};
 use crate::skills::zones::AccionGuardia;
-use crate::skills::{Face, SkillId};
+use crate::skills::{Face, KeeperMode, SkillId};
 use crate::rutinas::RutinaVista;
 use crate::snapshot::TickDebug;
 use crate::vision::VisionSource;
@@ -330,10 +331,12 @@ role,progress,feasible,face,nav_dest_x,nav_dest_y,nav_aim_x,nav_aim_y,nav_detour
 guard,guard_proj_x,guard_proj_y,escape_dx,escape_dy,arrival_s,coach_decision,striker,score_shoot,score_clear,\
 score_spin,score_intercept,score_approach,pick_score,pick,bonus_skill,commit_left,stall,stall_s,\
 adapt_shot_upper,adapt_shot_center,adapt_shot_lower,adapt_duel,\
+play,shot_feasible,shot_blocked,shot_factor,shot_lane,aim_x,aim_y,aim_kind,\
+switch_best,switch_best_s,switch_threshold_s,keeper_mode,\
 rutina,rutina_fase,puesto,repeticion,paso,accion\n";
 
 /// Cantidad de columnas de depuración después de las 21 de base de `MATCH_CSV_HEADER`.
-const MATCH_DEBUG_COLS: usize = 34;
+const MATCH_DEBUG_COLS: usize = 46;
 /// Cantidad de columnas de rutina al final de `MATCH_CSV_HEADER` (capability
 /// `rutinas-ejecucion`).
 const MATCH_RUTINA_COLS: usize = 6;
@@ -381,6 +384,8 @@ fn columnas_depuracion(debug: Option<&TickDebug>, id: i32) -> String {
         Some(Trabada::GiroProhibido(s)) => ("banned", Some(s)),
     };
     let adapt = coach.map(|c| c.adaptacion);
+    let objetivo = coach.and_then(|c| c.objetivo);
+    let cambio = coach.and_then(|c| c.cambio);
     [
         rol.and_then(|x| x.rol)
             .map(|x| match x {
@@ -446,8 +451,66 @@ fn columnas_depuracion(debug: Option<&TickDebug>, id: i32) -> String {
         num(adapt.map(|a| a.tiros[1].value)),
         num(adapt.map(|a| a.tiros[2].value)),
         num(adapt.map(|a| a.duelos.value)),
+        coach.map(|c| play_label(c.jugada)).unwrap_or_default(),
+        opciones.map(|o| u8::from(o.tiro.factible).to_string()).unwrap_or_default(),
+        opciones.map(|o| u8::from(o.tiro.tapado).to_string()).unwrap_or_default(),
+        num(opciones.map(|o| o.tiro.factor)),
+        opciones.map(|o| lane_label(o.tiro.carril)).unwrap_or_default().to_string(),
+        num(objetivo.map(|o| o.0.x)),
+        num(objetivo.map(|o| o.0.y)),
+        objetivo.map(|o| aim_label(o.1)).unwrap_or_default().to_string(),
+        cambio.map(|c| c.mejor.to_string()).unwrap_or_default(),
+        num(cambio.map(|c| c.t_mejor)),
+        num(cambio.map(|c| c.umbral_s())),
+        r.and_then(|r| r.arquero).map(keeper_label).unwrap_or_default().to_string(),
     ]
     .join(",")
+}
+
+fn play_label(play: Play) -> String {
+    match play {
+        Play::Open => "open".into(),
+        Play::Hold => "hold".into(),
+        Play::KickoffOurs => "kickoff_ours".into(),
+        Play::KickoffTheirs => "kickoff_theirs".into(),
+        Play::FreeBall(q) => format!("free_ball_q{}", q as u8),
+        Play::PenaltyOurs => "penalty_ours".into(),
+        Play::PenaltyTheirs => "penalty_theirs".into(),
+        Play::FreeKickOurs => "free_kick_ours".into(),
+        Play::FreeKickTheirs => "free_kick_theirs".into(),
+        Play::GoalKickOurs => "goal_kick_ours".into(),
+        Play::GoalKickTheirs => "goal_kick_theirs".into(),
+    }
+}
+
+fn lane_label(lane: Lane) -> &'static str {
+    match lane {
+        Lane::Upper => "upper",
+        Lane::Center => "center",
+        Lane::Lower => "lower",
+    }
+}
+
+fn aim_label(tipo: TipoObjetivo) -> &'static str {
+    match tipo {
+        TipoObjetivo::PaloLejano => "far_post",
+        TipoObjetivo::Arco => "goal",
+        TipoObjetivo::FondoRival => "their_end",
+        TipoObjetivo::FondoPropio => "own_end",
+        TipoObjetivo::Banda => "wing",
+        TipoObjetivo::Despeje => "clear",
+        TipoObjetivo::Pase => "pass",
+    }
+}
+
+fn keeper_label(mode: KeeperMode) -> &'static str {
+    match mode {
+        KeeperMode::SweepLine => "sweep_line",
+        KeeperMode::NearPost => "near_post",
+        KeeperMode::Shot => "shot",
+        KeeperMode::Rival => "rival",
+        KeeperMode::Angle => "angle",
+    }
 }
 
 /// CSV de partido: por tick, una fila por robot propio (skill, target y comando)
@@ -812,7 +875,7 @@ mod tests {
         );
         assert_eq!(col(lines[1], "role"), "", "sin depuración, vacía");
         assert_eq!(col(lines[1], "rutina"), "", "sin rutina, vacía");
-        assert!(MATCH_CSV_HEADER.trim_end().ends_with(",adapt_duel,rutina,rutina_fase,puesto,repeticion,paso,accion"));
+        assert!(MATCH_CSV_HEADER.trim_end().ends_with(",keeper_mode,rutina,rutina_fase,puesto,repeticion,paso,accion"));
     }
 
     #[test]
@@ -901,6 +964,7 @@ mod tests {
                 prohibidas: Vec::new(),
                 escape: None,
                 status: Some(SkillStatus { progress: 0.5, done: false, feasible: true, face: Face::Back }),
+                arquero: Some(KeeperMode::Shot),
             }],
         };
         // El robot manual va primero en la lista de comandos y no tiene elección: la del
@@ -942,6 +1006,14 @@ mod tests {
         assert_eq!(col(fila_atacante, "face"), "back");
         assert_eq!(col(fila_atacante, "progress"), "0.500");
         assert_eq!(col(fila_atacante, "coach_decision"), "1");
+        assert_eq!(col(fila_atacante, "play"), "open");
+        assert_eq!(col(fila_atacante, "shot_blocked"), "0", "sin rivales el tiro está libre");
+        assert_eq!(col(fila_atacante, "shot_lane"), "center");
+        assert_eq!(col(fila_atacante, "aim_kind"), "goal");
+        assert_eq!(col(fila_atacante, "aim_x"), format!("{:.3}", elegida.target.x));
+        assert_eq!(col(fila_atacante, "keeper_mode"), "shot");
+        assert_eq!(col(fila_manual, "keeper_mode"), "", "solo el robot con RailKeeper");
+        assert!(!col(fila_manual, "switch_threshold_s").is_empty(), "dos jugadores de campo");
         assert_eq!(col(fila_manual, "role"), "support", "los datos de coach van en cada fila propia");
     }
 

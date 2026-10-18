@@ -20,7 +20,7 @@ use crate::motion::{MotionCommand, NavDebug};
 use crate::radio::base_station::command_to_vw;
 use crate::rutinas::RutinaVista;
 use crate::skills::zones::{AreaRect, GuardiaDebug};
-use crate::skills::{SkillId, SkillStatus};
+use crate::skills::{KeeperMode, SkillId, SkillStatus};
 use crate::world::World;
 use glam::Vec2;
 use std::collections::VecDeque;
@@ -123,6 +123,8 @@ pub struct RobotDebug {
     pub escape: Option<Vec2>,
     /// `SkillStatus` de su skill aplicada.
     pub status: Option<SkillStatus>,
+    /// Por qué eligió la y el `RailKeeper`, si es su skill aplicada.
+    pub arquero: Option<KeeperMode>,
 }
 
 impl TickDebug {

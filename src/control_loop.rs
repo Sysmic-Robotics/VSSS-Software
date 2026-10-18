@@ -14,7 +14,7 @@ use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig, NavDebu
 use crate::radio::{RadioTarget, TransportError};
 use crate::rutinas::RutinaVista;
 use crate::skills::zones::{GuardiaDebug, ZoneGuard};
-use crate::skills::{SkillCatalog, SkillId, SkillStatus};
+use crate::skills::{KeeperMode, SkillCatalog, SkillId, SkillStatus};
 use crate::snapshot::{
     LoopSnapshot, LoopTiming, OwnTick, RadioCounters, RobotDebug, SnapshotSender, TickDebug,
     ball_view, publish, referee_view, robot_views,
@@ -439,6 +439,20 @@ pub(crate) type TickOut = (
     Vec<Option<GuardiaDebug>>,
 );
 
+/// Modo del `RailKeeper` de cada robot que lo tiene aplicado en este tick.
+pub(crate) fn keeper_modes(catalog: &SkillCatalog, applied: &[SkillChoice]) -> Vec<(i32, KeeperMode)> {
+    applied
+        .iter()
+        .filter(|c| c.skill_id == SkillId::RailKeeper)
+        .filter_map(|c| {
+            let idx = usize::try_from(c.robot_id)
+                .ok()
+                .filter(|&i| i < catalog.num_robots())?;
+            Some((c.robot_id, catalog.keeper_mode(idx)))
+        })
+        .collect()
+}
+
 /// `SkillStatus` de cada choice aplicada, con el mismo target que recibió
 /// `SkillCatalog::tick` en este tick (solo para la foto de la GUI). `status` no muta
 /// estado de control: solo vuelve a fijar el target que `tick` ya fijó.
@@ -625,7 +639,7 @@ pub(crate) fn tick_commands(
 
 /// La depuración del tick (`TickDebug`), con lo que ya calcularon el coach, motion, los
 /// reflejos y las skills: por id propio en `0..num_robots`, su navegación, lo que hizo el
-/// guardia, sus áreas prohibidas, el escape y el estado de su skill.
+/// guardia, sus áreas prohibidas, el escape, el estado de su skill y el modo del arquero.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tick_debug(
     coach: Option<CoachDebug>,
@@ -634,6 +648,7 @@ pub(crate) fn tick_debug(
     recovery: &BorderRecovery,
     zone_guard: &ZoneGuard,
     statuses: &[(i32, SkillStatus)],
+    arqueros: &[(i32, KeeperMode)],
     world: &World,
     own_team: i32,
     num_robots: usize,
@@ -656,6 +671,7 @@ pub(crate) fn tick_debug(
                     .filter(|&i| escaping.get(i).copied().unwrap_or(false))
                     .and_then(|_| recovery.escape(own_team, id)),
                 status: statuses.iter().find(|(i, _)| *i == id).map(|(_, s)| *s),
+                arquero: arqueros.iter().find(|(i, _)| *i == id).map(|(_, m)| *m),
             }
         })
         .collect();
@@ -1256,6 +1272,7 @@ pub async fn run_control_loop(
                         &recovery,
                         &zone_guard,
                         &statuses,
+                        &keeper_modes(&catalog, &out.2),
                         &world_guard,
                         config.own_team,
                         config.num_robots,
@@ -1832,6 +1849,7 @@ mod tests {
                         &rig.recovery,
                         &rig.guard,
                         &statuses,
+                        &keeper_modes(&rig.catalog, &out.2),
                         &world,
                         0,
                         3,
@@ -1875,7 +1893,7 @@ mod tests {
             0,
             3,
         );
-        let dbg = tick_debug(None, &HashMap::new(), &out, &rig.recovery, &rig.guard, &[], &world, 0, 3);
+        let dbg = tick_debug(None, &HashMap::new(), &out, &rig.recovery, &rig.guard, &[], &[], &world, 0, 3);
         let r0 = dbg.robot(0).unwrap();
         if out.3[0] {
             let e = r0.escape.expect("escapa: la dirección viaja");

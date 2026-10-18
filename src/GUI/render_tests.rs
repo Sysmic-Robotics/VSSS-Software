@@ -129,6 +129,7 @@ fn con_depuracion(snap: &mut LoopSnapshot, raro: bool) {
             prohibidas: vec![AreaRect::own(1.0)],
             escape: Some(n(Vec2::new(1.0, 0.0))),
             status: Some(status),
+            arquero: None,
         })
         .collect();
     let r = Rate { value: 0.5, samples: 0 };

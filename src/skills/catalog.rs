@@ -25,7 +25,7 @@
 use crate::motion::{Motion, MotionCommand};
 use crate::skills::{
     ApproachAlignedSkill, BlockLineSkill, ChaseBallSkill, ClearSkill, DefendGoalLineSkill,
-    FacePointSkill, GoToSkill, InterceptSkill, MarkSkill, RailKeeperSkill, ShootPushSkill, Skill,
+    FacePointSkill, GoToSkill, InterceptSkill, KeeperMode, MarkSkill, RailKeeperSkill, ShootPushSkill, Skill,
     SkillConfig, SkillStatus, SpinKickSkill, SpinSkill, StopSkill,
 };
 use crate::world::{RobotState, World};
@@ -255,6 +255,11 @@ impl SkillCatalog {
             SkillId::Hold => &mut self.hold[robot_id],
             SkillId::RailKeeper => &mut self.rail_keeper[robot_id],
         }
+    }
+
+    /// Modo con el que el `RailKeeper` de `robot_id` eligió la y en su último tick.
+    pub fn keeper_mode(&self, robot_id: usize) -> KeeperMode {
+        self.rail_keeper[robot_id].mode()
     }
 
     /// Estado observable (`SkillStatus`) de la skill `skill_id` para `robot_id`,
