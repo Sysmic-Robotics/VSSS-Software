@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_push_shows_the_stall_and_the_pass() {
+    fn pinned_push_shows_the_stall_and_the_spin_target() {
         // El mismo escenario que `pinned_push_turns_into_spin_kick_after_stall`.
         let mut c = coach();
         let mut o = obs(
@@ -341,6 +341,7 @@ mod tests {
             d.trabada
         );
         assert_eq!(d.skill_atacante, Some(SkillId::SpinKick));
-        assert_eq!(d.objetivo.unwrap().1, TipoObjetivo::Pase);
+        // El giro sale hacia el mismo objetivo del empuje: a lo largo de la banda.
+        assert_eq!(d.objetivo.unwrap().1, TipoObjetivo::Banda);
     }
 }

@@ -671,32 +671,24 @@ impl HeuristicCoach {
         pos
     }
 
-    /// `support`: posición del compañero de campo, destino del pase cuando el empuje
-    /// se traba. (Un pase deliberado con el tiro tapado se probó y se descartó: por empuje,
-    /// sin pateador, llegaba al receptor el 9-20 % de las veces y más de la mitad terminaba
-    /// en un rival; queda el apoyo adelantado como receptor de segunda pelota.)
-    fn striker_choice(
-        &mut self,
-        r: &RobotView,
-        ball: Vec2,
-        ball_vel: Vec2,
-        opp: &[RobotView],
-        support: Option<Vec2>,
-    ) -> SkillChoice {
-        let mut target = self.striker_target(ball, opp);
+    /// Con el empuje trabado gira hacia el mismo objetivo, sin pasarla. (Pases descartados con
+    /// datos: por empuje con el tiro tapado llegaba al receptor el 9-20 % de las veces. Con el
+    /// giro hacia el compañero, que con un rival encima suelta la pelota a ~0.23 m/s, la tocaba
+    /// primero el compañero el 6-11 % de las veces; además le obligaba a rodear la pelota y
+    /// erraba la dirección por ~70°. En 144 partidos, girar hacia el objetivo, o sin
+    /// reubicarse, nunca rindió peor que el pase, y hacia el objetivo le ganó cara a cara a
+    /// ambos: +0.29 ± 0.23 y +0.46 ± 0.29 goles por partido.)
+    fn striker_choice(&mut self, r: &RobotView, ball: Vec2, ball_vel: Vec2, opp: &[RobotView]) -> SkillChoice {
+        let target = self.striker_target(ball, opp);
         let mut scores = self.striker_scores(r, ball, ball_vel, opp, target);
         let current = self.committed[r.id as usize].map(|c| c.skill);
         match self.update_push_stall(current, r.pos, ball, ball_vel) {
-            // Empuje trabado: sacarla con el giro aunque los scores digan seguir
-            // empujando, como pase al compañero si lo hay a distancia útil.
+            // Empuje trabado: sacarla con el giro aunque los scores digan seguir empujando.
             StallAction::ForceSpin => {
                 for (skill, score) in scores.iter_mut() {
                     if *skill == SkillId::SpinKick {
                         *score = 1.0;
                     }
-                }
-                if let Some(mate) = support.filter(|p| (*p - ball).length() > 0.25) {
-                    target = mate;
                 }
             }
             StallAction::BanSpin => {
@@ -1049,10 +1041,6 @@ impl Coach for HeuristicCoach {
 
         self.assign_roles(&own, ball);
         let striker = self.striker_id.and_then(|id| own.iter().find(|r| r.id == id).copied());
-        let support = own
-            .iter()
-            .find(|r| r.active && r.id != self.keeper_id && Some(r.id) != self.striker_id)
-            .map(|r| r.pos);
         // El arquero decide primero: si juega la pelota, los de campo no se le amontonan.
         // Pelota dentro del área propia con arquero activo: la despeja él (§9.5, solo un
         // robot en el área) y los de campo cubren la línea desde afuera; si la despeja
@@ -1088,7 +1076,7 @@ impl Coach for HeuristicCoach {
                     let skill = self.commit(r.id, SkillId::Mark, |_| true);
                     SkillChoice::new(r.id, skill, self.press_point(ball))
                 }
-                Some(Role::Striker) => self.striker_choice(r, ball, ball_vel, &opp, support),
+                Some(Role::Striker) => self.striker_choice(r, ball, ball_vel, &opp),
                 _ => self.support_choice(r, ball, striker.as_ref(), &opp),
             };
             choices.push(choice);
@@ -2007,8 +1995,9 @@ mod tests {
         }
         assert_eq!(last.skill_id, SkillId::SpinKick);
         assert!(matches!(c.push_stall, Stall::Kicking(_)));
-        // El giro es un pase: apunta al compañero de campo (robot 1).
-        assert!((last.target - Vec2::new(0.2, -0.2)).length() < 1e-3, "{:?}", last.target);
+        // Gira hacia el mismo objetivo del empuje (banda: a lo largo de la pared), no al
+        // compañero de campo (robot 1).
+        assert!((last.target - Vec2::new(-0.15, 0.58)).length() < 1e-3, "{:?}", last.target);
         // La pelota se soltó (se aleja rodando): se vuelve a decidir por scores.
         let freed = obs(
             Vec2::new(-0.20, 0.50),

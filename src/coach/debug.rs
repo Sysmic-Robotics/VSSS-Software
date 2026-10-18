@@ -86,7 +86,8 @@ pub enum TipoObjetivo {
     Banda,
     /// Pelota en nuestra mitad: despeje.
     Despeje,
-    /// Pelota trabada: pase al compañero.
+    /// Pase al compañero: objetivo distinto del de `striker_target` (hoy el coach no pasa;
+    /// ver `striker_choice`).
     Pase,
 }
 
