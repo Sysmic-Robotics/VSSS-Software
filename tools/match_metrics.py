@@ -72,6 +72,10 @@ def dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+# Skills con las que el arquero cuida el arco (la de Seba y la del riel).
+KEEPER_SKILLS = ("goalkeep", "railkeeper")
+
+
 def infer_attack_sign(ticks, own_team):
     """Lado de ataque: el arquero propio (skill `goalkeep`, en todo el registro) vive en
     nuestro arco, así que atacamos hacia el otro. Sin arquero etiquetado (rule_based), lo dan
@@ -82,7 +86,7 @@ def infer_attack_sign(ticks, own_team):
         r["pos"][0]
         for e in ticks
         for r in e["robots"]
-        if r["own"] and r["skill"] == "goalkeep" and r["pos"][0] is not None
+        if r["own"] and r["skill"] in KEEPER_SKILLS and r["pos"][0] is not None
     ]
     if xs:
         mean_x = sum(xs) / len(xs)
@@ -284,7 +288,7 @@ def audit_rules(ticks, own_team, attack_sign) -> dict:
         opp = [r for r in e["robots"] if not r["own"] and r["pos"][0] is not None]
         if not own or not opp:
             continue
-        tagged = next((r for r in own if r["skill"] == "goalkeep"), None)
+        tagged = next((r for r in own if r["skill"] in KEEPER_SKILLS), None)
         if tagged is not None:
             keeper_id = tagged["id"]
         keeper = (next((r for r in own if r["id"] == keeper_id), None)

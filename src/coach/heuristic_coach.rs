@@ -236,7 +236,7 @@ impl HeuristicCoach {
             .map(|r| match self.role_of(r.id) {
                 Some(Role::Keeper) => match f.keeper {
                     Some(p) => SkillChoice::new(r.id, SkillId::Mark, p),
-                    None => SkillChoice::new(r.id, SkillId::GoalKeep, self.own_goal),
+                    None => SkillChoice::new(r.id, self.guard_skill(), self.own_goal),
                 },
                 Some(Role::Striker) => SkillChoice::new(r.id, SkillId::Mark, f.striker),
                 _ => SkillChoice::new(r.id, SkillId::Mark, f.support),
@@ -881,14 +881,30 @@ impl HeuristicCoach {
         // (Se probó también ceder la pelota a un rival en contacto si el arquero no estaba
         // listo para pegarle: los goles en contra subieron de 0,83 a 1,19 y se descartó.)
         let incoming = self.ball_heads_into_own_goal(ball, ball_vel);
-        if (parked || overdue || challenge) && !incoming {
+        // Pelota entre el riel y la línea de gol: Clear no tiene dónde ponerse detrás (el
+        // arquero la rodeaba por delante y dejaba la boca libre: 22 de 41 goles en contra);
+        // la barre el riel a lo largo de la línea.
+        let on_goal_line = self.p.gk_rail && self.ball_on_own_goal_line(ball);
+        if (parked || overdue || challenge) && !incoming && !on_goal_line {
             let target = self.clear_target(ball);
             let skill = self.commit(r.id, SkillId::Clear, |_| true);
             return SkillChoice::new(r.id, skill, target);
         }
-        // Volver a la línea por la regla de bloqueo es inmediato (sin compromiso).
-        let skill = self.commit(r.id, SkillId::GoalKeep, |_| !incoming);
+        // Volver a cuidar el arco por esas reglas es inmediato (sin compromiso).
+        let rule = incoming || on_goal_line;
+        let skill = self.commit(r.id, self.guard_skill(), |_| !rule);
         SkillChoice::new(r.id, skill, self.own_goal)
+    }
+
+    /// Skill con la que el arquero cuida el arco.
+    fn guard_skill(&self) -> SkillId {
+        if self.p.gk_rail { SkillId::RailKeeper } else { SkillId::GoalKeep }
+    }
+
+    /// Pelota entre el riel del arquero y nuestra línea de gol, dentro del ancho del área.
+    fn ball_on_own_goal_line(&self, ball: Vec2) -> bool {
+        let depth = (ball.x - self.own_goal.x) * self.attack_sign();
+        depth < params().skills.keeper_depth + 0.03 && ball.y.abs() <= GOAL_AREA_HALF_Y
     }
 
     /// La pelota avanza hacia nuestro arco a más de `gk_block_incoming_speed` y su
@@ -1166,7 +1182,7 @@ mod tests {
         assert_eq!(ch.len(), 3);
         assert_eq!(c.role_of(1), Some(Role::Striker));
         assert_eq!(c.role_of(0), Some(Role::Support));
-        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::RailKeeper);
         assert_eq!(choice_of(&ch, 2).target, OWN);
     }
 
@@ -1280,7 +1296,7 @@ mod tests {
         // Misma pelota sin rival encima: sigue en la línea.
         let mut c = coach();
         o.opp_robots[0] = RobotObs::default();
-        assert_eq!(choice_of(&c.decide(&o), 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&c.decide(&o), 2).skill_id, SkillId::RailKeeper);
         // Rival encima pero junto a la línea de fondo fuera del margen del área: no sale
         // (ahí el rival no puede marcar y el arco quedaría vacío).
         let mut c = coach();
@@ -1290,7 +1306,7 @@ mod tests {
             [Vec2::new(-0.35, -0.20), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)],
         );
         far.opp_robots[0] = robot(Vec2::new(-0.68, -0.50), 180.0);
-        assert_eq!(choice_of(&c.decide(&far), 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&c.decide(&far), 2).skill_id, SkillId::RailKeeper);
     }
 
     #[test]
@@ -1305,7 +1321,7 @@ mod tests {
         );
         let mut before = HeuristicCoach::from_params(ATTACK, OWN, old, true);
         assert_eq!(choice_of(&before.decide(&rolling), 2).skill_id, SkillId::Clear);
-        assert_eq!(choice_of(&coach().decide(&rolling), 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&coach().decide(&rolling), 2).skill_id, SkillId::RailKeeper);
         // La misma pelota rodando hacia la banda no entra: se despeja como siempre.
         let mut wide = rolling.clone();
         wide.ball.vy = 0.14 / 1.5;
@@ -1430,7 +1446,7 @@ mod tests {
         let ch_far = c.decide(&moving);
         assert_ne!(choice_of(&ch_far, 0).skill_id, SkillId::BlockLine, "lejos del área el striker juega");
         let ch = c.decide(&obs(edge, Vec2::new(-0.6, 0.0), robots));
-        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::RailKeeper);
         assert_eq!(choice_of(&ch, 0).skill_id, SkillId::BlockLine, "cambio inmediato, sin compromiso");
     }
 
@@ -1448,9 +1464,9 @@ mod tests {
             Vec2::new(0.0, 0.3),
             [Vec2::new(0.0, 0.3), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)],
         );
-        assert_eq!(choice_of(&c.decide(&o), 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&c.decide(&o), 2).skill_id, SkillId::RailKeeper);
         // ...pero tras 1 s dentro del área, despeja igual.
-        let mut last = SkillId::GoalKeep;
+        let mut last = SkillId::RailKeeper;
         for _ in 0..12 {
             last = choice_of(&c.decide(&o), 2).skill_id;
         }
@@ -1714,7 +1730,7 @@ mod tests {
         let ch = c.decide(&o);
         assert_ne!(choice_of(&ch, 0).skill_id, SkillId::Clear);
         assert_ne!(choice_of(&ch, 0).skill_id, SkillId::BlockLine);
-        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::RailKeeper);
         let r = RobotView { id: 0, pos: Vec2::new(-0.60, 0.45), theta: 0.0, active: true };
         let scores = c.striker_scores(&r, ball, Vec2::ZERO, &[], c.striker_target(ball, &[]));
         assert_eq!(scores.iter().find(|(s, _)| *s == SkillId::Clear).unwrap().1, 0.0);
@@ -1765,7 +1781,7 @@ mod tests {
         );
         let ch = c.decide(&o);
         assert_eq!(c.role_of(0), Some(Role::Keeper));
-        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::RailKeeper);
         assert_eq!(c.role_of(1), Some(Role::Striker));
         // Sin histéresis (hold 0, gain 1.0): el rol cambia apenas otro está más cerca.
         let o = obs(
@@ -1810,7 +1826,7 @@ mod tests {
         let k = choice_of(&ch, 0);
         assert_eq!(k.skill_id, SkillId::Mark);
         assert!(k.target.length() < 0.2 && k.target.x < 0.0, "{:?}", k.target);
-        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::RailKeeper);
         assert!(choice_of(&ch, 1).target.x < 0.0);
 
         // FREE BALL Q1 → robot en el punto a 0.20 m de la cruz del lado nuestro.
@@ -1889,7 +1905,7 @@ mod tests {
         for id in [0, 1] {
             assert!(choice_of(&ch, id).target.x < 0.0, "{:?}", choice_of(&ch, id));
         }
-        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 2).skill_id, SkillId::RailKeeper);
     }
 
     fn score_of(c: &HeuristicCoach, skill: SkillId) -> f32 {
@@ -2086,6 +2102,6 @@ mod tests {
         let ch = c.decide(&o);
         assert_eq!(ch.len(), 2);
         assert_eq!(c.role_of(0), Some(Role::Keeper));
-        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::GoalKeep);
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::RailKeeper);
     }
 }
