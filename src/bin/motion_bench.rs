@@ -38,7 +38,7 @@ use rustengine::protos::fira_packet::Environment;
 use rustengine::radio::{FIRASimClient, RadioTarget, TeleportItem};
 use rustengine::skills::zones::{AccionGuardia, AreaRect};
 use rustengine::skills::{
-    ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, RailKeeperSkill, SkillConfig, SkillId,
+    ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, RailKeeperSkill, ReceiveSkill, SkillConfig, SkillId,
     clear_direction,
 };
 use rustengine::vision::VisionSource;
@@ -84,6 +84,9 @@ enum Goal {
     Still,
     /// Llega y termina con la cara del modo a < 20° de la pelota (Mark).
     ArriveFacingBall,
+    /// Llega y termina a < 20° de la orientación de espera de `Receive` (entre la pelota y el
+    /// arco rival, con `skills.receive_goal_weight`).
+    ArriveFacingReceive,
     /// Llega sin mover la pelota más de 0.03 m (GoTo con la pelota en el camino: A4).
     ArriveNoBallPush,
     /// Árbitro: en la ventana HALT/STOP la traslación comandada es cero (en HALT también
@@ -176,6 +179,11 @@ const CASES: &[Case] = &[
     c("approach_front", SkillId::ApproachAligned, (0.75, 0.0), (0.3, 0.05, 180.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("approach_side", SkillId::ApproachAligned, (0.75, 0.0), (-0.1, -0.35, 90.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("mark_point", SkillId::Mark, (-0.3, 0.0), (0.2, -0.3, 0.0), (0.3, 0.3), 6.0, 0.08, Goal::ArriveFacingBall),
+    // Receive (apoyo como receptor): pelota detrás, de costado (~90° del arco: las dos
+    // bisectrices valen lo mismo) y adelante junto a la banda (segunda pelota).
+    c("receive_ball_behind", SkillId::Receive, (0.3, -0.2), (-0.1, 0.2, 0.0), (0.0, 0.25), 6.0, 0.08, Goal::ArriveFacingReceive),
+    c("receive_ball_side", SkillId::Receive, (0.35, 0.3), (0.0, -0.1, 90.0), (0.35, -0.15), 6.0, 0.08, Goal::ArriveFacingReceive),
+    c("receive_ball_ahead", SkillId::Receive, (0.45, -0.2), (0.1, 0.0, 180.0), (0.6, 0.45), 6.0, 0.08, Goal::ArriveFacingReceive),
     c("intercept_static", SkillId::Intercept, (0.0, 0.0), (-0.4, -0.3, 0.0), (0.2, 0.2), 6.0, 0.09, ARRIVE),
     // La pelota arranca rodando (teleport con velocidad) y cruza la cancha hacia abajo.
     Case {
@@ -250,16 +258,19 @@ const SUITE: &[&str] = &[
     "b2_blockline_open", "b2_blockline_corner", "b2_blockline_center", "goalkeep_keeper",
     "railkeeper_keeper", "rk_shot_far_post", "rk_shot_near_post", "rk_shot_center", "rk_line_roll",
     "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
-    "mark_point", "hold_still", "b1a_hold_in_area", "goto_around_area", "blockline_across_area",
-    "clear_own_arc", "blockline_fast_near_area", "goto_fast_near_area", "goto_slow_near_area",
+    "mark_point", "receive_ball_behind", "receive_ball_side", "receive_ball_ahead", "hold_still",
+    "b1a_hold_in_area", "goto_around_area", "blockline_across_area", "clear_own_arc", "blockline_fast_near_area", "goto_fast_near_area", "goto_slow_near_area",
 ];
 
 /// Suite rápida, un caso por skill (alias `suite-rapida`): para cada change.
 const SUITE_QUICK: &[&str] = &[
     "goto_side", "face_90", "chase_fwd", "spin_20", "approach_side", "b3_shoot_behind",
     "intercept_moving", "b2_blockline_open", "goalkeep_keeper", "clear_lateral",
-    "spinkick_wall", "mark_point", "hold_still", "railkeeper_keeper",
+    "spinkick_wall", "mark_point", "hold_still", "railkeeper_keeper", "receive_ball_side",
 ];
+
+/// Banco del receptor (alias `receptor`).
+const RECEIVE_CASES: &[&str] = &["receive_ball_behind", "receive_ball_side", "receive_ball_ahead"];
 
 /// Banco del arquero (alias `arquero`): los dos arqueros en su punto y los mismos tiros con cada uno.
 const KEEPER_CASES: &[&str] = &[
@@ -466,7 +477,7 @@ fn reference(case: &Case, r: &Row) -> Option<Vec2> {
     let target = Vec2::new(case.target.0, case.target.1);
     let ball = Vec2::new(r.bx, r.by);
     match case.skill {
-        SkillId::GoTo | SkillId::Mark => Some(target),
+        SkillId::GoTo | SkillId::Mark | SkillId::Receive => Some(target),
         SkillId::ChaseBall | SkillId::Intercept => Some(ball),
         SkillId::ApproachAligned => ApproachAlignedSkill::new(target).staging_point(ball),
         SkillId::BlockLine => BlockLineSkill::new(target).block_point(ball),
@@ -547,7 +558,7 @@ fn metrics(case: &Case, rows: &[Row], bidirectional: bool) -> Metrics {
 /// Mark o BlockLine (el punto de bloqueo de la primera fila); `None` en los demás o si el
 /// destino está a menos de 0.05 m del inicio.
 fn overshoot(case: &Case, rows: &[Row], pose: impl Fn(&Row) -> Option<Vec2>) -> Option<f32> {
-    let fixed = matches!(case.skill, SkillId::GoTo | SkillId::Mark | SkillId::BlockLine);
+    let fixed = matches!(case.skill, SkillId::GoTo | SkillId::Mark | SkillId::Receive | SkillId::BlockLine);
     if !fixed || !case.then.is_empty() || !case.referee.is_empty() {
         return None;
     }
@@ -654,6 +665,12 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
             let last = rows.last()?;
             let p = Vec2::new(last.x, last.y);
             m.arrived.is_some() && heading_err(Vec2::new(last.bx, last.by) - p, last.th, bidirectional).to_degrees() < 20.0
+        }
+        Goal::ArriveFacingReceive => {
+            let last = rows.last()?;
+            let p = Vec2::new(last.x, last.y);
+            let want = ReceiveSkill::new(p).facing(p, Vec2::new(last.bx, last.by), -OWN_GOAL, last.th as f32);
+            m.arrived.is_some() && heading_err(want, last.th, bidirectional).to_degrees() < 20.0
         }
         Goal::ArriveNoBallPush => {
             let b0 = rows.first().map(|r| Vec2::new(r.bx, r.by))?;
@@ -975,6 +992,7 @@ async fn main() {
     let suite = names.iter().any(|n| n == "suite");
     let suite_quick = names.iter().any(|n| n == "suite-rapida");
     let keeper_alias = names.iter().any(|n| n == "arquero");
+    let receive_alias = names.iter().any(|n| n == "receptor");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
@@ -984,6 +1002,7 @@ async fn main() {
                 || (suite && SUITE.contains(&c.name))
                 || (suite_quick && SUITE_QUICK.contains(&c.name))
                 || (keeper_alias && KEEPER_CASES.contains(&c.name))
+                || (receive_alias && RECEIVE_CASES.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {

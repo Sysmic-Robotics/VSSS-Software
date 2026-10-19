@@ -778,7 +778,7 @@ impl HeuristicCoach {
         if self.ball_on_end_wall(ball) && ball.x * s > 0.0 {
             let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
             let pos = self.away_from_ball(Vec2::new(s * (GOAL_AREA_X - 0.18), -side * 0.22), ball);
-            let skill = self.commit(r.id, SkillId::Mark, |_| true);
+            let skill = self.commit(r.id, SkillId::Receive, |_| true);
             return SkillChoice::new(r.id, skill, pos);
         }
         // Atacando: receptor de pase a la par de la pelota, en el carril contrario al
@@ -810,8 +810,8 @@ impl HeuristicCoach {
             (None, Some(b)) => b,
             (None, None) => self.receiver_point(Vec2::new(ball.x + s * 0.05, ball.y), ball),
         };
-        // Mark = ir al punto y quedar mirando a la pelota (listo para recibir).
-        let skill = self.commit(r.id, SkillId::Mark, |_| true);
+        // Receive = ir al punto como Mark y esperar orientado para empujar al arco al recibir.
+        let skill = self.commit(r.id, SkillId::Receive, |_| true);
         SkillChoice::new(r.id, skill, pos)
     }
 
@@ -1240,7 +1240,7 @@ mod tests {
         );
         let ch = c.decide(&o);
         let sup = choice_of(&ch, 1);
-        assert_eq!(sup.skill_id, SkillId::Mark);
+        assert_eq!(sup.skill_id, SkillId::Receive);
         assert!(sup.target.x >= 0.38 && sup.target.y < 0.0, "receptor a la par, carril contrario: {:?}", sup.target);
         assert!(sup.target.x.abs() <= FIELD_ROBOT_MAX_ABS_X + 1e-6);
         assert!(!c.in_own_area(sup.target));
@@ -1360,7 +1360,7 @@ mod tests {
         let ch = c.decide(&o);
         assert_eq!(c.role_of(0), Some(Role::Striker));
         let sup = choice_of(&ch, 1);
-        assert_eq!(sup.skill_id, SkillId::Mark);
+        assert_eq!(sup.skill_id, SkillId::Receive);
         assert!((sup.target - ball).length() >= c.p.standoff_from_ball - 1e-3, "{:?}", sup.target);
     }
 
@@ -1682,7 +1682,7 @@ mod tests {
         let ch = c.decide(&o);
         assert_eq!(c.role_of(0), Some(Role::Striker));
         let sup = choice_of(&ch, 1);
-        assert_eq!(sup.skill_id, SkillId::Mark);
+        assert_eq!(sup.skill_id, SkillId::Receive);
         assert!(sup.target.y < 0.0, "carril contrario: {:?}", sup.target);
         assert!(sup.target.x >= ball.x - 0.02, "a la par o adelante, no detrás: {:?}", sup.target);
         assert!((sup.target - ball).length() >= c.p.standoff_from_ball - 1e-3);
@@ -1699,7 +1699,7 @@ mod tests {
         let ch = c.decide(&o);
         assert_eq!(c.role_of(0), Some(Role::Striker));
         let sup = choice_of(&ch, 1);
-        assert_eq!(sup.skill_id, SkillId::Mark, "{sup:?}");
+        assert_eq!(sup.skill_id, SkillId::Receive, "{sup:?}");
         assert!(sup.target.x >= ball.x - 0.02 && sup.target.y < 0.0, "{:?}", sup.target);
         // Con un rival sobre la pelota, vuelve a cubrir la línea.
         let mut c2 = coach();
@@ -1741,7 +1741,7 @@ mod tests {
         let ch = c.decide(&o);
         assert_eq!(c.role_of(0), Some(Role::Striker));
         let sup = choice_of(&ch, 1);
-        assert_eq!(sup.skill_id, SkillId::Mark);
+        assert_eq!(sup.skill_id, SkillId::Receive);
         assert!(sup.target.y < 0.0, "support del lado contrario: {:?}", sup.target);
         assert!(sup.target.x < GOAL_AREA_X, "support fuera del área rival: {:?}", sup.target);
     }

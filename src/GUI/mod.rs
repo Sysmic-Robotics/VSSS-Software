@@ -171,6 +171,7 @@ const SKILL_GROUPS: [(&str, &[SkillId]); 4] = [
             SkillId::GoalKeep,
             SkillId::RailKeeper,
             SkillId::Mark,
+            SkillId::Receive,
         ],
     ),
     ("Quieto", &[SkillId::Hold]),
@@ -236,6 +237,9 @@ pub fn skill_help(skill: Option<SkillId>) -> &'static str {
              largo de él, anticipando el empuje rival (VSSL_SIDE). Solo coach.keeper_id entra al área."
         }
         Some(SkillId::Mark) => "click = dónde pararse; queda mirando a la pelota.",
+        Some(SkillId::Receive) => {
+            "click = dónde pararse; queda orientado entre la pelota y el arco rival              (skills.receive_goal_weight)."
+        }
         Some(SkillId::Hold) => "el click no se usa: quieto (sin avance ni giro).",
     }
 }

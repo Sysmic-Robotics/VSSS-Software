@@ -1,12 +1,14 @@
 pub mod catalog;
 pub mod config;
 pub mod keeper;
+pub mod receive;
 pub mod tactical;
 pub mod zones;
 
 pub use catalog::{SkillCatalog, SkillId};
 pub use config::SkillConfig;
 pub use keeper::{KeeperMode, RailKeeperSkill};
+pub use receive::ReceiveSkill;
 pub use tactical::{
     ApproachAlignedSkill, BlockLineSkill, ClearSkill, Face, InterceptSkill, MarkSkill,
     ShootPushSkill, SkillStatus, SpinKickSkill, clear_direction, shoot_push_feasible,
