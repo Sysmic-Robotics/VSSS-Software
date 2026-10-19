@@ -107,6 +107,9 @@ pub struct CoachParams {
     /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
     /// él, con anticipación) en vez de `GoalKeep`.
     pub gk_rail: bool,
+    /// Atacante: donde elegiría `ApproachAligned` o `ShootPush` conduce con `Dribble` (campo
+    /// "ir al arco": se aproxima y empuja sin pararse detrás de la pelota).
+    pub striker_dribble: bool,
 }
 
 impl Default for CoachParams {
@@ -147,6 +150,7 @@ impl Default for CoachParams {
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
             gk_rail: true,
+            striker_dribble: false,
         }
     }
 }
@@ -265,6 +269,12 @@ pub struct SkillParams {
     pub keeper_contact_dist: f32,
     /// RailKeeper: cuánto más allá de la pelota apunta al barrerla de la boca del arco (m).
     pub keeper_sweep: f32,
+    /// Dribble: radio de las espirales del campo "ir al arco" (m).
+    pub dribble_de: f32,
+    /// Dribble: suavizado de la espiral fuera de su círculo (m).
+    pub dribble_kr: f32,
+    /// Dribble: velocidad pedida antes del recorte por curvatura (m/s).
+    pub dribble_speed: f64,
 }
 
 impl Default for SkillParams {
@@ -301,6 +311,9 @@ impl Default for SkillParams {
             keeper_rail_tol: 0.06,
             keeper_contact_dist: 0.12,
             keeper_sweep: 0.10,
+            dribble_de: 0.10,
+            dribble_kr: 0.05,
+            dribble_speed: 0.8,
         }
     }
 }

@@ -136,6 +136,7 @@ const INFRA_RETRIES: u32 = 2;
 const EXIT_INFRA: i32 = 3;
 
 const ARRIVE: Goal = Goal::Arrive;
+const KICK_DRIBBLE: Goal = Goal::Kick { min_prog: 0.30, max_dir: 30.0 };
 const KICK_PUSH: Goal = Goal::Kick { min_prog: 0.10, max_dir: 30.0 };
 const KICK_SPIN: Goal = Goal::Kick { min_prog: 0.10, max_dir: 45.0 };
 
@@ -176,6 +177,21 @@ const CASES: &[Case] = &[
     c("approach_front", SkillId::ApproachAligned, (0.75, 0.0), (0.3, 0.05, 180.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("approach_side", SkillId::ApproachAligned, (0.75, 0.0), (-0.1, -0.35, 90.0), (0.0, 0.0), 8.0, 0.0, ARRIVE),
     c("mark_point", SkillId::Mark, (-0.3, 0.0), (0.2, -0.3, 0.0), (0.3, 0.3), 6.0, 0.08, Goal::ArriveFacingBall),
+    // Conducción "ir al arco" (Dribble) contra la combinación de hoy (ApproachAligned y luego
+    // ShootPush, `two_*`), desde las mismas poses y con el mismo tiempo total: la pelota debe
+    // avanzar 0.30 m hacia el objetivo con a lo sumo 30° de desvío.
+    c("dribble_behind", SkillId::Dribble, (0.75, 0.0), (-0.30, 0.0, 0.0), (0.0, 0.0), 3.0, 0.0, KICK_DRIBBLE),
+    c("dribble_side", SkillId::Dribble, (0.75, 0.0), (-0.10, -0.35, 90.0), (0.0, 0.0), 4.0, 0.0, KICK_DRIBBLE),
+    c("dribble_front", SkillId::Dribble, (0.75, 0.0), (0.30, 0.05, 180.0), (0.0, 0.0), 5.0, 0.0, KICK_DRIBBLE),
+    c("dribble_diag", SkillId::Dribble, (0.75, 0.0), (0.35, 0.35, -90.0), (0.0, 0.10), 5.0, 0.0, KICK_DRIBBLE),
+    Case {
+        then: &[(SkillId::ShootPush, (0.75, 0.0), 2.0)],
+        ..c("two_side", SkillId::ApproachAligned, (0.75, 0.0), (-0.10, -0.35, 90.0), (0.0, 0.0), 2.0, 0.0, KICK_DRIBBLE)
+    },
+    Case {
+        then: &[(SkillId::ShootPush, (0.75, 0.0), 2.0)],
+        ..c("two_front", SkillId::ApproachAligned, (0.75, 0.0), (0.30, 0.05, 180.0), (0.0, 0.0), 3.0, 0.0, KICK_DRIBBLE)
+    },
     c("intercept_static", SkillId::Intercept, (0.0, 0.0), (-0.4, -0.3, 0.0), (0.2, 0.2), 6.0, 0.09, ARRIVE),
     // La pelota arranca rodando (teleport con velocidad) y cruza la cancha hacia abajo.
     Case {
@@ -252,19 +268,25 @@ const SUITE: &[&str] = &[
     "clear_own", "clear_lateral", "spinkick_wall", "spinkick_side", "spinkick_interrupted",
     "mark_point", "hold_still", "b1a_hold_in_area", "goto_around_area", "blockline_across_area",
     "clear_own_arc", "blockline_fast_near_area", "goto_fast_near_area", "goto_slow_near_area",
+    "dribble_behind", "dribble_side", "dribble_front", "dribble_diag",
 ];
 
 /// Suite rápida, un caso por skill (alias `suite-rapida`): para cada change.
 const SUITE_QUICK: &[&str] = &[
     "goto_side", "face_90", "chase_fwd", "spin_20", "approach_side", "b3_shoot_behind",
     "intercept_moving", "b2_blockline_open", "goalkeep_keeper", "clear_lateral",
-    "spinkick_wall", "mark_point", "hold_still", "railkeeper_keeper",
+    "spinkick_wall", "mark_point", "hold_still", "railkeeper_keeper", "dribble_side",
 ];
 
 /// Banco del arquero (alias `arquero`): los dos arqueros en su punto y los mismos tiros con cada uno.
 const KEEPER_CASES: &[&str] = &[
     "goalkeep_keeper", "railkeeper_keeper", "rk_shot_far_post", "rk_shot_near_post", "rk_shot_center",
     "rk_line_roll", "gk_shot_far_post", "gk_shot_near_post", "gk_shot_center", "gk_line_roll",
+];
+
+/// Banco de conducción (alias `conduccion`): Dribble y la combinación de hoy desde las mismas poses.
+const DRIBBLE_CASES: &[&str] = &[
+    "dribble_behind", "dribble_side", "dribble_front", "dribble_diag", "two_side", "two_front",
 ];
 
 /// Casos del árbitro (alias `referee` en la línea de comandos).
@@ -975,6 +997,7 @@ async fn main() {
     let suite = names.iter().any(|n| n == "suite");
     let suite_quick = names.iter().any(|n| n == "suite-rapida");
     let keeper_alias = names.iter().any(|n| n == "arquero");
+    let dribble_alias = names.iter().any(|n| n == "conduccion");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
@@ -984,6 +1007,7 @@ async fn main() {
                 || (suite && SUITE.contains(&c.name))
                 || (suite_quick && SUITE_QUICK.contains(&c.name))
                 || (keeper_alias && KEEPER_CASES.contains(&c.name))
+                || (dribble_alias && DRIBBLE_CASES.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {

@@ -161,6 +161,7 @@ const SKILL_GROUPS: [(&str, &[SkillId]); 4] = [
             SkillId::ShootPush,
             SkillId::Clear,
             SkillId::SpinKick,
+            SkillId::Dribble,
         ],
     ),
     (
@@ -236,6 +237,7 @@ pub fn skill_help(skill: Option<SkillId>) -> &'static str {
              largo de él, anticipando el empuje rival (VSSL_SIDE). Solo coach.keeper_id entra al área."
         }
         Some(SkillId::Mark) => "click = dónde pararse; queda mirando a la pelota.",
+        Some(SkillId::Dribble) => "click = hacia dónde llevar la pelota (campo univectorial).",
         Some(SkillId::Hold) => "el click no se usa: quieto (sin avance ni giro).",
     }
 }

@@ -34,7 +34,8 @@
     "gk_engage_opp_dist": 0.2,
     "gk_engage_max_ball_speed": 0.4,
     "gk_block_incoming_speed": 0.1,
-    "gk_rail": true
+    "gk_rail": true,
+    "striker_dribble": false
   },
   "skills": {
     "approach_staging_offset": 0.14,
@@ -67,7 +68,10 @@
     "keeper_lead_s": 0.1,
     "keeper_rail_tol": 0.06,
     "keeper_contact_dist": 0.12,
-    "keeper_sweep": 0.1
+    "keeper_sweep": 0.1,
+    "dribble_de": 0.1,
+    "dribble_kr": 0.05,
+    "dribble_speed": 0.8
   },
   "motion": {
     "max_linear_speed": 1.2,

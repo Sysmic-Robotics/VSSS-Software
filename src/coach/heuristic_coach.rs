@@ -732,7 +732,15 @@ impl HeuristicCoach {
             scores.iter().any(|(s, v)| *s == prev && *v > 0.0)
         });
         self.depuracion_atacante(r, ball, opp, target, &scores, current, wanted, skill);
-        SkillChoice::new(r.id, skill, target)
+        // Conducción: aproximarse y empujar como un solo movimiento (`Dribble`, campo "ir al
+        // arco"), sin pararse detrás de la pelota. Las opciones y el compromiso siguen
+        // decidiéndose con `ApproachAligned`/`ShootPush`.
+        let executed = if self.p.striker_dribble && matches!(skill, SkillId::ApproachAligned | SkillId::ShootPush) {
+            SkillId::Dribble
+        } else {
+            skill
+        };
+        SkillChoice::new(r.id, executed, target)
     }
 
     /// Rival que amenaza en nuestra mitad sin ser el que está sobre la pelota
@@ -1132,7 +1140,9 @@ impl Coach for HeuristicCoach {
             ball,
             ball_vel,
             s,
-            striker_skill == Some(SkillId::ShootPush),
+            // Conduciendo, es tiro cuando el empuje ya es factible (el mismo criterio de ShootPush).
+            striker_skill == Some(SkillId::ShootPush)
+                || (striker_skill == Some(SkillId::Dribble) && self.last_scores[0].1 > 0.0),
             striker_skill == Some(SkillId::SpinKick),
             nearest(&own),
             nearest(&opp),
@@ -2038,6 +2048,22 @@ mod tests {
         );
         c.decide(&freed);
         assert!(matches!(c.push_stall, Stall::None));
+    }
+
+    #[test]
+    fn striker_dribbles_where_it_would_approach_or_push() {
+        let o = obs(Vec2::new(0.2, 0.0), Vec2::ZERO, [Vec2::new(-0.2, 0.15), Vec2::new(-0.3, -0.4), Vec2::new(-0.63, 0.0)]);
+        let mut plain = coach();
+        let before = choice_of(&plain.decide(&o), 0);
+        assert!(matches!(before.skill_id, SkillId::ApproachAligned | SkillId::ShootPush), "{:?}", before.skill_id);
+        let p = CoachParams { striker_dribble: true, ..CoachParams::default() };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        let after = choice_of(&c.decide(&o), 0);
+        assert_eq!(after.skill_id, SkillId::Dribble);
+        assert_eq!(after.target, before.target, "mismo objetivo");
+        // Las opciones del atacante siguen siendo las de siempre (depuración y compromiso).
+        let op = c.debug().unwrap().opciones.unwrap();
+        assert!(matches!(op.aplicada, SkillId::ApproachAligned | SkillId::ShootPush));
     }
 
     #[test]

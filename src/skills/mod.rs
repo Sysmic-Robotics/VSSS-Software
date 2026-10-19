@@ -1,11 +1,13 @@
 pub mod catalog;
 pub mod config;
+pub mod dribble;
 pub mod keeper;
 pub mod tactical;
 pub mod zones;
 
 pub use catalog::{SkillCatalog, SkillId};
 pub use config::SkillConfig;
+pub use dribble::DribbleSkill;
 pub use keeper::{KeeperMode, RailKeeperSkill};
 pub use tactical::{
     ApproachAlignedSkill, BlockLineSkill, ClearSkill, Face, InterceptSkill, MarkSkill,
