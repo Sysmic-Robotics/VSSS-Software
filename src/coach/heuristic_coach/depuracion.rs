@@ -240,7 +240,14 @@ mod tests {
         let striker = d.atacante.expect("hay atacante");
         let op = d.opciones.expect("el atacante eligió entre las 5");
         assert_eq!(op.puntajes, *c.last_striker_scores());
-        assert_eq!(op.aplicada, choice_of(&ch, striker).skill_id);
+        // Aproximarse o empujar se ejecutan conduciendo (`Dribble`).
+        let emitida = choice_of(&ch, striker).skill_id;
+        assert!(
+            emitida == op.aplicada
+                || (emitida == SkillId::Dribble && matches!(op.aplicada, SkillId::ApproachAligned | SkillId::ShootPush)),
+            "{emitida:?} vs {:?}",
+            op.aplicada
+        );
         assert_eq!(d.skill_atacante, Some(op.aplicada));
         assert_eq!(d.objetivo.unwrap().0, choice_of(&ch, striker).target);
     }

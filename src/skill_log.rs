@@ -949,6 +949,7 @@ mod tests {
         let choices = c.decide(&Observation::from_world(&world, 0));
         let coach = c.debug().unwrap();
         let striker = coach.atacante.unwrap();
+        let aplicada = coach.opciones.unwrap().aplicada;
         let elegida = *choices.iter().find(|ch| ch.robot_id == striker).unwrap();
         let debug = TickDebug {
             coach: Some(coach),
@@ -999,7 +1000,7 @@ mod tests {
         assert_eq!(col(fila_manual, "skill"), "", "el manual no tiene elección");
         assert_eq!(col(fila_atacante, "skill"), skill_label(Some(elegida.skill_id)));
         assert_eq!(col(fila_atacante, "role"), "striker");
-        assert_eq!(col(fila_atacante, "pick"), skill_label(Some(elegida.skill_id)));
+        assert_eq!(col(fila_atacante, "pick"), skill_label(Some(aplicada)));
         assert!(!col(fila_atacante, "score_approach").is_empty());
         assert_eq!(col(fila_atacante, "nav_detour"), "ball");
         assert_eq!(col(fila_atacante, "nav_side"), "1");

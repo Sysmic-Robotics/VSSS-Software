@@ -734,8 +734,10 @@ impl HeuristicCoach {
         self.depuracion_atacante(r, ball, opp, target, &scores, current, wanted, skill);
         // Conducción: aproximarse y empujar como un solo movimiento (`Dribble`, campo "ir al
         // arco"), sin pararse detrás de la pelota. Las opciones y el compromiso siguen
-        // decidiéndose con `ApproachAligned`/`ShootPush`.
-        let executed = if self.p.striker_dribble && matches!(skill, SkillId::ApproachAligned | SkillId::ShootPush) {
+        // decidiéndose con `ApproachAligned`/`ShootPush`. Contra aproximarse a un punto detrás
+        // de la pelota y recién empujar: ganó 19-3-2 cara a cara, +1.00 ± 0.20 goles por
+        // partido (48 partidos), con 74 % más empujes en contacto.
+        let executed = if matches!(skill, SkillId::ApproachAligned | SkillId::ShootPush) {
             SkillId::Dribble
         } else {
             skill
@@ -1201,6 +1203,23 @@ mod tests {
         *choices.iter().find(|c| c.robot_id == id).expect("robot sin choice")
     }
 
+    /// Lo que decidió el coach para el robot `id`: con `Dribble`, la opción del atacante
+    /// (aproximarse o empujar se ejecutan conduciendo); si no, la skill emitida.
+    fn decidida(c: &HeuristicCoach, ch: &[SkillChoice], id: i32) -> SkillId {
+        let s = choice_of(ch, id).skill_id;
+        if s == SkillId::Dribble {
+            c.debug().and_then(|d| d.opciones).map(|o| o.aplicada).expect("conduce: hay opciones")
+        } else {
+            s
+        }
+    }
+
+    /// Decide con `o` y devuelve `decidida` para el robot `id`.
+    fn decidida_de(c: &mut HeuristicCoach, o: &Observation, id: i32) -> SkillId {
+        let ch = c.decide(o);
+        decidida(c, &ch, id)
+    }
+
     #[test]
     fn closest_field_robot_becomes_striker_and_keeper_keeps_goal() {
         let mut c = coach();
@@ -1227,7 +1246,7 @@ mod tests {
             [Vec2::new(-0.5, 0.3), Vec2::new(0.08, 0.0), Vec2::new(-0.63, 0.0)],
         );
         let ch = c.decide(&o);
-        assert_eq!(choice_of(&ch, 1).skill_id, SkillId::ShootPush);
+        assert_eq!(decidida(&c, &ch, 1), SkillId::ShootPush);
         assert_eq!(choice_of(&ch, 1).target, ATTACK);
 
         // Robot 1 DELANTE de la pelota → no puede empujar: ApproachAligned.
@@ -1238,7 +1257,7 @@ mod tests {
             [Vec2::new(-0.5, 0.3), Vec2::new(0.32, 0.0), Vec2::new(-0.63, 0.0)],
         );
         let ch = c.decide(&o);
-        assert_eq!(choice_of(&ch, 1).skill_id, SkillId::ApproachAligned);
+        assert_eq!(decidida(&c, &ch, 1), SkillId::ApproachAligned);
     }
 
     #[test]
@@ -1606,7 +1625,7 @@ mod tests {
             Vec2::ZERO,
             [Vec2::new(-0.5, 0.3), Vec2::new(0.08, 0.0), Vec2::new(-0.63, 0.0)],
         );
-        assert_eq!(choice_of(&c.decide(&behind), 1).skill_id, SkillId::ShootPush);
+        assert_eq!(decidida_de(&mut c, &behind, 1), SkillId::ShootPush);
         // Un tick de percepción dice que la pelota se movió delante del robot:
         // ShootPush deja de ser factible → cambia de inmediato (no se finge empuje).
         let flicker = obs(
@@ -1614,13 +1633,13 @@ mod tests {
             Vec2::ZERO,
             [Vec2::new(-0.5, 0.3), Vec2::new(0.30, 0.0), Vec2::new(-0.63, 0.0)],
         );
-        assert_eq!(choice_of(&c.decide(&flicker), 1).skill_id, SkillId::ApproachAligned);
+        assert_eq!(decidida_de(&mut c, &flicker, 1), SkillId::ApproachAligned);
         // Vuelve a estar detrás: ApproachAligned se mantiene el hold mínimo
         // aunque ShootPush ya sea factible otra vez (evita el ping-pong).
-        assert_eq!(choice_of(&c.decide(&behind), 1).skill_id, SkillId::ApproachAligned);
+        assert_eq!(decidida_de(&mut c, &behind, 1), SkillId::ApproachAligned);
         let mut last = SkillId::ApproachAligned;
         for _ in 0..CoachParams::default().skill_min_hold {
-            last = choice_of(&c.decide(&behind), 1).skill_id;
+            last = decidida_de(&mut c, &behind, 1);
         }
         assert_eq!(last, SkillId::ShootPush);
     }
@@ -1654,7 +1673,7 @@ mod tests {
             [Vec2::new(0.5, 0.3), Vec2::new(-0.08, 0.0), Vec2::new(0.63, 0.0)],
         );
         let ch = c.decide(&o);
-        assert_eq!(choice_of(&ch, 1).skill_id, SkillId::ShootPush);
+        assert_eq!(decidida(&c, &ch, 1), SkillId::ShootPush);
         assert_eq!(choice_of(&ch, 1).target, OWN);
         assert_eq!(choice_of(&ch, 2).target, ATTACK);
         assert!(c.in_own_area(Vec2::new(0.70, 0.1)));
@@ -1705,12 +1724,12 @@ mod tests {
         let far = [Vec2::new(-0.10, 0.30), Vec2::new(-0.20, -0.30), Vec2::new(-0.68, 0.0)];
         let ch = c.decide(&obs(ball, Vec2::ZERO, far));
         assert_eq!(c.role_of(0), Some(Role::Striker));
-        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::ApproachAligned);
+        assert_eq!(decidida(&c, &ch, 0), SkillId::ApproachAligned);
         // ...y ya en el staging, pasado el compromiso mínimo, cambia al giro.
         let parked = [Vec2::new(0.20, 0.57), Vec2::new(-0.20, -0.30), Vec2::new(-0.68, 0.0)];
         let mut last = SkillId::ApproachAligned;
         for _ in 0..(CoachParams::default().skill_min_hold + 2) {
-            last = choice_of(&c.decide(&obs(ball, Vec2::ZERO, parked)), 0).skill_id;
+            last = decidida_de(&mut c, &obs(ball, Vec2::ZERO, parked), 0);
         }
         assert_eq!(last, SkillId::SpinKick, "{:?}", c.last_striker_scores());
     }
@@ -1877,7 +1896,7 @@ mod tests {
         assert!(ch.iter().all(|x| x.skill_id != SkillId::Mark || x.robot_id != striker_id));
         assert!(matches!(
             choice_of(&ch, striker_id).skill_id,
-            SkillId::ApproachAligned | SkillId::ShootPush | SkillId::Intercept | SkillId::Clear
+            SkillId::ApproachAligned | SkillId::ShootPush | SkillId::Dribble | SkillId::Intercept | SkillId::Clear
         ));
     }
 
@@ -1911,7 +1930,7 @@ mod tests {
         assert_eq!(c.role_of(1), Some(Role::Striker));
         assert!(matches!(
             choice_of(&ch, 1).skill_id,
-            SkillId::ApproachAligned | SkillId::ShootPush | SkillId::Clear | SkillId::SpinKick
+            SkillId::ApproachAligned | SkillId::ShootPush | SkillId::Dribble | SkillId::Clear | SkillId::SpinKick
         ), "{:?}", choice_of(&ch, 1));
     }
 
@@ -1953,7 +1972,7 @@ mod tests {
             [Vec2::new(0.08, 0.0), Vec2::new(-0.5, 0.3), Vec2::new(-0.63, 0.0)],
         );
         let ch = c.decide(&o);
-        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::ShootPush);
+        assert_eq!(decidida(&c, &ch, 0), SkillId::ShootPush);
         assert!(score_of(&c, SkillId::ShootPush) > 0.95);
         assert!(score_of(&c, SkillId::Intercept) == 0.0 && score_of(&c, SkillId::Clear) == 0.0);
 
@@ -2000,12 +2019,12 @@ mod tests {
         // Primero llega desde adelante (approach vigente)...
         let mut before = o.clone();
         before.own_robots[0] = robot(Vec2::new(0.70, 0.45), 0.0);
-        assert_eq!(choice_of(&c.decide(&before), 0).skill_id, SkillId::ApproachAligned);
+        assert_eq!(decidida_de(&mut c, &before, 0), SkillId::ApproachAligned);
         // ...y ya detrás y alineado: pasado el compromiso mínimo, el tiro tapado vale
         // más que seguir "aproximando".
         let mut last = SkillId::ApproachAligned;
         for _ in 0..CoachParams::default().skill_min_hold {
-            last = choice_of(&c.decide(&o), 0).skill_id;
+            last = decidida_de(&mut c, &o, 0);
         }
         assert_eq!(last, SkillId::ShootPush);
         let shoot = score_of(&c, SkillId::ShootPush);
@@ -2026,7 +2045,7 @@ mod tests {
             [Vec2::new(-0.60, 0.60), Vec2::new(0.2, -0.2), Vec2::new(-0.63, 0.0)],
         );
         o.opp_robots[0] = robot(Vec2::new(-0.42, 0.56), 180.0);
-        let first = choice_of(&c.decide(&o), 0).skill_id;
+        let first = decidida_de(&mut c, &o, 0);
         assert!(matches!(first, SkillId::Clear | SkillId::ShootPush), "{first:?}");
         // El plazo corre desde la primera decisión ya empujando (la segunda).
         let d = CoachParams::default();
@@ -2053,17 +2072,14 @@ mod tests {
     #[test]
     fn striker_dribbles_where_it_would_approach_or_push() {
         let o = obs(Vec2::new(0.2, 0.0), Vec2::ZERO, [Vec2::new(-0.2, 0.15), Vec2::new(-0.3, -0.4), Vec2::new(-0.63, 0.0)]);
-        let mut plain = coach();
-        let before = choice_of(&plain.decide(&o), 0);
-        assert!(matches!(before.skill_id, SkillId::ApproachAligned | SkillId::ShootPush), "{:?}", before.skill_id);
-        let p = CoachParams { striker_dribble: true, ..CoachParams::default() };
-        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
-        let after = choice_of(&c.decide(&o), 0);
-        assert_eq!(after.skill_id, SkillId::Dribble);
-        assert_eq!(after.target, before.target, "mismo objetivo");
-        // Las opciones del atacante siguen siendo las de siempre (depuración y compromiso).
-        let op = c.debug().unwrap().opciones.unwrap();
-        assert!(matches!(op.aplicada, SkillId::ApproachAligned | SkillId::ShootPush));
+        let mut c = coach();
+        let ch = choice_of(&c.decide(&o), 0);
+        assert_eq!(ch.skill_id, SkillId::Dribble);
+        // Las opciones del atacante siguen siendo las de siempre (depuración y compromiso), y
+        // conduce hacia el mismo objetivo con que se puntuó el empuje.
+        let d = c.debug().unwrap();
+        assert!(matches!(d.opciones.unwrap().aplicada, SkillId::ApproachAligned | SkillId::ShootPush));
+        assert_eq!(ch.target, d.objetivo.unwrap().0);
     }
 
     #[test]
