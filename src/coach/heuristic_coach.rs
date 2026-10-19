@@ -230,7 +230,7 @@ impl HeuristicCoach {
             return Vec::new();
         };
         // El pateador es el jugador de campo que llega antes a su punto.
-        self.assign_roles(own, f.striker);
+        self.assign_roles(own, f.striker, Vec2::ZERO);
         own.iter()
             .filter(|r| r.active)
             .map(|r| match self.role_of(r.id) {
@@ -339,6 +339,41 @@ impl HeuristicCoach {
             turn = err / self.p.omega_ref;
         }
         dist / self.p.v_ref + turn
+    }
+
+    /// Tiempo de llegada a la pelota con que se reparten los roles: a donde estará siguiendo su
+    /// trayectoria (`role_by_intercept`) o a donde está.
+    fn arrival_time(&self, r: &RobotView, ball: Vec2, ball_vel: Vec2) -> f32 {
+        if self.p.role_by_intercept {
+            self.time_to_intercept(r, ball, ball_vel)
+        } else {
+            self.time_to_reach(r, ball)
+        }
+    }
+
+    /// Primer instante en que `r` puede estar sobre la pelota que rueda, con el modelo de
+    /// `InterceptSkill` y sus parámetros (frenado exponencial, horizonte, pasos de 0.05 s);
+    /// la pelota predicha se recorta a la cancha. Sin alcanzarla en el horizonte, el tiempo
+    /// hasta donde queda; con la pelota quieta, `time_to_reach`.
+    fn time_to_intercept(&self, r: &RobotView, ball: Vec2, ball_vel: Vec2) -> f32 {
+        let sp = &params().skills;
+        if ball_vel.length() < sp.intercept_min_ball_speed {
+            return self.time_to_reach(r, ball);
+        }
+        let k = sp.intercept_ball_decay_per_s;
+        let at = |t: f32| {
+            let travel = if k > 1e-6 { (1.0 - (-k * t).exp()) / k } else { t };
+            let p = ball + ball_vel * travel;
+            Vec2::new(p.x.clamp(-FIELD_HALF_X, FIELD_HALF_X), p.y.clamp(-FIELD_HALF_Y, FIELD_HALF_Y))
+        };
+        let mut t = 0.0_f32;
+        while t <= sp.intercept_horizon {
+            if self.time_to_reach(r, at(t)) <= t {
+                return t;
+            }
+            t += 0.05;
+        }
+        self.time_to_reach(r, at(sp.intercept_horizon))
     }
 
     /// Punto del arco rival al que apuntar: centro, o el palo lejano si hay un
@@ -913,7 +948,7 @@ impl HeuristicCoach {
 
     // ── Play: roles ──────────────────────────────────────────────────────────
 
-    fn assign_roles(&mut self, own: &[RobotView], ball: Vec2) {
+    fn assign_roles(&mut self, own: &[RobotView], ball: Vec2, ball_vel: Vec2) {
         self.decisions_since_role_switch = self.decisions_since_role_switch.saturating_add(1);
 
         // Arquero: fijo; si está inactivo, el activo más cercano al arco propio.
@@ -937,7 +972,7 @@ impl HeuristicCoach {
         let mut field: Vec<(&RobotView, f32)> = own
             .iter()
             .filter(|r| r.active && r.id != self.keeper_id)
-            .map(|r| (r, self.time_to_reach(r, ball)))
+            .map(|r| (r, self.arrival_time(r, ball, ball_vel)))
             .collect();
         field.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         self.depuracion_roles(&field);
@@ -1039,7 +1074,7 @@ impl Coach for HeuristicCoach {
             | Play::GoalKickTheirs => {}
         }
 
-        self.assign_roles(&own, ball);
+        self.assign_roles(&own, ball, ball_vel);
         let striker = self.striker_id.and_then(|id| own.iter().find(|r| r.id == id).copied());
         // El arquero decide primero: si juega la pelota, los de campo no se le amontonan.
         // Pelota dentro del área propia con arquero activo: la despeja él (§9.5, solo un
@@ -2006,6 +2041,26 @@ mod tests {
         );
         c.decide(&freed);
         assert!(matches!(c.push_stall, Stall::None));
+    }
+
+    #[test]
+    fn rolling_ball_goes_to_whoever_reaches_its_path_first() {
+        // La pelota pasa junto al robot 0 pero rueda rápido hacia el robot 1: por distancia
+        // es del 0; por intercepción, del 1, que la espera en su camino.
+        let ball = Vec2::new(0.15, 0.0);
+        let o = obs(ball, Vec2::new(0.8, 0.0), [Vec2::new(0.0, 0.0), Vec2::new(0.6, 0.02), Vec2::new(-0.63, 0.0)]);
+        let mut by_distance = coach();
+        by_distance.decide(&o);
+        assert_eq!(by_distance.role_of(0), Some(Role::Striker));
+        let p = CoachParams { role_by_intercept: true, ..CoachParams::default() };
+        let mut by_intercept = HeuristicCoach::from_params(ATTACK, OWN, p.clone(), true);
+        by_intercept.decide(&o);
+        assert_eq!(by_intercept.role_of(1), Some(Role::Striker));
+        // Con la pelota quieta, la intercepción es la llegada de siempre.
+        let quieta = obs(ball, Vec2::ZERO, [Vec2::new(0.0, 0.0), Vec2::new(0.6, 0.02), Vec2::new(-0.63, 0.0)]);
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        c.decide(&quieta);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
     }
 
     #[test]

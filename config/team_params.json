@@ -34,7 +34,8 @@
     "gk_engage_opp_dist": 0.2,
     "gk_engage_max_ball_speed": 0.4,
     "gk_block_incoming_speed": 0.1,
-    "gk_rail": true
+    "gk_rail": true,
+    "role_by_intercept": false
   },
   "skills": {
     "approach_staging_offset": 0.14,

@@ -107,6 +107,9 @@ pub struct CoachParams {
     /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
     /// él, con anticipación) en vez de `GoalKeep`.
     pub gk_rail: bool,
+    /// Roles: el atacante es el que llega antes a donde ESTARÁ la pelota (modelo de
+    /// `InterceptSkill`), no a donde está.
+    pub role_by_intercept: bool,
 }
 
 impl Default for CoachParams {
@@ -147,6 +150,7 @@ impl Default for CoachParams {
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
             gk_rail: true,
+            role_by_intercept: false,
         }
     }
 }
