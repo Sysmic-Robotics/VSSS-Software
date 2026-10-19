@@ -68,8 +68,7 @@
     "keeper_lead_s": 0.1,
     "keeper_rail_tol": 0.06,
     "keeper_contact_dist": 0.12,
-    "keeper_sweep": 0.1,
-    "receive_goal_weight": 0.0
+    "keeper_sweep": 0.1
   },
   "motion": {
     "max_linear_speed": 1.2,

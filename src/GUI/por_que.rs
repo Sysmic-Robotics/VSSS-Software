@@ -39,7 +39,6 @@ fn haciendo(skill: SkillId) -> &'static str {
         SkillId::Mark => "está marcando",
         SkillId::Hold => "está esperando",
         SkillId::RailKeeper => "cuida el arco desde el riel",
-        SkillId::Receive => "espera la pelota para empujarla al arco",
     }
 }
 
@@ -106,7 +105,6 @@ pub fn causa(id: i32, vista: Option<&OwnRobotView>, coach: &CoachDebug) -> Optio
             (Some(Role::Keeper), SkillId::Clear) => "Sale a despejar la pelota.",
             (Some(Role::Keeper), _) => "Cuida el arco.",
             (_, SkillId::Mark) => "Marca a un rival o espera el rebote.",
-            (_, SkillId::Receive) => "Espera el rebote orientado para empujar al arco.",
             (_, SkillId::BlockLine) => "Cubre la línea de tiro hacia nuestro arco.",
             _ => "Acompaña la jugada.",
         }

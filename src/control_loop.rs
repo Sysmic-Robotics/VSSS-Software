@@ -767,8 +767,7 @@ fn dispatch_choices(
             | SkillId::Clear
             | SkillId::SpinKick
             | SkillId::Mark
-            | SkillId::RailKeeper
-            | SkillId::Receive => Some(choice.target),
+            | SkillId::RailKeeper => Some(choice.target),
             SkillId::ChaseBall | SkillId::Intercept => Some(world.get_ball_state().position),
             SkillId::Spin | SkillId::Hold => None,
         };

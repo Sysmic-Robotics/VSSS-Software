@@ -457,11 +457,10 @@ impl Args {
                         "clear" => SkillId::Clear,
                         "spinkick" => SkillId::SpinKick,
                         "mark" => SkillId::Mark,
-                        "receive" => SkillId::Receive,
                         "hold" => SkillId::Hold,
                         other => {
                             return Err(format!(
-                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep|railkeeper|clear|spinkick|mark|receive|hold)"
+                                "--skill: valor inválido '{other}' (esperaba goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|goalkeep|railkeeper|clear|spinkick|mark|hold)"
                             ));
                         }
                     });
@@ -699,7 +698,6 @@ impl Args {
                         | SkillId::Clear
                         | SkillId::SpinKick
                         | SkillId::Mark
-                        | SkillId::Receive
                 ) && target.is_none()
                 {
                     return Err(format!(

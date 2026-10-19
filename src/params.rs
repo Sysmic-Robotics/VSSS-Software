@@ -269,9 +269,6 @@ pub struct SkillParams {
     pub keeper_contact_dist: f32,
     /// RailKeeper: cuánto más allá de la pelota apunta al barrerla de la boca del arco (m).
     pub keeper_sweep: f32,
-    /// Receive: peso del arco rival en la orientación de espera (0 = mira la pelota, como
-    /// `Mark`; 1 = una cara hacia el arco).
-    pub receive_goal_weight: f32,
 }
 
 impl Default for SkillParams {
@@ -308,7 +305,6 @@ impl Default for SkillParams {
             keeper_rail_tol: 0.06,
             keeper_contact_dist: 0.12,
             keeper_sweep: 0.10,
-            receive_goal_weight: 0.0,
         }
     }
 }
