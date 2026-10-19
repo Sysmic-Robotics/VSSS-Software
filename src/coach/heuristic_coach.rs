@@ -341,16 +341,6 @@ impl HeuristicCoach {
         dist / self.p.v_ref + turn
     }
 
-    /// Tiempo de llegada a la pelota con que se reparten los roles: a donde estará siguiendo su
-    /// trayectoria (`role_by_intercept`) o a donde está.
-    fn arrival_time(&self, r: &RobotView, ball: Vec2, ball_vel: Vec2) -> f32 {
-        if self.p.role_by_intercept {
-            self.time_to_intercept(r, ball, ball_vel)
-        } else {
-            self.time_to_reach(r, ball)
-        }
-    }
-
     /// Primer instante en que `r` puede estar sobre la pelota que rueda, con el modelo de
     /// `InterceptSkill` y sus parámetros (frenado exponencial, horizonte, pasos de 0.05 s);
     /// la pelota predicha se recorta a la cancha. Sin alcanzarla en el horizonte, el tiempo
@@ -971,11 +961,15 @@ impl HeuristicCoach {
             }
         }
 
-        // Striker: el jugador de campo que llega antes a la pelota, con histéresis.
+        // Striker: el jugador de campo que llega antes a la pelota, con histéresis. Llegar a
+        // donde ESTARÁ la pelota, no a donde está: con la pelota rodando hacia el apoyo, este
+        // pasaba a atacante 0.28-0.35 s después de que empezaba a venir; con la intercepción,
+        // 0.17-0.20 s. En 95 partidos ganó 23-9-16 cara a cara y +0.56 ± 0.37 de aptitud contra
+        // rule_based.
         let mut field: Vec<(&RobotView, f32)> = own
             .iter()
             .filter(|r| r.active && r.id != self.keeper_id)
-            .map(|r| (r, self.arrival_time(r, ball, ball_vel)))
+            .map(|r| (r, self.time_to_intercept(r, ball, ball_vel)))
             .collect();
         field.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         self.depuracion_roles(&field);
@@ -2049,20 +2043,15 @@ mod tests {
     #[test]
     fn rolling_ball_goes_to_whoever_reaches_its_path_first() {
         // La pelota pasa junto al robot 0 pero rueda rápido hacia el robot 1: por distancia
-        // es del 0; por intercepción, del 1, que la espera en su camino.
+        // sería del 0; por intercepción es del 1, que la espera en su camino.
         let ball = Vec2::new(0.15, 0.0);
-        let o = obs(ball, Vec2::new(0.8, 0.0), [Vec2::new(0.0, 0.0), Vec2::new(0.6, 0.02), Vec2::new(-0.63, 0.0)]);
-        let mut by_distance = coach();
-        by_distance.decide(&o);
-        assert_eq!(by_distance.role_of(0), Some(Role::Striker));
-        let p = CoachParams { role_by_intercept: true, ..CoachParams::default() };
-        let mut by_intercept = HeuristicCoach::from_params(ATTACK, OWN, p.clone(), true);
-        by_intercept.decide(&o);
-        assert_eq!(by_intercept.role_of(1), Some(Role::Striker));
+        let own = [Vec2::new(0.0, 0.0), Vec2::new(0.6, 0.02), Vec2::new(-0.63, 0.0)];
+        let mut c = coach();
+        c.decide(&obs(ball, Vec2::new(0.8, 0.0), own));
+        assert_eq!(c.role_of(1), Some(Role::Striker));
         // Con la pelota quieta, la intercepción es la llegada de siempre.
-        let quieta = obs(ball, Vec2::ZERO, [Vec2::new(0.0, 0.0), Vec2::new(0.6, 0.02), Vec2::new(-0.63, 0.0)]);
-        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
-        c.decide(&quieta);
+        let mut c = coach();
+        c.decide(&obs(ball, Vec2::ZERO, own));
         assert_eq!(c.role_of(0), Some(Role::Striker));
     }
 
