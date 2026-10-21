@@ -128,6 +128,8 @@ pub struct HeuristicCoach {
     push_stall: Stall,
     /// Depuración de las decisiones (GUI y CSV de partido; no decide nada).
     depuracion: depuracion::Registro,
+    /// Lado (±1) del último camino libre elegido por `free_lane`.
+    escape_side: std::sync::Mutex<Option<f32>>,
 }
 
 fn clamp01(x: f32) -> f32 {
@@ -188,6 +190,7 @@ impl HeuristicCoach {
             side_checked: false,
             push_stall: Stall::None,
             depuracion: depuracion::Registro::default(),
+            escape_side: std::sync::Mutex::new(None),
             p,
         }
     }
@@ -458,7 +461,54 @@ impl HeuristicCoach {
             self.depuracion.tipo_objetivo(TipoObjetivo::Despeje);
             return self.clear_target(ball);
         }
-        self.aim_point(opp)
+        let aim = self.aim_point(opp);
+        if self.p.dribble_escape {
+            return self.free_lane(ball, aim, opp);
+        }
+        aim
+    }
+
+    /// Conducir por un camino libre: si un rival tapa los próximos `LANE_REACH` m de la recta
+    /// pelota → `aim`, la dirección más cercana a esa recta (±25°, ±45°, ±65°) con el camino
+    /// libre y sin chocar contra la pared; el lado elegido se mantiene mientras siga libre. En
+    /// los registros con `Dribble`, 2 de cada 3 conducciones empezaban con un rival en el
+    /// camino: así terminaban en gol el 0.7 % y cortadas por el rival el 50 %; con el camino
+    /// libre, 7 % y 17 %. Sin camino libre, sigue hacia `aim`.
+    fn free_lane(&self, ball: Vec2, aim: Vec2, opp: &[RobotView]) -> Vec2 {
+        const LANE_REACH: f32 = 0.40;
+        const LANE_MARGIN: f32 = 0.10;
+        const ANGLES_DEG: [f32; 3] = [25.0, 45.0, 65.0];
+        let blocked = |dir: Vec2| {
+            opp.iter().filter(|o| o.active).any(|o| {
+                let rel = o.pos - ball;
+                let along = rel.dot(dir);
+                along > 0.03 && along < LANE_REACH && (rel - dir * along).length() < LANE_MARGIN
+            })
+        };
+        let base = (aim - ball).normalize_or_zero();
+        if base == Vec2::ZERO || !blocked(base) {
+            *self.escape_side.lock().expect("escape_side") = None;
+            return aim;
+        }
+        let previous = *self.escape_side.lock().expect("escape_side");
+        let sides: [f32; 2] = match previous {
+            Some(s) => [s, -s],
+            None => [1.0, -1.0],
+        };
+        for a in ANGLES_DEG {
+            // Con el lado anterior primero: cambia de lado solo si ese se tapa.
+            for side in sides {
+                let dir = Vec2::from_angle(side * a.to_radians()).rotate(base);
+                let end = ball + dir * LANE_REACH;
+                let inside = end.x.abs() <= FIELD_HALF_X - 0.05 && end.y.abs() <= FIELD_HALF_Y - 0.05;
+                if inside && !blocked(dir) {
+                    *self.escape_side.lock().expect("escape_side") = Some(side);
+                    self.depuracion.tipo_objetivo(TipoObjetivo::Regate);
+                    return end;
+                }
+            }
+        }
+        aim
     }
 
     // ── Compromiso por skill ─────────────────────────────────────────────────
@@ -2067,6 +2117,35 @@ mod tests {
         );
         c.decide(&freed);
         assert!(matches!(c.push_stall, Stall::None));
+    }
+
+    #[test]
+    fn dribble_takes_a_free_lane_around_a_rival_in_the_way() {
+        let p = CoachParams { dribble_escape: true, ..CoachParams::default() };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        let ball = Vec2::new(0.1, 0.0);
+        let own = [Vec2::new(-0.05, 0.0), Vec2::new(-0.3, -0.4), Vec2::new(-0.63, 0.0)];
+        // Camino libre: al arco.
+        let ch = c.decide(&obs(ball, Vec2::ZERO, own));
+        assert_eq!(choice_of(&ch, 0).target, ATTACK);
+        // Rival 0.2 m adelante sobre la recta: ±25° sigue tapado, sale por 45°.
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.3, 0.0), 180.0);
+        let ch = c.decide(&o);
+        let dir = (choice_of(&ch, 0).target - ball).normalize();
+        assert!((dir.y.atan2(dir.x).to_degrees().abs() - 45.0).abs() < 1e-3, "{dir}");
+        assert_eq!(c.debug().unwrap().objetivo.unwrap().1, TipoObjetivo::Regate);
+        let side = dir.y.signum();
+        // Otro rival tapa ese lado: cambia al otro...
+        o.opp_robots[1] = robot(ball + Vec2::from_angle(side * 45f32.to_radians()) * 0.2, 180.0);
+        let ch = c.decide(&o);
+        let other = (choice_of(&ch, 0).target - ball).normalize();
+        assert_eq!(other.y.signum(), -side, "{other}");
+        // ...y se queda ahí aunque el primero vuelva a estar libre (no zigzaguea).
+        o.opp_robots[1] = RobotObs::default();
+        let ch = c.decide(&o);
+        let kept = (choice_of(&ch, 0).target - ball).normalize();
+        assert_eq!(kept.y.signum(), -side, "{kept}");
     }
 
     #[test]

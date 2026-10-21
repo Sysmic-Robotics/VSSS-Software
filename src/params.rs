@@ -107,6 +107,9 @@ pub struct CoachParams {
     /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
     /// él, con anticipación) en vez de `GoalKeep`.
     pub gk_rail: bool,
+    /// Atacante: con un rival en el camino de la pelota al arco, conduce por una dirección
+    /// libre cercana (`free_lane`).
+    pub dribble_escape: bool,
 }
 
 impl Default for CoachParams {
@@ -147,6 +150,7 @@ impl Default for CoachParams {
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
             gk_rail: true,
+            dribble_escape: false,
         }
     }
 }
