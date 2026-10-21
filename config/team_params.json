@@ -71,7 +71,8 @@
     "keeper_sweep": 0.1,
     "dribble_de": 0.1,
     "dribble_kr": 0.05,
-    "dribble_speed": 0.8
+    "dribble_speed": 0.8,
+    "dribble_center_tol": 0.0
   },
   "motion": {
     "max_linear_speed": 1.2,

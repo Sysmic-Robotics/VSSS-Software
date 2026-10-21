@@ -275,6 +275,9 @@ pub struct SkillParams {
     pub dribble_kr: f32,
     /// Dribble: velocidad pedida antes del recorte por curvatura (m/s).
     pub dribble_speed: f64,
+    /// Dribble: cerca de la pelota, avanza solo con ella a menos de esto del centro de la cara
+    /// (m); 0 = sin puerta.
+    pub dribble_center_tol: f32,
 }
 
 impl Default for SkillParams {
@@ -314,6 +317,7 @@ impl Default for SkillParams {
             dribble_de: 0.10,
             dribble_kr: 0.05,
             dribble_speed: 0.8,
+            dribble_center_tol: 0.0,
         }
     }
 }
