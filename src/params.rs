@@ -265,11 +265,6 @@ pub struct SkillParams {
     pub keeper_contact_dist: f32,
     /// RailKeeper: cuánto más allá de la pelota apunta al barrerla de la boca del arco (m).
     pub keeper_sweep: f32,
-    /// RailKeeper: un tiro que entra se tapa en su cruce aunque ya esté entre el riel y la
-    /// línea (antes que barrer).
-    pub keeper_shot_first: bool,
-    /// RailKeeper: sin amenaza directa, sobre la bisectriz del ángulo pelota → palos.
-    pub keeper_bisector: bool,
     /// RailKeeper: ante un tiro, pide la velocidad para llegar al cruce a tiempo aunque no
     /// alcance a frenar en el punto.
     pub keeper_shot_no_brake: bool,
@@ -315,8 +310,6 @@ impl Default for SkillParams {
             keeper_rail_tol: 0.06,
             keeper_contact_dist: 0.12,
             keeper_sweep: 0.10,
-            keeper_shot_first: false,
-            keeper_bisector: false,
             keeper_shot_no_brake: false,
             dribble_de: 0.10,
             dribble_kr: 0.05,

@@ -76,12 +76,6 @@ pub struct RailKeeperSkill {
     pub contact_dist: f32,
     /// Cuánto más allá de la pelota (hacia su palo) apunta al barrerla de la boca (m).
     pub sweep: f32,
-    /// El tiro manda sobre la barrida: una pelota que viene rápido hacia la línea se tapa en
-    /// su cruce aunque ya esté entre el riel y la línea.
-    pub shot_first: bool,
-    /// Sin amenaza directa, sobre la bisectriz del ángulo pelota → palos (mismas chances a
-    /// los dos lados) en vez de la recta pelota → centro del arco.
-    pub bisector: bool,
     /// Ante un tiro, pide al menos la velocidad para llegar al cruce a tiempo (distancia /
     /// tiempo hasta el cruce) aunque no alcance a frenar en el punto.
     pub shot_no_brake: bool,
@@ -102,8 +96,6 @@ impl RailKeeperSkill {
             rail_tol: p.keeper_rail_tol,
             contact_dist: p.keeper_contact_dist,
             sweep: p.keeper_sweep,
-            shot_first: p.keeper_shot_first,
-            bisector: p.keeper_bisector,
             shot_no_brake: p.keeper_shot_no_brake,
             v_prev: 0.0,
             last_target: None,
@@ -146,7 +138,7 @@ impl RailKeeperSkill {
         // mediano 0.10 m, casi siempre en `SweepLine`). Tapa el cruce con el riel o, si la
         // pelota ya lo pasó, con la línea de gol.
         let toward = -ball_vel.x * self.inward();
-        if self.shot_first && toward > SHOT_MIN_SPEED {
+        if toward > SHOT_MIN_SPEED {
             let d_now = self.depth_of(ball);
             let line = if d_now > self.depth { self.depth } else { 0.0 };
             let t = (d_now - line) / toward;
@@ -203,14 +195,11 @@ impl RailKeeperSkill {
             }
         }
 
-        // Sin amenaza directa: sobre la recta pelota → centro del arco, o sobre la bisectriz del
-        // ángulo con que se ven los palos desde la pelota (RoboIME, SSL; con la pelota abierta
-        // cubre más el palo cercano).
-        let y = if self.bisector {
-            self.bisector_y(ball_ahead)
-        } else {
-            ball_ahead.y * (self.depth / d_ball.max(self.depth))
-        };
+        // Sin amenaza directa: sobre la bisectriz del ángulo con que se ven los palos desde la
+        // pelota (RoboIME, SSL), no sobre la recta pelota → centro del arco: con la pelota
+        // abierta cubre más el palo cercano. Junto con el tiro antes que la barrida: 13-6-5 cara
+        // a cara, 14 goles en contra contra 25 en 48 partidos.
+        let y = self.bisector_y(ball_ahead);
         (y.clamp(-GOAL_HALF_Y, GOAL_HALF_Y), KeeperMode::Angle)
     }
 
@@ -359,16 +348,13 @@ mod tests {
 
     #[test]
     fn bisector_covers_the_near_post_more_than_the_center_line() {
-        let mut k = keeper();
-        let ball = Vec2::new(-0.40, 0.40);
-        k.bisector = false;
-        let (center, _) = k.target_y(ball, Vec2::ZERO, &[]);
-        k.bisector = true;
-        let (bis, mode) = k.target_y(ball, Vec2::ZERO, &[]);
+        // Pelota en (−0.40, 0.40): la recta al centro del arco cruza el riel en y ≈ 0.057; la
+        // bisectriz de los palos, en y ≈ 0.103 (más cerca del palo cercano).
+        let k = keeper();
+        let (y, mode) = k.target_y(Vec2::new(-0.40, 0.40), Vec2::ZERO, &[]);
         assert_eq!(mode, KeeperMode::Angle);
-        assert!((center - 0.057).abs() < 0.002, "{center}");
-        assert!((bis - 0.103).abs() < 0.003, "{bis}");
-        // Pelota centrada: las dos coinciden en el centro.
+        assert!((y - 0.103).abs() < 0.003, "{y}");
+        // Pelota centrada: en el centro.
         assert!(k.target_y(Vec2::new(-0.2, 0.0), Vec2::ZERO, &[]).0.abs() < 1e-5);
     }
 
@@ -379,12 +365,7 @@ mod tests {
         // con la línea de gol.
         let ball = Vec2::new(-0.71, 0.05);
         let vel = Vec2::new(-0.6, -0.3);
-        let mut k = keeper();
-        k.shot_first = false;
-        let (y, mode) = k.target_y(ball, vel, &[]);
-        assert_eq!(mode, KeeperMode::SweepLine);
-        assert!((y - (ball.y + vel.y * k.lead_s + k.sweep)).abs() < 1e-5, "{y}");
-        k.shot_first = true;
+        let k = keeper();
         let (y, mode) = k.target_y(ball, vel, &[]);
         assert_eq!(mode, KeeperMode::Shot);
         let t = 0.04 / 0.6;
@@ -451,10 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn far_ball_keeps_the_keeper_on_the_ball_goal_line_and_inside_the_posts() {
+    fn far_ball_keeps_the_keeper_on_the_post_bisector_and_inside_the_posts() {
+        // Pelota en (0.30, 0.50): bisectriz de los palos (−0.75, ±0.20) cruzando el riel
+        // (x = −0.70) en y ≈ 0.0376 (la recta al centro daba 0.0238).
         let (y, mode) = keeper().target_y(Vec2::new(0.30, 0.50), Vec2::ZERO, &[]);
         assert_eq!(mode, KeeperMode::Angle);
-        assert!((y - 0.50 * 0.05 / 1.05).abs() < 1e-3, "{y}");
+        assert!((y - 0.0376).abs() < 1e-3, "{y}");
         // Pelota a 10 cm de la línea y muy abierta: recortada al palo.
         let (y, _) = keeper().target_y(Vec2::new(-0.65, -0.45), Vec2::ZERO, &[]);
         assert_eq!(y, -GOAL_HALF_Y);
