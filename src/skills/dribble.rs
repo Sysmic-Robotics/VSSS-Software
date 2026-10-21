@@ -29,6 +29,10 @@
 //!   √((ω_max/κ)² + 2·a·d): la velocidad desde la que frena a tiempo para esa curva. Mirando
 //!   solo la curvatura donde estaba, llegaba a 0.7 m/s a la espiral, se pasaba de la pelota y
 //!   daba una vuelta entera.
+//!
+//! (Se probó frenar cerca de la pelota hasta tenerla centrada en la cara, porque las
+//! conducciones que la perdían empezaban con ella a ~3 cm del centro: llegaba más tarde y cara
+//! a cara quedó +0.58 ± 0.29 para no frenar; se descartó. En partido pesa más llegar primero.)
 
 use super::{Face, MarkSkill, Skill, SkillStatus};
 use crate::motion::{CONTROL_DT, Motion, MotionCommand};
@@ -46,8 +50,6 @@ const FACE_HYSTERESIS: f64 = 0.5;
 const AHEAD_BAND: f32 = 0.03;
 /// Punto al que rodea: detrás de la pelota a esta distancia (m).
 const GO_AROUND_BACK: f32 = 0.12;
-/// Distancia centro del robot–pelota desde la que se exige la pelota centrada en la cara (m).
-const CENTER_ZONE: f32 = 0.15;
 
 pub struct DribbleSkill {
     pub target: Vec2,
@@ -57,9 +59,6 @@ pub struct DribbleSkill {
     pub kr: f32,
     /// Velocidad pedida (m/s), antes del recorte por curvatura.
     pub speed: f64,
-    /// Cerca de la pelota, distancia máxima de su centro a la recta de la cara que empuja (m)
-    /// para avanzar; más corrida, gira casi en el lugar. 0 = sin puerta.
-    pub center_tol: f32,
     v_prev: f64,
     /// Cara con la que avanza: +1 frente, −1 espalda; 0 sin elegir.
     face: f64,
@@ -75,7 +74,6 @@ impl DribbleSkill {
             de: p.dribble_de,
             kr: p.dribble_kr,
             speed: p.dribble_speed,
-            center_tol: p.dribble_center_tol,
             v_prev: 0.0,
             face: 0.0,
             going_around: false,
@@ -139,18 +137,6 @@ impl DribbleSkill {
         limit
     }
 
-    /// Cerca de la pelota y con ella por delante de la cara que empuja (dirección `push`),
-    /// pero corrida de su centro más que `center_tol`: empujar así la desliza por el borde de la
-    /// cara (en los registros, las conducciones que salían bien empezaban con la pelota a
-    /// 1.2 cm del centro; las que se perdían, a ~3 cm).
-    fn off_center(&self, pos: Vec2, push: Vec2, ball: Vec2) -> bool {
-        let rel = ball - pos;
-        self.center_tol > 0.0
-            && rel.length() < CENTER_ZONE
-            && rel.dot(push) > 0.0
-            && rel.perp_dot(push).abs() > self.center_tol
-    }
-
     /// Curvatura del campo (1/m, positiva antihoraria) a lo largo de su dirección en `p`.
     fn curvature(&self, p: Vec2, ball: Vec2) -> f32 {
         let a = self.field(p, ball);
@@ -193,12 +179,7 @@ impl Skill for DribbleSkill {
         let v_max = self.speed.min(cfg.max_linear_speed);
         let horizon = (v_max * v_max / (2.0 * cfg.max_linear_accel)) as f32 + CURVATURE_STEP;
         let v_curve = self.speed_limit(robot.position, ball, max_w, cfg.max_linear_accel, horizon);
-        let push = Vec2::new(robot.orientation.cos() as f32, robot.orientation.sin() as f32) * dir as f32;
-        let speed = if self.off_center(robot.position, push, ball) {
-            cfg.min_linear_speed
-        } else {
-            v_max.min(v_curve).max(cfg.min_linear_speed)
-        };
+        let speed = v_max.min(v_curve).max(cfg.min_linear_speed);
         let v_target = dir * speed * err.cos().max(0.0);
         let dv = cfg.max_linear_accel * CONTROL_DT;
         let v = v_target.clamp(self.v_prev - dv, self.v_prev + dv);
@@ -303,18 +284,6 @@ mod tests {
             let dir = reached.unwrap_or_else(|| panic!("desde {start} no llegó (quedó en {p})"));
             assert!(dir.dot(to_goal) > 15f32.to_radians().cos(), "desde {start}: llega en {dir}");
         }
-    }
-
-    #[test]
-    fn near_the_ball_it_only_pushes_with_the_ball_centered_on_the_face() {
-        let s = DribbleSkill { center_tol: 0.015, ..skill() };
-        let pos = Vec2::ZERO;
-        let push = Vec2::X;
-        assert!(!s.off_center(pos, push, Vec2::new(0.07, 0.01)), "centrada");
-        assert!(s.off_center(pos, push, Vec2::new(0.07, 0.03)), "corrida 3 cm");
-        assert!(!s.off_center(pos, push, Vec2::new(0.40, 0.10)), "lejos no aplica");
-        assert!(!s.off_center(pos, push, Vec2::new(-0.07, 0.03)), "detrás de la cara no aplica");
-        assert!(!skill().off_center(pos, push, Vec2::new(0.07, 0.03)), "sin puerta");
     }
 
     #[test]
