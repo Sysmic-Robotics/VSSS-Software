@@ -270,6 +270,9 @@ pub struct SkillParams {
     pub keeper_shot_first: bool,
     /// RailKeeper: sin amenaza directa, sobre la bisectriz del ángulo pelota → palos.
     pub keeper_bisector: bool,
+    /// RailKeeper: ante un tiro, pide la velocidad para llegar al cruce a tiempo aunque no
+    /// alcance a frenar en el punto.
+    pub keeper_shot_no_brake: bool,
     /// Dribble: radio de las espirales del campo "ir al arco" (m).
     pub dribble_de: f32,
     /// Dribble: suavizado de la espiral fuera de su círculo (m).
@@ -314,6 +317,7 @@ impl Default for SkillParams {
             keeper_sweep: 0.10,
             keeper_shot_first: false,
             keeper_bisector: false,
+            keeper_shot_no_brake: false,
             dribble_de: 0.10,
             dribble_kr: 0.05,
             dribble_speed: 0.8,
