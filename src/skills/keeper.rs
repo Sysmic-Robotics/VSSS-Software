@@ -79,6 +79,9 @@ pub struct RailKeeperSkill {
     /// El tiro manda sobre la barrida: una pelota que viene rápido hacia la línea se tapa en
     /// su cruce aunque ya esté entre el riel y la línea.
     pub shot_first: bool,
+    /// Sin amenaza directa, sobre la bisectriz del ángulo pelota → palos (mismas chances a
+    /// los dos lados) en vez de la recta pelota → centro del arco.
+    pub bisector: bool,
     v_prev: f64,
     last_target: Option<Vec2>,
     last_mode: KeeperMode,
@@ -97,6 +100,7 @@ impl RailKeeperSkill {
             contact_dist: p.keeper_contact_dist,
             sweep: p.keeper_sweep,
             shot_first: p.keeper_shot_first,
+            bisector: p.keeper_bisector,
             v_prev: 0.0,
             last_target: None,
             last_mode: KeeperMode::Angle,
@@ -195,9 +199,25 @@ impl RailKeeperSkill {
             }
         }
 
-        // Sin amenaza directa: sobre la recta pelota → centro del arco.
-        let y = ball_ahead.y * (self.depth / d_ball.max(self.depth));
+        // Sin amenaza directa: sobre la recta pelota → centro del arco, o sobre la bisectriz del
+        // ángulo con que se ven los palos desde la pelota (RoboIME, SSL; con la pelota abierta
+        // cubre más el palo cercano).
+        let y = if self.bisector {
+            self.bisector_y(ball_ahead)
+        } else {
+            ball_ahead.y * (self.depth / d_ball.max(self.depth))
+        };
         (y.clamp(-GOAL_HALF_Y, GOAL_HALF_Y), KeeperMode::Angle)
+    }
+
+    /// y donde la bisectriz del ángulo pelota → palos cruza el riel.
+    fn bisector_y(&self, ball: Vec2) -> f32 {
+        let post = |side: f32| Vec2::new(self.own_goal.x, side * GOAL_HALF_Y);
+        let w = (post(1.0) - ball).normalize_or_zero() + (post(-1.0) - ball).normalize_or_zero();
+        if w.x.abs() < 1e-6 {
+            return ball.y;
+        }
+        ball.y + w.y * (self.rail_x() - ball.x) / w.x
     }
 
     /// Velocidad lateral pedida (m/s, con signo de y) para un error `dy`: proporcional y
@@ -291,6 +311,21 @@ mod tests {
     /// Arco propio a la izquierda (−x): el riel queda en x = −0.70.
     fn keeper() -> RailKeeperSkill {
         RailKeeperSkill::new(Vec2::new(-0.75, 0.0))
+    }
+
+    #[test]
+    fn bisector_covers_the_near_post_more_than_the_center_line() {
+        let mut k = keeper();
+        let ball = Vec2::new(-0.40, 0.40);
+        k.bisector = false;
+        let (center, _) = k.target_y(ball, Vec2::ZERO, &[]);
+        k.bisector = true;
+        let (bis, mode) = k.target_y(ball, Vec2::ZERO, &[]);
+        assert_eq!(mode, KeeperMode::Angle);
+        assert!((center - 0.057).abs() < 0.002, "{center}");
+        assert!((bis - 0.103).abs() < 0.003, "{bis}");
+        // Pelota centrada: las dos coinciden en el centro.
+        assert!(k.target_y(Vec2::new(-0.2, 0.0), Vec2::ZERO, &[]).0.abs() < 1e-5);
     }
 
     #[test]
