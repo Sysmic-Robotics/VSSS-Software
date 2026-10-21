@@ -76,6 +76,9 @@ pub struct RailKeeperSkill {
     pub contact_dist: f32,
     /// Cuánto más allá de la pelota (hacia su palo) apunta al barrerla de la boca (m).
     pub sweep: f32,
+    /// El tiro manda sobre la barrida: una pelota que viene rápido hacia la línea se tapa en
+    /// su cruce aunque ya esté entre el riel y la línea.
+    pub shot_first: bool,
     v_prev: f64,
     last_target: Option<Vec2>,
     last_mode: KeeperMode,
@@ -93,6 +96,7 @@ impl RailKeeperSkill {
             rail_tol: p.keeper_rail_tol,
             contact_dist: p.keeper_contact_dist,
             sweep: p.keeper_sweep,
+            shot_first: p.keeper_shot_first,
             v_prev: 0.0,
             last_target: None,
             last_mode: KeeperMode::Angle,
@@ -127,6 +131,24 @@ impl RailKeeperSkill {
     pub fn target_y(&self, ball: Vec2, ball_vel: Vec2, rivals: &[Vec2]) -> (f32, KeeperMode) {
         let ball_ahead = ball + ball_vel * self.lead_s;
         let d_ball = self.depth_of(ball_ahead);
+
+        // Tiro que entra: va antes que la barrida. Un tiro pasa por la franja entre el riel y la
+        // línea en sus últimos ~0.2 s; con la barrida primero el arquero se corría `sweep` hacia
+        // el palo y la pelota entraba por donde estaba (50 goles en contra: desfase final
+        // mediano 0.10 m, casi siempre en `SweepLine`). Tapa el cruce con el riel o, si la
+        // pelota ya lo pasó, con la línea de gol.
+        let toward = -ball_vel.x * self.inward();
+        if self.shot_first && toward > SHOT_MIN_SPEED {
+            let d_now = self.depth_of(ball);
+            let line = if d_now > self.depth { self.depth } else { 0.0 };
+            let t = (d_now - line) / toward;
+            if (0.0..=self.horizon_s).contains(&t) {
+                let y = ball.y + ball_vel.y * t;
+                if y.abs() <= GOAL_HALF_Y + 0.10 {
+                    return (y.clamp(-GOAL_HALF_Y, GOAL_HALF_Y), KeeperMode::Shot);
+                }
+            }
+        }
 
         // Pelota entre el riel y la línea de gol: ya está "detrás" del arquero.
         if d_ball < self.depth + BALL_RADIUS {
@@ -269,6 +291,27 @@ mod tests {
     /// Arco propio a la izquierda (−x): el riel queda en x = −0.70.
     fn keeper() -> RailKeeperSkill {
         RailKeeperSkill::new(Vec2::new(-0.75, 0.0))
+    }
+
+    #[test]
+    fn a_shot_through_the_strip_before_the_line_is_blocked_not_swept() {
+        // Pelota ya entre el riel (x = −0.70) y la línea (−0.75), entrando rápido en diagonal:
+        // con la barrida primero se corría 10 cm hacia el palo; con el tiro primero, al cruce
+        // con la línea de gol.
+        let ball = Vec2::new(-0.71, 0.05);
+        let vel = Vec2::new(-0.6, -0.3);
+        let mut k = keeper();
+        k.shot_first = false;
+        let (y, mode) = k.target_y(ball, vel, &[]);
+        assert_eq!(mode, KeeperMode::SweepLine);
+        assert!((y - (ball.y + vel.y * k.lead_s + k.sweep)).abs() < 1e-5, "{y}");
+        k.shot_first = true;
+        let (y, mode) = k.target_y(ball, vel, &[]);
+        assert_eq!(mode, KeeperMode::Shot);
+        let t = 0.04 / 0.6;
+        assert!((y - (ball.y + vel.y * t)).abs() < 1e-5, "{y}");
+        // Quieta en la línea: sigue barriéndola.
+        assert_eq!(k.target_y(ball, Vec2::ZERO, &[]).1, KeeperMode::SweepLine);
     }
 
     fn robot(x: f32, y: f32, theta_deg: f64) -> RobotState {
