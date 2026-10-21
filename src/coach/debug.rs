@@ -89,8 +89,6 @@ pub enum TipoObjetivo {
     /// Pase al compañero: objetivo distinto del de `striker_target` (hoy el coach no pasa;
     /// ver `striker_choice`).
     Pase,
-    /// Rival en el camino hacia el arco: conduce por una dirección libre cercana.
-    Regate,
 }
 
 /// Condición para cambiar de atacante: otro jugador de campo llega claramente antes.

@@ -502,7 +502,6 @@ fn aim_label(tipo: TipoObjetivo) -> &'static str {
         TipoObjetivo::Banda => "wing",
         TipoObjetivo::Despeje => "clear",
         TipoObjetivo::Pase => "pass",
-        TipoObjetivo::Regate => "dodge",
     }
 }
 

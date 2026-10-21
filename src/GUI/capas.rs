@@ -245,7 +245,6 @@ pub fn nombre_objetivo(tipo: TipoObjetivo) -> &'static str {
         TipoObjetivo::Banda => "a lo largo de la banda",
         TipoObjetivo::Despeje => "despeje",
         TipoObjetivo::Pase => "pase al compañero",
-        TipoObjetivo::Regate => "esquiva al rival",
     }
 }
 
