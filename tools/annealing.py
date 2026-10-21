@@ -329,14 +329,20 @@ class MatchRunner:
                               work / "amarillo.log", yellow_csv)
         time.sleep(4.0)
         out = work / "partido.jsonl"
-        director = subprocess.run(
-            [str(DIRECTOR), "--minutes", str(self.minutes), "--goals", str(self.goals), "--kickoff", kickoff,
-             "--speed", str(max(1, self.sim.fps // 60)), "--out", str(out),
-             "--vision-port", str(self.sim.vision_port), "--cmd-port", str(self.sim.cmd_port)],
-            env=dict(os.environ, VSSL_REFEREE_ADDR=self.referee_addr), cwd=REPO,
-            stdout=open(work / "director.log", "w"), stderr=subprocess.STDOUT,
-            timeout=60 + self.minutes * 60 * 2,
-        )
+        limit = 60 + self.minutes * 60 * 2
+        try:
+            director = subprocess.run(
+                [str(DIRECTOR), "--minutes", str(self.minutes), "--goals", str(self.goals), "--kickoff", kickoff,
+                 "--speed", str(max(1, self.sim.fps // 60)), "--out", str(out),
+                 "--vision-port", str(self.sim.vision_port), "--cmd-port", str(self.sim.cmd_port)],
+                env=dict(os.environ, VSSL_REFEREE_ADDR=self.referee_addr), cwd=REPO,
+                stdout=open(work / "director.log", "w"), stderr=subprocess.STDOUT,
+                timeout=limit,
+            )
+            director_code = director.returncode
+        except subprocess.TimeoutExpired:
+            # `run` ya mató al director; el partido se trata como inválido (abajo).
+            director_code = None
         for proc in (blue, yellow):
             proc.terminate()
         for proc in (blue, yellow):
@@ -344,17 +350,20 @@ class MatchRunner:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        if director.returncode != 0 or not out.exists():
-            raise RuntimeError(f"el director falló en {tag} (código {director.returncode})")
-        score = json.loads(out.read_text(encoding="utf-8").strip().splitlines()[-1])
-        metrics = analyze(str(blue_csv))
-        covered = float(metrics.get("duracion_s", 0.0))
-        touches = int(metrics.get("toques_propios", 0)) + int(metrics.get("toques_rival", 0))
         problem = None
-        if covered < 0.7 * float(score["seconds"]):
-            problem = f"el registro azul cubre {covered:.0f} s de {score['seconds']:.0f} s"
-        elif touches == 0 and float(metrics.get("pelota_libre_pct", 0.0)) > 99.0:
-            problem = "nadie tocó la pelota en todo el partido (simulador congelado)"
+        if director_code is None:
+            problem = f"el director no terminó en {limit:.0f} s (simulador colgado)"
+        elif director_code != 0 or not out.exists():
+            raise RuntimeError(f"el director falló en {tag} (código {director_code})")
+        else:
+            score = json.loads(out.read_text(encoding="utf-8").strip().splitlines()[-1])
+            metrics = analyze(str(blue_csv))
+            covered = float(metrics.get("duracion_s", 0.0))
+            touches = int(metrics.get("toques_propios", 0)) + int(metrics.get("toques_rival", 0))
+            if covered < 0.7 * float(score["seconds"]):
+                problem = f"el registro azul cubre {covered:.0f} s de {score['seconds']:.0f} s"
+            elif touches == 0 and float(metrics.get("pelota_libre_pct", 0.0)) > 99.0:
+                problem = "nadie tocó la pelota en todo el partido (simulador congelado)"
         if problem is not None:
             # Partido inválido: el directorio queda para inspección, se relanza el FIRASim de este
             # carril y el partido se repite una vez.
