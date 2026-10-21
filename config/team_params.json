@@ -68,7 +68,6 @@
     "keeper_rail_tol": 0.06,
     "keeper_contact_dist": 0.12,
     "keeper_sweep": 0.1,
-    "keeper_shot_no_brake": false,
     "dribble_de": 0.1,
     "dribble_kr": 0.05,
     "dribble_speed": 0.8

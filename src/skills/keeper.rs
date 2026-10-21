@@ -76,9 +76,6 @@ pub struct RailKeeperSkill {
     pub contact_dist: f32,
     /// Cuánto más allá de la pelota (hacia su palo) apunta al barrerla de la boca (m).
     pub sweep: f32,
-    /// Ante un tiro, pide al menos la velocidad para llegar al cruce a tiempo (distancia /
-    /// tiempo hasta el cruce) aunque no alcance a frenar en el punto.
-    pub shot_no_brake: bool,
     v_prev: f64,
     last_target: Option<Vec2>,
     last_mode: KeeperMode,
@@ -96,7 +93,6 @@ impl RailKeeperSkill {
             rail_tol: p.keeper_rail_tol,
             contact_dist: p.keeper_contact_dist,
             sweep: p.keeper_sweep,
-            shot_no_brake: p.keeper_shot_no_brake,
             v_prev: 0.0,
             last_target: None,
             last_mode: KeeperMode::Angle,
@@ -223,28 +219,6 @@ impl RailKeeperSkill {
         let u = (self.gain * d).min((2.0 * accel * d).sqrt()).min(v_max);
         u * (dy as f64).signum()
     }
-
-    /// Segundos hasta que la pelota cruza el riel (o la línea de gol, si ya pasó el riel)
-    /// viniendo hacia el arco; `None` si no viene.
-    fn time_to_cross(&self, ball: Vec2, ball_vel: Vec2) -> Option<f32> {
-        let toward = -ball_vel.x * self.inward();
-        if toward <= SHOT_MIN_SPEED {
-            return None;
-        }
-        let d_now = self.depth_of(ball);
-        let line = if d_now > self.depth { self.depth } else { 0.0 };
-        Some(((d_now - line) / toward).max(0.0))
-    }
-
-    /// Velocidad lateral ante un tiro: la de `lateral_speed`, o la necesaria para llegar al
-    /// cruce en `t` s si es mayor (sin reservar distancia para frenar: ante un tiro alcanza
-    /// con estar ahí cuando llega la pelota; frenando, moverse 15 cm desde quieto tomaba
-    /// ~0.77 s en vez de ~0.55 s).
-    fn shot_speed(&self, dy: f32, t: f32, accel: f64, v_max: f64) -> f64 {
-        let base = self.lateral_speed(dy, accel, v_max);
-        let needed = (dy.abs() / t.max(0.05)) as f64;
-        if needed > base.abs() { needed.min(v_max) * (dy as f64).signum() } else { base }
-    }
 }
 
 impl Skill for RailKeeperSkill {
@@ -273,11 +247,10 @@ impl Skill for RailKeeperSkill {
         }
 
         let cfg = &motion.config;
-        let dy = y_t - robot.position.y;
-        let u = match (self.shot_no_brake && mode == KeeperMode::Shot, self.time_to_cross(ball.position, ball.velocity)) {
-            (true, Some(t)) => self.shot_speed(dy, t, cfg.max_linear_accel, cfg.max_linear_speed),
-            _ => self.lateral_speed(dy, cfg.max_linear_accel, cfg.max_linear_speed),
-        };
+        // (Se probó, ante un tiro, pedir la velocidad para llegar al cruce a tiempo sin reservar
+        // frenado: el arquero terminaba más desfasado, 0.12 m contra 0.09, y cara a cara quedó
+        // −0.21 ± 0.28 goles; se descartó.)
+        let u = self.lateral_speed(y_t - robot.position.y, cfg.max_linear_accel, cfg.max_linear_speed);
         // Dirección deseada: a lo largo del riel, inclinada hacia él si se desvió. Quieto,
         // solo mantiene la orientación a lo largo del riel.
         let theta_d = if u.abs() > 0.02 {
@@ -330,20 +303,6 @@ mod tests {
     /// Arco propio a la izquierda (−x): el riel queda en x = −0.70.
     fn keeper() -> RailKeeperSkill {
         RailKeeperSkill::new(Vec2::new(-0.75, 0.0))
-    }
-
-    #[test]
-    fn against_an_imminent_shot_it_does_not_hold_back_to_brake() {
-        let k = keeper();
-        // A 15 cm del cruce: el perfil de frenado pide √(2·1·0.15) ≈ 0.55 m/s; con la pelota
-        // llegando en 0.2 s hace falta 0.75 m/s.
-        let base = k.lateral_speed(0.15, 1.0, 1.2);
-        let shot = k.shot_speed(0.15, 0.2, 1.0, 1.2);
-        assert!((base - 0.5477).abs() < 1e-3, "{base}");
-        assert!((shot - 0.75).abs() < 1e-6, "{shot}");
-        // Con tiempo de sobra, el perfil de siempre; y nunca más que el tope.
-        assert_eq!(k.shot_speed(0.15, 2.0, 1.0, 1.2), base);
-        assert!((k.shot_speed(-0.15, 0.05, 1.0, 1.2) + 1.2).abs() < 1e-9);
     }
 
     #[test]
