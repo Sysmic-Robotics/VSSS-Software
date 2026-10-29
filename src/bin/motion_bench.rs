@@ -77,6 +77,8 @@ enum Goal {
     RailSpot,
     /// La pelota nunca entra entera a la boca del arco propio (tiro atajado).
     Save,
+    /// La pelota entra entera a la boca del arco rival (+x).
+    Score,
     /// Spin: desde 1.0 s, velocidad angular medida con el signo de `target.x` y magnitud
     /// ≥ 80 % de `SkillConfig::default().spin_omega`; traslación ≤ 0.03 m en todo el caso.
     Spin,
@@ -203,6 +205,13 @@ const CASES: &[Case] = &[
     c("clear_lateral", SkillId::Clear, (0.3, -0.2), (-0.4, 0.0, 0.0), (-0.4, -0.2), 6.0, 0.0, KICK_PUSH),
     c("spinkick_wall", SkillId::SpinKick, (0.0, 0.0), (-0.2, -0.3, 0.0), (0.2, -0.6), 6.0, 0.0, KICK_SPIN),
     c("spinkick_side", SkillId::SpinKick, (0.75, 0.0), (-0.10, 0.065, 90.0), (0.0, 0.0), 5.0, 0.0, KICK_SPIN),
+    // Penal sin arquero desde la cruz (0.375, 0) a un palo (y = ±0.14): de giro, con el robot
+    // en el centro de contacto detrás de la pelota del lado del palo, o empujando con Dribble
+    // desde la fila detrás de la pelota. La pelota tiene que entrar.
+    c("penal_giro_arriba", SkillId::SpinKick, (0.75, 0.14), (0.352, 0.061, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
+    c("penal_giro_abajo", SkillId::SpinKick, (0.75, -0.14), (0.352, -0.061, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
+    c("penal_empuje_arriba", SkillId::Dribble, (0.75, 0.14), (0.235, 0.0, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
+    c("penal_empuje_abajo", SkillId::Dribble, (0.75, -0.14), (0.235, 0.0, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
     // Girando junto a la pelota → GoTo a 0.16 m (dentro del radio en que SpinKick daba el
     // giro por vigente) → SpinKick de nuevo: la segunda activación debe acercarse y patear.
     Case {
@@ -283,6 +292,9 @@ const KEEPER_CASES: &[&str] = &[
     "goalkeep_keeper", "railkeeper_keeper", "rk_shot_far_post", "rk_shot_near_post", "rk_shot_center",
     "rk_line_roll", "gk_shot_far_post", "gk_shot_near_post", "gk_shot_center", "gk_line_roll",
 ];
+
+/// Penales sin arquero (alias `penal`): de giro y empujando, a cada palo.
+const PENALTY_CASES: &[&str] = &["penal_giro_arriba", "penal_giro_abajo", "penal_empuje_arriba", "penal_empuje_abajo"];
 
 /// Banco de conducción (alias `conduccion`): Dribble y la combinación de hoy desde las mismas poses.
 const DRIBBLE_CASES: &[&str] = &[
@@ -669,6 +681,7 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
                 && heading_err(Vec2::Y, last.th, true).to_degrees() <= 20.0
         }
         Goal::Save => !rows.iter().any(|r| r.bx < OWN_GOAL.x - BALL_RADIUS && r.by.abs() < GOAL_HALF_Y),
+        Goal::Score => rows.iter().any(|r| r.bx > -OWN_GOAL.x + BALL_RADIUS && r.by.abs() < GOAL_HALF_Y),
         Goal::Referee => referee_ok(case, rows, bidirectional),
         Goal::Spin => spin_ok(case, rows),
         Goal::Still => still_ok(rows),
@@ -998,6 +1011,7 @@ async fn main() {
     let suite_quick = names.iter().any(|n| n == "suite-rapida");
     let keeper_alias = names.iter().any(|n| n == "arquero");
     let dribble_alias = names.iter().any(|n| n == "conduccion");
+    let penalty_alias = names.iter().any(|n| n == "penal");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
@@ -1008,6 +1022,7 @@ async fn main() {
                 || (suite_quick && SUITE_QUICK.contains(&c.name))
                 || (keeper_alias && KEEPER_CASES.contains(&c.name))
                 || (dribble_alias && DRIBBLE_CASES.contains(&c.name))
+                || (penalty_alias && PENALTY_CASES.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {
