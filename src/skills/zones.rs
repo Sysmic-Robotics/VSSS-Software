@@ -191,6 +191,17 @@ impl ZoneGuard {
         }
     }
 
+    /// Cambia el arquero, el único robot propio que puede estar en su área: el control loop
+    /// le pasa el arquero vigente del decisor (`TickDecider::arquero`).
+    pub fn set_keeper(&mut self, keeper_id: i32) {
+        self.keeper_id = keeper_id;
+    }
+
+    /// El arquero vigente.
+    pub fn keeper(&self) -> i32 {
+        self.keeper_id
+    }
+
     pub fn own_area(&self) -> AreaRect {
         self.own_area
     }
@@ -381,6 +392,21 @@ mod tests {
         guard.guard_commands(&mut cmds, &w, 0, &manual);
         assert_eq!(cmds[0].vx, -1.0, "el arquero entra a su área");
         assert_eq!(cmds[1].vx, -1.0, "control manual no se recorta");
+    }
+
+    #[test]
+    fn set_keeper_moves_the_own_area_permission() {
+        // Arquero de reemplazo (`arquero`): con el 0 de arquero, el 0 entra y el 2 no.
+        let mut guard = ZoneGuard::new(1.0, 2);
+        guard.set_keeper(0);
+        assert_eq!(guard.keeper(), 0);
+        let w = world_with(&[(0, 0, -0.52, 0.0, std::f32::consts::PI), (0, 2, -0.52, 0.2, std::f32::consts::PI)]);
+        let mut cmds = vec![cmd(0, -1.0, 0.0), cmd(2, -1.0, 0.0)];
+        guard.guard_commands(&mut cmds, &w, 0, &HashSet::new());
+        assert_eq!(cmds[0].vx, -1.0, "el arquero de reemplazo entra a su área");
+        assert_eq!((cmds[1].vx, cmds[1].vy), (0.0, 0.0), "el 2 ya no es el arquero");
+        assert!(guard.areas_prohibidas(0, &w, 0).is_empty());
+        assert_eq!(guard.areas_prohibidas(2, &w, 0), vec![guard.own_area()]);
     }
 
     #[test]

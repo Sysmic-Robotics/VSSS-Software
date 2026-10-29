@@ -42,6 +42,14 @@ pub trait TickDecider: Send {
         None
     }
 
+    /// Robot propio que el decisor deja estar en su área (el arquero), o `None` si no
+    /// opina. El lazo lo lee después de cada `decide` y lo fija en `ZoneGuard` y `Motion`
+    /// en el mismo tick; con `None` queda el anterior, y al arrancar es `coach.keeper_id`
+    /// (`zone-guard`, "Arquero vigente del lazo"). No altera ninguna decisión.
+    fn arquero(&self) -> Option<i32> {
+        None
+    }
+
     /// Depuración de la última decisión del coach, para la GUI y el CSV de partido.
     /// `None` si el decisor no la exporta. No altera ninguna decisión.
     fn coach_debug(&self) -> Option<CoachDebug> {
@@ -290,6 +298,12 @@ impl TickDecider for CoachDecider {
         self.coach.role(robot_id)
     }
 
+    /// El robot que el coach tiene de arquero, entre los ids que observa (0 a 2, los de
+    /// `Observation`). Un coach sin roles (`RuleBasedCoach`) no opina.
+    fn arquero(&self) -> Option<i32> {
+        (0..3).find(|&id| self.coach.role(id) == Some(Role::Keeper))
+    }
+
     /// La del coach, con la skill que quedó aplicada al atacante (sin elección entre
     /// opciones, BlockLine, Mark o la de una jugada de pelota parada).
     fn coach_debug(&self) -> Option<CoachDebug> {
@@ -328,6 +342,12 @@ impl TickDecider for FixedSkillDecider {
             skill_id: self.skill_id,
             target: self.target,
         }]
+    }
+
+    /// Con una skill de arquero, su robot es el arquero (`skill_test`, `scenario`): así
+    /// cualquier robot prueba GoalKeep o RailKeeper sin cambiar `coach.keeper_id`.
+    fn arquero(&self) -> Option<i32> {
+        matches!(self.skill_id, SkillId::GoalKeep | SkillId::RailKeeper).then_some(self.robot_id)
     }
 }
 
@@ -577,7 +597,8 @@ fn stop_translation(
 
 /// Comandos de un tick: `(comandos, targets, choices aplicadas, en escape)`.
 ///
-/// - `Play`: decider → overrides de GUI → skills → control manual → reflejos.
+/// - `Play`: decider (y su arquero, a `motion` y `zone_guard`) → overrides de GUI →
+///   skills → control manual → reflejos.
 /// - `Stop`: igual sin reflejos, con traslación cero (`stop_translation`).
 /// - `Halt`: cero a todos los ids propios, sin decider, skills ni reflejos.
 ///
@@ -591,9 +612,9 @@ pub(crate) fn tick_commands(
     decider: &mut dyn TickDecider,
     tick: u32,
     catalog: &mut SkillCatalog,
-    motion: &Motion,
+    motion: &mut Motion,
     recovery: &mut BorderRecovery,
-    zone_guard: &ZoneGuard,
+    zone_guard: &mut ZoneGuard,
     manual_state: &HashMap<(i32, i32), (ManualCommand, u32)>,
     skill_state: &HashMap<(i32, i32), (GuiSkillCommand, u32)>,
     own_team: i32,
@@ -618,6 +639,12 @@ pub(crate) fn tick_commands(
         }
     }
     let mut choices = decider.decide(tick, world);
+    // El arquero vigente del decisor vale desde este mismo tick, para las skills (motion
+    // rodea las áreas) y para el guardia; sin opinión, queda el anterior.
+    if let Some(id) = decider.arquero() {
+        motion.set_keeper(id);
+        zone_guard.set_keeper(id);
+    }
     apply_gui_skill_overrides(&mut choices, skill_state, own_team);
     let (mut cmds, mut tgts, applied) = dispatch_choices(&choices, catalog, world, motion, own_team);
     apply_manual_overrides(&mut cmds, &mut tgts, manual_state, world);
@@ -1079,7 +1106,7 @@ pub async fn run_control_loop(
     let attack_sign = crate::skills::zones::attack_sign_from_env(config.own_team);
     let keeper_id = crate::params::params().coach.keeper_id;
     let mut motion = Motion::with_config(motion_cfg).with_areas(attack_sign, keeper_id);
-    let zone_guard = ZoneGuard::new(attack_sign, keeper_id);
+    let mut zone_guard = ZoneGuard::new(attack_sign, keeper_id);
     // Perfil de velocidad de una rutina (topes de motion y giro de Spin); sin rutina no
     // escribe nada.
     let mut perfil = PerfilEnLazo::default();
@@ -1250,9 +1277,9 @@ pub async fn run_control_loop(
                     decider.as_mut(),
                     tick_counter,
                     &mut catalog,
-                    &motion,
+                    &mut motion,
                     &mut recovery,
-                    &zone_guard,
+                    &mut zone_guard,
                     &manual_state,
                     &skill_state,
                     config.own_team,
@@ -1400,6 +1427,7 @@ pub async fn run_control_loop(
                         radio: radio_counters,
                         debug: debug.clone(),
                         rutina: rutina_vista.clone(),
+                        arquero: zone_guard.keeper(),
                     },
                 );
             }
@@ -1504,9 +1532,9 @@ mod tests {
                 decider,
                 self.tick,
                 &mut self.catalog,
-                &self.motion,
+                &mut self.motion,
                 &mut self.recovery,
-                &self.guard,
+                &mut self.guard,
                 &self.manual,
                 &self.gui,
                 0,
@@ -1833,9 +1861,9 @@ mod tests {
                     &mut d,
                     t,
                     &mut rig.catalog,
-                    &rig.motion,
+                    &mut rig.motion,
                     &mut rig.recovery,
-                    &rig.guard,
+                    &mut rig.guard,
                     &rig.manual,
                     &rig.gui,
                     0,
@@ -1886,9 +1914,9 @@ mod tests {
             &mut d,
             0,
             &mut rig.catalog,
-            &rig.motion,
+            &mut rig.motion,
             &mut rig.recovery,
-            &rig.guard,
+            &mut rig.guard,
             &rig.manual,
             &rig.gui,
             0,
@@ -2485,9 +2513,9 @@ mod tests {
                         &mut decider,
                         rig.tick,
                         &mut rig.catalog,
-                        &rig.motion,
+                        &mut rig.motion,
                         &mut rig.recovery,
-                        &rig.guard,
+                        &mut rig.guard,
                         &rig.manual,
                         &rig.gui,
                         0,
@@ -2541,5 +2569,253 @@ mod tests {
         let keeper = crate::params::params().coach.keeper_id;
         let decider = CoachDecider::new(Box::new(coach), 0, 6);
         assert_eq!(decider.role(keeper), Some(Role::Keeper));
+    }
+
+    /// Lazo cerrado del change `arquero`, con la planta de test y `coach.keeper_id = 2`:
+    /// robots 0 y 1, sin el 2, con la pelota quieta en (0.20, 0.05). Solo el 0 se mueve.
+    /// Devuelve la planta del 0 al final y los ticks en que el guardia lo frenó o lo sacó.
+    fn correr_en_planta(d: &mut dyn TickDecider, ticks: u32) -> (crate::motion::test_plant::Plant, usize) {
+        let cfg = MotionConfig { bidirectional: true, ..MotionConfig::default() };
+        let mut motion = Motion::with_config(cfg).with_areas(1.0, 2);
+        let mut guard = ZoneGuard::new(1.0, 2);
+        let mut catalog = SkillCatalog::new(3);
+        let mut recovery = BorderRecovery::new(true);
+        let (manual, gui) = (HashMap::new(), HashMap::new());
+        let mut planta = crate::motion::test_plant::Plant::new(-0.45, 0.10, 0.0);
+        let mut guardia = 0;
+        for t in 0..ticks {
+            let mut w = World::new(3, 3);
+            w.update_robot(0, 0, Vec2::new(planta.x, planta.y), planta.th, planta.velocity(), 0.0);
+            w.update_robot(1, 0, Vec2::new(0.10, -0.20), 0.0, Vec2::ZERO, 0.0);
+            w.update_ball(Vec2::new(0.20, 0.05), Vec2::ZERO);
+            let (cmds, _, _, _, g) = tick_commands(
+                TickMode::Play,
+                &w,
+                d,
+                t,
+                &mut catalog,
+                &mut motion,
+                &mut recovery,
+                &mut guard,
+                &manual,
+                &gui,
+                0,
+                3,
+            );
+            let k = cmds.iter().position(|c| c.id == 0).expect("comando del 0");
+            guardia += usize::from(g[k].is_some_and(|g| g.accion.is_some()));
+            planta.step(&cmds[k]);
+        }
+        (planta, guardia)
+    }
+
+    /// x del riel de RailKeeper con el arco propio a la izquierda, y su tolerancia.
+    fn riel() -> (f32, f32) {
+        let x = crate::skills::RailKeeperSkill::new(Vec2::new(-0.75, 0.0)).rail_x();
+        (x, crate::params::params().skills.keeper_rail_tol)
+    }
+
+    /// `skill-test-harness`: con RailKeeper, el robot de `skill_test` es el arquero aunque
+    /// no sea `coach.keeper_id`; con una skill de campo, no entra al área propia.
+    #[test]
+    fn skill_test_keeper_skill_makes_its_robot_the_keeper() {
+        let (x, tol) = riel();
+        let mut d = FixedSkillDecider::new(0, SkillId::RailKeeper, Vec2::new(-0.75, 0.0));
+        let (planta, guardia) = correr_en_planta(&mut d, 180);
+        assert!((planta.x - x).abs() <= tol, "RailKeeper: el 0 llega a su riel: ({:.3}, {:.3})", planta.x, planta.y);
+        assert_eq!(guardia, 0);
+        let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(-0.70, 0.10));
+        let (planta, _) = correr_en_planta(&mut d, 180);
+        let robot = Vec2::new(planta.x, planta.y);
+        assert!(!crate::skills::zones::AreaRect::own(1.0).touches(robot), "GoTo: el 0 no entra: {robot}");
+    }
+
+    /// Decisor de prueba con un arquero fijo (o sin opinión).
+    struct ConArquero {
+        fijo: FixedSkillDecider,
+        arquero: Option<i32>,
+    }
+
+    impl TickDecider for ConArquero {
+        fn decide(&mut self, tick: u32, world: &World) -> Vec<SkillChoice> {
+            self.fijo.decide(tick, world)
+        }
+
+        fn arquero(&self) -> Option<i32> {
+            self.arquero
+        }
+    }
+
+    /// Lo que hizo el guardia con el robot propio `id` en el tick.
+    fn accion_guardia(out: &TickOut, id: i32) -> Option<crate::skills::zones::AccionGuardia> {
+        let k = out.0.iter().position(|c| c.id == id && c.team == 0)?;
+        out.4[k].and_then(|g| g.accion)
+    }
+
+    /// `zone-guard`, "Arquero vigente del lazo": arranca en `coach.keeper_id` (2), vale
+    /// desde el mismo tick en que el decisor lo declara, queda con `None` y no cambia en
+    /// HALT ni en el corte sin visión.
+    #[test]
+    fn the_keeper_follows_the_decider_from_the_same_tick() {
+        // El 0 en (−0.52, 0) ya toca el arco del área propia y va hacia el arco.
+        let world = world_with_robot(-0.52, 0.0, std::f64::consts::PI);
+        let mut rig = Rig::new(false);
+        rig.motion = Motion::new().with_areas(1.0, 2);
+        assert_eq!(rig.guard.keeper(), 2, "al arrancar, coach.keeper_id");
+        let goto = || FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(-0.70, 0.0));
+        let mut d = ConArquero { fijo: goto(), arquero: None };
+        let paso = |rig: &mut Rig, d: &mut ConArquero, modo: TickMode| {
+            let out = tick_commands(
+                modo,
+                &world,
+                d,
+                rig.tick,
+                &mut rig.catalog,
+                &mut rig.motion,
+                &mut rig.recovery,
+                &mut rig.guard,
+                &rig.manual,
+                &rig.gui,
+                0,
+                3,
+            );
+            rig.tick += 1;
+            out
+        };
+        let out = paso(&mut rig, &mut d, TickMode::Play);
+        assert!(accion_guardia(&out, 0).is_some(), "sin opinión, el 0 no es el arquero");
+        d.arquero = Some(0);
+        let out = paso(&mut rig, &mut d, TickMode::Play);
+        assert_eq!(rig.guard.keeper(), 0);
+        assert_eq!(accion_guardia(&out, 0), None, "ya en este tick el guardia no lo toca");
+        let robot = world.get_robot_state(0, 0).unwrap();
+        assert!(rig.motion.forbidden_areas(robot, &world).is_empty(), "motion tampoco rodea su área");
+        d.arquero = None;
+        paso(&mut rig, &mut d, TickMode::Play);
+        assert_eq!(rig.guard.keeper(), 0, "con None queda el anterior");
+        d.arquero = Some(1);
+        for modo in [TickMode::Halt, TickMode::SinVision] {
+            paso(&mut rig, &mut d, modo);
+            assert_eq!(rig.guard.keeper(), 0, "{modo:?}: sin decide, no cambia");
+        }
+    }
+
+    /// `CoachDecider` declara el arquero que el coach dice por `role()`; un coach sin roles
+    /// no opina. `FixedSkillDecider` declara a su robot solo con una skill de arquero.
+    #[test]
+    fn deciders_declare_their_keeper() {
+        struct KeeperCoach;
+        impl Coach for KeeperCoach {
+            fn decide(&mut self, _obs: &Observation) -> Vec<SkillChoice> {
+                Vec::new()
+            }
+            fn role(&self, robot_id: i32) -> Option<Role> {
+                (robot_id == 1).then_some(Role::Keeper)
+            }
+        }
+        struct SinRoles;
+        impl Coach for SinRoles {
+            fn decide(&mut self, _obs: &Observation) -> Vec<SkillChoice> {
+                Vec::new()
+            }
+        }
+        assert_eq!(CoachDecider::new(Box::new(KeeperCoach), 0, 6).arquero(), Some(1));
+        assert_eq!(CoachDecider::new(Box::new(SinRoles), 0, 6).arquero(), None);
+        for (skill, esperado) in [
+            (SkillId::RailKeeper, Some(0)),
+            (SkillId::GoalKeep, Some(0)),
+            (SkillId::GoTo, None),
+            (SkillId::BlockLine, None),
+        ] {
+            assert_eq!(FixedSkillDecider::new(0, skill, Vec2::ZERO).arquero(), esperado, "{skill:?}");
+        }
+    }
+
+    /// El titular que vuelve después de que el coach nombró un reemplazo: el coach se queda
+    /// con el reemplazo y el guardia saca al 2 de su área.
+    #[test]
+    fn the_returning_keeper_is_a_field_player_and_is_taken_out() {
+        let coach = crate::coach::HeuristicCoach::with_options(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0), 2, true);
+        let mut d = CoachDecider::new(Box::new(coach), 0, 6);
+        let mut rig = Rig::new(false);
+        let mundo = |con_el_2: bool| {
+            let mut w = World::new(3, 3);
+            w.update_robot(0, 0, Vec2::new(-0.45, 0.10), 0.0, Vec2::ZERO, 0.0);
+            w.update_robot(1, 0, Vec2::new(0.10, -0.20), 0.0, Vec2::ZERO, 0.0);
+            if con_el_2 {
+                w.update_robot(2, 0, Vec2::new(-0.66, 0.0), std::f64::consts::FRAC_PI_2, Vec2::ZERO, 0.0);
+            }
+            w.update_ball(Vec2::new(0.20, 0.05), Vec2::ZERO);
+            w
+        };
+        let sin = mundo(false);
+        rig.step(TickMode::Play, &sin, &mut d);
+        assert_eq!((d.arquero(), rig.guard.keeper()), (Some(0), 0));
+        let con = mundo(true);
+        let mut ultimo = None;
+        for _ in 0..12 {
+            let out = tick_commands(
+                TickMode::Play,
+                &con,
+                &mut d,
+                rig.tick,
+                &mut rig.catalog,
+                &mut rig.motion,
+                &mut rig.recovery,
+                &mut rig.guard,
+                &rig.manual,
+                &rig.gui,
+                0,
+                3,
+            );
+            rig.tick += 1;
+            ultimo = Some(out);
+        }
+        assert_eq!((d.arquero(), rig.guard.keeper()), (Some(0), 0), "el coach se queda con el reemplazo");
+        let out = ultimo.unwrap();
+        assert_eq!(accion_guardia(&out, 2), Some(crate::skills::zones::AccionGuardia::Saca));
+    }
+
+    /// Con el robot 2 en la cancha, declarar el arquero no cambia ningún comando: los 360
+    /// ticks del guion dan lo mismo con el coach que lo declara y con el mismo coach
+    /// envuelto en un decisor que no lo declara (el arquero fijo de `main`).
+    #[test]
+    fn declaring_the_titular_keeper_changes_no_command() {
+        struct SinArquero(CoachDecider);
+        impl TickDecider for SinArquero {
+            fn decide(&mut self, tick: u32, world: &World) -> Vec<SkillChoice> {
+                self.0.decide(tick, world)
+            }
+        }
+        let correr = |declara: bool| {
+            let mut rig = Rig::new(true);
+            rig.motion = Motion::new().with_areas(1.0, 2);
+            let coach = crate::coach::HeuristicCoach::with_options(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0), 2, true);
+            let coach = CoachDecider::new(Box::new(coach), 0, 6);
+            let mut d: Box<dyn TickDecider> = if declara { Box::new(coach) } else { Box::new(SinArquero(coach)) };
+            (0..360u32).map(|t| rig.step(TickMode::Play, &mundo_con_guion(t), d.as_mut()).0).collect::<Vec<_>>()
+        };
+        let (con, sin) = (correr(true), correr(false));
+        for (t, (a, b)) in con.iter().zip(&sin).enumerate() {
+            assert_eq!(a, b, "tick {t}: comandos distintos al declarar el arquero titular");
+        }
+    }
+
+    /// El arquero de reemplazo que nombra el coach entra a su área hasta el riel de
+    /// RailKeeper, sin que el guardia lo frene ni lo saque (`zone-guard`).
+    #[test]
+    fn the_coach_substitute_keeper_reaches_its_rail() {
+        let coach = crate::coach::HeuristicCoach::with_options(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0), 2, true);
+        let mut d = CoachDecider::new(Box::new(coach), 0, 6);
+        let (planta, guardia) = correr_en_planta(&mut d, 180);
+        assert_eq!(d.role(0), Some(Role::Keeper), "el coach nombra arquero al 0");
+        let (riel, tol) = riel();
+        assert!(
+            (planta.x - riel).abs() <= tol,
+            "en 3 s el 0 llega a su riel (x = {riel}): quedó en ({:.3}, {:.3})",
+            planta.x,
+            planta.y
+        );
+        assert_eq!(guardia, 0, "el guardia no actúa sobre el arquero");
     }
 }

@@ -217,6 +217,16 @@ impl TickDecider for DecisorConRutinas {
         if self.rutina.is_some() || self.en_pausa { None } else { self.base.role(robot_id) }
     }
 
+    /// Con una rutina, el robot de su puesto `arquero` (o nada); sin rutina, el de la base,
+    /// también en pausa: el coach no decide y su arquero no cambia.
+    fn arquero(&self) -> Option<i32> {
+        match &self.rutina {
+            None => self.base.arquero(),
+            Some(Activa::Corriendo(r)) => r.arquero(),
+            Some(Activa::Fallida(_)) => None,
+        }
+    }
+
     fn coach_debug(&self) -> Option<CoachDebug> {
         if self.rutina.is_some() || self.en_pausa { None } else { self.base.coach_debug() }
     }

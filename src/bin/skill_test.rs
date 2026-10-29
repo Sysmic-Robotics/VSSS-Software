@@ -122,11 +122,17 @@ FLAGS COMUNES (opcionales):
 FLAGS MODO skill:
     --vision <sim|real>
     --skill <goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|
-             goalkeep|clear|spinkick|mark>
+             goalkeep|railkeeper|clear|spinkick|mark|dribble|hold>
+                         con goalkeep o railkeeper, el robot de --robot es el
+                         arquero (puede entrar a su área) aunque no sea
+                         coach.keeper_id; con las demás, el arquero es
+                         coach.keeper_id y el robot no entra al área propia.
     --target x,y         obligatorio para goto, facepoint, spin, approach,
-                         shoot/clear/spinkick (punto al que lanzar la pelota),
-                         blockline y goalkeep (centro del arco propio, p.ej.
-                         -0.75,0) y mark (punto donde pararse mirando la pelota)
+                         shoot/clear/spinkick/dribble (punto al que lanzar o
+                         llevar la pelota),
+                         blockline, goalkeep y railkeeper (centro del arco
+                         propio, p.ej. -0.75,0) y mark (punto donde pararse
+                         mirando la pelota)
                          (spin solo usa el signo de x: + = CCW, − = CW)
                          opcional para chaseball; ignorado por intercept
 
@@ -1330,6 +1336,10 @@ impl TickDecider for DecisorDeConsola {
 
     fn rutina(&self) -> Option<Arc<RutinaVista>> {
         TickDecider::rutina(&self.rutina)
+    }
+
+    fn arquero(&self) -> Option<i32> {
+        self.rutina.arquero()
     }
 }
 

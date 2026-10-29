@@ -190,11 +190,12 @@ pub fn texto_ninguna(coach_en_pausa: bool) -> (&'static str, &'static str) {
     }
 }
 
-/// Aviso de Herramientas cuando un jugador maneja al arquero del coach con el coach
-/// activo (`coach-pausa`): el coach no lo reemplaza y el arco queda solo.
-pub fn aviso_arquero_manual(jugadores: &[Option<(i32, i32)>], own_team: i32, keeper_id: i32, coach_activo: bool) -> Option<String> {
-    (coach_activo && jugadores.contains(&Some((own_team, keeper_id))))
-        .then(|| format!("el robot {keeper_id} es el arquero del coach: el arco queda solo"))
+/// Aviso de Herramientas cuando un jugador maneja al arquero vigente (el de la foto, que
+/// con el coach activo es el del coach) con el coach activo (`coach-pausa`): el coach no
+/// lo reemplaza y el arco queda solo.
+pub fn aviso_arquero_manual(jugadores: &[Option<(i32, i32)>], own_team: i32, arquero: i32, coach_activo: bool) -> Option<String> {
+    (coach_activo && jugadores.contains(&Some((own_team, arquero))))
+        .then(|| format!("el robot {arquero} es el arquero del coach: el arco queda solo"))
 }
 
 /// Línea de ayuda de la skill activa: qué significa el click para esa skill (el
@@ -230,11 +231,12 @@ pub fn skill_help(skill: Option<SkillId>) -> &'static str {
         }
         Some(SkillId::GoalKeep) => {
             "el click no se usa: arquero en la línea del arco propio (VSSL_SIDE). Solo el \
-             robot coach.keeper_id puede entrar al área."
+             arquero (ver abajo) puede entrar al área."
         }
         Some(SkillId::RailKeeper) => {
             "el click no se usa: arquero sobre un riel a 5 cm del arco propio, orientado a lo \
-             largo de él, anticipando el empuje rival (VSSL_SIDE). Solo coach.keeper_id entra al área."
+             largo de él, anticipando el empuje rival (VSSL_SIDE). Solo el arquero (ver abajo) \
+             entra al área."
         }
         Some(SkillId::Mark) => "click = dónde pararse; queda mirando a la pelota.",
         Some(SkillId::Dribble) => "click = hacia dónde llevar la pelota (campo univectorial).",
@@ -276,20 +278,27 @@ pub fn skill_marker(skill: SkillId, click: Vec2, own_goal: Vec2) -> Option<Vec2>
     }
 }
 
-/// Aviso para `GoalKeep` en un robot que no es el arquero: el `ZoneGuard` del
-/// loop solo deja entrar al área propia a `coach.keeper_id`, y la GUI no se
-/// exime del guardia (mismo comportamiento que `main` y `skill_test`).
+/// Aviso para `GoalKeep` o `RailKeeper` en un robot que no es el arquero: el `ZoneGuard`
+/// del loop solo deja entrar al área propia al arquero vigente (el de la foto), y la GUI
+/// no se exime del guardia (mismo comportamiento que `main` y `skill_test`).
 pub fn keeper_warning(
     skill: Option<SkillId>,
     selected_robot: u32,
-    keeper_id: i32,
+    arquero: i32,
 ) -> Option<String> {
-    (matches!(skill, Some(SkillId::GoalKeep | SkillId::RailKeeper)) && selected_robot as i32 != keeper_id).then(|| {
+    (matches!(skill, Some(SkillId::GoalKeep | SkillId::RailKeeper)) && selected_robot as i32 != arquero).then(|| {
         format!(
-            "este robot no es el arquero (keeper_id = {keeper_id} en team_params.json): \
+            "este robot no es el arquero (el arquero es el robot {arquero}): \
              el guardia no lo deja entrar al área"
         )
     })
+}
+
+/// Nota de solo lectura de la sección Skills con el lado del arco propio y el arquero
+/// vigente de la foto (`gui-skill-runner`).
+pub fn nota_arco(arco_izquierdo: bool, arquero: i32) -> String {
+    let lado = if arco_izquierdo { "izquierdo" } else { "derecho" };
+    format!("Arco propio: {lado} (VSSL_SIDE). Arquero: robot {arquero}.")
 }
 
 /// Agrega una muestra a una serie de telemetría, descartando las más viejas al
@@ -526,7 +535,8 @@ pub struct DebugGui {
     skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
     /// Centro del arco propio (m), desde `VSSL_SIDE`.
     own_goal: Vec2,
-    /// Único robot que el `ZoneGuard` deja entrar al área propia (`coach.keeper_id`).
+    /// `coach.keeper_id` de los parámetros: el arquero de los puestos `arquero` de las
+    /// rutinas (D4 de `arquero`). El arquero vigente del guardia viene en la foto.
     keeper_id: i32,
     // Tuning.
     spin_omega: f64,
@@ -1790,6 +1800,11 @@ mod tests {
         assert_eq!(aviso_arquero_manual(&j, 0, 2, false), None, "con el coach en pausa no");
         assert_eq!(aviso_arquero_manual(&[Some((0, 0)), None], 0, 2, true), None);
         assert_eq!(aviso_arquero_manual(&[Some((1, 2)), None], 0, 2, true), None, "rival");
+        // Arquero de reemplazo: el 0 es el arquero vigente y lo toma el jugador 1.
+        assert_eq!(
+            aviso_arquero_manual(&[Some((0, 0)), None], 0, 0, true).as_deref(),
+            Some("el robot 0 es el arquero del coach: el arco queda solo")
+        );
     }
 
     /// 3.5 — La rampa no sobrepasa, converge y decae hacia cero.
@@ -1893,14 +1908,25 @@ mod tests {
         assert_eq!(own_goal_center(false), Vec2::new(0.75, 0.0));
     }
 
-    /// El aviso aparece solo con GoalKeep en un robot que no es el arquero.
+    /// El aviso aparece solo con GoalKeep o RailKeeper en un robot que no es el arquero
+    /// vigente (`gui-skill-runner`).
     #[test]
     fn keeper_warning_only_for_goalkeep_off_keeper() {
         let w = keeper_warning(Some(SkillId::GoalKeep), 1, 2).expect("robot 1 no es el arquero");
-        assert!(w.contains("keeper_id = 2"), "{w}");
+        assert_eq!(w, "este robot no es el arquero (el arquero es el robot 2): el guardia no lo deja entrar al área");
         assert_eq!(keeper_warning(Some(SkillId::GoalKeep), 2, 2), None);
         assert_eq!(keeper_warning(Some(SkillId::BlockLine), 1, 2), None);
         assert_eq!(keeper_warning(None, 1, 2), None);
+        // Arquero de reemplazo: con el 0 de arquero vigente, el 0 no lleva aviso y el 2 sí.
+        assert_eq!(keeper_warning(Some(SkillId::RailKeeper), 0, 0), None);
+        assert!(keeper_warning(Some(SkillId::RailKeeper), 2, 0).is_some_and(|w| w.contains("robot 0")));
+    }
+
+    /// La nota de la sección Skills nombra al arquero vigente, no a `coach.keeper_id`.
+    #[test]
+    fn the_goal_note_names_the_current_keeper() {
+        assert_eq!(nota_arco(true, 0), "Arco propio: izquierdo (VSSL_SIDE). Arquero: robot 0.");
+        assert_eq!(nota_arco(false, 2), "Arco propio: derecho (VSSL_SIDE). Arquero: robot 2.");
     }
 
     /// Round-trip del preset de tuning (serialize → deserialize preserva valores).

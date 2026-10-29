@@ -2019,6 +2019,12 @@ impl TickDecider for RoutineDecider {
     fn rutina(&self) -> Option<Arc<RutinaVista>> {
         Some(self.vista.clone())
     }
+
+    /// El robot asignado al puesto `arquero` (D4 de `arquero`: por la asignación, el
+    /// `keeper_id` del entorno). Sin ese puesto, o antes de asignar, no opina.
+    fn arquero(&self) -> Option<i32> {
+        self.rutina.puestos.iter().zip(&self.asignados).find(|(p, _)| p.arquero).map(|(_, id)| *id)
+    }
 }
 
 /// Hold para cada robot propio activo con id < `num_robots` (lo usa el conmutador cuando

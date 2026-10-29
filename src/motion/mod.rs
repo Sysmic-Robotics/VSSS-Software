@@ -182,6 +182,15 @@ impl Motion {
         self
     }
 
+    /// Cambia el arquero de las reglas de áreas: el control loop le pasa el arquero
+    /// vigente en cada tick, el mismo que a `ZoneGuard::set_keeper`. Sin `with_areas` no
+    /// hace nada.
+    pub fn set_keeper(&mut self, keeper_id: i32) {
+        if let Some(rules) = self.areas.as_mut() {
+            rules.keeper_id = keeper_id;
+        }
+    }
+
     /// Dirección hacia el arco rival (`with_areas`); `None` sin reglas de áreas.
     pub fn attack_dir(&self) -> Option<Vec2> {
         self.areas.map(|r| Vec2::new(r.attack_sign, 0.0))
@@ -1086,6 +1095,23 @@ mod tests {
         assert_eq!(motion.forbidden_areas(&field, &world).len(), 1);
         let aim = motion.aim_point(&field, target, &world, true).0;
         assert!(aim.x > -0.66, "el jugador de campo rodea por el frente: {aim:?}");
+    }
+
+    #[test]
+    fn set_keeper_moves_who_avoids_the_own_area() {
+        // Arquero de reemplazo (`arquero`): el área propia deja de ser obstáculo para el 0
+        // y pasa a serlo para el 2. Sin reglas de áreas, `set_keeper` no hace nada.
+        let mut motion = Motion::new().with_areas(1.0, 2);
+        motion.set_keeper(0);
+        let mut world = World::new(3, 3);
+        world.update_ball(FAR_BALL, Vec2::ZERO);
+        let nuevo = robot_id(0, -0.66, -0.45, 1.57);
+        let viejo = robot_id(2, -0.66, -0.45, 1.57);
+        assert!(motion.forbidden_areas(&nuevo, &world).is_empty());
+        assert_eq!(motion.forbidden_areas(&viejo, &world).len(), 1);
+        let mut sin_areas = Motion::new();
+        sin_areas.set_keeper(0);
+        assert!(sin_areas.forbidden_areas(&viejo, &world).is_empty());
     }
 
     #[test]
