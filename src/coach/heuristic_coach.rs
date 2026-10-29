@@ -206,15 +206,14 @@ impl HeuristicCoach {
         self.current_play
     }
 
-    /// Equipo propio según el lado de ataque (convención del engine: azul ataca +x).
-    fn own_team_id(&self) -> i32 {
-        if self.attack_goal.x > 0.0 { 0 } else { 1 }
-    }
-
-    /// Play según el último comando del árbitro (juego abierto si no hay árbitro).
-    fn read_play(&self) -> Play {
+    /// Play según el último comando del árbitro (juego abierto si no hay árbitro). El equipo
+    /// propio es el color de la observación (`VSSL_TEAM_COLOR`), no el lado de ataque: antes
+    /// se deducía de que "el azul ataca +x", y con el azul a la derecha (o el amarillo a la
+    /// izquierda, como en el segundo tiempo) todas las pelotas paradas con equipo quedaban al
+    /// revés (en un penal propio se quedaba afuera y en uno rival se ponía a patear).
+    fn read_play(&self, own_team: i32) -> Play {
         match self.referee.as_ref().and_then(|r| r.lock().ok().map(|s| s.command)) {
-            Some(cmd) => Play::from_command(&cmd, self.own_team_id()),
+            Some(cmd) => Play::from_command(&cmd, own_team),
             None => Play::Open,
         }
     }
@@ -1050,7 +1049,7 @@ impl Coach for HeuristicCoach {
 
         // Árbitro: al cambiar de play se olvidan los compromisos de skill para que
         // el silbato (GAME_ON) tenga efecto inmediato.
-        let play = self.read_play();
+        let play = self.read_play(obs.own_team);
         if play != self.current_play {
             self.committed = [None; 3];
             self.push_stall = Stall::None;
@@ -1848,6 +1847,36 @@ mod tests {
     }
 
     #[test]
+    fn set_pieces_follow_the_team_color_not_the_side_it_attacks() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let cmd = |foul, team| RefereeCommand { foul, team, ..RefereeCommand::GAME_ON };
+        let own = [Vec2::new(0.3, 0.1), Vec2::new(0.4, -0.3), Vec2::new(0.63, 0.0)];
+        // Azul jugando a la derecha (segundo tiempo): ataca hacia −x.
+        let shared = new_shared_referee();
+        let mut blue = HeuristicCoach::with_options(Vec2::new(-0.75, 0.0), Vec2::new(0.75, 0.0), 2, true);
+        blue.set_referee(shared.clone());
+        let o = obs(Vec2::ZERO, Vec2::ZERO, own);
+        apply_command(&shared, cmd(Foul::PenaltyKick, RefTeam::Blue));
+        blue.decide(&o);
+        assert_eq!(blue.current_play(), Play::PenaltyOurs);
+        apply_command(&shared, cmd(Foul::Kickoff, RefTeam::Yellow));
+        blue.decide(&o);
+        assert_eq!(blue.current_play(), Play::KickoffTheirs);
+        // Amarillo jugando a la izquierda: ataca hacia +x.
+        let shared = new_shared_referee();
+        let mut yellow = coach();
+        yellow.set_referee(shared.clone());
+        let mut o = obs(Vec2::ZERO, Vec2::ZERO, [Vec2::new(-0.3, 0.1), Vec2::new(-0.4, -0.3), Vec2::new(-0.63, 0.0)]);
+        o.own_team = 1;
+        apply_command(&shared, cmd(Foul::GoalKick, RefTeam::Yellow));
+        yellow.decide(&o);
+        assert_eq!(yellow.current_play(), Play::GoalKickOurs);
+        apply_command(&shared, cmd(Foul::FreeKick, RefTeam::Blue));
+        yellow.decide(&o);
+        assert_eq!(yellow.current_play(), Play::FreeKickTheirs);
+    }
+
+    #[test]
     fn referee_drives_hold_set_pieces_and_game_on() {
         use crate::coach::referee::{Foul, Quadrant, RefTeam, RefereeCommand, apply_command, new_shared_referee};
         let shared = new_shared_referee();
@@ -1948,11 +1977,13 @@ mod tests {
             &shared,
             RefereeCommand { foul: Foul::PenaltyKick, team: RefTeam::Blue, ..RefereeCommand::GAME_ON },
         );
-        let o = obs(
+        let mut o = obs(
             Vec2::new(-0.375, 0.0),
             Vec2::ZERO,
             [Vec2::new(0.3, 0.1), Vec2::new(0.4, -0.3), Vec2::new(0.63, 0.0)],
         );
+        // El color sale de la observación (VSSL_TEAM_COLOR), no del lado de ataque.
+        o.own_team = 1;
         let ch = c.decide(&o);
         assert_eq!(c.current_play(), Play::PenaltyTheirs);
         // Penal en contra: jugadores de campo en la mitad rival (x < 0 para amarillo).
