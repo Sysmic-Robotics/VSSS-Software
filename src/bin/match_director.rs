@@ -13,6 +13,14 @@
 //! El tiempo de juego se cuenta en frames de visión (60 por segundo simulado), así vale
 //! igual con FIRASim acelerado. Los lados se leen de la primera detección: cada equipo
 //! defiende la mitad en la que está respecto del otro.
+//!
+//! Con `--penalties N` no juega un partido: tira N penales alternando el pateador (empieza
+//! `--kickoff`). Pelota en el punto penal (cruz frente al arco que defiende el otro),
+//! pateador detrás, arquero rival en su línea y el resto en la otra mitad; `STOP` →
+//! `PENALTY <equipo>` → `GAME_ON`. Es gol si entra en `PENALTY_S` s de juego; falla si se
+//! acaba el tiempo o la pelota vuelve más allá del punto (despejada). En la salida, `blue`
+//! y `yellow` son los penales convertidos por cada uno (`penalties`: los que pateó cada uno).
+//! Un empate en eliminatoria se define con 3 penales por equipo y luego muerte súbita.
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
@@ -43,6 +51,10 @@ const MARK_OFFSET: f64 = 0.20;
 const AREA_X: f64 = 0.60;
 const AREA_HALF_Y: f64 = 0.35;
 const AREA_KEEP_OUT: f64 = 0.10;
+/// Tiempo de juego de un penal (s) y cuánto puede volver la pelota detrás del punto antes de
+/// darlo por despejado (m).
+const PENALTY_S: f64 = 6.0;
+const PENALTY_CLEARED: f64 = 0.15;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Team {
@@ -87,6 +99,8 @@ struct Options {
     /// Factor de aceleración del simulador: divide las pausas de pared de las paradas
     /// (con FIRASim a 8× una pausa de 1 s son 8 s de partido).
     speed: f64,
+    /// Modo penales: cantidad de penales a tirar (0 = partido normal).
+    penalties: u32,
 }
 
 fn parse_args() -> Options {
@@ -98,6 +112,7 @@ fn parse_args() -> Options {
         vision_port: 10002,
         cmd_port: 20011,
         speed: 1.0,
+        penalties: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -124,6 +139,7 @@ fn parse_args() -> Options {
             "--vision-port" => o.vision_port = value(&mut args).parse().expect("--vision-port: entero"),
             "--cmd-port" => o.cmd_port = value(&mut args).parse().expect("--cmd-port: entero"),
             "--speed" => o.speed = value(&mut args).parse::<f64>().expect("--speed: número").max(1.0),
+            "--penalties" => o.penalties = value(&mut args).parse().expect("--penalties: entero"),
             other => {
                 eprintln!("[director] opción desconocida: {other}");
                 std::process::exit(2);
@@ -359,6 +375,48 @@ async fn free_ball(m: &mut Match, ball: (f64, f64), robots: &[Seen], whistle: &W
     set_piece(m, &format!("FREE_BALL Q{quadrant}"), &items, whistle, sim, vision).await;
 }
 
+/// Colocación de un penal de `kicker` (ataca hacia `s`): pelota en la cruz rival, pateador
+/// detrás de ella, el arquero de cada equipo en su línea y los demás en la mitad del
+/// pateador (la otra mitad respecto del penal).
+fn penalty_positions(kicker: Team, s: f64) -> Vec<TeleportItem> {
+    let (k, d) = (kicker.fira_id(), kicker.other().fira_id());
+    let theta_k = if s > 0.0 { 0.0 } else { 180.0 };
+    let theta_d = 180.0 - theta_k;
+    vec![
+        TeleportItem::Ball { x: s * MARK_X, y: 0.0, vx: 0.0, vy: 0.0 },
+        TeleportItem::Robot { team: k, id: 0, x: s * (MARK_X - 0.14), y: 0.0, theta: theta_k },
+        TeleportItem::Robot { team: k, id: 1, x: -s * 0.10, y: 0.35, theta: theta_k },
+        TeleportItem::Robot { team: k, id: 2, x: -s * 0.68, y: 0.0, theta: 90.0 },
+        TeleportItem::Robot { team: d, id: 2, x: s * 0.70, y: 0.0, theta: 90.0 },
+        TeleportItem::Robot { team: d, id: 0, x: -s * 0.12, y: -0.35, theta: theta_d },
+        TeleportItem::Robot { team: d, id: 1, x: -s * 0.25, y: 0.10, theta: theta_d },
+    ]
+}
+
+/// Tira un penal de `kicker` y devuelve si fue gol. Cuenta su tiempo como tiempo de juego.
+async fn penalty(m: &mut Match, kicker: Team, whistle: &Whistle, sim: &mut FiraSimTransport, vision: &UdpSocket) -> bool {
+    let s = m.attack_sign(kicker);
+    set_piece(m, &format!("PENALTY {}", kicker.name()), &penalty_positions(kicker, s), whistle, sim, vision).await;
+    let mut buf = [0u8; 65536];
+    let end = m.frames + (PENALTY_S * FRAMES_PER_S) as u64;
+    while m.frames < end {
+        let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), vision.recv(&mut buf)).await else {
+            eprintln!("[director] FIRASim dejó de emitir visión");
+            return false;
+        };
+        let Some(f) = parse_frame(&buf[..n]) else { continue };
+        m.frames += 1;
+        let Some(ball) = f.ball else { continue };
+        if let Some(scorer) = m.goal_scored(ball) {
+            return scorer == kicker;
+        }
+        if ball.0 * s < MARK_X - PENALTY_CLEARED {
+            return false;
+        }
+    }
+    false
+}
+
 #[tokio::main]
 async fn main() {
     let opt = parse_args();
@@ -409,6 +467,37 @@ async fn main() {
         "[director] azul ataca hacia {:+}X · {} min · corte a {} goles · árbitro {}",
         blue_attack_sign as i32, opt.minutes, opt.goals, whistle.addr
     );
+
+    if opt.penalties > 0 {
+        let mut taken = [0u32; 2];
+        let mut kicker = opt.kickoff;
+        for i in 0..opt.penalties {
+            let scored = penalty(&mut m, kicker, &whistle, &mut sim, &vision).await;
+            taken[kicker.fira_id() as usize] += 1;
+            if scored {
+                m.score[kicker.fira_id() as usize] += 1;
+                m.goals.push((m.seconds(), kicker));
+            }
+            eprintln!("[director] penal {} de {}: {}", i + 1, kicker.spanish(), if scored { "gol" } else { "atajado" });
+            kicker = kicker.other();
+        }
+        whistle.send("HALT");
+        println!(
+            "PENALES azul {}/{} · amarillo {}/{}",
+            m.score[0], taken[0], m.score[1], taken[1]
+        );
+        if let Some(path) = opt.out {
+            let line = format!(
+                "{{\"blue\":{},\"yellow\":{},\"seconds\":{:.1},\"ended\":\"penalties\",\"free_balls\":0,\"goals\":[],\"penalties\":[{},{}]}}",
+                m.score[0], m.score[1], m.seconds(), taken[0], taken[1]
+            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        return;
+    }
 
     kickoff(&mut m, opt.kickoff, &whistle, &mut sim, &vision).await;
     let limit_frames = (opt.minutes * 60.0 * FRAMES_PER_S) as u64;
@@ -483,6 +572,31 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn penalty_puts_the_ball_on_the_spot_the_keeper_on_its_line_and_the_rest_in_the_other_half() {
+        // Patea el amarillo, que ataca hacia −x: la cruz es (−0.375, 0) y defiende el azul.
+        let items = penalty_positions(Team::Yellow, -1.0);
+        let ball = items.iter().find_map(|i| match i {
+            TeleportItem::Ball { x, y, .. } => Some((*x, *y)),
+            _ => None,
+        });
+        assert_eq!(ball, Some((-MARK_X, 0.0)));
+        for i in &items {
+            if let TeleportItem::Robot { team, id, x, .. } = *i {
+                match (team, id) {
+                    // Pateador detrás de la pelota, del lado de la cancha.
+                    (1, 0) => assert!(x > -MARK_X && x < 0.0, "pateador en {x}"),
+                    // Arquero que ataja, en su línea (−x).
+                    (0, 2) => assert!(x < -0.65, "arquero en {x}"),
+                    // Arquero del pateador, en su arco (+x).
+                    (1, 2) => assert!(x > 0.65),
+                    // Los demás, en la otra mitad.
+                    _ => assert!(x > 0.0, "robot {team}/{id} en {x}"),
+                }
+            }
+        }
+    }
 
     fn m(blue_attack_sign: f64) -> Match {
         Match {

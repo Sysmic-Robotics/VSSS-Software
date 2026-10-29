@@ -52,11 +52,11 @@ def resolve_params(arg: str, label: str, out: Path) -> Path:
     return path
 
 
-def schedule(rounds: int, a: Path, b: Path) -> list[Job]:
+def schedule(rounds: int, a: Path, b: Path, rival_params: Path | None = None) -> list[Job]:
     jobs = []
     for i in range(rounds):
         kickoff = "blue" if i % 2 == 0 else "yellow"
-        rb = Rival("rule_based", "rule_based", None)
+        rb = Rival("rule_based", "rule_based", rival_params)
         jobs += [
             Job(f"r{i}_A_rb", "A", a, rb, i, kickoff),
             Job(f"r{i}_B_rb", "B", b, rb, i, kickoff),
@@ -133,6 +133,10 @@ def main() -> int:
     ap.add_argument("--cmd-port", type=int, default=20011)
     ap.add_argument("--referee-port", type=int, default=10003)
     ap.add_argument("--keep-work", action="store_true", help="conservar CSV y logs de cada partido en WORK")
+    ap.add_argument("--penalties", type=int, default=0,
+                    help="en vez de partidos, tandas de N penales alternados; los goles son penales convertidos")
+    ap.add_argument("--rival-params", type=Path, default=None,
+                    help="VSSL_PARAMS de rule_based (p. ej. el mismo tope de ruedas que A y B)")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -140,13 +144,14 @@ def main() -> int:
     a = resolve_params(args.a, "A", args.out)
     b = resolve_params(args.b, "B", args.out)
     names = {"A": str(args.a), "B": str(args.b)}
-    jobs = schedule(args.rounds, a, b)
+    jobs = schedule(args.rounds, a, b, args.rival_params)
 
     sims = [Simulator(args.fps, args.vision_port + 10 * k, args.cmd_port + 10 * k, args.out / f"firasim_{k}.log")
             for k in range(max(1, args.sims))]
     runners: "queue.Queue[MatchRunner]" = queue.Queue()
     for k, sim in enumerate(sims):
-        runners.put(MatchRunner(sim, args.minutes, args.goals, args.referee_port + k, keep_work=args.keep_work))
+        runners.put(MatchRunner(sim, args.minutes, args.goals, args.referee_port + k, keep_work=args.keep_work,
+                                penalties=args.penalties))
     pool = ThreadPoolExecutor(max_workers=len(sims))
     results: list[dict] = []
     log = open(args.out / "partidos.jsonl", "a", encoding="utf-8")
