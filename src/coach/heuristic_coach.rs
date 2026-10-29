@@ -45,6 +45,8 @@ pub const GOAL_AREA_HALF_Y: f32 = 0.35;
 /// Mitad del ancho de la boca del arco.
 pub const GOAL_HALF_Y: f32 = 0.20;
 /// Límite |x| para robots de campo (no entrar al área propia: solo 1 permitido).
+/// Segundos desde el silbato de un penal propio en que el atacante patea al palo elegido.
+const PENALTY_SHOT_S: f32 = 3.0;
 const FIELD_ROBOT_MAX_ABS_X: f32 = 0.55;
 const FIELD_ROBOT_MAX_ABS_Y: f32 = 0.55;
 
@@ -119,6 +121,10 @@ pub struct HeuristicCoach {
     referee: Option<SharedReferee>,
     /// Play vigente (derivada del último comando del árbitro).
     current_play: Play,
+    /// Penal propio en juego: palo al que patea y decisión en que sonó el silbato.
+    penalty_shot: Option<(Vec2, u64)>,
+    /// Penales propios pateados (alterna el palo cuando el arquero está centrado).
+    penalties_taken: u32,
     /// Últimos scores del striker (skill, score) — para logs/GUI y tests.
     last_scores: [(SkillId, f32); 5],
     /// Contadores de adaptación al rival (éxito de tiro por carril, disputas).
@@ -177,6 +183,8 @@ impl HeuristicCoach {
             ball_in_area_since: None,
             referee: None,
             current_play: Play::Open,
+            penalty_shot: None,
+            penalties_taken: 0,
             last_scores: [
                 (SkillId::ShootPush, 0.0),
                 (SkillId::Clear, 0.0),
@@ -365,6 +373,30 @@ impl HeuristicCoach {
         self.time_to_reach(r, at(sp.intercept_horizon))
     }
 
+    /// Palo al que patea un penal propio: el contrario al arquero rival, o alternando si está
+    /// centrado. Con el arquero en el centro se apuntaba al centro y la pelota le pegaba: en
+    /// la cancha a velocidad real convertíamos el 10 % contra el arquero de rule_based.
+    fn penalty_corner(&mut self, opp: &[RobotView]) -> Vec2 {
+        let keeper_y = opp
+            .iter()
+            .filter(|o| o.active && (o.pos - self.attack_goal).length() <= self.p.opp_keeper_radius)
+            .min_by(|a, b| (a.pos - self.attack_goal).length().total_cmp(&(b.pos - self.attack_goal).length()))
+            .map(|k| k.pos.y);
+        let side = match keeper_y {
+            Some(y) if y.abs() > 0.01 => -y.signum(),
+            _ => if self.penalties_taken % 2 == 0 { 1.0 } else { -1.0 },
+        };
+        self.penalties_taken += 1;
+        Vec2::new(self.attack_goal.x, side * (GOAL_HALF_Y - 0.06))
+    }
+
+    /// Palo del penal propio mientras dura el tiro (`PENALTY_SHOT_S` desde el silbato).
+    fn active_penalty_shot(&self) -> Option<Vec2> {
+        self.penalty_shot
+            .filter(|&(_, since)| (self.decision_count - since) as f32 / self.p.decision_hz.max(1e-3) < PENALTY_SHOT_S)
+            .map(|(corner, _)| corner)
+    }
+
     /// Punto del arco rival al que apuntar: centro, o el palo lejano si hay un
     /// rival parado en el arco.
     fn aim_point(&self, opp: &[RobotView]) -> Vec2 {
@@ -456,6 +488,10 @@ impl HeuristicCoach {
         if self.in_own_half(ball) && (ball.x * -s) > 0.35 {
             self.depuracion.tipo_objetivo(TipoObjetivo::Despeje);
             return self.clear_target(ball);
+        }
+        if let Some(corner) = self.active_penalty_shot() {
+            self.depuracion.tipo_objetivo(TipoObjetivo::PaloLejano);
+            return corner;
         }
         // (Se probó conducir por una dirección libre cercana con un rival en el camino: menos
         // conducciones contra un rival, pero el rival la cortaba igual (30 % y 30 %) y cara a
@@ -1061,6 +1097,9 @@ impl Coach for HeuristicCoach {
             if play.is_set_piece() {
                 self.striker_id = None;
             }
+            // Silbato de un penal propio: elegir el palo antes de que el pateador se mueva.
+            self.penalty_shot = (self.current_play == Play::PenaltyOurs && play == Play::Open)
+                .then(|| (self.penalty_corner(&opp), self.decision_count));
             self.current_play = play;
         }
         match play {
@@ -1844,6 +1883,40 @@ mod tests {
         );
         c.decide(&o);
         assert_eq!(c.role_of(2), Some(Role::Striker));
+    }
+
+    #[test]
+    fn our_penalty_goes_to_the_post_away_from_the_keeper() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = coach(); // azul, ataca +x
+        c.set_referee(shared.clone());
+        let post_y = GOAL_HALF_Y - 0.06;
+        let mut o = obs(
+            Vec2::new(0.375, 0.0),
+            Vec2::ZERO,
+            [Vec2::new(0.235, 0.0), Vec2::new(-0.1, 0.35), Vec2::new(-0.68, 0.0)],
+        );
+        let shoot = |c: &mut HeuristicCoach, o: &Observation| {
+            apply_command(&shared, RefereeCommand { foul: Foul::PenaltyKick, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
+            c.decide(o);
+            apply_command(&shared, RefereeCommand::GAME_ON);
+            choice_of(&c.decide(o), 0).target
+        };
+        // Arquero rival corrido hacia +y: al palo de −y.
+        o.opp_robots[2] = robot(Vec2::new(0.70, 0.05), 90.0);
+        assert_eq!(shoot(&mut c, &o), Vec2::new(0.75, -post_y));
+        // Arquero centrado: alterna (el primero fue el 1.º penal; este, el 2.º → −y).
+        o.opp_robots[2] = robot(Vec2::new(0.70, 0.0), 90.0);
+        assert_eq!(shoot(&mut c, &o), Vec2::new(0.75, -post_y));
+        assert_eq!(shoot(&mut c, &o), Vec2::new(0.75, post_y));
+        // Pasado el tiro, vuelve al objetivo normal.
+        let steps = (PENALTY_SHOT_S * c.p.decision_hz) as usize + 2;
+        let mut last = Vec2::ZERO;
+        for _ in 0..steps {
+            last = choice_of(&c.decide(&o), 0).target;
+        }
+        assert_eq!(last, ATTACK);
     }
 
     #[test]
