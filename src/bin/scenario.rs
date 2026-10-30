@@ -182,6 +182,7 @@ fn run_bench(
         pid_tx: None,
         teleport_tx: None,
         rutina_tx: None, // las rutinas se lanzan desde main con GUI
+        identidad_tx: None, // la identidad se edita desde main con GUI
         estop,
         coach_pausa: None, // una skill fija: no hay coach que pausar
         run: GUI::RunInfo::from_env(
@@ -220,6 +221,14 @@ async fn async_run(
 
     let max_ticks = dur_s.map(|s| (s * 60.0).ceil() as u32);
 
+    // Con la base station, la identidad de los robots (en simulación no se lee).
+    let identidad =
+        rustengine::identidad::para_transporte("scenario", transport == RadioTarget::BaseStation).identidad;
+    let radio_slot = match transport {
+        RadioTarget::BaseStation => identidad.radio_de(robot_id).ok(),
+        _ => usize::try_from(robot_id).ok().filter(|r| *r < SLOT_COUNT),
+    };
+
     let config = ControlLoopConfig {
         own_team: team.as_team_id(),
         num_robots: SLOT_COUNT,
@@ -229,6 +238,7 @@ async fn async_run(
         vision_timeout: None,
         referee: None,
         exportar_depuracion: false,
+        identidad,
     };
 
     let mut csv: Option<CsvLogger> = match &log {
@@ -250,10 +260,7 @@ async fn async_run(
         transport,
         vision: Some(vision),
         robot: robot_id as usize,
-        radio_slot: rustengine::radio::base_station::radio_slot(
-            robot_id,
-            &rustengine::params::params().robot.radio_slot_by_vision_id,
-        ),
+        radio_slot,
         team,
         skill: scenario.skill_id,
     };
@@ -276,6 +283,7 @@ async fn async_run(
         estop: Some(estop),
         pid_rx: None,
         teleport_rx: None,
+        identidad_rx: None,
     });
 
     if let Err(err) = run_control_loop(config, decider, Some(on_tick), gui, shutdown).await {

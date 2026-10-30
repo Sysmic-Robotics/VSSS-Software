@@ -12,6 +12,7 @@ pub use transport::{
     FiraSimTransport, GrSimTransport, RobotTransport, TeleportItem, TransportError,
 };
 
+use crate::identidad::{GiroIdentificacion, Identidad};
 use crate::motion::RobotCommand;
 use std::collections::HashMap;
 
@@ -57,6 +58,8 @@ pub fn sim_cmd_port() -> u16 {
 pub struct Radio {
     transport: Box<dyn RobotTransport>,
     command_map: HashMap<(i32, i32), RobotCommand>,
+    /// Giro de identificación del próximo envío; se borra al enviar (vale un frame).
+    giro: Option<GiroIdentificacion>,
 }
 
 impl Radio {
@@ -65,6 +68,7 @@ impl Radio {
         Self {
             transport,
             command_map: HashMap::new(),
+            giro: None,
         }
     }
 
@@ -136,13 +140,25 @@ impl Radio {
         self.transport.teleport(items).await
     }
 
+    /// Identidad vigente de los robots, para el transporte (solo la base station la usa).
+    pub fn usar_identidad(&mut self, identidad: &Identidad) {
+        self.transport.usar_identidad(identidad);
+    }
+
+    /// Giro de identificación para el próximo envío. Vale un solo frame: el envío lo
+    /// borra, salga bien o no, así que la parada segura del cierre nunca lo lleva.
+    pub fn giro_identificacion(&mut self, giro: GiroIdentificacion) {
+        self.giro = Some(giro);
+    }
+
     pub async fn send_commands(&mut self) -> Result<(), TransportError> {
-        if self.command_map.is_empty() {
+        let giro = self.giro.take();
+        if self.command_map.is_empty() && giro.is_none() {
             return Ok(());
         }
 
         let all_commands: Vec<RobotCommand> = self.command_map.values().cloned().collect();
-        let result = self.transport.send_commands(&all_commands).await;
+        let result = self.transport.enviar(&all_commands, giro).await;
         self.command_map.clear();
         result
     }
@@ -165,6 +181,57 @@ mod tests {
             self.sent.lock().unwrap().push(commands.to_vec());
             Ok(())
         }
+    }
+
+    /// Registra los giros de cada envío.
+    struct GiroTransport {
+        giros: Arc<Mutex<Vec<Option<GiroIdentificacion>>>>,
+    }
+
+    #[async_trait]
+    impl RobotTransport for GiroTransport {
+        async fn send_commands(&mut self, _commands: &[RobotCommand]) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn enviar(
+            &mut self,
+            _commands: &[RobotCommand],
+            giro: Option<GiroIdentificacion>,
+        ) -> Result<(), TransportError> {
+            self.giros.lock().unwrap().push(giro);
+            Ok(())
+        }
+    }
+
+    fn cero() -> MotionCommand {
+        MotionCommand { id: 0, team: 0, vx: 0.0, vy: 0.0, omega: 0.0, orientation: 0.0 }
+    }
+
+    #[tokio::test]
+    async fn radio_envia_el_giro_una_sola_vez() {
+        let giros = Arc::new(Mutex::new(Vec::new()));
+        let mut radio = Radio::new(Box::new(GiroTransport { giros: giros.clone() }));
+        let g = GiroIdentificacion { radio: 3, w_deg_s: 90 };
+        radio.add_motion_command(cero());
+        radio.giro_identificacion(g);
+        radio.send_commands().await.unwrap();
+        // El envío siguiente (por ejemplo, los ceros de la parada segura) va sin giro.
+        radio.add_motion_command(cero());
+        radio.send_commands().await.unwrap();
+        assert_eq!(*giros.lock().unwrap(), vec![Some(g), None]);
+    }
+
+    #[tokio::test]
+    async fn radio_no_salta_el_envio_con_giro() {
+        let giros = Arc::new(Mutex::new(Vec::new()));
+        let mut radio = Radio::new(Box::new(GiroTransport { giros: giros.clone() }));
+        let g = GiroIdentificacion { radio: 1, w_deg_s: -90 };
+        radio.giro_identificacion(g);
+        radio.send_commands().await.unwrap();
+        // Sin comandos ni giro, no hay envío (como antes).
+        radio.send_commands().await.unwrap();
+        assert_eq!(*giros.lock().unwrap(), vec![Some(g)]);
     }
 
     fn test_radio() -> (Radio, Arc<Mutex<Vec<Vec<RobotCommand>>>>) {

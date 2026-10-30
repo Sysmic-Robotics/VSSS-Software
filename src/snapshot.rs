@@ -78,6 +78,9 @@ pub struct LoopSnapshot {
     /// Arquero vigente del lazo: el único robot propio que el guardia deja estar en su
     /// área (`zone-guard`). Está en todos los modos, con o sin roles.
     pub arquero: i32,
+    /// Identidad vigente de los robots (qué patrón lleva cada radio), solo con la base
+    /// station; `None` en simulación, donde cada robot es su patrón.
+    pub identidad: Option<Arc<crate::identidad::Identidad>>,
 }
 
 impl Default for LoopSnapshot {
@@ -98,6 +101,7 @@ impl Default for LoopSnapshot {
             debug: None,
             rutina: None,
             arquero: crate::params::params().coach.keeper_id,
+            identidad: None,
         }
     }
 }

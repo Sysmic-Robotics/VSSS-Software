@@ -8,6 +8,7 @@
 // como baseline para A/B testing contra el modelo RL.
 pub mod GUI;
 pub mod coach;
+pub mod identidad;
 pub mod control_loop;
 pub mod motion;
 pub mod parada;

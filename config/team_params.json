@@ -86,8 +86,7 @@
   },
   "robot": {
     "max_v_mm_s": 1500,
-    "max_w_deg_s": 720,
-    "radio_slot_by_vision_id": {}
+    "max_w_deg_s": 720
   },
   "sim": {
     "wheel_base_m": 0.085,

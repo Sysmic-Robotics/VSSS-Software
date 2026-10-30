@@ -10,6 +10,7 @@
 
 use crate::coach::debug::CoachDebug;
 use crate::coach::{Coach, Foul, Observation, Role, SharedReferee, SkillChoice};
+use crate::identidad::{GiroIdentificacion, Identidad, OrdenIdentidad};
 use crate::motion::{BorderRecovery, Motion, MotionCommand, MotionConfig, NavDebug};
 use crate::radio::{RadioTarget, TransportError};
 use crate::rutinas::RutinaVista;
@@ -55,6 +56,12 @@ pub trait TickDecider: Send {
     fn coach_debug(&self) -> Option<CoachDebug> {
         None
     }
+
+    /// Patrones propios a los que no les llegan comandos (desactivados, sin robot o
+    /// repetidos, `Identidad::sin_comandos`). El coach los saca de su observación y la
+    /// asignación automática de las rutinas no los elige. El lazo la entrega al arrancar y
+    /// en cada cambio de identidad, solo con la base station.
+    fn usar_sin_comandos(&mut self, _patrones: &[i32]) {}
 
     /// Lo que pasó en el tick, al final de cada tick y en todos los modos (también en
     /// HALT y en el corte sin visión, cuando el lazo no llama a `decide`). Lo usa la
@@ -157,6 +164,120 @@ impl PerfilEnLazo {
     }
 }
 
+/// Identidad de los robots en el lazo: la vigente (la que usa el frame) y el giro de
+/// identificación pedido por la GUI, con su vigencia. Con la base station:
+/// - `Usar` reemplaza la vigente desde el envío del mismo tick;
+/// - el giro caduca a los `MANUAL_STALE_TICKS` sin refresco, se corta con la parada y
+///   HALT (`cortar_giro`) y no sale en HALT ni en el corte sin visión.
+///
+/// En simulación no hay identidad: ni foto, ni patrones sin comandos (cada robot es su
+/// patrón); el giro lo ignora el transporte.
+#[derive(Debug)]
+pub(crate) struct IdentidadEnLazo {
+    vigente: Arc<Identidad>,
+    giro: Option<(GiroIdentificacion, u32)>,
+    base_station: bool,
+}
+
+impl IdentidadEnLazo {
+    pub(crate) fn new(identidad: Identidad, base_station: bool) -> Self {
+        Self { vigente: Arc::new(identidad), giro: None, base_station }
+    }
+
+    /// Al arrancar: la identidad al transporte antes del primer envío y, con la base
+    /// station, sus líneas y los patrones sin comandos al decisor.
+    pub(crate) fn arrancar(&self, radio: &mut crate::radio::Radio, decider: &mut dyn TickDecider) {
+        radio.usar_identidad(&self.vigente);
+        if self.base_station {
+            for linea in self.vigente.describir() {
+                eprintln!("[control_loop] identidad: {linea}");
+            }
+            decider.usar_sin_comandos(&self.sin_comandos());
+        }
+    }
+
+    /// Las órdenes de la GUI del tick `tick`, y la caducidad del giro. Con la base station,
+    /// una identidad nueva va al transporte (rige desde el envío de este tick) y sus
+    /// patrones sin comandos al decisor (rigen desde su decisión siguiente).
+    pub(crate) fn ordenes(
+        &mut self,
+        ordenes: Vec<OrdenIdentidad>,
+        tick: u32,
+        radio: &mut crate::radio::Radio,
+        decider: &mut dyn TickDecider,
+    ) {
+        let mut cambio = false;
+        for orden in ordenes {
+            cambio |= self.recibir(orden, tick);
+        }
+        if cambio && self.base_station {
+            radio.usar_identidad(&self.vigente);
+            decider.usar_sin_comandos(&self.sin_comandos());
+            for linea in self.vigente.describir() {
+                eprintln!("[control_loop] identidad nueva: {linea}");
+            }
+        }
+        self.expirar(tick);
+    }
+
+    /// Antes del envío: el giro del tick, si sale, va a la radio (vale ese envío).
+    pub(crate) fn al_enviar(&self, modo: TickMode, radio: &mut crate::radio::Radio) {
+        if let Some(g) = self.giro_del_tick(modo) {
+            radio.giro_identificacion(g);
+        }
+    }
+
+    /// Una orden de la GUI en el tick `tick`. Devuelve `true` si cambió la identidad.
+    pub(crate) fn recibir(&mut self, orden: OrdenIdentidad, tick: u32) -> bool {
+        match orden {
+            OrdenIdentidad::Usar(i) => {
+                let cambia = *self.vigente != i;
+                self.vigente = Arc::new(i);
+                cambia
+            }
+            OrdenIdentidad::Giro { radio, w_deg_s } => {
+                self.giro = Some((GiroIdentificacion { radio, w_deg_s }, tick));
+                false
+            }
+            OrdenIdentidad::FinGiro => {
+                self.giro = None;
+                false
+            }
+        }
+    }
+
+    /// Caduca el giro sin refresco (como el manual).
+    pub(crate) fn expirar(&mut self, tick: u32) {
+        if self.giro.is_some_and(|(_, visto)| tick.wrapping_sub(visto) > MANUAL_STALE_TICKS) {
+            self.giro = None;
+        }
+    }
+
+    /// La parada y HALT borran el giro: no vuelve hasta un pedido nuevo.
+    pub(crate) fn cortar_giro(&mut self) {
+        self.giro = None;
+    }
+
+    /// El giro que sale en el envío de este tick, o `None` en HALT (parada incluida) y en el
+    /// corte sin visión.
+    pub(crate) fn giro_del_tick(&self, modo: TickMode) -> Option<GiroIdentificacion> {
+        match modo {
+            TickMode::Halt | TickMode::SinVision => None,
+            TickMode::Play | TickMode::Stop => self.giro.map(|(g, _)| g),
+        }
+    }
+
+    /// La identidad para la foto: solo con la base station.
+    pub(crate) fn para_foto(&self) -> Option<Arc<Identidad>> {
+        self.base_station.then(|| self.vigente.clone())
+    }
+
+    /// Los patrones sin comandos para el decisor: vacía en simulación.
+    pub(crate) fn sin_comandos(&self) -> Vec<i32> {
+        if self.base_station { self.vigente.sin_comandos() } else { Vec::new() }
+    }
+}
+
 /// Ids propios con un comando manual o una skill de la GUI vigente, ordenados.
 pub(crate) fn intervenidos(
     manual_state: &HashMap<(i32, i32), (ManualCommand, u32)>,
@@ -209,6 +330,9 @@ pub struct ControlLoopConfig {
     /// Arma la depuración por tick (`TickDebug`) aunque no haya GUI: `main` lo activa con
     /// el registro de partido (`VSSL_MATCH_LOG`). Con GUI se arma siempre.
     pub exportar_depuracion: bool,
+    /// Identidad de los robots al arrancar (solo la usa la base station; en simulación,
+    /// la por defecto). La GUI la cambia en vivo con `GuiChannels::identidad_rx`.
+    pub identidad: Identidad,
 }
 
 /// Qué hace el loop con el equipo propio en un tick.
@@ -272,6 +396,8 @@ pub struct CoachDecider {
     own_team: i32,
     decision_period: u32,
     last_choices: Vec<SkillChoice>,
+    /// Patrones sin comandos: el coach no los ve, igual que a un robot que no se ve.
+    sin_comandos: Vec<i32>,
 }
 
 impl CoachDecider {
@@ -281,6 +407,7 @@ impl CoachDecider {
             own_team,
             decision_period,
             last_choices: Vec::new(),
+            sin_comandos: Vec::new(),
         }
     }
 }
@@ -288,10 +415,15 @@ impl CoachDecider {
 impl TickDecider for CoachDecider {
     fn decide(&mut self, tick: u32, world: &World) -> Vec<SkillChoice> {
         if tick.is_multiple_of(self.decision_period) {
-            let obs = Observation::from_world(world, self.own_team);
+            let mut obs = Observation::from_world(world, self.own_team);
+            obs.quitar_propios(&self.sin_comandos);
             self.last_choices = self.coach.decide(&obs);
         }
         self.last_choices.clone()
+    }
+
+    fn usar_sin_comandos(&mut self, patrones: &[i32]) {
+        self.sin_comandos = patrones.to_vec();
     }
 
     fn role(&self, robot_id: i32) -> Option<Role> {
@@ -411,6 +543,8 @@ pub struct GuiChannels {
     pub pid_rx: Option<mpsc::Receiver<HeadingPid>>,
     /// Canal opcional de teleport (sim) GUI→loop. `None` = sin teleport.
     pub teleport_rx: Option<mpsc::Receiver<Vec<crate::radio::TeleportItem>>>,
+    /// Órdenes de identidad (pestaña Robots) GUI→loop. `None` = sin pestaña.
+    pub identidad_rx: Option<mpsc::Receiver<OrdenIdentidad>>,
 }
 
 /// Construye comandos de velocidad cero para todos los robots activos del equipo
@@ -961,7 +1095,7 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(tracker_on_at_start));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (snapshot_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx) =
+    let (snapshot_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx, mut identidad_rx) =
         match gui {
             Some(g) => (
                 Some(g.snapshot_tx),
@@ -970,8 +1104,9 @@ pub async fn run_control_loop(
                 g.estop,
                 g.pid_rx,
                 g.teleport_rx,
+                g.identidad_rx,
             ),
-            None => (None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None),
         };
     // Contadores de la visión (atómicos; no cambian ningún comando).
     let vision_stats = Arc::new(VisionStats::default());
@@ -1093,6 +1228,12 @@ pub async fn run_control_loop(
         }
     };
 
+    // Identidad de los robots: al transporte antes del primer envío, y los patrones sin
+    // comandos al decisor (solo con la base station).
+    let base_station = config.radio_target == RadioTarget::BaseStation;
+    let mut identidad = IdentidadEnLazo::new(config.identidad.clone(), base_station);
+    identidad.arrancar(&mut *radio.lock().await, decider.as_mut());
+
     eprintln!("[control_loop] listo. 60 Hz control loop. Ctrl+C para detener.");
 
     let motion_cfg = MotionConfig::from_env();
@@ -1193,6 +1334,13 @@ pub async fn run_control_loop(
                     .retain(|_, (_, seen)| tick_counter.wrapping_sub(*seen) <= MANUAL_STALE_TICKS);
             }
 
+            // Identidad de los robots (pestaña Robots): rige desde el envío de este tick.
+            let ordenes: Vec<OrdenIdentidad> = match identidad_rx.as_mut() {
+                Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).collect(),
+                None => Vec::new(),
+            };
+            identidad.ordenes(ordenes, tick_counter, &mut *radio.lock().await, decider.as_mut());
+
             // Tuneo de PID de heading desde la GUI (aplica al catálogo en runtime).
             if let Some(rx) = pid_rx.as_mut() {
                 while let Ok(p) = rx.try_recv() {
@@ -1246,10 +1394,12 @@ pub async fn run_control_loop(
                     eprintln!("[control_loop] fin de HALT");
                 }
             }
-            // La parada y HALT vacían el manual y las skills de la GUI; el corte sin visión no.
+            // La parada y HALT vacían el manual, las skills de la GUI y el giro de
+            // identificación; el corte sin visión no (el giro no sale igual en ese modo).
             if tick_mode(estop_engaged, ref_mode, false) == TickMode::Halt {
                 manual_state.clear();
                 skill_state.clear();
+                identidad.cortar_giro();
             }
 
             let skill_warning: Option<String>;
@@ -1428,6 +1578,7 @@ pub async fn run_control_loop(
                         debug: debug.clone(),
                         rutina: rutina_vista.clone(),
                         arquero: zone_guard.keeper(),
+                        identidad: identidad.para_foto(),
                     },
                 );
             }
@@ -1438,6 +1589,9 @@ pub async fn run_control_loop(
             for cmd in ceros.as_deref().unwrap_or(&commands) {
                 radio_guard.add_motion_command(cmd.clone());
             }
+            // El giro de identificación (exclusivo: el transporte pone en cero las demás
+            // posiciones) vale este envío; no sale en la parada, HALT ni el corte sin visión.
+            identidad.al_enviar(mode, &mut radio_guard);
             let send_result = radio_guard.send_commands().await;
             drop(radio_guard);
             let ok = send_result.is_ok();
@@ -1974,7 +2128,6 @@ mod tests {
     #[test]
     fn base_station_frame_is_all_zero_while_stopped() {
         use crate::radio::base_station::{TeamColor, build_frame};
-        use std::collections::BTreeMap;
         let to_radio = |cmds: &[MotionCommand]| -> Vec<RobotCommand> {
             cmds.iter()
                 .map(|c| RobotCommand {
@@ -1985,8 +2138,13 @@ mod tests {
                 })
                 .collect()
         };
-        // Mapa no vacío que deja las posiciones de radio 1 y 2 sin usar.
-        let slots: BTreeMap<u32, u32> = [(0, 3), (1, 0), (2, 4)].into_iter().collect();
+        // Identidad cruzada que deja las posiciones de radio 1 y 2 sin patrón.
+        let mut slots = Identidad::default();
+        slots.robots[3].patron = Some(0);
+        slots.robots[0].patron = Some(1);
+        slots.robots[4].patron = Some(2);
+        slots.robots[1].patron = None;
+        slots.robots[2].patron = None;
         let mut world = world_with_robot(-0.4, 0.0, 0.0);
         world.update_robot(1, 0, Vec2::new(0.0, 0.3), 0.0, Vec2::ZERO, 0.0);
         let mut d = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.4, 0.0));
@@ -2473,6 +2631,7 @@ mod tests {
             vision_timeout: None,
             referee: None,
             exportar_depuracion: false,
+            identidad: Identidad::default(),
         };
         let _decider: Box<dyn TickDecider> =
             Box::new(FixedSkillDecider::new(0, SkillId::GoTo, Vec2::ZERO));
@@ -2817,5 +2976,313 @@ mod tests {
             planta.y
         );
         assert_eq!(guardia, 0, "el guardia no actúa sobre el arquero");
+    }
+
+    // ── Identidad de los robots: órdenes, giro de identificación y patrones sin comandos ──
+
+    use crate::identidad::RobotFisico;
+    use crate::radio::{Radio, TeamColor};
+    use crate::radio::base_station::frame_del_envio;
+
+    /// Transporte que arma el frame como la base station y lo anota.
+    struct FrameTransport {
+        identidad: Identidad,
+        frames: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl RobotTransport for FrameTransport {
+        async fn send_commands(&mut self, commands: &[RobotCommand]) -> Result<(), TErr> {
+            self.enviar(commands, None).await
+        }
+
+        fn usar_identidad(&mut self, identidad: &Identidad) {
+            self.identidad = identidad.clone();
+        }
+
+        async fn enviar(&mut self, commands: &[RobotCommand], giro: Option<GiroIdentificacion>) -> Result<(), TErr> {
+            let frame = frame_del_envio(commands, TeamColor::Blue, &self.identidad, giro);
+            self.frames.lock().unwrap().push(frame);
+            Ok(())
+        }
+    }
+
+    /// Decisor espía: anota cada lista sin comandos que recibe.
+    #[derive(Default)]
+    struct EspiaLista {
+        listas: Vec<Vec<i32>>,
+    }
+
+    impl TickDecider for EspiaLista {
+        fn decide(&mut self, _tick: u32, _world: &World) -> Vec<SkillChoice> {
+            Vec::new()
+        }
+
+        fn usar_sin_comandos(&mut self, patrones: &[i32]) {
+            self.listas.push(patrones.to_vec());
+        }
+    }
+
+    /// La parte del lazo que toca la identidad, en el mismo orden que `run_control_loop`:
+    /// órdenes → corte en HALT → comandos → giro → envío.
+    struct BancoIdentidad {
+        identidad: IdentidadEnLazo,
+        radio: TokioMutex<Radio>,
+        frames: Arc<Mutex<Vec<String>>>,
+        decisor: EspiaLista,
+        tick: u32,
+    }
+
+    impl BancoIdentidad {
+        fn new(base_station: bool) -> Self {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let transporte = FrameTransport { identidad: Identidad::default(), frames: frames.clone() };
+            let mut b = Self {
+                identidad: IdentidadEnLazo::new(Identidad::default(), base_station),
+                radio: TokioMutex::new(Radio::new(Box::new(transporte))),
+                frames,
+                decisor: EspiaLista::default(),
+                tick: 0,
+            };
+            b.identidad.arrancar(b.radio.get_mut(), &mut b.decisor);
+            b
+        }
+
+        async fn tick(&mut self, ordenes: Vec<OrdenIdentidad>, modo: TickMode, cmds: &[MotionCommand]) -> String {
+            self.identidad.ordenes(ordenes, self.tick, self.radio.get_mut(), &mut self.decisor);
+            if modo == TickMode::Halt {
+                self.identidad.cortar_giro();
+            }
+            let radio = self.radio.get_mut();
+            for c in cmds {
+                radio.add_motion_command(c.clone());
+            }
+            self.identidad.al_enviar(modo, radio);
+            radio.send_commands().await.unwrap();
+            self.tick += 1;
+            self.frames.lock().unwrap().last().cloned().unwrap()
+        }
+    }
+
+    fn avance(id: i32, vx: f64) -> MotionCommand {
+        MotionCommand { id, team: 0, vx, vy: 0.0, omega: 0.0, orientation: 0.0 }
+    }
+
+    fn ceros() -> Vec<MotionCommand> {
+        (0..3).map(|id| avance(id, 0.0)).collect()
+    }
+
+    fn cruzada() -> Identidad {
+        let mut i = Identidad::default();
+        i.robots[0] = RobotFisico { patron: Some(1), activo: true };
+        i.robots[1] = RobotFisico { patron: Some(0), activo: true };
+        i
+    }
+
+    const CERO: &str = "0,0,0,0,0,0,0,0,0,0\n";
+    const GIRO_3: OrdenIdentidad = OrdenIdentidad::Giro { radio: 3, w_deg_s: 90 };
+
+    #[tokio::test]
+    async fn usar_rige_en_el_mismo_tick() {
+        let mut b = BancoIdentidad::new(true);
+        assert_eq!(b.tick(vec![], TickMode::Play, &[avance(1, 0.5)]).await, "0,0,500,0,0,0,0,0,0,0\n");
+        let frame = b.tick(vec![OrdenIdentidad::Usar(cruzada())], TickMode::Play, &[avance(1, 0.5)]).await;
+        assert_eq!(frame, "500,0,0,0,0,0,0,0,0,0\n");
+        assert_eq!(b.identidad.para_foto().as_deref(), Some(&cruzada()));
+    }
+
+    #[tokio::test]
+    async fn giro_llega_al_transporte() {
+        let mut b = BancoIdentidad::new(true);
+        // Exclusivo: el comando del patrón 0 no sale mientras gira la radio 3.
+        assert_eq!(b.tick(vec![GIRO_3], TickMode::Play, &[avance(0, 0.3)]).await, "0,0,0,0,0,0,0,90,0,0\n");
+    }
+
+    async fn el_corte_borra_el_giro(modo_corte: TickMode) {
+        let mut b = BancoIdentidad::new(true);
+        let giro_1 = OrdenIdentidad::Giro { radio: 1, w_deg_s: 90 };
+        assert_eq!(b.tick(vec![giro_1], TickMode::Play, &ceros()).await, "0,0,0,90,0,0,0,0,0,0\n");
+        assert_eq!(b.tick(vec![], modo_corte, &ceros()).await, CERO);
+        // Soltada la parada, no vuelve a girar sin un pedido nuevo.
+        assert_eq!(b.tick(vec![], TickMode::Play, &ceros()).await, CERO);
+    }
+
+    #[tokio::test]
+    async fn parada_borra_el_giro() {
+        el_corte_borra_el_giro(tick_mode(true, TickMode::Play, false)).await;
+    }
+
+    #[tokio::test]
+    async fn halt_borra_el_giro() {
+        el_corte_borra_el_giro(tick_mode(false, TickMode::Halt, false)).await;
+    }
+
+    #[tokio::test]
+    async fn corte_sin_vision_no_manda_el_giro() {
+        let mut b = BancoIdentidad::new(true);
+        let modo = tick_mode(false, TickMode::Play, true);
+        assert_eq!(modo, TickMode::SinVision);
+        assert_eq!(b.tick(vec![GIRO_3], modo, &ceros()).await, CERO);
+    }
+
+    #[tokio::test]
+    async fn giro_caduca_a_los_16_ticks() {
+        let mut b = BancoIdentidad::new(true);
+        assert_eq!(b.tick(vec![GIRO_3], TickMode::Play, &ceros()).await, "0,0,0,0,0,0,0,90,0,0\n");
+        for k in 1..=MANUAL_STALE_TICKS {
+            assert_eq!(b.tick(vec![], TickMode::Play, &ceros()).await, "0,0,0,0,0,0,0,90,0,0\n", "tick {k}");
+        }
+        assert_eq!(b.tick(vec![], TickMode::Play, &ceros()).await, CERO, "a los 16 ticks sin refresco caducó");
+    }
+
+    #[tokio::test]
+    async fn fin_giro_lo_borra_al_instante() {
+        let mut b = BancoIdentidad::new(true);
+        b.tick(vec![GIRO_3], TickMode::Play, &ceros()).await;
+        assert_eq!(b.tick(vec![OrdenIdentidad::FinGiro], TickMode::Play, &[avance(0, 0.5)]).await, "500,0,0,0,0,0,0,0,0,0\n");
+    }
+
+    #[test]
+    fn foto_trae_la_identidad_con_base_station() {
+        let i = IdentidadEnLazo::new(cruzada(), true);
+        assert_eq!(i.para_foto().as_deref(), Some(&cruzada()));
+    }
+
+    #[test]
+    fn foto_sin_identidad_en_sim() {
+        let mut i = IdentidadEnLazo::new(cruzada(), false);
+        assert_eq!(i.para_foto(), None);
+        assert!(i.sin_comandos().is_empty());
+        i.recibir(OrdenIdentidad::Usar(Identidad { robots: [RobotFisico { patron: None, activo: false }; 5] }), 0);
+        assert!(i.sin_comandos().is_empty(), "en simulación cada robot es su patrón");
+    }
+
+    #[tokio::test]
+    async fn parada_segura_no_lleva_giro() {
+        let mut b = BancoIdentidad::new(true);
+        // El último tick del lazo con el giro vigente: lo lleva su envío.
+        assert_eq!(b.tick(vec![GIRO_3], TickMode::Play, &ceros()).await, "0,0,0,0,0,0,0,90,0,0\n");
+        // El lazo termina: los ceros de la parada del cierre salen sin giro.
+        let world = TokioRwLock::new(World::new(3, 3));
+        let antes = b.frames.lock().unwrap().len();
+        parada_del_lazo(&b.radio, &world, 0, 3).await;
+        let frames = b.frames.lock().unwrap();
+        assert!(frames.len() > antes);
+        assert!(frames[antes..].iter().all(|f| f == CERO), "{:?}", &frames[antes..]);
+    }
+
+    #[tokio::test]
+    async fn lazo_entrega_sin_comandos_al_arrancar_y_con_usar() {
+        let mut b = BancoIdentidad::new(true);
+        assert_eq!(b.decisor.listas, vec![Vec::<i32>::new()], "al arrancar, la lista de la identidad");
+        let mut sin_el_2 = Identidad::default();
+        sin_el_2.robots[2].activo = false;
+        b.tick(vec![OrdenIdentidad::Usar(sin_el_2)], TickMode::Play, &ceros()).await;
+        assert_eq!(b.decisor.listas.last(), Some(&vec![2]));
+        // Repetir la misma identidad no la vuelve a entregar.
+        let n = b.decisor.listas.len();
+        let misma = (*b.identidad.para_foto().unwrap()).clone();
+        b.tick(vec![OrdenIdentidad::Usar(misma)], TickMode::Play, &ceros()).await;
+        assert_eq!(b.decisor.listas.len(), n);
+    }
+
+    #[tokio::test]
+    async fn sim_no_entrega_sin_comandos() {
+        let mut b = BancoIdentidad::new(false);
+        let mut sin_el_2 = Identidad::default();
+        sin_el_2.robots[2].activo = false;
+        b.tick(vec![OrdenIdentidad::Usar(sin_el_2)], TickMode::Play, &ceros()).await;
+        assert!(b.decisor.listas.is_empty());
+    }
+
+    // ── El coach no cuenta a los robots sin comandos ──
+
+    /// Los tres propios a la vista, la pelota en `pelota`.
+    fn tres_a_la_vista(pelota: Vec2) -> World {
+        let mut w = World::new(3, 3);
+        w.update_robot(0, 0, Vec2::new(-0.20, 0.10), 0.0, Vec2::ZERO, 0.0);
+        w.update_robot(1, 0, Vec2::new(0.10, -0.25), 0.0, Vec2::ZERO, 0.0);
+        w.update_robot(2, 0, Vec2::new(-0.62, 0.0), 0.0, Vec2::ZERO, 0.0);
+        w.update_ball(pelota, Vec2::ZERO);
+        w
+    }
+
+    fn coach() -> CoachDecider {
+        let c = crate::coach::HeuristicCoach::with_options(Vec2::new(0.75, 0.0), Vec2::new(-0.75, 0.0), 2, true);
+        CoachDecider::new(Box::new(c), 0, 6)
+    }
+
+    fn eligio(choices: &[SkillChoice], id: i32) -> bool {
+        choices.iter().any(|c| c.robot_id == id)
+    }
+
+    fn delantero(d: &CoachDecider) -> Option<i32> {
+        (0..3).find(|id| d.role(*id) == Some(Role::Striker))
+    }
+
+    #[test]
+    fn coach_no_elige_de_arquero_al_desactivado() {
+        let w = tres_a_la_vista(Vec2::new(0.2, 0.1));
+        let mut d = coach();
+        d.decide(0, &w);
+        assert_eq!(d.arquero(), Some(2), "sin desactivar, el 2 es el arquero");
+        let mut d = coach();
+        let mut ident = Identidad::default();
+        ident.robots[2].activo = false;
+        d.usar_sin_comandos(&ident.sin_comandos());
+        let choices = d.decide(0, &w);
+        assert!(!eligio(&choices, 2), "{choices:?}");
+        assert!(d.arquero().is_some_and(|k| k != 2), "otro arquero: {:?}", d.arquero());
+        assert!(!matches!(d.role(2), Some(Role::Keeper | Role::Striker)), "{:?}", d.role(2));
+    }
+
+    #[test]
+    fn coach_no_elige_de_delantero_al_desactivado() {
+        // La pelota junto al robot 1: sin desactivar, es el delantero.
+        let w = tres_a_la_vista(Vec2::new(0.16, -0.25));
+        let mut d = coach();
+        d.decide(0, &w);
+        assert_eq!(delantero(&d), Some(1));
+        let mut d = coach();
+        let mut ident = Identidad::default();
+        ident.robots[1].activo = false;
+        d.usar_sin_comandos(&ident.sin_comandos());
+        let choices = d.decide(0, &w);
+        assert!(!eligio(&choices, 1), "{choices:?}");
+        assert!(delantero(&d).is_some_and(|k| k != 1), "otro delantero: {:?}", delantero(&d));
+    }
+
+    #[test]
+    fn coach_no_cuenta_un_patron_repetido() {
+        let w = tres_a_la_vista(Vec2::new(0.16, -0.25));
+        let mut ident = Identidad::default();
+        ident.robots[3].patron = Some(1); // las radios 1 y 3 con el patrón 1
+        let mut d = coach();
+        d.usar_sin_comandos(&ident.sin_comandos());
+        let choices = d.decide(0, &w);
+        assert!(!eligio(&choices, 1), "{choices:?}");
+        assert!(!matches!(d.role(1), Some(Role::Keeper | Role::Striker)));
+    }
+
+    #[test]
+    fn coach_no_cuenta_un_patron_sin_robot() {
+        let w = tres_a_la_vista(Vec2::new(0.2, 0.1));
+        let mut ident = Identidad::default();
+        ident.robots[0].patron = None;
+        let mut d = coach();
+        d.usar_sin_comandos(&ident.sin_comandos());
+        let choices = d.decide(0, &w);
+        assert!(!eligio(&choices, 0), "{choices:?}");
+        assert!(!matches!(d.role(0), Some(Role::Keeper | Role::Striker)));
+    }
+
+    #[test]
+    fn corregir_la_identidad_vuelve_a_decidir() {
+        let w = tres_a_la_vista(Vec2::new(0.2, 0.1));
+        let mut d = coach();
+        d.usar_sin_comandos(&[0]);
+        assert!(!eligio(&d.decide(0, &w), 0));
+        d.usar_sin_comandos(&[]);
+        assert!(eligio(&d.decide(6, &w), 0), "en la decisión siguiente vuelve a tener decisión");
     }
 }

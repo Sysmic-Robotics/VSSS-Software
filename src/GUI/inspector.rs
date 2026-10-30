@@ -11,6 +11,15 @@ use crate::vision::VisionSource;
 use iced::widget::{Canvas, Column, column, horizontal_rule, row, text};
 use iced::{Element, Length};
 
+/// Las líneas de la identidad vigente para la sección Radio (las mismas que imprime el
+/// lazo), de la foto.
+pub fn lineas_identidad(snap: &crate::snapshot::LoopSnapshot) -> Vec<String> {
+    match snap.identidad.as_deref() {
+        Some(i) => i.describir(),
+        None => vec!["Todavía no llegó la primera foto del lazo.".to_string()],
+    }
+}
+
 fn titulo(t: impl ToString) -> Element<'static, Message> {
     text(t.to_string())
         .font(fonts::TITULO)
@@ -217,10 +226,12 @@ impl DebugGui {
                 .push(nota(
                     "Se fijan al arrancar con VSSL_BASESTATION_DEVICE y VSSL_BASESTATION_BAUD.",
                 ))
-                .push(nota("Mapeo de visión a radio (el número de robot de la GUI es el de visión):"));
-            // Las líneas son las del log de la base; la flecha no está en Barlow.
-            for linea in crate::radio::base_station::describe_slot_map(&self.run.slot_map) {
-                col = col.push(text(linea.replace(" \u{2192} ", " va a la ")).size(theme::TXT_CHICO));
+                .push(nota(
+                    "Identidad de los robots: qué patrón lleva cada radio. El número de robot de la GUI \
+                     es el patrón; se cambia en la pestaña Robots.",
+                ));
+            for linea in lineas_identidad(&self.snap) {
+                col = col.push(text(linea).size(theme::TXT_CHICO));
             }
         }
         col.into()
@@ -253,5 +264,23 @@ impl DebugGui {
         ]
         .spacing(theme::SP_XS)
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identidad::Identidad;
+    use crate::snapshot::LoopSnapshot;
+    use std::sync::Arc;
+
+    #[test]
+    fn inspector_muestra_describir() {
+        let mut ident = Identidad::default();
+        ident.robots[2].activo = false;
+        let snap = LoopSnapshot { identidad: Some(Arc::new(ident.clone())), ..LoopSnapshot::default() };
+        assert_eq!(lineas_identidad(&snap), ident.describir());
+        assert!(lineas_identidad(&snap).contains(&"radio 2 (MI_ROBOT_ID 3): patrón 2, desactivado".to_string()));
+        assert_eq!(lineas_identidad(&LoopSnapshot::default()).len(), 1);
     }
 }

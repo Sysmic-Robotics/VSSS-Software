@@ -295,6 +295,9 @@ pub struct RoutineDecider {
     fase: Fase,
     /// Robot de cada puesto en uso; vacío hasta asignar.
     asignados: Vec<i32>,
+    /// Patrones sin comandos (identidad de los robots): la asignación automática no los
+    /// elige. Vale al preparar: si cambia en la corrida, la asignación no se rehace.
+    sin_comandos: Vec<i32>,
     /// Reloj de la rutina en el último tick visto (s).
     t: f64,
     t_prep: Option<f64>,
@@ -494,6 +497,7 @@ impl RoutineDecider {
             recorridos,
             fase: Fase::Preparando,
             asignados: Vec::new(),
+            sin_comandos: Vec::new(),
             t: 0.0,
             t_prep: None,
             ventanas: Vec::new(),
@@ -755,7 +759,7 @@ impl RoutineDecider {
 
     fn preparar_asignacion(&mut self, world: &World) -> Result<(), String> {
         let vistos: Vec<(i32, Vec2)> = self.propios(world).iter().map(|r| (r.id, r.position)).collect();
-        self.asignados = asignar(&self.rutina, &vistos, self.ent.keeper_id, &self.op.eleccion)?;
+        self.asignados = asignar(&self.rutina, &vistos, self.ent.keeper_id, &self.op.eleccion, &self.sin_comandos)?;
         self.t_prep = Some(self.t);
         self.ventanas = vec![VecDeque::new(); self.asignados.len()];
         if self.op.teletransportar && self.op.simulacion {
@@ -2020,6 +2024,10 @@ impl TickDecider for RoutineDecider {
         Some(self.vista.clone())
     }
 
+    fn usar_sin_comandos(&mut self, patrones: &[i32]) {
+        self.sin_comandos = patrones.to_vec();
+    }
+
     /// El robot asignado al puesto `arquero` (D4 de `arquero`: por la asignación, el
     /// `keeper_id` del entorno). Sin ese puesto, o antes de asignar, no opina.
     fn arquero(&self) -> Option<i32> {
@@ -2136,6 +2144,19 @@ mod tests {
     }
 
     const IR: &str = r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#;
+
+    #[test]
+    fn preparar_usa_la_lista_sin_comandos() {
+        // Dos robots; el más cercano al inicio (el 0) no recibe comandos: va el 1.
+        let w = mundo(&[(0, INICIO.x, INICIO.y, 0.0), (1, 0.3, 0.3, 0.0)]);
+        let mut sin = decisor(IR, opciones(false));
+        correr(&mut sin, &w, 0, 3);
+        assert_eq!(sin.asignados(), &[0]);
+        let mut con = decisor(IR, opciones(false));
+        con.usar_sin_comandos(&[0]);
+        correr(&mut con, &w, 0, 3);
+        assert_eq!(con.asignados(), &[1]);
+    }
 
     #[test]
     fn prepares_with_goto_then_facepoint_and_gets_ready() {

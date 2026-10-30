@@ -84,6 +84,24 @@ pub fn vistos_propios(snap: &LoopSnapshot, own_team: i32, num_robots: usize) -> 
         .collect()
 }
 
+/// Patrones sin comandos según la identidad de la foto (vacía sin identidad: simulación).
+pub fn sin_comandos_de(snap: &LoopSnapshot) -> Vec<i32> {
+    snap.identidad.as_deref().map(|i| i.sin_comandos()).unwrap_or_default()
+}
+
+/// La asignación que haría la preparación con los robots y la identidad de la foto: la
+/// misma función y la misma lista que el decisor.
+pub fn asignacion_prevista(
+    rutina: &Rutina,
+    snap: &LoopSnapshot,
+    own_team: i32,
+    num_robots: usize,
+    keeper_id: i32,
+    eleccion: &Eleccion,
+) -> Result<Vec<i32>, String> {
+    asignar(rutina, &vistos_propios(snap, own_team, num_robots), keeper_id, eleccion, &sin_comandos_de(snap))
+}
+
 /// Por qué no se puede preparar la rutina elegida, o `None` si se puede.
 pub fn razon_no_preparar(
     hay_canal: bool,
@@ -112,7 +130,7 @@ pub fn razon_no_preparar(
         TickMode::SinVision => return Some("Corte sin visión: no se ve ningún robot propio.".to_string()),
         TickMode::Play => {}
     }
-    asignar(rutina, &vistos_propios(snap, own_team, num_robots), keeper_id, eleccion)
+    asignacion_prevista(rutina, snap, own_team, num_robots, keeper_id, eleccion)
         .err()
         .map(|e| format!("No se puede preparar: {e}."))
 }
@@ -259,8 +277,15 @@ impl DebugGui {
             return Some(DibujoRutina::de_vista(v));
         }
         let rutina = self.rutinas.entrada()?.rutina.clone()?;
-        let vistos = vistos_propios(&self.snap, self.run.own_team, self.run.num_robots);
-        let asignados = asignar(&rutina, &vistos, self.keeper_id, &self.rutinas.eleccion()).unwrap_or_default();
+        let asignados = asignacion_prevista(
+            &rutina,
+            &self.snap,
+            self.run.own_team,
+            self.run.num_robots,
+            self.keeper_id,
+            &self.rutinas.eleccion(),
+        )
+        .unwrap_or_default();
         let puestos = if asignados.is_empty() { rutina.robots_max } else { asignados.len() };
         Some(DibujoRutina {
             asignacion: asignados.into_iter().enumerate().collect(),
@@ -457,32 +482,37 @@ impl DebugGui {
     }
 }
 
-fn titulo(t: impl ToString) -> Element<'static, Message> {
+pub(super) fn titulo(t: impl ToString) -> Element<'static, Message> {
     text(t.to_string()).font(fonts::TITULO).size(theme::TXT_TITULO).into()
 }
 
-fn subtitulo(t: impl ToString) -> Element<'static, Message> {
+pub(super) fn subtitulo(t: impl ToString) -> Element<'static, Message> {
     text(t.to_string()).font(fonts::TITULO_MEDIO).size(theme::TXT).into()
 }
 
-fn nota(t: impl ToString) -> Element<'static, Message> {
+pub(super) fn nota(t: impl ToString) -> Element<'static, Message> {
     text(t.to_string()).size(theme::TXT_CHICO).style(theme::gris).into()
 }
 
-fn etiqueta(t: impl ToString) -> Element<'static, Message> {
+pub(super) fn etiqueta(t: impl ToString) -> Element<'static, Message> {
     text(t.to_string()).size(theme::TXT_CHICO).style(theme::gris).into()
 }
 
 fn opcion<'a>(t: impl ToString, activa: bool, msg: Message) -> Element<'a, Message> {
+    opcion_si(t, activa, Some(msg))
+}
+
+/// Opción; sin mensaje, deshabilitada.
+pub(super) fn opcion_si<'a>(t: impl ToString, activa: bool, msg: Option<Message>) -> Element<'a, Message> {
     button(text(t.to_string()).size(theme::TXT_CHICO))
         .padding([3, 8])
         .style(theme::boton_opcion(activa))
-        .on_press(msg)
+        .on_press_maybe(msg)
         .into()
 }
 
 /// Botón chico; sin mensaje, deshabilitado.
-fn boton_chico<'a>(t: &str, msg: Option<Message>) -> Element<'a, Message> {
+pub(super) fn boton_chico<'a>(t: &str, msg: Option<Message>) -> Element<'a, Message> {
     button(text(t.to_string()).size(theme::TXT))
         .padding([4, 10])
         .style(theme::boton)
@@ -723,6 +753,33 @@ mod tests {
         assert_eq!(botones(Some(Fase::Pausada)), vec![Reanudar, Abortar]);
         assert_eq!(botones(Some(Fase::Terminada)), vec![Cerrar, Preparar]);
         assert_eq!(botones(Some(Fase::Abortada)), vec![Cerrar, Preparar]);
+    }
+
+    /// Los robots de "El más cercano": el 1 es el más cercano al inicio del puesto.
+    fn tres_robots(identidad: Option<crate::identidad::Identidad>) -> LoopSnapshot {
+        LoopSnapshot {
+            robots: vec![robot(0, 0.5, 0.4), robot(1, -0.2, -0.2), robot(2, 0.0, 0.5)],
+            identidad: identidad.map(Arc::new),
+            ..LoopSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn vista_previa_usa_la_lista_de_la_foto() {
+        let rutina = prueba::rutina(&prueba::un_puesto(r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#));
+        let mut ident = crate::identidad::Identidad::default();
+        ident.robots[1].patron = None;
+        let snap = tres_robots(Some(ident));
+        assert_eq!(sin_comandos_de(&snap), vec![1]);
+        assert_eq!(asignacion_prevista(&rutina, &snap, 0, 3, 2, &Eleccion::Automatica), Ok(vec![2]));
+    }
+
+    #[test]
+    fn vista_previa_sin_identidad_igual_que_antes() {
+        let rutina = prueba::rutina(&prueba::un_puesto(r#"{ "paso": "ir", "x": 0.3, "y": -0.25 }"#));
+        assert_eq!(asignacion_prevista(&rutina, &tres_robots(None), 0, 3, 2, &Eleccion::Automatica), Ok(vec![1]));
+        let por_defecto = tres_robots(Some(crate::identidad::Identidad::default()));
+        assert_eq!(asignacion_prevista(&rutina, &por_defecto, 0, 3, 2, &Eleccion::Automatica), Ok(vec![1]));
     }
 
     #[test]

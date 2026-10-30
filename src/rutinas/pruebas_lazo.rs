@@ -312,6 +312,65 @@ impl TickDecider for Espia {
     }
 }
 
+/// Decisor de base espía: anota la lista sin comandos que recibe.
+struct EspiaSinComandos {
+    lista: Arc<Mutex<Option<Vec<i32>>>>,
+}
+
+impl TickDecider for EspiaSinComandos {
+    fn decide(&mut self, _tick: u32, _world: &World) -> Vec<SkillChoice> {
+        Vec::new()
+    }
+
+    fn usar_sin_comandos(&mut self, patrones: &[i32]) {
+        *self.lista.lock().unwrap() = Some(patrones.to_vec());
+    }
+}
+
+/// El robot 0 en el inicio del puesto y el 1 lejos.
+fn dos_robots() -> World {
+    let mut w = en_inicio();
+    w.update_robot(1, 0, Vec2::new(0.3, 0.35), 0.0, Vec2::ZERO, 0.0);
+    w
+}
+
+/// Prepara la rutina de un puesto con el conmutador `d` y devuelve el robot asignado.
+fn asignado_por(d: &mut DecisorConRutinas, tx: &mpsc::Sender<OrdenRutina>) -> Vec<i32> {
+    let rutina = prueba::rutina(&prueba::un_puesto(IR_LEJOS));
+    tx.try_send(OrdenRutina::Preparar { rutina, opciones: opciones(100, false) }).unwrap();
+    let mut lazo = Lazo::new(false);
+    let w = dos_robots();
+    for _ in 0..5 {
+        lazo.paso(TickMode::Play, false, false, &w, d);
+    }
+    d.rutina().expect("rutina preparada").robots.iter().map(|r| r.robot).collect()
+}
+
+#[test]
+fn conmutador_reparte_sin_comandos() {
+    let (tx, rx) = mpsc::channel(8);
+    let lista = Arc::new(Mutex::new(None));
+    let mut d = DecisorConRutinas::new(Box::new(EspiaSinComandos { lista: lista.clone() }), rx, 0, 3);
+    d.usar_sin_comandos(&[0]);
+    assert_eq!(*lista.lock().unwrap(), Some(vec![0]), "la base recibe la lista");
+    // Con una rutina activa, la base la sigue recibiendo.
+    assert_eq!(asignado_por(&mut d, &tx), vec![1]);
+    d.usar_sin_comandos(&[]);
+    assert_eq!(*lista.lock().unwrap(), Some(vec![]));
+}
+
+#[test]
+fn rutina_nueva_recibe_la_lista_vigente() {
+    // Sin lista, el más cercano (el 0); con el 0 sin comandos, el 1.
+    let (tx, rx) = mpsc::channel(8);
+    let mut d = DecisorConRutinas::new(Box::new(EspiaSinComandos { lista: Arc::new(Mutex::new(None)) }), rx, 0, 3);
+    assert_eq!(asignado_por(&mut d, &tx), vec![0]);
+    let (tx, rx) = mpsc::channel(8);
+    let mut d = DecisorConRutinas::new(Box::new(EspiaSinComandos { lista: Arc::new(Mutex::new(None)) }), rx, 0, 3);
+    d.usar_sin_comandos(&[0]);
+    assert_eq!(asignado_por(&mut d, &tx), vec![1]);
+}
+
 struct ConCoach {
     lazo: Lazo,
     d: DecisorConRutinas,
