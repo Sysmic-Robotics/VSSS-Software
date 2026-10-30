@@ -156,7 +156,10 @@ impl RailKeeperSkill {
                 let y = (ball_ahead.y + side * self.sweep).clamp(-reach, reach);
                 return (y, KeeperMode::SweepLine);
             }
-            // Abierta, rodando por la línea de fondo hacia la boca: cerrar ese palo.
+            // Abierta, rodando por la línea de fondo hacia la boca: cerrar ese palo. (Se probó
+            // pararse a |y| 0.13 en este modo, Rival y Angle, con el cuerpo tapando igual el
+            // palo y 7 cm más cerca del centro: 48 partidos cara a cara a velocidad real,
+            // 16-18-14 y 29 goles en contra contra 27; los goles no vienen del arquero en el palo.)
             return (ball_ahead.y.signum() * GOAL_HALF_Y, KeeperMode::NearPost);
         }
 
