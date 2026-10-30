@@ -55,9 +55,9 @@ def resolve_params(arg: str, label: str, out: Path) -> Path:
 
 
 def schedule(rounds: int, a: Path, b: Path, rival_params: Path | None = None,
-             vs_rule_based: bool = True) -> list[Job]:
+             vs_rule_based: bool = True, first_seed: int = 0) -> list[Job]:
     jobs = []
-    for i in range(rounds):
+    for i in range(first_seed, first_seed + rounds):
         kickoff = "blue" if i % 2 == 0 else "yellow"
         if vs_rule_based:
             rb = Rival("rule_based", "rule_based", rival_params)
@@ -135,6 +135,8 @@ def main() -> int:
     ap.add_argument("--rounds", type=int, default=12, help="rondas de 4 partidos (2 con --solo-cara-a-cara)")
     ap.add_argument("--solo-cara-a-cara", action="store_true",
                     help="sin partidos contra rule_based: decide solo el cara a cara A contra B")
+    ap.add_argument("--semilla-inicial", type=int, default=0,
+                    help="semilla de la primera ronda (una serie de confirmación usa semillas nuevas)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--fps", type=int, default=480)
     ap.add_argument("--minutes", type=float, default=3.0)
@@ -155,7 +157,8 @@ def main() -> int:
     a = resolve_params(args.a, "A", args.out)
     b = resolve_params(args.b, "B", args.out)
     names = {"A": str(args.a), "B": str(args.b)}
-    jobs = schedule(args.rounds, a, b, args.rival_params, vs_rule_based=not args.solo_cara_a_cara)
+    jobs = schedule(args.rounds, a, b, args.rival_params, vs_rule_based=not args.solo_cara_a_cara,
+                    first_seed=args.semilla_inicial)
 
     sims = [Simulator(args.fps, args.vision_port + 10 * k, args.cmd_port + 10 * k, args.out / f"firasim_{k}.log")
             for k in range(max(1, args.sims))]
