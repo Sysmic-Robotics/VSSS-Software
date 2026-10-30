@@ -207,7 +207,10 @@ const CASES: &[Case] = &[
     c("spinkick_side", SkillId::SpinKick, (0.75, 0.0), (-0.10, 0.065, 90.0), (0.0, 0.0), 5.0, 0.0, KICK_SPIN),
     // Penal sin arquero desde la cruz (0.375, 0) a un palo (y = ±0.14): de giro, con el robot
     // en el centro de contacto detrás de la pelota del lado del palo, o empujando con Dribble
-    // desde la fila detrás de la pelota. La pelota tiene que entrar.
+    // desde la fila detrás de la pelota. La pelota tiene que entrar. A velocidad real
+    // (`sim.max_wheel_rad_s` 22.5) el giro no sirve de penal: 0/10, empieza a girar recién a
+    // los 1.2-1.8 s (empuja la pelota al acomodarse en el centro) y la pelota sale a 60-90°
+    // del objetivo; el empuje entra 10/10.
     c("penal_giro_arriba", SkillId::SpinKick, (0.75, 0.14), (0.352, 0.061, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
     c("penal_giro_abajo", SkillId::SpinKick, (0.75, -0.14), (0.352, -0.061, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
     c("penal_empuje_arriba", SkillId::Dribble, (0.75, 0.14), (0.235, 0.0, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),

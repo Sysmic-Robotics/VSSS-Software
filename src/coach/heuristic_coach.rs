@@ -1097,7 +1097,12 @@ impl Coach for HeuristicCoach {
             if play.is_set_piece() {
                 self.striker_id = None;
             }
-            // Silbato de un penal propio: elegir el palo antes de que el pateador se mueva.
+            // Silbato de un penal propio: elegir el palo antes de que el pateador se mueva. (Se
+            // probó amagar: empujar al centro y doblar al palo con la pelota pasada x = 0.50 o
+            // 0.58. Empujando no se alcanza a desviar en lo que queda y la pelota sigue al centro,
+            // contra el arquero: 12 % contra el nuestro igual que sin amague, 3 % doblando en 0.58,
+            // y contra el de rule_based 5 % en vez de 78 %. El giro tampoco sirve de penal; ver los
+            // casos `penal_*` de motion_bench.)
             self.penalty_shot = (self.current_play == Play::PenaltyOurs && play == Play::Open)
                 .then(|| (self.penalty_corner(&opp), self.decision_count));
             self.current_play = play;
