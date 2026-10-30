@@ -107,6 +107,9 @@ pub struct CoachParams {
     /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
     /// él, con anticipación) en vez de `GoalKeep`.
     pub gk_rail: bool,
+    /// Dos atacantes: con la pelota disputada más allá de esta x hacia el arco rival (m), el
+    /// apoyo también va a la pelota, desde el lado contrario al striker. 0 = nunca.
+    pub two_attackers_x: f32,
 }
 
 impl Default for CoachParams {
@@ -147,6 +150,7 @@ impl Default for CoachParams {
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
             gk_rail: true,
+            two_attackers_x: 0.0,
         }
     }
 }
