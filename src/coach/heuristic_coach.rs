@@ -848,20 +848,11 @@ impl HeuristicCoach {
             let skill = self.commit(r.id, SkillId::Mark, |_| true);
             return SkillChoice::new(r.id, skill, pos);
         }
-        // Dos atacantes (ThunderVolt/USP, H1 del tramo 2): pelota disputada en el tercio rival
-        // (nuestro striker encima y un rival sobre ella) → el apoyo también va, desde el lado
-        // contrario al striker: conduce hacia el palo del lado del striker, así su campo lo
-        // acerca por el otro lado.
+        // (Se probó el modo dos atacantes de ThunderVolt/USP: con la pelota disputada en el
+        // tercio rival, el apoyo también iba a conducirla desde el lado contrario al striker.
+        // Primera serie 14-28-6 a favor; la confirmación con semillas nuevas 10-22-16 en contra;
+        // en 96 partidos +0.06 ± 0.09 goles: sin efecto.)
         let s = self.attack_sign();
-        if self.p.two_attackers_x > 0.0 && ball.x * s >= self.p.two_attackers_x {
-            if let Some(st) = striker.filter(|st| (st.pos - ball).length() <= 0.20) {
-                if opp.iter().any(|o| o.active && (o.pos - ball).length() <= 0.12) {
-                    let up = if st.pos.y >= ball.y { 1.0 } else { -1.0 };
-                    let skill = self.commit(r.id, SkillId::Dribble, |_| true);
-                    return SkillChoice::new(r.id, skill, Vec2::new(self.attack_goal.x, up * (GOAL_HALF_Y - 0.06)));
-                }
-            }
-        }
         // Pelota en el fondo/esquina rival: el striker la saca al frente del arco;
         // el support espera ahí la "segunda pelota", del lado contrario, fuera del
         // área rival (no amontonarse contra la pared con el striker).
@@ -1472,29 +1463,6 @@ mod tests {
             last = choice_of(&c.decide(&o), 0).skill_id;
         }
         assert!(matches!(c.push_stall, Stall::None | Stall::Kicking(_)), "{:?}", c.push_stall);
-    }
-
-    #[test]
-    fn two_attackers_send_the_support_to_a_contested_ball_in_the_attacking_third() {
-        let ball = Vec2::new(0.45, 0.10);
-        let mut o = obs(ball, Vec2::ZERO, [Vec2::new(0.37, 0.12), Vec2::new(0.10, -0.20), Vec2::new(-0.63, 0.0)]);
-        o.opp_robots[0] = robot(Vec2::new(0.53, 0.08), 0.0);
-        let mut c = coach();
-        assert_eq!(choice_of(&c.decide(&o), 1).skill_id, SkillId::Mark);
-        let mut c = coach();
-        c.p.two_attackers_x = 0.25;
-        let ch = c.decide(&o);
-        assert_eq!(c.role_of(0), Some(Role::Striker));
-        let sup = choice_of(&ch, 1);
-        // Striker arriba de la pelota: el apoyo conduce hacia el palo de arriba, llegando por abajo.
-        assert_eq!(sup.skill_id, SkillId::Dribble);
-        assert_eq!(sup.target, Vec2::new(0.75, GOAL_HALF_Y - 0.06));
-        // Sin rival encima vuelve a receptor (pasado el compromiso mínimo de la skill).
-        o.opp_robots[0] = robot(Vec2::new(0.70, -0.30), 0.0);
-        for _ in 0..c.p.skill_min_hold {
-            c.decide(&o);
-        }
-        assert_eq!(choice_of(&c.decide(&o), 1).skill_id, SkillId::Mark);
     }
 
     #[test]
