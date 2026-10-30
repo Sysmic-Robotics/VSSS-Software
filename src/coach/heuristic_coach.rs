@@ -851,6 +851,10 @@ impl HeuristicCoach {
         let s = self.attack_sign();
         if self.ball_on_end_wall(ball) && ball.x * s > 0.0 {
             let side = if ball.y >= 0.0 { 1.0 } else { -1.0 };
+            // (Se probó esperar a 0.30 m de la pelota hacia el frente del arco, para emparejar el
+            // dos contra uno de la esquina: el apoyo quedó a 0.34 m en vez de 0.68, pero la
+            // pelota salió al frente del arco igual (15 % y 18 %) y cara a cara 15-22-11 para
+            // el actual, 21 goles contra 18.)
             let pos = self.away_from_ball(Vec2::new(s * (GOAL_AREA_X - 0.18), -side * 0.22), ball);
             let skill = self.commit(r.id, SkillId::Mark, |_| true);
             return SkillChoice::new(r.id, skill, pos);
