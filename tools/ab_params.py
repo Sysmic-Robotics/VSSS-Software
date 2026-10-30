@@ -7,6 +7,8 @@ En cada ronda i, con la misma semilla de ruido para las dos configuraciones:
 Informa, para cada configuración, aptitud media ± error estándar contra rule_based y el
 cara a cara entre ambas (diferencia de goles desde el punto de vista de A, en los dos
 sentidos de cancha). La palabra `default` como archivo usa config/team_params.json.
+Con `--solo-cara-a-cara` no juega contra rule_based (le ganamos siempre por ~4 goles: ya no
+distingue variantes) y cada ronda son solo los dos partidos A contra B.
 
     python3 tools/ab_params.py default logs/annealing/corrida2/best.json --rounds 12 --sims 3 --out logs/annealing/ab_88
 """
@@ -52,14 +54,15 @@ def resolve_params(arg: str, label: str, out: Path) -> Path:
     return path
 
 
-def schedule(rounds: int, a: Path, b: Path, rival_params: Path | None = None) -> list[Job]:
+def schedule(rounds: int, a: Path, b: Path, rival_params: Path | None = None,
+             vs_rule_based: bool = True) -> list[Job]:
     jobs = []
     for i in range(rounds):
         kickoff = "blue" if i % 2 == 0 else "yellow"
-        rb = Rival("rule_based", "rule_based", rival_params)
+        if vs_rule_based:
+            rb = Rival("rule_based", "rule_based", rival_params)
+            jobs += [Job(f"r{i}_A_rb", "A", a, rb, i, kickoff), Job(f"r{i}_B_rb", "B", b, rb, i, kickoff)]
         jobs += [
-            Job(f"r{i}_A_rb", "A", a, rb, i, kickoff),
-            Job(f"r{i}_B_rb", "B", b, rb, i, kickoff),
             Job(f"r{i}_A_vs_B", "A", a, Rival("B", "heuristic", b), i, kickoff),
             Job(f"r{i}_B_vs_A", "B", b, Rival("A", "heuristic", a), i, kickoff),
         ]
@@ -84,12 +87,14 @@ def record_line(blue: str, rival: str, r: MatchResult) -> str:
 def summarize(results: list[dict], names: dict[str, str]) -> str:
     lines = []
     for side in ("A", "B"):
+        lines.append(f"{side} = {names[side]}")
         vs_rb = [r for r in results if r["blue"] == side and r["rival"] == "rule_based"]
+        if not vs_rb:
+            continue
         fits = [r["fitness"] for r in vs_rb]
         gd = [r["goals_for"] - r["goals_against"] for r in vs_rb]
         w = sum(1 for g in gd if g > 0); d = sum(1 for g in gd if g == 0)
         m, s = mean_sem(fits); gm, gs = mean_sem([float(g) for g in gd])
-        lines.append(f"{side} = {names[side]}")
         lines.append(f"  vs rule_based ({len(vs_rb)} partidos): V{w} E{d} D{len(gd) - w - d}  "
                      f"aptitud {m:+.2f} ± {s:.2f}  dif. goles {gm:+.2f} ± {gs:.2f}  "
                      f"posesión {statistics.mean(r['possession_pct'] for r in vs_rb):.0f} %  "
@@ -99,7 +104,8 @@ def summarize(results: list[dict], names: dict[str, str]) -> str:
     by_seed_b = {r["seed"]: r["fitness"] for r in results if r["blue"] == "B" and r["rival"] == "rule_based"}
     paired = [by_seed_b[k] - by_seed_a[k] for k in by_seed_a if k in by_seed_b]
     pm, ps = mean_sem(paired)
-    lines.append(f"Pareado vs rule_based (B − A, {len(paired)} rondas): {pm:+.2f} ± {ps:.2f} por partido")
+    if paired:
+        lines.append(f"Pareado vs rule_based (B − A, {len(paired)} rondas): {pm:+.2f} ± {ps:.2f} por partido")
     # Cara a cara, desde A: A azul vs B, y B azul vs A (invertido).
     h2h = []
     for r in results:
@@ -111,7 +117,10 @@ def summarize(results: list[dict], names: dict[str, str]) -> str:
     lines.append(f"Cara a cara A contra B ({len(h2h)} partidos, ambos lados): A gana {w}, empata {d}, pierde "
                  f"{len(h2h) - w - d}; dif. goles A−B {hm:+.2f} ± {hs:.2f} por partido")
     verdict = "sin diferencia detectable con estos partidos"
-    if not math.isnan(pm) and abs(pm) > 2 * ps and not math.isnan(hm) and abs(hm) > 2 * hs and (pm > 0) == (hm < 0):
+    if not paired:
+        if not math.isnan(hm) and abs(hm) > 2 * hs:
+            verdict = f"{'A' if hm > 0 else 'B'} es mejor cara a cara (más de 2 errores estándar)"
+    elif not math.isnan(pm) and abs(pm) > 2 * ps and not math.isnan(hm) and abs(hm) > 2 * hs and (pm > 0) == (hm < 0):
         verdict = f"{'B' if pm > 0 else 'A'} es mejor en ambas medidas (más de 2 errores estándar)"
     elif (not math.isnan(pm) and abs(pm) > 2 * ps) or (not math.isnan(hm) and abs(hm) > 2 * hs):
         verdict = "diferencia en una sola medida: no concluyente"
@@ -123,7 +132,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="comparación A/B de dos configuraciones de estilo")
     ap.add_argument("a", help="archivo VSSL_PARAMS de A, o 'default'")
     ap.add_argument("b", help="archivo VSSL_PARAMS de B, o 'default'")
-    ap.add_argument("--rounds", type=int, default=12, help="rondas de 4 partidos")
+    ap.add_argument("--rounds", type=int, default=12, help="rondas de 4 partidos (2 con --solo-cara-a-cara)")
+    ap.add_argument("--solo-cara-a-cara", action="store_true",
+                    help="sin partidos contra rule_based: decide solo el cara a cara A contra B")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--fps", type=int, default=480)
     ap.add_argument("--minutes", type=float, default=3.0)
@@ -144,7 +155,7 @@ def main() -> int:
     a = resolve_params(args.a, "A", args.out)
     b = resolve_params(args.b, "B", args.out)
     names = {"A": str(args.a), "B": str(args.b)}
-    jobs = schedule(args.rounds, a, b, args.rival_params)
+    jobs = schedule(args.rounds, a, b, args.rival_params, vs_rule_based=not args.solo_cara_a_cara)
 
     sims = [Simulator(args.fps, args.vision_port + 10 * k, args.cmd_port + 10 * k, args.out / f"firasim_{k}.log")
             for k in range(max(1, args.sims))]
