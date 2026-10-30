@@ -64,6 +64,9 @@ pub struct DecisorConRutinas {
     en_pausa: bool,
     /// Ids propios con manual o skill de la GUI vigente en el tick anterior.
     intervenidos: Vec<i32>,
+    /// Patrones sin comandos (identidad de los robots): van a la base, a la rutina activa y
+    /// a cada rutina nueva al prepararla.
+    sin_comandos: Vec<i32>,
 }
 
 /// Mensaje de un pánico atrapado.
@@ -86,6 +89,7 @@ impl DecisorConRutinas {
             pausa: None,
             en_pausa: false,
             intervenidos: Vec::new(),
+            sin_comandos: Vec::new(),
         }
     }
 
@@ -156,7 +160,8 @@ impl DecisorConRutinas {
                     }
                 };
                 if acepta {
-                    let r = RoutineDecider::vigente(rutina, opciones, self.own_team, self.num_robots);
+                    let mut r = RoutineDecider::vigente(rutina, opciones, self.own_team, self.num_robots);
+                    r.usar_sin_comandos(&self.sin_comandos);
                     self.rutina = Some(Activa::Corriendo(Box::new(r)));
                 } else {
                     eprintln!("[rutinas] Preparar ignorado: hay una rutina en ejecución");
@@ -217,8 +222,24 @@ impl TickDecider for DecisorConRutinas {
         if self.rutina.is_some() || self.en_pausa { None } else { self.base.role(robot_id) }
     }
 
+    /// Con una rutina, el robot de su puesto `arquero` (o nada); sin rutina, el de la base,
+    /// también en pausa: el coach no decide y su arquero no cambia.
+    fn arquero(&self) -> Option<i32> {
+        match &self.rutina {
+            None => self.base.arquero(),
+            Some(Activa::Corriendo(r)) => r.arquero(),
+            Some(Activa::Fallida(_)) => None,
+        }
+    }
+
     fn coach_debug(&self) -> Option<CoachDebug> {
         if self.rutina.is_some() || self.en_pausa { None } else { self.base.coach_debug() }
+    }
+
+    fn usar_sin_comandos(&mut self, patrones: &[i32]) {
+        self.sin_comandos = patrones.to_vec();
+        self.base.usar_sin_comandos(patrones);
+        self.proteger(|r| r.usar_sin_comandos(patrones));
     }
 
     fn observar(&mut self, ctx: &ContextoTick<'_>) {

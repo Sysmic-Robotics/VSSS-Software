@@ -1,5 +1,6 @@
 use super::actuator::{ActuatorModel, ActuatorState};
 use super::base_station::command_to_vw;
+use crate::identidad::{GiroIdentificacion, Identidad};
 use crate::motion::RobotCommand;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -40,6 +41,20 @@ pub trait RobotTransport: Send + Sync {
     /// Reposiciona robots/pelota en el simulador. Default no-op (base station real).
     async fn teleport(&mut self, _items: &[TeleportItem]) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    /// Identidad vigente de los robots (qué patrón lleva cada posición de radio). Solo la
+    /// usa la base station; en simulación cada robot es su patrón.
+    fn usar_identidad(&mut self, _identidad: &Identidad) {}
+
+    /// Envío con un giro de identificación opcional. Solo la base station lo usa (frame
+    /// del giro, exclusivo); por defecto se mandan los comandos y el giro se ignora.
+    async fn enviar(
+        &mut self,
+        commands: &[RobotCommand],
+        _giro: Option<GiroIdentificacion>,
+    ) -> Result<(), TransportError> {
+        self.send_commands(commands).await
     }
 }
 

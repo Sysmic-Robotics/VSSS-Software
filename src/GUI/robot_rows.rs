@@ -10,6 +10,7 @@ use super::run_info::RunInfo;
 use super::tag::ParcheCanvas;
 use super::{DebugGui, Message, fonts, theme};
 use crate::coach::Role;
+use crate::identidad::SinRadio;
 use crate::skills::Face;
 use crate::snapshot::{CommandSource, LoopSnapshot, OwnRobotView, RobotView};
 use iced::widget::{
@@ -33,25 +34,46 @@ pub fn nombre_rol(rol: Role) -> &'static str {
     }
 }
 
-/// Texto al lado del nombre: el rol (o la fuente del comando si no es el coach) y la
-/// posición de radio. `pausa`: el coach está en pausa y no hay rutina, así que lo que
-/// manda el decisor es el Hold de la pausa (`coach-pausa`).
-pub fn al_lado(vista: Option<&OwnRobotView>, radio: Option<usize>, pausa: bool) -> String {
+/// La radio de la fila: "radio P", o por qué no le llegan comandos.
+pub fn texto_radio(radio: &Result<usize, SinRadio>) -> String {
+    match radio {
+        Ok(p) => format!("radio {p}"),
+        Err(SinRadio::Desactivado(p)) => format!("desactivado, radio {p}"),
+        Err(SinRadio::SinRobot) => "sin radio".to_string(),
+        Err(SinRadio::Repetido(rs)) => format!("patrón repetido, radios {}", lista(rs)),
+    }
+}
+
+/// Texto al lado del nombre: el rol (o la fuente del comando si no es el coach) y, con la
+/// base station, la radio según la identidad (`radio`). `pausa`: el coach está en pausa y
+/// no hay rutina, así que lo que manda el decisor es el Hold de la pausa (`coach-pausa`).
+///
+/// Devuelve también si va en alerta: un robot al que no le llegan comandos (desactivado,
+/// sin radio o patrón repetido). Ese robot no muestra rol: el coach no lo cuenta, aunque
+/// `role` diga "apoyo" para cualquier id 0–2.
+pub fn al_lado(
+    vista: Option<&OwnRobotView>,
+    radio: Option<&Result<usize, SinRadio>>,
+    pausa: bool,
+) -> (String, bool) {
+    let sin_comandos = radio.is_some_and(|r| r.is_err());
     let quien = vista.and_then(|v| match v.source {
+        Some(CommandSource::Coach) if sin_comandos => None,
         Some(CommandSource::Coach) if pausa => Some("quieto, coach en pausa"),
         Some(CommandSource::Coach) => v.role.map(nombre_rol),
         Some(CommandSource::GuiSkill) => Some("skill de la GUI"),
         Some(CommandSource::Manual) => Some("control manual"),
         Some(CommandSource::Halt) => Some("detenido"),
         Some(CommandSource::Stop) => Some("STOP del árbitro"),
+        None if sin_comandos => None,
         None => v.role.map(nombre_rol),
     });
-    let radio = radio.map(|p| format!("radio {p}"));
-    [quien.map(str::to_string), radio]
+    let texto = [quien.map(str::to_string), radio.map(texto_radio)]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    (texto, sin_comandos)
 }
 
 /// Datos de una fila; un dato que no existe en el tick se omite.
@@ -59,6 +81,8 @@ pub fn al_lado(vista: Option<&OwnRobotView>, radio: Option<usize>, pausa: bool) 
 pub struct DatosFila {
     pub titulo: String,
     pub al_lado: String,
+    /// El texto de al lado va en alerta: al robot no le llegan comandos.
+    pub al_lado_alerta: bool,
     pub skill: Option<String>,
     pub cara: Option<&'static str>,
     pub pedido: Option<String>,
@@ -134,9 +158,13 @@ pub fn datos_fila(
         .map(|r| (r.forward_speed(), r.angular_velocity as f32))
         .filter(|(v, w)| v.is_finite() && w.is_finite())
         .map(|(v, w)| par(v, w));
+    // La radio, de la identidad de la foto (solo con la base station).
+    let radio = snap.identidad.as_deref().filter(|_| run.is_base_station()).map(|i| i.radio_de(id));
+    let (al_lado, al_lado_alerta) = al_lado(vista, radio.as_ref(), coach_en_pausa && snap.rutina.is_none());
     DatosFila {
         titulo: format!("Robot {id}"),
-        al_lado: al_lado(vista, run.radio_slot(id), coach_en_pausa && snap.rutina.is_none()),
+        al_lado,
+        al_lado_alerta,
         skill,
         cara,
         pedido,
@@ -229,7 +257,9 @@ impl DebugGui {
             row![
                 text(d.titulo).font(fonts::TITULO).size(theme::TXT_NOMBRE),
                 horizontal_space(),
-                text(d.al_lado).size(theme::TXT_CHICO).style(theme::gris),
+                text(d.al_lado)
+                    .size(theme::TXT_CHICO)
+                    .style(if d.al_lado_alerta { theme::alerta } else { theme::gris }),
             ]
             .align_y(Alignment::Center),
         );
@@ -277,6 +307,7 @@ impl DebugGui {
 mod tests {
     use super::*;
     use crate::GUI::run_info::run_info_de_prueba;
+    use crate::identidad::Identidad;
     use crate::radio::RadioTarget;
     use crate::skills::{SkillId, SkillStatus};
     use crate::snapshot::CommandView;
@@ -391,19 +422,70 @@ mod tests {
         assert_eq!(d.skill, None);
     }
 
-    #[test]
-    fn base_station_shows_the_radio_position() {
+    fn base_station() -> RunInfo {
         let mut run = run_info_de_prueba();
         run.transport = RadioTarget::BaseStation;
-        run.slot_map.insert(1, 0);
-        run.slot_map.insert(0, 1);
-        let mut v = vista(1, CommandSource::Coach);
-        v.role = Some(Role::Support);
+        run
+    }
+
+    /// Foto con el robot `id` del coach (con rol) y esta identidad.
+    fn foto_con(id: i32, rol: Role, ident: Identidad) -> LoopSnapshot {
+        let mut v = vista(id, CommandSource::Coach);
+        v.role = Some(rol);
+        LoopSnapshot { own: vec![v], identidad: Some(std::sync::Arc::new(ident)), ..LoopSnapshot::default() }
+    }
+
+    #[test]
+    fn fila_radio_desde_identidad_de_la_foto() {
+        let mut ident = Identidad::default();
+        ident.robots[0].patron = Some(1);
+        ident.robots[1].patron = Some(0);
+        let snap = foto_con(1, Role::Support, ident);
+        let d = datos_fila(1, &base_station(), &snap, None, false);
+        assert_eq!((d.al_lado.as_str(), d.al_lado_alerta), ("apoyo, radio 0", false));
+        // En simulación no hay radio, aunque la foto traiga identidad.
+        assert_eq!(datos_fila(1, &run_info_de_prueba(), &snap, None, false).al_lado, "apoyo");
+    }
+
+    #[test]
+    fn fila_desactivado_en_alerta_y_sin_rol() {
+        let mut ident = Identidad::default();
+        ident.robots[1].activo = false;
+        let d = datos_fila(1, &base_station(), &foto_con(1, Role::Support, ident), None, false);
+        assert_eq!((d.al_lado.as_str(), d.al_lado_alerta), ("desactivado, radio 1", true));
+        // Tampoco "quieto, coach en pausa".
+        let mut ident = Identidad::default();
+        ident.robots[1].activo = false;
+        let d = datos_fila(1, &base_station(), &foto_con(1, Role::Support, ident), None, true);
+        assert_eq!(d.al_lado, "desactivado, radio 1");
+    }
+
+    #[test]
+    fn fila_patron_repetido_sin_rol() {
+        let mut ident = Identidad::default();
+        ident.robots[2].patron = Some(0);
+        let d = datos_fila(0, &base_station(), &foto_con(0, Role::Striker, ident), None, false);
+        assert_eq!((d.al_lado.as_str(), d.al_lado_alerta), ("patrón repetido, radios 0 y 2", true));
+    }
+
+    #[test]
+    fn fila_sin_radio_sin_rol() {
+        let mut ident = Identidad::default();
+        ident.robots[2].patron = None;
+        let d = datos_fila(2, &base_station(), &foto_con(2, Role::Keeper, ident), None, false);
+        assert_eq!((d.al_lado.as_str(), d.al_lado_alerta), ("sin radio", true));
+    }
+
+    #[test]
+    fn fila_sin_comandos_con_manual_dice_el_manual() {
+        let mut ident = Identidad::default();
+        ident.robots[1].activo = false;
         let snap = LoopSnapshot {
-            own: vec![v],
+            own: vec![vista(1, CommandSource::Manual)],
+            identidad: Some(std::sync::Arc::new(ident)),
             ..LoopSnapshot::default()
         };
-        assert_eq!(datos_fila(1, &run, &snap, None, false).al_lado, "apoyo, radio 0");
+        assert_eq!(datos_fila(1, &base_station(), &snap, None, false).al_lado, "control manual, desactivado, radio 1");
     }
 
     #[test]

@@ -2,10 +2,11 @@
 //! entorno con las mismas funciones que usan el lazo y la visión, y es de solo
 //! lectura: cambiarla exige reiniciar el proceso.
 
+use crate::identidad::{Cargada, Origen};
 use crate::radio::RadioTarget;
 use crate::skills::SkillId;
 use crate::vision::VisionSource;
-use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// Qué decide los comandos de los robots propios.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,8 +92,11 @@ pub struct RunInfo {
     /// Puerto y baud de la base station con que arrancó el proceso.
     pub radio_port: String,
     pub radio_baud: String,
-    /// `robot.radio_slot_by_vision_id`.
-    pub slot_map: BTreeMap<u32, u32>,
+    /// Archivo de la identidad de los robots: de donde se leyó al arrancar y donde la
+    /// pestaña Robots la guarda (`VSSL_IDENTIDAD` o `config/identidad_robots.json`).
+    pub identidad_ruta: PathBuf,
+    /// Si la identidad del arranque salió del archivo o es la por defecto.
+    pub identidad_origen: Origen,
 }
 
 impl RunInfo {
@@ -118,24 +122,22 @@ impl RunInfo {
                 .unwrap_or_else(|_| "/dev/ttyUSB0".to_string()),
             radio_baud: std::env::var("VSSL_BASESTATION_BAUD")
                 .unwrap_or_else(|_| "115200".to_string()),
-            slot_map: crate::params::params().robot.radio_slot_by_vision_id.clone(),
+            identidad_ruta: crate::identidad::ruta(),
+            identidad_origen: Origen::PorDefecto,
         }
+    }
+
+    /// Con la ruta y el origen de la identidad que cargó el binario.
+    pub fn con_identidad(mut self, cargada: &Cargada) -> Self {
+        self.identidad_ruta = cargada.ruta.clone();
+        self.identidad_origen = cargada.origen;
+        self
     }
 
     pub fn is_base_station(&self) -> bool {
         self.transport == RadioTarget::BaseStation
     }
 
-    /// El mapa visión → radio, solo con la base station (en simulación el id va directo).
-    pub fn radio_slots(&self) -> Option<&BTreeMap<u32, u32>> {
-        self.is_base_station().then_some(&self.slot_map)
-    }
-
-    /// Posición de radio de un robot propio, solo con la base station.
-    pub fn radio_slot(&self, id: i32) -> Option<usize> {
-        self.radio_slots()
-            .and_then(|m| crate::radio::base_station::radio_slot(id, m))
-    }
 }
 
 #[cfg(test)]
@@ -152,7 +154,8 @@ pub(crate) fn run_info_de_prueba() -> RunInfo {
         num_robots: 3,
         radio_port: "/dev/ttyUSB0".to_string(),
         radio_baud: "115200".to_string(),
-        slot_map: BTreeMap::new(),
+        identidad_ruta: PathBuf::from(crate::identidad::DEFAULT_PATH),
+        identidad_origen: Origen::PorDefecto,
     }
 }
 
@@ -188,16 +191,5 @@ mod tests {
         assert!(CoachKind::RuleBased.se_puede_pausar());
         assert!(!CoachKind::Off.se_puede_pausar());
         assert!(!CoachKind::Fixed(SkillId::GoTo).se_puede_pausar());
-    }
-
-    #[test]
-    fn radio_slot_only_with_the_base_station() {
-        let mut run = run_info_de_prueba();
-        run.slot_map.insert(1, 0);
-        run.slot_map.insert(0, 1);
-        assert_eq!(run.radio_slot(1), None, "en simulación no hay radio");
-        run.transport = RadioTarget::BaseStation;
-        assert_eq!(run.radio_slot(1), Some(0));
-        assert_eq!(run.radio_slot(2), Some(2), "sin entrada, el mismo id");
     }
 }

@@ -55,6 +55,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_REAL_CALIBRATION` | `config/real_calibration.json` | Otro archivo de calibración del robot real (ensayos). |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
 | `VSSL_BASESTATION_BAUD` | `115200` | Baudrate del enlace USB↔ESP32 base station. |
+| `VSSL_IDENTIDAD` | `config/identidad_robots.json` | Archivo de la identidad de los robots reales (qué patrón lleva cada radio). Solo con la base station; la pestaña Robots guarda ahí. Sin archivo, la radio N lleva el patrón N. |
 
 ---
 
@@ -721,19 +722,38 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 | `robot.max_v_mm_s` (`config/team_params.json`) | `1500` | Tope de v, el mismo clamp que aplica la base (`MAX_V_MM_S`) |
 | `robot.max_w_deg_s` (`config/team_params.json`) | `720` | Tope de ω en grados/s, el mismo clamp que aplica la base (`MAX_W_DEG_S`) |
 | `SLOT_COUNT` | `5` | Slots del frame ASCII; el robot físico con `MI_ROBOT_ID = N` (firmware, desde 1) lee `slots[N-1]`. El robot del checkout actual es `MI_ROBOT_ID 2` → slot 1 |
-| `robot.radio_slot_by_vision_id` (`config/team_params.json`) | `{}` | Mapa id de visión → posición del frame (ver abajo) |
+| Identidad de los robots (`config/identidad_robots.json`) | sin archivo: radio N ↔ patrón N | Qué patrón lleva cada robot físico y si está activo (ver abajo) |
 
-**Ids de visión y de radio.** Cada robot real tiene dos ids:
-- **id de visión:** el del parche de colores. Con él aparece en el `World` y en la GUI, y es el número que se elige en la GUI y en `skill_test --mode skill --robot`.
-- **id de radio:** `MI_ROBOT_ID` del firmware. El robot escucha la posición `MI_ROBOT_ID − 1` del frame.
+**Patrones y radios.** Cada robot real tiene dos números:
+- **patrón** (id de visión): el de su parche de colores. ssl-vision numera los patrones por su celda en `VsssPatern.png`, 4 por color de equipo (0 a 3). Con él aparece en el `World` y en la GUI, y es el número que se elige en la GUI y en `skill_test --mode skill --robot`. El coach manda los patrones 0 a 2.
+- **radio**: la posición del frame que escucha el robot, `MI_ROBOT_ID − 1` del firmware (0 a 4).
 
-Si no calzan, se declara el mapa en `robot.radio_slot_by_vision_id` como `{"<id de visión>": <posición>}`. Por ejemplo, `{"0": 1, "1": 0}`: la visión ve el robot como #1, pero ese robot tiene `MI_ROBOT_ID 1`, es decir, la posición 0. Un id sin entrada usa su propio número. Así, el manual, las skills y el coach le llegan al robot correcto.
+**La identidad de los robots** dice, por cada radio, qué patrón lleva el robot (o ninguno) y si está activo. Vive en `config/identidad_robots.json`, que **no se versiona** (es el estado de los robots de la salita, no una configuración del equipo):
 
-Reglas, validadas al cargar los params (si no se cumplen, el proceso no arranca y el error dice qué corregir):
-- toda posición está en `0..4`;
-- dos ids de visión nunca caen en la misma posición, **contando los ids sin entrada**. Por eso `{"1": 0}` solo no vale: el #0 seguiría yendo a la posición 0. Hay que mapear también el #0 a una posición libre.
+```json
+{ "robots": [
+  { "radio": 0, "patron": 1, "activo": true },
+  { "radio": 1, "patron": 0, "activo": true },
+  { "radio": 2, "patron": 2, "activo": false }
+] }
+```
 
-El mapa solo afecta a la base station; FIRASim y grSim usan el id directo. Al abrir la base, la terminal imprime el mapeo vigente (`[BaseStation] visión #1 → radio pos 0 (MI_ROBOT_ID 1)`), y la sección Radio del Inspector de la GUI lo muestra. `skill_test --mode vw --robot N` **no** pasa por el mapa: ahí N es la posición de radio cruda (bring-up sin visión).
+- **Sin archivo:** la radio N lleva el patrón N (la radio 4, ninguno), todas activas: el mismo frame de siempre. El archivo se crea la primera vez que se guarda desde la GUI.
+- **Otro archivo:** `VSSL_IDENTIDAD=<ruta>` (por ejemplo, uno por engine). La GUI guarda en esa misma ruta.
+- **Validación al arrancar:** radio en 0 a 4 sin repetir, patrón en 0 a 3. Con un archivo inválido, `main` y `skill_test` no arrancan y dicen qué corregir. Una radio que no aparece queda sin patrón y activa.
+- **Solo con la base station:** en FIRASim y grSim cada robot es su patrón, y el archivo no se lee.
+
+**Cuándo un patrón no recibe comandos:** si su robot está desactivado, si ninguna radio lo tiene o si dos radios lo tienen. Entonces:
+- esa posición del frame sale en `0,0` (el robot queda quieto);
+- el coach no lo cuenta: no lo elige de arquero ni de delantero (sale de su observación, como un robot que no se ve);
+- la asignación automática de las rutinas no lo elige.
+
+**Pestaña Robots de la GUI** (solo con la base station):
+- una fila por radio, con el patrón y el interruptor de activo, editables en vivo (rigen desde el tick siguiente y se guardan en el archivo), y una frase con lo que ve la cámara;
+- avisos: dos radios con el mismo patrón, un patrón que el coach no manda (el 3) visto en la cámara, un patrón visto que ningún robot tiene;
+- **Identificar:** con el coach en pausa (P), sin rutina, sin el manual ni una skill de la GUI, gira cada robot activo de a uno (90 °/s, 0.6 s de ida y 0.6 s de vuelta: termina donde empezó), ve qué patrón giró y propone la identidad. "Aplicar" la usa y la guarda; "Descartar" no cambia nada. Si no gira ninguno, giran dos con la misma radio (dos robots con el mismo `MI_ROBOT_ID`) o dos radios hacen girar el mismo patrón, lo dice en frase. Mientras gira, solo se mueve ese robot (el frame pone en cero a los demás); la parada de emergencia y HALT lo cortan en el acto, y sin refresco de la GUI se corta a los 250 ms.
+
+La terminal imprime la identidad al arrancar y en cada cambio (`[control_loop] identidad: radio 0 (MI_ROBOT_ID 1): patrón 1`), y la sección Radio del Inspector la muestra. `skill_test --mode vw --robot N` **no** pasa por la identidad: ahí N es la posición de radio cruda (bring-up sin visión).
 
 **Conversión** (en `command_to_vw`, única fuente de verdad del frame, el CSV y la GUI):
 ```

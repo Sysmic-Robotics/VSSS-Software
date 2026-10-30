@@ -102,6 +102,17 @@ impl Observation {
         }
     }
 
+    /// Quita de los robots propios a esos ids (los que estén en 0..3): quedan como un robot
+    /// que la visión no ve (`RobotObs::default()`, `active = 0`). Lo usa `CoachDecider` con
+    /// los patrones sin comandos (`Identidad::sin_comandos`).
+    pub fn quitar_propios(&mut self, ids: &[i32]) {
+        for id in ids {
+            if let Some(r) = usize::try_from(*id).ok().and_then(|i| self.own_robots.get_mut(i)) {
+                *r = RobotObs::default();
+            }
+        }
+    }
+
     /// Serializa la observación a un Vec<f32> plano para pasarle al modelo.
     /// El layout es fijo (ver `FLAT_SIZE`).
     pub fn to_flat_vec(&self) -> Vec<f32> {
@@ -215,6 +226,35 @@ mod tests {
         let obs = Observation::from_world(&world, 0);
         assert!((obs.ball.x - 0.5).abs() < 0.01);
         assert!((obs.ball.y - 0.5).abs() < 0.01);
+    }
+
+    fn mundo_con(ids: &[i32]) -> World {
+        let mut world = World::new(3, 3);
+        for id in ids {
+            let x = 0.1 * (*id as f32 + 1.0);
+            world.update_robot(*id, 0, glam::Vec2::new(x, -x), 0.3, glam::Vec2::new(0.1, 0.0), 0.5);
+        }
+        world.update_robot(0, 1, glam::Vec2::new(0.5, 0.2), 1.0, glam::Vec2::ZERO, 0.0);
+        world.update_ball(glam::Vec2::new(0.2, 0.1), glam::Vec2::ZERO);
+        world
+    }
+
+    #[test]
+    fn quitar_propios_igual_que_no_verlo() {
+        let mut obs = Observation::from_world(&mundo_con(&[0, 1, 2]), 0);
+        obs.quitar_propios(&[1]);
+        let sin_1 = Observation::from_world(&mundo_con(&[0, 2]), 0);
+        assert_eq!(obs.to_flat_vec(), sin_1.to_flat_vec());
+        assert_eq!(obs.own_robots[1].active, 0.0);
+        assert_eq!(obs.own_robots[0].active, 1.0);
+    }
+
+    #[test]
+    fn quitar_propios_ignora_ids_fuera_de_rango() {
+        let antes = Observation::from_world(&mundo_con(&[0, 1, 2]), 0);
+        let mut obs = antes.clone();
+        obs.quitar_propios(&[-1, 3, 9]);
+        assert_eq!(obs.to_flat_vec(), antes.to_flat_vec());
     }
 
     #[test]

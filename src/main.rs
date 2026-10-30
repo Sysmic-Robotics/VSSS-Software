@@ -23,6 +23,7 @@ use rustengine::control_loop::{
     CoachDecider, ControlLoopConfig, GuiChannels, GuiSkillCommand, HeadingPid, ManualCommand,
     TickDecider, run_control_loop,
 };
+use rustengine::identidad::{Cargada, Identidad, OrdenIdentidad};
 use rustengine::radio::{RadioTarget, TeamColor};
 use rustengine::rutinas::resumen::{VigiaResumen, corrida_json, escribir_resumen, junto_al_log};
 use rustengine::rutinas::{DecisorConRutinas, OrdenRutina};
@@ -113,18 +114,21 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // Identidad de los robots (qué patrón lleva cada radio), solo con la base station y
+    // antes de abrir nada: un archivo inválido no arranca. En simulación no se lee.
+    let identidad = rustengine::identidad::para_transporte("main", RadioTarget::from_env() == RadioTarget::BaseStation);
     if con_gui {
-        run_with_gui(shutdown, pausa);
+        run_with_gui(shutdown, pausa, identidad);
     } else {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(None, None, shutdown));
+        rt.block_on(async_main(None, None, shutdown, identidad.identidad));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Modo debug: GUI en el hilo principal, tokio en background
 // ─────────────────────────────────────────────────────────────────────────────
-fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool) {
+fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada) {
     // Foto de cada tick, lazo → GUI (canal de "último valor": nunca frena el lazo).
     let (snapshot_tx, snapshot_rx) = rustengine::snapshot::snapshot_channel();
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
@@ -133,6 +137,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool) {
     let (teleport_tx, teleport_rx) =
         mpsc::channel::<Vec<rustengine::radio::TeleportItem>>(16);
     let (rutina_tx, rutina_rx) = mpsc::channel::<OrdenRutina>(16);
+    let (identidad_tx, identidad_rx) = mpsc::channel::<OrdenIdentidad>(16);
     let estop = Arc::new(AtomicBool::new(false));
 
     // Configuración de la corrida para la barra de estado y el Inspector (solo lectura).
@@ -142,7 +147,8 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool) {
         own_team_from_env(),
         NUM_ROBOTS,
         GUI::CoachKind::from_env(),
-    );
+    )
+    .con_identidad(&identidad);
     // Interruptor del coach, compartido con el conmutador: solo si hay un coach que pausar.
     let coach_pausa = if run.coach.se_puede_pausar() {
         Some(Arc::new(AtomicBool::new(pausa)))
@@ -159,9 +165,10 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool) {
     let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(
-            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx, rutina_rx)),
+            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx, rutina_rx, identidad_rx)),
             coach_pausa_loop,
             shutdown_loop,
+            identidad.identidad,
         ));
     });
 
@@ -172,6 +179,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool) {
         pid_tx: Some(pid_tx),
         teleport_tx: Some(teleport_tx),
         rutina_tx: Some(rutina_tx),
+        identidad_tx: Some(identidad_tx),
         estop,
         coach_pausa,
         run,
@@ -201,12 +209,14 @@ type GuiChannelBundle = (
     mpsc::Receiver<HeadingPid>,
     mpsc::Receiver<Vec<rustengine::radio::TeleportItem>>,
     mpsc::Receiver<OrdenRutina>,
+    mpsc::Receiver<OrdenIdentidad>,
 );
 
 async fn async_main(
     gui_channels: Option<GuiChannelBundle>,
     coach_pausa: Option<Arc<AtomicBool>>,
     shutdown: Arc<AtomicBool>,
+    identidad: Identidad,
 ) {
     if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
         eprintln!("[main] no pude registrar las señales de terminación: {e}");
@@ -251,8 +261,8 @@ async fn async_main(
     };
     // Con GUI, las rutinas: el coach (o ninguno) hasta que la GUI prepara una.
     let (gui_channels, rutina_rx) = match gui_channels {
-        Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, rutina_rx)) => (
-            Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)),
+        Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, rutina_rx, identidad_rx)) => (
+            Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, identidad_rx)),
             Some(rutina_rx),
         ),
         None => (None, None),
@@ -313,16 +323,18 @@ async fn async_main(
         referee: Some(referee.clone()),
         // El CSV de partido lleva la depuración por tick (columnas al final).
         exportar_depuracion: on_tick.is_some(),
+        identidad,
     };
 
     let gui = gui_channels.map(
-        |(snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx)| GuiChannels {
+        |(snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, identidad_rx)| GuiChannels {
             snapshot_tx,
             manual_rx: Some(manual_rx),
             skill_rx: Some(skill_rx),
             estop: Some(estop),
             pid_rx: Some(pid_rx),
             teleport_rx: Some(teleport_rx),
+            identidad_rx: Some(identidad_rx),
         },
     );
 

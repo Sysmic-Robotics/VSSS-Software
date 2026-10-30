@@ -21,6 +21,7 @@ mod por_que;
 #[cfg(test)]
 mod render_tests;
 mod robot_rows;
+mod robots;
 mod rutinas;
 pub mod run_info;
 mod status_line;
@@ -190,11 +191,12 @@ pub fn texto_ninguna(coach_en_pausa: bool) -> (&'static str, &'static str) {
     }
 }
 
-/// Aviso de Herramientas cuando un jugador maneja al arquero del coach con el coach
-/// activo (`coach-pausa`): el coach no lo reemplaza y el arco queda solo.
-pub fn aviso_arquero_manual(jugadores: &[Option<(i32, i32)>], own_team: i32, keeper_id: i32, coach_activo: bool) -> Option<String> {
-    (coach_activo && jugadores.contains(&Some((own_team, keeper_id))))
-        .then(|| format!("el robot {keeper_id} es el arquero del coach: el arco queda solo"))
+/// Aviso de Herramientas cuando un jugador maneja al arquero vigente (el de la foto, que
+/// con el coach activo es el del coach) con el coach activo (`coach-pausa`): el coach no
+/// lo reemplaza y el arco queda solo.
+pub fn aviso_arquero_manual(jugadores: &[Option<(i32, i32)>], own_team: i32, arquero: i32, coach_activo: bool) -> Option<String> {
+    (coach_activo && jugadores.contains(&Some((own_team, arquero))))
+        .then(|| format!("el robot {arquero} es el arquero del coach: el arco queda solo"))
 }
 
 /// Línea de ayuda de la skill activa: qué significa el click para esa skill (el
@@ -230,11 +232,12 @@ pub fn skill_help(skill: Option<SkillId>) -> &'static str {
         }
         Some(SkillId::GoalKeep) => {
             "el click no se usa: arquero en la línea del arco propio (VSSL_SIDE). Solo el \
-             robot coach.keeper_id puede entrar al área."
+             arquero (ver abajo) puede entrar al área."
         }
         Some(SkillId::RailKeeper) => {
             "el click no se usa: arquero sobre un riel a 5 cm del arco propio, orientado a lo \
-             largo de él, anticipando el empuje rival (VSSL_SIDE). Solo coach.keeper_id entra al área."
+             largo de él, anticipando el empuje rival (VSSL_SIDE). Solo el arquero (ver abajo) \
+             entra al área."
         }
         Some(SkillId::Mark) => "click = dónde pararse; queda mirando a la pelota.",
         Some(SkillId::Dribble) => "click = hacia dónde llevar la pelota (campo univectorial).",
@@ -276,20 +279,27 @@ pub fn skill_marker(skill: SkillId, click: Vec2, own_goal: Vec2) -> Option<Vec2>
     }
 }
 
-/// Aviso para `GoalKeep` en un robot que no es el arquero: el `ZoneGuard` del
-/// loop solo deja entrar al área propia a `coach.keeper_id`, y la GUI no se
-/// exime del guardia (mismo comportamiento que `main` y `skill_test`).
+/// Aviso para `GoalKeep` o `RailKeeper` en un robot que no es el arquero: el `ZoneGuard`
+/// del loop solo deja entrar al área propia al arquero vigente (el de la foto), y la GUI
+/// no se exime del guardia (mismo comportamiento que `main` y `skill_test`).
 pub fn keeper_warning(
     skill: Option<SkillId>,
     selected_robot: u32,
-    keeper_id: i32,
+    arquero: i32,
 ) -> Option<String> {
-    (matches!(skill, Some(SkillId::GoalKeep | SkillId::RailKeeper)) && selected_robot as i32 != keeper_id).then(|| {
+    (matches!(skill, Some(SkillId::GoalKeep | SkillId::RailKeeper)) && selected_robot as i32 != arquero).then(|| {
         format!(
-            "este robot no es el arquero (keeper_id = {keeper_id} en team_params.json): \
+            "este robot no es el arquero (el arquero es el robot {arquero}): \
              el guardia no lo deja entrar al área"
         )
     })
+}
+
+/// Nota de solo lectura de la sección Skills con el lado del arco propio y el arquero
+/// vigente de la foto (`gui-skill-runner`).
+pub fn nota_arco(arco_izquierdo: bool, arquero: i32) -> String {
+    let lado = if arco_izquierdo { "izquierdo" } else { "derecho" };
+    format!("Arco propio: {lado} (VSSL_SIDE). Arquero: robot {arquero}.")
 }
 
 /// Agrega una muestra a una serie de telemetría, descartando las más viejas al
@@ -323,7 +333,8 @@ const VENTANA_INICIAL: (f32, f32) = (1440.0, 900.0);
 /// Ancho de la planilla de robots y del panel de pestañas, y alto de los gráficos.
 const ANCHO_ROBOTS: f32 = 300.0;
 const ANCHO_PANEL: f32 = 300.0;
-/// Espaciado y margen lateral de la barra de pestañas (cinco en `ANCHO_PANEL`).
+/// Espaciado y margen lateral de la barra de pestañas (cinco en una línea de `ANCHO_PANEL`;
+/// con la base station, seis en dos).
 const BARRA_PESTANAS_SP: f32 = theme::SP_XS;
 const BARRA_PESTANAS_MARGEN: f32 = 4.0;
 const ALTO_GRAFICOS: f32 = 168.0;
@@ -338,14 +349,21 @@ pub enum Tab {
     Arbitro,
     /// Rutinas: lista, opciones, botones por fase y estado (capability `gui-rutinas`).
     Rutinas,
+    /// Identidad de los robots reales (capability `gui-robots`), solo con la base station.
+    Robots,
     Parametros,
     /// Provisional hasta la fase 4: control manual, skills de la GUI y teleport.
     Herramientas,
 }
 
 impl Tab {
-    /// Las implementadas en esta fase.
-    pub const VISIBLES: [Tab; 5] = [Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Parametros, Tab::Herramientas];
+    /// Las implementadas en esta fase, en orden. Robots, solo con la base station.
+    pub fn visibles(base_station: bool) -> Vec<Tab> {
+        [Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Robots, Tab::Parametros, Tab::Herramientas]
+            .into_iter()
+            .filter(|t| *t != Tab::Robots || base_station)
+            .collect()
+    }
 
     pub fn titulo(self) -> &'static str {
         match self {
@@ -353,6 +371,7 @@ impl Tab {
             Tab::Inspector => "Inspector",
             Tab::Arbitro => "Árbitro",
             Tab::Rutinas => "Rutinas",
+            Tab::Robots => "Robots",
             Tab::Parametros => "Parámetros",
             Tab::Herramientas => "Herramientas",
         }
@@ -416,6 +435,8 @@ pub enum Message {
     SetMarcas(MarcasRobot),
     /// Pestaña Rutinas.
     Rutina(rutinas::MensajeRutina),
+    /// Pestaña Robots.
+    Robots(robots::MensajeRobots),
 }
 
 /// Cuadros por segundo de la propia GUI (fotos procesadas por segundo).
@@ -465,6 +486,9 @@ pub struct GuiSetup {
     /// Órdenes de las rutinas → conmutador de `main`. `None` (p. ej. `scenario`): la
     /// pestaña muestra la lista y la vista previa, sin poder preparar.
     pub rutina_tx: Option<mpsc::Sender<OrdenRutina>>,
+    /// Órdenes de la pestaña Robots → lazo (identidad y giro de identificación). `None`:
+    /// la pestaña muestra la identidad sin poder editarla.
+    pub identidad_tx: Option<mpsc::Sender<crate::identidad::OrdenIdentidad>>,
     /// Flag de parada de emergencia compartido con el lazo.
     pub estop: Arc<AtomicBool>,
     /// Interruptor del coach (en pausa = `true`), compartido con el conmutador de `main`.
@@ -526,7 +550,8 @@ pub struct DebugGui {
     skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
     /// Centro del arco propio (m), desde `VSSL_SIDE`.
     own_goal: Vec2,
-    /// Único robot que el `ZoneGuard` deja entrar al área propia (`coach.keeper_id`).
+    /// `coach.keeper_id` de los parámetros: el arquero de los puestos `arquero` de las
+    /// rutinas (D4 de `arquero`). El arquero vigente del guardia viene en la foto.
     keeper_id: i32,
     // Tuning.
     spin_omega: f64,
@@ -567,6 +592,8 @@ pub struct DebugGui {
     trazas: capas::Trazas,
     // Pestaña Rutinas.
     rutinas: rutinas::EstadoRutinas,
+    // Pestaña Robots.
+    robots: robots::EstadoRobots,
 }
 
 impl DebugGui {
@@ -651,6 +678,7 @@ impl DebugGui {
                 telemetry_window_s: TELEMETRY_WINDOW_DEFAULT_S,
                 run: setup.run,
                 rutinas,
+                robots: robots::EstadoRobots::new(setup.identidad_tx),
             },
             Task::none(),
         )
@@ -676,6 +704,7 @@ impl DebugGui {
                 self.salud.push(snap.t_ms, snap.vision, snap.radio);
                 self.trazas.registrar(&snap);
                 self.snap = snap;
+                self.foto_robots();
                 self.registrar_cuadros();
                 if !self.telemetry_frozen {
                     self.registrar_series();
@@ -810,6 +839,8 @@ impl DebugGui {
                 // Enclava o libera.
                 let ahora = self.estop.load(Ordering::Relaxed);
                 self.estop.store(!ahora, Ordering::Relaxed);
+                // Al enclavarla corta la identificación ya (el lazo borra el giro igual).
+                self.paso_identificacion(Instant::now(), false);
             }
             Message::TpRobotXChanged(s) => self.tp_robot_x = s,
             Message::TpRobotYChanged(s) => self.tp_robot_y = s,
@@ -859,6 +890,7 @@ impl DebugGui {
             }
             Message::SetMarcas(m) => self.marcas = m,
             Message::Rutina(m) => self.mensaje_rutina(m),
+            Message::Robots(m) => self.mensaje_robots(m),
         }
         Task::none()
     }
@@ -964,6 +996,7 @@ impl DebugGui {
                     for j in &mut self.jugadores {
                         j.soltar();
                     }
+                    self.paso_identificacion(Instant::now(), false);
                 }
                 AccionTecla::SalirManual => self.set_manual(false),
                 AccionTecla::AlternarCoach => {
@@ -1242,7 +1275,7 @@ impl DebugGui {
             skill_target: self
                 .active_skill
                 .and_then(|s| skill_marker(s, self.skill_target, self.own_goal)),
-            radio_slots: self.run.radio_slots(),
+            identidad: self.snap.identidad.as_deref(),
             capas: &self.capas,
             trazas: &self.trazas,
             sim: !self.run.is_base_station(),
@@ -1263,9 +1296,10 @@ impl DebugGui {
 
     /// Panel derecho: barra de pestañas y la pestaña activa (con scroll).
     fn vista_panel(&self) -> Element<'_, Message> {
-        // Cinco pestañas en 300 px: espaciado y margen chicos, texto de 12 px.
+        // Cinco pestañas en 300 px: espaciado y margen chicos, texto de 12 px. Con la base
+        // station son seis y no entran: la barra sigue en una segunda línea (`wrap`).
         let mut barra = row![].spacing(BARRA_PESTANAS_SP).align_y(Alignment::End);
-        for t in Tab::VISIBLES {
+        for t in Tab::visibles(self.run.is_base_station()) {
             let activa = t == self.tab;
             let boton = button(
                 text(t.titulo())
@@ -1287,13 +1321,14 @@ impl DebugGui {
             Tab::Herramientas => self.pestana_herramientas(),
             Tab::Inspector => self.pestana_inspector(),
             Tab::Rutinas => self.pestana_rutinas(),
+            Tab::Robots => self.pestana_robots(),
             Tab::Parametros => self.pestana_parametros(),
             Tab::PorQue => self.pestana_por_que(),
             Tab::Arbitro => text("Llega en una fase posterior.").into(),
         };
         container(
             column![
-                container(barra).padding([8.0, BARRA_PESTANAS_MARGEN]),
+                container(barra.wrap()).padding([8.0, BARRA_PESTANAS_MARGEN]),
                 horizontal_rule(1).style(theme::filete),
                 scrollable(container(contenido).padding([10, 14]).width(Length::Fill))
                     .height(Length::Fill),
@@ -1395,17 +1430,43 @@ pub fn run_gui(setup: GuiSetup) -> iced::Result {
 mod tests {
     use super::*;
 
+    /// Líneas que ocupa la barra con `Row::wrap` (el mismo reparto: un título baja de
+    /// línea si no entra entero), con la estimación de ancho del texto.
+    fn lineas_de_barra(tabs: &[Tab]) -> usize {
+        let disponible = ANCHO_PANEL - 2.0 * BARRA_PESTANAS_MARGEN;
+        let mut lineas = 1;
+        let mut x = 0.0;
+        for t in tabs {
+            let w = field::ancho_texto(t.titulo(), theme::TXT_PESTANA);
+            assert!(w <= disponible, "el título {} no entra ni solo", t.titulo());
+            if x > 0.0 && x + w > disponible {
+                lineas += 1;
+                x = 0.0;
+            }
+            x += w + BARRA_PESTANAS_SP;
+        }
+        lineas
+    }
+
     #[test]
-    fn the_five_tabs_fit_in_the_panel() {
-        assert_eq!(Tab::VISIBLES[2], Tab::Rutinas, "Rutinas va después de Inspector");
-        let titulos: f32 = Tab::VISIBLES
-            .iter()
-            .map(|t| field::ancho_texto(t.titulo(), theme::TXT_PESTANA))
-            .sum();
-        let total = titulos
-            + BARRA_PESTANAS_SP * (Tab::VISIBLES.len() - 1) as f32
-            + 2.0 * BARRA_PESTANAS_MARGEN;
-        assert!(total <= ANCHO_PANEL, "la barra mide {total} px");
+    fn cinco_pestanas_en_sim_en_una_linea() {
+        let tabs = Tab::visibles(false);
+        assert_eq!(tabs, vec![Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Parametros, Tab::Herramientas]);
+        assert_eq!(lineas_de_barra(&tabs), 1);
+    }
+
+    #[test]
+    fn seis_pestanas_en_a_lo_mas_dos_lineas() {
+        let tabs = Tab::visibles(true);
+        assert_eq!(tabs[2], Tab::Rutinas, "Rutinas va después de Inspector");
+        assert_eq!(tabs[3], Tab::Robots, "Robots, después de Rutinas");
+        assert_eq!(lineas_de_barra(&tabs), 2);
+    }
+
+    #[test]
+    fn robots_solo_con_base_station() {
+        assert!(Tab::visibles(true).contains(&Tab::Robots));
+        assert!(!Tab::visibles(false).contains(&Tab::Robots));
     }
 
     #[tokio::test]
@@ -1444,6 +1505,7 @@ mod tests {
             pid_tx: None,
             teleport_tx: None,
             rutina_tx: None,
+            identidad_tx: None,
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: Some(pausa.clone()),
             run: run_info::run_info_de_prueba(),
@@ -1790,6 +1852,11 @@ mod tests {
         assert_eq!(aviso_arquero_manual(&j, 0, 2, false), None, "con el coach en pausa no");
         assert_eq!(aviso_arquero_manual(&[Some((0, 0)), None], 0, 2, true), None);
         assert_eq!(aviso_arquero_manual(&[Some((1, 2)), None], 0, 2, true), None, "rival");
+        // Arquero de reemplazo: el 0 es el arquero vigente y lo toma el jugador 1.
+        assert_eq!(
+            aviso_arquero_manual(&[Some((0, 0)), None], 0, 0, true).as_deref(),
+            Some("el robot 0 es el arquero del coach: el arco queda solo")
+        );
     }
 
     /// 3.5 — La rampa no sobrepasa, converge y decae hacia cero.
@@ -1893,14 +1960,25 @@ mod tests {
         assert_eq!(own_goal_center(false), Vec2::new(0.75, 0.0));
     }
 
-    /// El aviso aparece solo con GoalKeep en un robot que no es el arquero.
+    /// El aviso aparece solo con GoalKeep o RailKeeper en un robot que no es el arquero
+    /// vigente (`gui-skill-runner`).
     #[test]
     fn keeper_warning_only_for_goalkeep_off_keeper() {
         let w = keeper_warning(Some(SkillId::GoalKeep), 1, 2).expect("robot 1 no es el arquero");
-        assert!(w.contains("keeper_id = 2"), "{w}");
+        assert_eq!(w, "este robot no es el arquero (el arquero es el robot 2): el guardia no lo deja entrar al área");
         assert_eq!(keeper_warning(Some(SkillId::GoalKeep), 2, 2), None);
         assert_eq!(keeper_warning(Some(SkillId::BlockLine), 1, 2), None);
         assert_eq!(keeper_warning(None, 1, 2), None);
+        // Arquero de reemplazo: con el 0 de arquero vigente, el 0 no lleva aviso y el 2 sí.
+        assert_eq!(keeper_warning(Some(SkillId::RailKeeper), 0, 0), None);
+        assert!(keeper_warning(Some(SkillId::RailKeeper), 2, 0).is_some_and(|w| w.contains("robot 0")));
+    }
+
+    /// La nota de la sección Skills nombra al arquero vigente, no a `coach.keeper_id`.
+    #[test]
+    fn the_goal_note_names_the_current_keeper() {
+        assert_eq!(nota_arco(true, 0), "Arco propio: izquierdo (VSSL_SIDE). Arquero: robot 0.");
+        assert_eq!(nota_arco(false, 2), "Arco propio: derecho (VSSL_SIDE). Arquero: robot 2.");
     }
 
     /// Round-trip del preset de tuning (serialize → deserialize preserva valores).

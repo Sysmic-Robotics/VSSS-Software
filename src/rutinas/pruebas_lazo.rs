@@ -72,9 +72,9 @@ impl Lazo {
             d,
             self.tick,
             &mut self.catalog,
-            &self.motion,
+            &mut self.motion,
             &mut self.recovery,
-            &self.guard,
+            &mut self.guard,
             &self.manual,
             &self.gui,
             0,
@@ -310,6 +310,65 @@ impl TickDecider for Espia {
     fn role(&self, _robot_id: i32) -> Option<Role> {
         Some(Role::Striker)
     }
+}
+
+/// Decisor de base espía: anota la lista sin comandos que recibe.
+struct EspiaSinComandos {
+    lista: Arc<Mutex<Option<Vec<i32>>>>,
+}
+
+impl TickDecider for EspiaSinComandos {
+    fn decide(&mut self, _tick: u32, _world: &World) -> Vec<SkillChoice> {
+        Vec::new()
+    }
+
+    fn usar_sin_comandos(&mut self, patrones: &[i32]) {
+        *self.lista.lock().unwrap() = Some(patrones.to_vec());
+    }
+}
+
+/// El robot 0 en el inicio del puesto y el 1 lejos.
+fn dos_robots() -> World {
+    let mut w = en_inicio();
+    w.update_robot(1, 0, Vec2::new(0.3, 0.35), 0.0, Vec2::ZERO, 0.0);
+    w
+}
+
+/// Prepara la rutina de un puesto con el conmutador `d` y devuelve el robot asignado.
+fn asignado_por(d: &mut DecisorConRutinas, tx: &mpsc::Sender<OrdenRutina>) -> Vec<i32> {
+    let rutina = prueba::rutina(&prueba::un_puesto(IR_LEJOS));
+    tx.try_send(OrdenRutina::Preparar { rutina, opciones: opciones(100, false) }).unwrap();
+    let mut lazo = Lazo::new(false);
+    let w = dos_robots();
+    for _ in 0..5 {
+        lazo.paso(TickMode::Play, false, false, &w, d);
+    }
+    d.rutina().expect("rutina preparada").robots.iter().map(|r| r.robot).collect()
+}
+
+#[test]
+fn conmutador_reparte_sin_comandos() {
+    let (tx, rx) = mpsc::channel(8);
+    let lista = Arc::new(Mutex::new(None));
+    let mut d = DecisorConRutinas::new(Box::new(EspiaSinComandos { lista: lista.clone() }), rx, 0, 3);
+    d.usar_sin_comandos(&[0]);
+    assert_eq!(*lista.lock().unwrap(), Some(vec![0]), "la base recibe la lista");
+    // Con una rutina activa, la base la sigue recibiendo.
+    assert_eq!(asignado_por(&mut d, &tx), vec![1]);
+    d.usar_sin_comandos(&[]);
+    assert_eq!(*lista.lock().unwrap(), Some(vec![]));
+}
+
+#[test]
+fn rutina_nueva_recibe_la_lista_vigente() {
+    // Sin lista, el más cercano (el 0); con el 0 sin comandos, el 1.
+    let (tx, rx) = mpsc::channel(8);
+    let mut d = DecisorConRutinas::new(Box::new(EspiaSinComandos { lista: Arc::new(Mutex::new(None)) }), rx, 0, 3);
+    assert_eq!(asignado_por(&mut d, &tx), vec![0]);
+    let (tx, rx) = mpsc::channel(8);
+    let mut d = DecisorConRutinas::new(Box::new(EspiaSinComandos { lista: Arc::new(Mutex::new(None)) }), rx, 0, 3);
+    d.usar_sin_comandos(&[0]);
+    assert_eq!(asignado_por(&mut d, &tx), vec![1]);
 }
 
 struct ConCoach {
@@ -599,6 +658,8 @@ const ERROR_MAX_CORDURA_M: f64 = 0.25;
 /// Decisor de base espía de tres robots: GoTo para los ids 0–2, y anota los ticks.
 struct EspiaTres {
     ticks: Arc<Mutex<Vec<u32>>>,
+    /// Arquero que declara (como `CoachDecider`), o ninguno.
+    arquero: Option<i32>,
 }
 
 impl TickDecider for EspiaTres {
@@ -611,6 +672,10 @@ impl TickDecider for EspiaTres {
 
     fn role(&self, _robot_id: i32) -> Option<Role> {
         Some(Role::Support)
+    }
+
+    fn arquero(&self) -> Option<i32> {
+        self.arquero
     }
 }
 
@@ -636,10 +701,15 @@ struct ConPausa {
 
 impl ConPausa {
     fn nuevo(en_pausa: bool) -> Self {
+        Self::con_arquero(en_pausa, None)
+    }
+
+    /// Con una base que declara `arquero`.
+    fn con_arquero(en_pausa: bool, arquero: Option<i32>) -> Self {
         let (tx, rx) = mpsc::channel(8);
         let ticks = Arc::new(Mutex::new(Vec::new()));
         let pausa = Arc::new(std::sync::atomic::AtomicBool::new(en_pausa));
-        let d = DecisorConRutinas::new(Box::new(EspiaTres { ticks: ticks.clone() }), rx, 0, 3)
+        let d = DecisorConRutinas::new(Box::new(EspiaTres { ticks: ticks.clone(), arquero }), rx, 0, 3)
             .con_pausa(pausa.clone());
         Self { lazo: Lazo::new(false), d, tx, ticks, pausa }
     }
@@ -794,4 +864,67 @@ fn the_pause_shows_also_in_ticks_without_decide() {
     c.pausar(false);
     c.lazo.paso(TickMode::Halt, false, false, &tres_robots(), &mut c.d);
     assert_eq!(c.d.role(0), Some(Role::Support), "al reanudar, otra vez el coach");
+}
+
+// ─── Arquero vigente (change `arquero`) ─────────────────────────────────────
+
+/// Rutina de un robot cuyo único puesto es de arquero.
+fn rutina_de_arquero() -> Arc<Rutina> {
+    let texto = prueba::un_puesto(r#"{ "paso": "esperar", "tiempo_s": 0.3 }"#)
+        .replace(r#""nombre": "A","#, r#""nombre": "A", "arquero": true,"#);
+    prueba::rutina(&texto)
+}
+
+#[test]
+fn the_coach_keeper_stays_while_paused_and_with_a_manual_robot() {
+    let mut c = ConPausa::con_arquero(false, Some(0));
+    c.tick();
+    assert_eq!(c.lazo.guard.keeper(), 0, "el arquero del coach");
+    c.manual(0, 0.2);
+    c.tick();
+    assert_eq!(c.lazo.guard.keeper(), 0, "tomarlo en manual no cambia el arquero");
+    c.lazo.manual.clear();
+    c.pausar(true);
+    for _ in 0..5 {
+        c.tick();
+        assert_eq!(c.d.role(0), None, "en pausa no hay roles");
+        assert_eq!((c.d.arquero(), c.lazo.guard.keeper()), (Some(0), 0), "pero sí arquero");
+    }
+}
+
+#[test]
+fn a_routine_without_a_keeper_post_keeps_the_last_keeper() {
+    let mut c = ConPausa::con_arquero(false, Some(0));
+    c.tick();
+    let rutina = prueba::rutina(&prueba::un_puesto(r#"{ "paso": "esperar", "tiempo_s": 0.3 }"#));
+    c.tx.try_send(OrdenRutina::Preparar { rutina, opciones: opciones(100, true) }).unwrap();
+    for _ in 0..30 {
+        c.tick();
+        assert_eq!(c.d.arquero(), None, "la rutina no tiene puesto de arquero");
+        assert_eq!(c.lazo.guard.keeper(), 0, "queda el último: {:?}", c.d.fase());
+    }
+}
+
+#[test]
+fn a_routine_keeper_post_is_the_keeper_until_it_is_closed() {
+    let mut c = ConPausa::con_arquero(false, Some(0));
+    c.tick();
+    assert_eq!(c.lazo.guard.keeper(), 0);
+    // La asignación lleva el puesto de arquero al `keeper_id` de los parámetros (el 2).
+    c.tx.try_send(OrdenRutina::Preparar { rutina: rutina_de_arquero(), opciones: opciones(100, false) }).unwrap();
+    c.tick();
+    c.tick();
+    assert_eq!(c.d.fase(), Some(Fase::Preparando));
+    assert_eq!((c.d.arquero(), c.lazo.guard.keeper()), (Some(2), 2));
+    // Una rutina fallida no opina: queda el 2.
+    c.d.provocar_panico();
+    c.tick();
+    assert_eq!(c.d.fase(), Some(Fase::Abortada));
+    assert_eq!((c.d.arquero(), c.lazo.guard.keeper()), (None, 2));
+    // Al cerrarla vuelve el arquero del coach.
+    c.tx.try_send(OrdenRutina::Cerrar).unwrap();
+    c.tick();
+    c.tick();
+    assert_eq!(c.d.fase(), None);
+    assert_eq!((c.d.arquero(), c.lazo.guard.keeper()), (Some(0), 0));
 }

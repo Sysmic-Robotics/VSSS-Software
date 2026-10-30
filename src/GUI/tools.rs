@@ -5,7 +5,7 @@
 use super::field::{Fieltro, OrientacionVista};
 use super::tag::MarcasRobot;
 use super::{
-    DebugGui, Message, SKILL_GROUPS, aviso_arquero_manual, fonts, keeper_warning, skill_help,
+    DebugGui, Message, SKILL_GROUPS, aviso_arquero_manual, fonts, keeper_warning, nota_arco, skill_help,
     texto_ninguna, theme,
 };
 use iced::widget::{
@@ -114,7 +114,7 @@ impl DebugGui {
 
         let rutina_en_curso = self.snap.rutina.as_ref().is_some_and(|v| v.fase.activa());
         let arquero = self.manual_enabled.then(|| {
-            aviso_arquero_manual(&self.robots_jugadores(), self.run.own_team, self.keeper_id, self.coach_activo())
+            aviso_arquero_manual(&self.robots_jugadores(), self.run.own_team, self.snap.arquero, self.coach_activo())
         });
         column![
             titulo("Control manual"),
@@ -177,7 +177,7 @@ impl DebugGui {
         {
             col = col.push(text(aviso.clone()).size(theme::TXT_CHICO).style(theme::alerta));
         }
-        if let Some(aviso) = keeper_warning(self.active_skill, self.selected_robot, self.keeper_id) {
+        if let Some(aviso) = keeper_warning(self.active_skill, self.selected_robot, self.snap.arquero) {
             col = col.push(text(aviso).size(theme::TXT_CHICO).style(theme::alerta));
         }
         let motion = if self.run.bidirectional {
@@ -185,12 +185,8 @@ impl DebugGui {
         } else {
             "Motion de una cara (bidireccional apagado)."
         };
-        let lado = if self.own_goal.x < 0.0 { "izquierdo" } else { "derecho" };
         col.push(nota(motion))
-            .push(nota(format!(
-                "Arco propio: {lado} (VSSL_SIDE). Arquero: robot {} (coach.keeper_id).",
-                self.keeper_id
-            )))
+            .push(nota(nota_arco(self.own_goal.x < 0.0, self.snap.arquero)))
             .push(nota(
                 "En Parámetros, el giro de Spin solo afecta a Spin, y el PID de heading solo a GoTo, \
                  FacePoint y ChaseBall.",

@@ -75,6 +75,12 @@ pub struct LoopSnapshot {
     pub debug: Option<Arc<TickDebug>>,
     /// Rutina activa (capability `rutinas-ejecucion`), tomada después de `observar`.
     pub rutina: Option<Arc<RutinaVista>>,
+    /// Arquero vigente del lazo: el único robot propio que el guardia deja estar en su
+    /// área (`zone-guard`). Está en todos los modos, con o sin roles.
+    pub arquero: i32,
+    /// Identidad vigente de los robots (qué patrón lleva cada radio), solo con la base
+    /// station; `None` en simulación, donde cada robot es su patrón.
+    pub identidad: Option<Arc<crate::identidad::Identidad>>,
 }
 
 impl Default for LoopSnapshot {
@@ -94,6 +100,8 @@ impl Default for LoopSnapshot {
             radio: RadioCounters::default(),
             debug: None,
             rutina: None,
+            arquero: crate::params::params().coach.keeper_id,
+            identidad: None,
         }
     }
 }
@@ -692,6 +700,12 @@ mod tests {
         assert!(t0.elapsed() < std::time::Duration::from_secs(1));
         assert!(rx.has_changed().unwrap());
         assert_eq!(rx.borrow().tick, 1000);
+    }
+
+    #[test]
+    fn the_default_snapshot_keeper_is_keeper_id() {
+        // Antes de la primera foto, la GUI muestra el arquero con que arranca el lazo.
+        assert_eq!(LoopSnapshot::default().arquero, crate::params::params().coach.keeper_id);
     }
 
     #[test]

@@ -13,11 +13,12 @@ use rustengine::control_loop::{
     ContextoTick, ControlLoopConfig, FixedSkillDecider, GuiChannels, PerfilVelocidad, TickDecider, TickRecord,
     run_control_loop,
 };
+use rustengine::identidad::{self, Identidad};
 use rustengine::motion::{KickerCommand, MotionCommand, RobotCommand};
 use rustengine::radio::{
     BaseStationTransport, FiraSimTransport, RadioTarget, RobotTransport, TeamColor, TeleportItem,
     base_station::SLOT_COUNT,
-    base_station::{build_frame_from_vw, clamp_vw, radio_slot},
+    base_station::{build_frame_from_vw, clamp_vw},
 };
 use rustengine::rutinas::resumen::{Resultado, ResumenCorrida, TipoAborto, corrida_json, escribir_resumen, junto_al_log};
 use rustengine::rutinas::{
@@ -103,10 +104,13 @@ FLAGS COMUNES (obligatorios):
                        VSSL-firmware/include/config.h. El robot del checkout
                        actual del firmware (rama Peluche) es MI_ROBOT_ID 2
                        → --robot 1.
-                       --mode skill: N es el id de VISIÓN (parche de colores,
-                       el mismo número que muestra la GUI). Con base-station,
-                       la posición de radio sale de robot.radio_slot_by_vision_id
-                       (config/team_params.json); sin entrada, posición = N.
+                       --mode skill: N es el PATRÓN, el id de VISIÓN (parche de
+                       colores, el mismo número que muestra la GUI). Con
+                       base-station va al robot que lo tiene en la identidad de
+                       config/identidad_robots.json (o en la ruta de
+                       VSSL_IDENTIDAD; sin archivo, la radio N lleva el patrón
+                       N). Si el patrón no llega a ningún robot (sin robot,
+                       repetido o desactivado), no arranca.
     --team <blue|yellow>
     --mode <vw|skill|rutina>
     --dur S            segundos antes del auto-stop (float > 0). No con --profile.
@@ -122,11 +126,17 @@ FLAGS COMUNES (opcionales):
 FLAGS MODO skill:
     --vision <sim|real>
     --skill <goto|facepoint|chaseball|spin|approach|shoot|intercept|blockline|
-             goalkeep|clear|spinkick|mark>
+             goalkeep|railkeeper|clear|spinkick|mark|dribble|hold>
+                         con goalkeep o railkeeper, el robot de --robot es el
+                         arquero (puede entrar a su área) aunque no sea
+                         coach.keeper_id; con las demás, el arquero es
+                         coach.keeper_id y el robot no entra al área propia.
     --target x,y         obligatorio para goto, facepoint, spin, approach,
-                         shoot/clear/spinkick (punto al que lanzar la pelota),
-                         blockline y goalkeep (centro del arco propio, p.ej.
-                         -0.75,0) y mark (punto donde pararse mirando la pelota)
+                         shoot/clear/spinkick/dribble (punto al que lanzar o
+                         llevar la pelota),
+                         blockline, goalkeep y railkeeper (centro del arco
+                         propio, p.ej. -0.75,0) y mark (punto donde pararse
+                         mirando la pelota)
                          (spin solo usa el signo de x: + = CCW, − = CW)
                          opcional para chaseball; ignorado por intercept
 
@@ -1214,6 +1224,22 @@ fn print_profiles() {
 //  Modo skill
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Posición de radio del patrón `robot` (`--mode skill`), para el frame y el `frame_str`
+/// del CSV. Con la base station, la de la identidad; si el patrón no llega a ningún robot,
+/// el error dice por qué y nombra el archivo. En simulación, el mismo número.
+fn radio_del_patron(robot: i32, identidad: &Identidad, ruta: &Path, base_station: bool) -> Result<Option<usize>, String> {
+    if !base_station {
+        return Ok(usize::try_from(robot).ok().filter(|r| *r < SLOT_COUNT));
+    }
+    identidad.radio_de(robot).map(Some).map_err(|e| {
+        format!(
+            "el patrón {robot} no llega a ningún robot: {} ({}; se cambia en la pestaña Robots)",
+            e.frase(),
+            ruta.display()
+        )
+    })
+}
+
 async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), String> {
     if args.dry_run {
         eprintln!(
@@ -1237,6 +1263,12 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
 
     let max_ticks = Some((args.dur * 60.0).ceil() as u32);
 
+    // Con la base station, la identidad de los robots (sin edición en vivo): el patrón
+    // --robot tiene que llegar a un robot, o no arranca (antes de abrir el puerto).
+    let base_station = args.transport == RadioTarget::BaseStation;
+    let cargada = identidad::para_transporte("skill_test", base_station);
+    let radio_slot = radio_del_patron(args.robot as i32, &cargada.identidad, &cargada.ruta, base_station)?;
+
     let config = ControlLoopConfig {
         own_team: args.team.as_team_id(),
         num_robots: SLOT_COUNT,
@@ -1246,6 +1278,7 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
         vision_timeout,
         referee: None,
         exportar_depuracion: false,
+        identidad: cargada.identidad,
     };
 
     // Logger compartido (si --log presente).
@@ -1260,11 +1293,8 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
         transport: args.transport,
         vision: args.vision,
         robot: args.robot,
-        // --robot en modo skill es el id de visión; el frame va a su posición de radio.
-        radio_slot: radio_slot(
-            args.robot as i32,
-            &rustengine::params::params().robot.radio_slot_by_vision_id,
-        ),
+        // --robot en modo skill es el patrón; el frame va a la posición de su robot.
+        radio_slot,
         team: args.team,
         skill: skill_id,
     };
@@ -1330,6 +1360,14 @@ impl TickDecider for DecisorDeConsola {
 
     fn rutina(&self) -> Option<Arc<RutinaVista>> {
         TickDecider::rutina(&self.rutina)
+    }
+
+    fn arquero(&self) -> Option<i32> {
+        self.rutina.arquero()
+    }
+
+    fn usar_sin_comandos(&mut self, patrones: &[i32]) {
+        self.rutina.usar_sin_comandos(patrones);
     }
 }
 
@@ -1413,6 +1451,9 @@ async fn run_rutina_mode(args: &Args, shutdown: Arc<AtomicBool>, detener: Arc<At
         referee: None,
         // El CSV de partido lleva la depuración, como en `main`.
         exportar_depuracion: true,
+        // Con la base station, la identidad de los robots: la asignación automática no
+        // elige a los que no reciben comandos.
+        identidad: identidad::para_transporte("skill_test", !simulacion).identidad,
     };
 
     let mut logger = match &args.log {
@@ -1934,6 +1975,49 @@ mod tests {
         assert!(err.contains("--v"), "got: {err}");
     }
 
+    fn cruzada() -> Identidad {
+        let mut i = Identidad::default();
+        i.robots[0].patron = Some(1);
+        i.robots[1].patron = Some(0);
+        i
+    }
+
+    #[test]
+    fn resuelve_radio_desde_identidad_cruzada() {
+        let ruta = Path::new("config/identidad_robots.json");
+        assert_eq!(radio_del_patron(1, &cruzada(), ruta, true), Ok(Some(0)));
+        // El frame que muestra el CSV con esa posición.
+        assert_eq!(
+            build_frame_from_vw([(500, 0), (0, 0), (0, 0), (0, 0), (0, 0)]).trim_end(),
+            "500,0,0,0,0,0,0,0,0,0"
+        );
+        // En simulación, el mismo número (la identidad no se aplica).
+        assert_eq!(radio_del_patron(1, &cruzada(), ruta, false), Ok(Some(1)));
+    }
+
+    #[test]
+    fn patron_sin_robot_no_arranca() {
+        let mut i = Identidad::default();
+        i.robots[2].patron = None;
+        let err = radio_del_patron(2, &i, Path::new("config/identidad_robots.json"), true).unwrap_err();
+        assert!(err.contains("el patrón 2 no llega a ningún robot"), "{err}");
+        assert!(err.contains("ninguna radio lo tiene") && err.contains("config/identidad_robots.json"), "{err}");
+    }
+
+    #[test]
+    fn patron_desactivado_no_arranca() {
+        let mut i = Identidad::default();
+        i.robots[1].activo = false;
+        let err = radio_del_patron(1, &i, Path::new("/tmp/x.json"), true).unwrap_err();
+        assert!(err.contains("la radio 1 está desactivada") && err.contains("/tmp/x.json"), "{err}");
+    }
+
+    #[test]
+    fn help_nombra_identidad_robots() {
+        assert!(HELP_TEXT.contains("config/identidad_robots.json") && HELP_TEXT.contains("VSSL_IDENTIDAD"));
+        assert!(!HELP_TEXT.contains("radio_slot_by_vision_id"));
+    }
+
     #[test]
     fn help_text_documents_bring_up_sequence() {
         // El --help documenta la convención de slot, el robot del checkout y la
@@ -1942,7 +2026,8 @@ mod tests {
             "MI_ROBOT_ID = N + 1",
             "--robot 1",
             "id de VISIÓN",
-            "robot.radio_slot_by_vision_id",
+            "config/identidad_robots.json",
+            "VSSL_IDENTIDAD",
             "SECUENCIA DE BRING-UP",
             "GYRO_Z_SIGN",
             "LEFT/RIGHT_WHEEL_SIGN",

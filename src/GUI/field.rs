@@ -30,7 +30,8 @@ use crate::snapshot::{LoopSnapshot, RobotView};
 use glam::Vec2;
 use iced::widget::canvas::{self, Cache, Frame, Path, Stroke};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, keyboard, mouse};
-use std::collections::{BTreeMap, HashSet};
+use crate::identidad::Identidad;
+use std::collections::HashSet;
 
 /// Ancho de las paredes vistas desde arriba (2.5 cm, reglamento).
 pub const WALL_M: f32 = 0.025;
@@ -312,8 +313,8 @@ pub struct FieldCanvas<'a> {
     pub selected: Option<(i32, i32)>,
     /// Target de la skill de la GUI (`skill_marker`).
     pub skill_target: Option<Vec2>,
-    /// Mapa visión → radio, solo con la base station (rótulo "radio P").
-    pub radio_slots: Option<&'a BTreeMap<u32, u32>>,
+    /// Identidad vigente de los robots, solo con la base station (rótulo "radio P").
+    pub identidad: Option<&'a Identidad>,
     /// Capas encendidas y trazas de la capa T.
     pub capas: &'a HashSet<Layer>,
     pub trazas: &'a Trazas,
@@ -811,7 +812,7 @@ impl FieldCanvas<'_> {
                 escribir(frame, rotulo_jugador, trazos);
             }
             let texto = canvas::Text {
-                content: rotulo(r.team == self.own_team, r.id, self.radio_slots),
+                content: rotulo(r.team == self.own_team, r.id, self.identidad),
                 // Arriba a la izquierda (ver `ancho_texto`): el rótulo queda arriba a la
                 // derecha del robot.
                 position: Point::new(
@@ -838,13 +839,13 @@ impl FieldCanvas<'_> {
     }
 }
 
-/// Rótulo de un robot: el número de visión, y "radio P" para los propios con la base
-/// station.
-pub fn rotulo(propio: bool, id: i32, radio_slots: Option<&BTreeMap<u32, u32>>) -> String {
-    match radio_slots.filter(|_| propio) {
-        Some(mapa) => match crate::radio::base_station::radio_slot(id, mapa) {
-            Some(slot) => format!("{id} radio {slot}"),
-            None => id.to_string(),
+/// Rótulo de un robot: el número de visión (el patrón) y, para los propios con la base
+/// station, "radio P" o "sin radio" si sus comandos no llegan a ningún robot.
+pub fn rotulo(propio: bool, id: i32, identidad: Option<&Identidad>) -> String {
+    match identidad.filter(|_| propio) {
+        Some(ident) => match ident.radio_de(id) {
+            Ok(slot) => format!("{id} radio {slot}"),
+            Err(_) => format!("{id} sin radio"),
         },
         None => id.to_string(),
     }
@@ -984,12 +985,22 @@ mod tests {
 
     #[test]
     fn labels() {
-        let mut mapa = BTreeMap::new();
-        mapa.insert(1, 0);
-        mapa.insert(0, 1);
+        let mut ident = Identidad::default();
+        ident.robots[0].patron = Some(1);
+        ident.robots[1].patron = Some(0);
         assert_eq!(rotulo(true, 1, None), "1");
-        assert_eq!(rotulo(true, 1, Some(&mapa)), "1 radio 0");
-        assert_eq!(rotulo(false, 1, Some(&mapa)), "1", "los rivales no llevan radio");
+        assert_eq!(rotulo(true, 1, Some(&ident)), "1 radio 0");
+        assert_eq!(rotulo(false, 1, Some(&ident)), "1", "los rivales no llevan radio");
+    }
+
+    #[test]
+    fn rotulo_sin_radio() {
+        let mut ident = Identidad::default();
+        ident.robots[2].patron = None;
+        assert_eq!(rotulo(true, 2, Some(&ident)), "2 sin radio");
+        ident.robots[2].patron = Some(2);
+        ident.robots[2].activo = false;
+        assert_eq!(rotulo(true, 2, Some(&ident)), "2 sin radio", "desactivado tampoco recibe");
     }
 
     #[test]
@@ -1124,7 +1135,7 @@ mod tests {
                 own_team: 0,
                 selected: Some((0, 0)),
                 skill_target: None,
-                radio_slots: None,
+                identidad: None,
                 capas: &capas,
                 trazas: &trazas,
                 sim,
@@ -1166,7 +1177,7 @@ mod tests {
             own_team: 0,
             selected: Some((0, 0)),
             skill_target: None,
-            radio_slots: None,
+            identidad: None,
             capas: &capas,
             trazas: &trazas,
             sim: true,
@@ -1202,7 +1213,7 @@ mod tests {
             own_team: 0,
             selected: Some((0, 0)),
             skill_target: None,
-            radio_slots: None,
+            identidad: None,
             capas: &capas,
             trazas: &trazas,
             sim: true,

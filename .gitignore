@@ -9,3 +9,8 @@
 
 # Caché de Python de los scripts de tools/
 __pycache__/
+
+# Identidad de los robots de la salita (qué patrón lleva cada robot): estado del día,
+# no configuración del equipo. La crea la pestaña Robots de la GUI.
+/config/identidad_robots.json
+/config/identidad_robots.json.tmp

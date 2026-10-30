@@ -175,7 +175,7 @@ fn cuadro(
         own_team: 0,
         selected: Some((0, 1)),
         skill_target,
-        radio_slots: None,
+        identidad: None,
         capas: &capas,
         trazas,
         sim: true,
