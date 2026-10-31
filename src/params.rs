@@ -158,7 +158,7 @@ impl Default for CoachParams {
             gk_rail: true,
             aim_post_centered_keeper: false,
             estilo: "equilibrado".to_string(),
-            playbook_episodio_s: 20.0,
+            playbook_episodio_s: 15.0,
         }
     }
 }

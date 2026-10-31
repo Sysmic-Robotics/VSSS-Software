@@ -6,8 +6,13 @@
 //! expertos (Exp3): se elige un estilo con probabilidad proporcional a su peso y, al terminar
 //! su episodio, el peso se multiplica por `m^(1/P(elegido))` y se normaliza. Multiplicadores de
 //! competencia de CMDragons: 3/2 gol a favor, 2/3 gol en contra, 11/10 episodio completado,
-//! 10/11 abortado. Aquí, completado = la pelota pasó más de la mitad del episodio en la mitad
-//! rival.
+//! 10/11 abortado. Aquí, completado = la pelota pasó más tiempo en el tercio rival que en el
+//! propio. (Con "más de la mitad del episodio en la mitad rival" el estilo ofensivo metía más
+//! goles pero perdía terreno, y lo uno cancelaba lo otro: los pesos no se movían.)
+//!
+//! Los goles se cuentan de dos formas, sin repetir: la pelota dentro del arco en juego abierto,
+//! o el saque que sigue a un gol (`gol`), porque el árbitro suele parar el juego antes de que el
+//! coach, a 10 Hz, vea la pelota adentro.
 
 use glam::Vec2;
 
@@ -72,9 +77,11 @@ pub struct Playbook {
     vigente: usize,
     /// Probabilidad con que se eligió el vigente.
     prob: f64,
-    /// Decisiones de juego abierto del episodio, y cuántas con la pelota en la mitad rival.
+    /// Decisiones de juego abierto del episodio, y cuántas con la pelota en el tercio rival y
+    /// en el propio.
     decisiones: u32,
     en_ataque: u32,
+    en_defensa: u32,
     /// Decisiones que dura un episodio sin goles.
     largo: u32,
     /// Ya se contó el gol de la pelota que está en el arco (hasta que vuelva a la cancha).
@@ -90,6 +97,7 @@ impl Playbook {
             prob: 1.0 / 3.0,
             decisiones: 0,
             en_ataque: 0,
+            en_defensa: 0,
             largo: largo_decisiones.max(1),
             gol_contado: false,
             rng: semilla | 1,
@@ -121,18 +129,35 @@ impl Playbook {
             Some(if x > 0.0 { Resultado::GolAFavor } else { Resultado::GolEnContra })
         } else {
             self.decisiones += 1;
-            if x > 0.0 {
+            if x > 0.25 {
                 self.en_ataque += 1;
+            } else if x < -0.25 {
+                self.en_defensa += 1;
             }
             (self.decisiones >= self.largo).then(|| {
-                if 2 * self.en_ataque > self.decisiones { Resultado::Completado } else { Resultado::Abortado }
+                if self.en_ataque > self.en_defensa { Resultado::Completado } else { Resultado::Abortado }
             })
         };
         if let Some(r) = resultado {
-            self.actualizar(r);
-            self.elegir();
+            self.cerrar(r);
         }
         resultado
+    }
+
+    /// Gol visto por el árbitro (el saque que lo sigue), si no se contó ya con la pelota.
+    pub fn gol(&mut self, a_favor: bool) -> Option<Resultado> {
+        if self.gol_contado {
+            self.gol_contado = false;
+            return None;
+        }
+        let r = if a_favor { Resultado::GolAFavor } else { Resultado::GolEnContra };
+        self.cerrar(r);
+        Some(r)
+    }
+
+    fn cerrar(&mut self, r: Resultado) {
+        self.actualizar(r);
+        self.elegir();
     }
 
     fn actualizar(&mut self, r: Resultado) {
@@ -144,6 +169,7 @@ impl Playbook {
         }
         self.decisiones = 0;
         self.en_ataque = 0;
+        self.en_defensa = 0;
     }
 
     fn elegir(&mut self) {
@@ -184,6 +210,19 @@ mod tests {
         let v = pb.vigente;
         let antes = pb.pesos()[v];
         assert_eq!(pb.observar(Vec2::new(-0.78, 0.05), 1.0), Some(Resultado::GolEnContra));
+        assert!(pb.pesos[v] < antes, "{:?}", pb.pesos);
+    }
+
+    #[test]
+    fn a_goal_seen_by_the_referee_counts_once() {
+        let mut pb = Playbook::new(200, 5);
+        // Visto con la pelota dentro y después por el saque: una sola vez.
+        assert_eq!(pb.observar(Vec2::new(0.78, 0.0), 1.0), Some(Resultado::GolAFavor));
+        assert_eq!(pb.gol(true), None);
+        // Solo por el saque (el árbitro paró antes de que se viera adentro).
+        let v = pb.vigente;
+        let antes = pb.pesos()[v];
+        assert_eq!(pb.gol(false), Some(Resultado::GolEnContra));
         assert!(pb.pesos[v] < antes, "{:?}", pb.pesos);
     }
 

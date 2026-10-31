@@ -140,6 +140,9 @@ pub struct HeuristicCoach {
     aim_up: AtomicBool,
     /// Con `estilo = adaptativo`: elige el estilo de juego abierto durante el partido.
     playbook: Option<Playbook>,
+    /// Pelota en la última decisión de juego abierto (el playbook reconoce un gol por el saque
+    /// que lo sigue con la pelota junto a un arco).
+    last_open_ball: Vec2,
 }
 
 fn clamp01(x: f32) -> f32 {
@@ -207,6 +210,7 @@ impl HeuristicCoach {
                 let largo = (p.playbook_episodio_s * p.decision_hz).round() as u32;
                 Playbook::new(largo, 0x9E37_79B9_7F4A_7C15 ^ u64::from(attack_goal.x.to_bits()))
             }),
+            last_open_ball: Vec2::ZERO,
             p,
         }
     }
@@ -1160,6 +1164,25 @@ impl Coach for HeuristicCoach {
             // casos `penal_*` de motion_bench.)
             self.penalty_shot = (self.current_play == Play::PenaltyOurs && play == Play::Open)
                 .then(|| (self.penalty_corner(&opp), self.decision_count));
+            // Saque tras un gol: saca el equipo que lo recibió.
+            let x = self.last_open_ball.x * self.attack_sign();
+            let gol = match play {
+                Play::KickoffTheirs if x > 0.55 => Some(true),
+                Play::KickoffOurs if x < -0.55 => Some(false),
+                _ => None,
+            };
+            if let (Some(a_favor), Some(pb)) = (gol, self.playbook.as_mut()) {
+                self.last_open_ball = Vec2::ZERO;
+                let antes = pb.vigente();
+                if let Some(r) = pb.gol(a_favor) {
+                    eprintln!(
+                        "[coach] playbook: {} terminó en {r:?} → {} (pesos {:.2?})",
+                        antes.nombre(),
+                        pb.vigente().nombre(),
+                        pb.pesos()
+                    );
+                }
+            }
             self.current_play = play;
         }
         match play {
@@ -1184,6 +1207,7 @@ impl Coach for HeuristicCoach {
         }
 
         let s = self.attack_sign();
+        self.last_open_ball = ball;
         if let Some(pb) = self.playbook.as_mut() {
             let antes = pb.vigente();
             if let Some(r) = pb.observar(ball, s) {
@@ -2015,6 +2039,24 @@ mod tests {
         let p = CoachParams { estilo: "adaptativo".to_string(), ..CoachParams::default() };
         let c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
         assert!(c.playbook.is_some() && Estilo::TODOS.contains(&c.estilo()));
+    }
+
+    #[test]
+    fn the_playbook_counts_a_goal_by_the_kickoff_that_follows_it() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let p = CoachParams { estilo: "adaptativo".to_string(), ..CoachParams::default() };
+        let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
+        c.set_referee(shared.clone());
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        // Pelota junto al arco rival en juego abierto; el árbitro para y saca el amarillo.
+        let o = obs(Vec2::new(0.72, 0.05), Vec2::ZERO, [Vec2::new(0.6, 0.0), Vec2::new(0.0, 0.3), Vec2::new(-0.63, 0.0)]);
+        c.decide(&o);
+        assert_eq!(c.playbook.as_ref().unwrap().pesos(), [1.0; 3]);
+        apply_command(&shared, RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Yellow, ..RefereeCommand::GAME_ON });
+        c.decide(&o);
+        let pesos = c.playbook.as_ref().unwrap().pesos();
+        assert!(pesos.iter().any(|&w| w > 1.0), "gol a favor: {pesos:?}");
     }
 
     #[test]
