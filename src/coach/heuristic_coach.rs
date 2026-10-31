@@ -1096,6 +1096,22 @@ impl Coach for HeuristicCoach {
         self.role_of(robot_id)
     }
 
+    /// Entretiempo: los arcos se intercambian y se olvida lo que dependía del lado
+    /// (compromisos, atacante, penal en curso, chequeo de lado). La adaptación por carril
+    /// (arriba/centro/abajo) y el playbook no dependen del lado y se conservan.
+    fn set_side(&mut self, attack_sign: f32) {
+        let s = if attack_sign >= 0.0 { 1.0 } else { -1.0 };
+        let x = self.attack_goal.x.abs().max(self.own_goal.x.abs());
+        self.attack_goal = Vec2::new(s * x, 0.0);
+        self.own_goal = Vec2::new(-s * x, 0.0);
+        self.committed = [None; 3];
+        self.striker_id = None;
+        self.penalty_shot = None;
+        self.push_stall = Stall::None;
+        self.side_checked = false;
+        self.last_open_ball = Vec2::ZERO;
+    }
+
     fn debug(&self) -> Option<CoachDebug> {
         Some(self.depuracion())
     }
@@ -2047,6 +2063,28 @@ mod tests {
         c.decide(&o);
         let pesos = c.playbook.as_ref().unwrap().pesos();
         assert!(pesos.iter().any(|&w| w > 1.0), "gol a favor: {pesos:?}");
+    }
+
+    #[test]
+    fn switching_sides_swaps_the_goals_and_the_attack_direction() {
+        let mut c = coach(); // ataca +x
+        let o = obs(Vec2::new(0.5, 0.0), Vec2::ZERO, [Vec2::new(0.4, 0.0), Vec2::new(0.0, 0.3), Vec2::new(-0.63, 0.0)]);
+        c.decide(&o);
+        assert!(choice_of(&c.decide(&o), 0).target.x > 0.0);
+        c.set_side(-1.0);
+        assert_eq!((c.attack_goal, c.own_goal), (OWN, ATTACK));
+        assert_eq!(c.attack_sign(), -1.0);
+        assert!(c.in_own_half(Vec2::new(0.5, 0.0)));
+        // Mismo mundo, ahora esa pelota está en nuestra mitad: el arquero es el robot junto a
+        // nuestro arco nuevo (+x) y el atacante empuja hacia −x.
+        let o = obs(Vec2::new(-0.5, 0.0), Vec2::ZERO, [Vec2::new(-0.4, 0.0), Vec2::new(0.0, 0.3), Vec2::new(0.63, 0.0)]);
+        c.decide(&o);
+        let ch = c.decide(&o);
+        assert!(choice_of(&ch, 0).target.x < 0.0, "{:?}", choice_of(&ch, 0));
+        assert_eq!(c.role_of(2), Some(Role::Keeper));
+        // Volver deja todo como al principio.
+        c.set_side(1.0);
+        assert_eq!((c.attack_goal, c.own_goal), (ATTACK, OWN));
     }
 
     #[test]
