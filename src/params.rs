@@ -113,6 +113,10 @@ pub struct CoachParams {
     pub estilo: String,
     /// Adaptativo: segundos de juego abierto que dura el episodio de un estilo si no hay gol.
     pub playbook_episodio_s: f32,
+    /// Free ball: al silbato el atacante saca la pelota en diagonal hacia el centro y adelante
+    /// (1.5 s) en vez de empujarla de frente contra el pateador rival (hoy el primer toque es
+    /// un choque de frente: 51 %, y la pelota no avanza).
+    pub free_ball_lateral: bool,
 }
 
 impl Default for CoachParams {
@@ -155,6 +159,7 @@ impl Default for CoachParams {
             gk_rail: true,
             estilo: "equilibrado".to_string(),
             playbook_episodio_s: 15.0,
+            free_ball_lateral: false,
         }
     }
 }
@@ -275,7 +280,9 @@ pub struct SkillParams {
     pub keeper_sweep: f32,
     /// RailKeeper: con la pelota quieta, un rival detrás de ella hasta esta distancia (m) ya
     /// anticipa su empuje (penal rival: el pateador espera a 14 cm; en juego, un rival que se
-    /// acomoda). 0 = solo encima de la pelota (`keeper_contact_dist`).
+    /// acomoda). 0 = solo encima de la pelota (`keeper_contact_dist`). En el simulador no
+    /// cambió nada (con 0.30: nuestro pateador convierte 0.8 % en vez de 3.3 %, juego abierto
+    /// +0.08 ± 0.17): queda apagado, como palanca para un rival que se alinea temprano.
     pub keeper_still_rival_dist: f32,
     /// Dribble: radio de las espirales del campo "ir al arco" (m).
     pub dribble_de: f32,

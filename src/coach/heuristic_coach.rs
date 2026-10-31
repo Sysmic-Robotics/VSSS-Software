@@ -48,6 +48,8 @@ pub const GOAL_HALF_Y: f32 = 0.20;
 /// Límite |x| para robots de campo (no entrar al área propia: solo 1 permitido).
 /// Segundos desde el silbato de un penal propio en que el atacante patea al palo elegido.
 const PENALTY_SHOT_S: f32 = 3.0;
+/// Segundos que dura la salida en diagonal del free ball (`free_ball_lateral`).
+const FREE_BALL_EXIT_S: f32 = 1.5;
 const FIELD_ROBOT_MAX_ABS_X: f32 = 0.55;
 const FIELD_ROBOT_MAX_ABS_Y: f32 = 0.55;
 
@@ -122,8 +124,10 @@ pub struct HeuristicCoach {
     referee: Option<SharedReferee>,
     /// Play vigente (derivada del último comando del árbitro).
     current_play: Play,
-    /// Penal propio en juego: palo al que patea y decisión en que sonó el silbato.
-    penalty_shot: Option<(Vec2, u64)>,
+    /// Tiro de pelota parada en juego: objetivo del atacante, decisión en que sonó el silbato
+    /// y cuánto dura (s). Penal propio: el palo; free ball con `free_ball_lateral`: la salida
+    /// en diagonal.
+    penalty_shot: Option<(Vec2, u64, f32)>,
     /// Penales propios pateados (alterna el palo cuando el arquero está centrado).
     penalties_taken: u32,
     /// Últimos scores del striker (skill, score) — para logs/GUI y tests.
@@ -409,11 +413,18 @@ impl HeuristicCoach {
         Vec2::new(self.attack_goal.x, side * (GOAL_HALF_Y - 0.06))
     }
 
-    /// Palo del penal propio mientras dura el tiro (`PENALTY_SHOT_S` desde el silbato).
+    /// Objetivo del tiro de pelota parada mientras dura (desde el silbato).
     fn active_penalty_shot(&self) -> Option<Vec2> {
         self.penalty_shot
-            .filter(|&(_, since)| (self.decision_count - since) as f32 / self.p.decision_hz.max(1e-3) < PENALTY_SHOT_S)
-            .map(|(corner, _)| corner)
+            .filter(|&(_, since, secs)| (self.decision_count - since) as f32 / self.p.decision_hz.max(1e-3) < secs)
+            .map(|(target, _, _)| target)
+    }
+
+    /// Salida del free ball: en diagonal, 0.20 m adelante y hacia el centro de la cancha, así
+    /// el pateador rival que viene de frente no la encuentra.
+    fn free_ball_exit(&self, ball: Vec2) -> Vec2 {
+        let side = if ball.y >= 0.0 { -1.0 } else { 1.0 };
+        self.clamp_field_robot(Vec2::new(ball.x + self.attack_sign() * 0.20, ball.y + side * 0.25))
     }
 
     /// Punto del arco rival al que apuntar: centro, o el palo lejano si hay un
@@ -504,13 +515,15 @@ impl HeuristicCoach {
             self.depuracion.tipo_objetivo(TipoObjetivo::Banda);
             return Vec2::new(ball.x + s * 0.35, ball.y);
         }
+        // Tiro de pelota parada en curso (penal al palo, salida del free ball): antes que el
+        // despeje, porque la mitad de los free balls caen en nuestra mitad.
+        if let Some(target) = self.active_penalty_shot() {
+            self.depuracion.tipo_objetivo(TipoObjetivo::PaloLejano);
+            return target;
+        }
         if self.in_own_half(ball) && (ball.x * -s) > 0.35 {
             self.depuracion.tipo_objetivo(TipoObjetivo::Despeje);
             return self.clear_target(ball);
-        }
-        if let Some(corner) = self.active_penalty_shot() {
-            self.depuracion.tipo_objetivo(TipoObjetivo::PaloLejano);
-            return corner;
         }
         // (Se probó conducir por una dirección libre cercana con un rival en el camino: menos
         // conducciones contra un rival, pero el rival la cortaba igual (30 % y 30 %) y cara a
@@ -1166,8 +1179,13 @@ impl Coach for HeuristicCoach {
             // contra el arquero: 12 % contra el nuestro igual que sin amague, 3 % doblando en 0.58,
             // y contra el de rule_based 5 % en vez de 78 %. El giro tampoco sirve de penal; ver los
             // casos `penal_*` de motion_bench.)
-            self.penalty_shot = (self.current_play == Play::PenaltyOurs && play == Play::Open)
-                .then(|| (self.penalty_corner(&opp), self.decision_count));
+            self.penalty_shot = match (self.current_play, play) {
+                (Play::PenaltyOurs, Play::Open) => Some((self.penalty_corner(&opp), self.decision_count, PENALTY_SHOT_S)),
+                (Play::FreeBall(_), Play::Open) if self.p.free_ball_lateral => {
+                    Some((self.free_ball_exit(ball), self.decision_count, FREE_BALL_EXIT_S))
+                }
+                _ => None,
+            };
             // Saque tras un gol: saca el equipo que lo recibió.
             let x = self.last_open_ball.x * self.attack_sign();
             let gol = match play {
@@ -2063,6 +2081,38 @@ mod tests {
         c.decide(&o);
         let pesos = c.playbook.as_ref().unwrap().pesos();
         assert!(pesos.iter().any(|&w| w > 1.0), "gol a favor: {pesos:?}");
+    }
+
+    #[test]
+    fn free_ball_exit_goes_diagonally_toward_the_center_for_a_while() {
+        use crate::coach::referee::{Foul, Quadrant, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let ball = Vec2::new(0.375, 0.40); // cruz Q1, atacamos +x
+        let o = obs(ball, Vec2::ZERO, [Vec2::new(0.175, 0.40), Vec2::new(-0.33, -0.33), Vec2::new(-0.63, 0.0)]);
+        let fb = RefereeCommand { foul: Foul::FreeBall, quadrant: Quadrant::Q1, ..RefereeCommand::GAME_ON };
+        // Apagado: al silbato empuja hacia el arco.
+        let mut c = coach();
+        c.set_referee(shared.clone());
+        apply_command(&shared, fb);
+        c.decide(&o);
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        assert_eq!(choice_of(&c.decide(&o), 0).target, ATTACK);
+        // Encendido: 0.20 adelante y 0.25 hacia el centro, durante FREE_BALL_EXIT_S; después, al arco.
+        let mut c = coach();
+        c.p.free_ball_lateral = true;
+        c.set_referee(shared.clone());
+        apply_command(&shared, fb);
+        c.decide(&o);
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        // (La x queda recortada al campo del robot, fuera del área rival.)
+        let t = choice_of(&c.decide(&o), 0).target;
+        assert!((t.y - 0.15).abs() < 1e-5 && t.x > ball.x && t.x <= 0.575, "{t:?}");
+        let steps = (FREE_BALL_EXIT_S * c.p.decision_hz) as usize + 2;
+        let mut last = Vec2::ZERO;
+        for _ in 0..steps {
+            last = choice_of(&c.decide(&o), 0).target;
+        }
+        assert_eq!(last, ATTACK);
     }
 
     #[test]
