@@ -9,7 +9,9 @@ calibrar el simulador y el coach con la cancha de verdad.
   (v = v0·e^(−k·t), el modelo de `skills.intercept_ball_decay_per_s`) y uno constante
   (v = v0 − d·t), y dice cuál ajusta mejor.
 - **Robots propios:** rapidez, aceleración y giro en juego (percentiles 50/95 y máximo), para
-  comparar con `motion.max_linear_speed`, `motion.max_linear_accel` y el tope del firmware.
+  comparar con `motion.max_linear_speed`, `motion.max_linear_accel` y el tope del firmware; y lo
+  mismo por robot, con la fracción de ticks que jugó de atacante, para ordenar los robots reales
+  sin sysid (el que acelera más y llega más veces primero a la pelota).
 
 Solo la biblioteca estándar.
 """
@@ -33,8 +35,8 @@ DIFF_S = 0.05          # media ventana de la diferencia centrada (s)
 class Tick:
     t: float
     ball: tuple[float, float]
-    robots: list[tuple[float, float]] = field(default_factory=list)          # todos (propios y rivales)
-    own: dict[str, tuple[float, float, float]] = field(default_factory=dict)  # id -> (vx, vy, ω)
+    robots: list[tuple[float, float]] = field(default_factory=list)               # todos (propios y rivales)
+    own: dict[str, tuple[float, float, float, str]] = field(default_factory=dict)  # id -> (vx, vy, ω, rol)
 
 
 def load(path: str) -> list[Tick]:
@@ -50,7 +52,8 @@ def load(path: str) -> list[Tick]:
                     tk = by_tick[k] = Tick(float(r["t_ms"]) / 1000.0, (float(r["ball_x"]), float(r["ball_y"])))
                 tk.robots.append((float(r["pose_x"]), float(r["pose_y"])))
                 if r.get("own") == "1" and r.get("vel_x"):
-                    tk.own[r["robot"]] = (float(r["vel_x"]), float(r["vel_y"] or 0), float(r.get("omega") or 0))
+                    tk.own[r["robot"]] = (float(r["vel_x"]), float(r["vel_y"] or 0), float(r.get("omega") or 0),
+                                          r.get("role") or "")
             except (ValueError, KeyError):
                 continue  # fila truncada (registro en vivo)
     return [by_tick[k] for k in sorted(by_tick)]
@@ -114,17 +117,23 @@ def free_ball_segments(ticks: list[Tick]) -> list[dict]:
 
 
 def robot_dynamics(ticks: list[Tick]) -> dict[str, list[float]]:
-    out = defaultdict(list)
+    """Rapidez (`v`), aceleración (`a`) y giro (`w`) de todos los propios, y por robot en
+    `por_robot[id]` con además `striker` (1 por tick de atacante, 0 si no)."""
+    out: dict = defaultdict(list)
+    out["por_robot"] = defaultdict(lambda: defaultdict(list))
     prev: dict[str, tuple[float, float]] = {}
     for tk in ticks:
-        for rid, (vx, vy, w) in tk.own.items():
+        for rid, (vx, vy, w, role) in tk.own.items():
             v = math.hypot(vx, vy)
-            out["v"].append(v)
-            out["w"].append(abs(w))
+            mine = out["por_robot"][rid]
+            out["v"].append(v); mine["v"].append(v)
+            out["w"].append(abs(w)); mine["w"].append(abs(w))
+            mine["striker"].append(1.0 if role == "striker" else 0.0)
             if rid in prev:
                 t0, v0 = prev[rid]
                 if 0.08 <= tk.t - t0:
-                    out["a"].append(abs(v - v0) / (tk.t - t0))
+                    a = abs(v - v0) / (tk.t - t0)
+                    out["a"].append(a); mine["a"].append(a)
                     prev[rid] = (tk.t, v)
             else:
                 prev[rid] = (tk.t, v)
@@ -138,10 +147,15 @@ def pct(xs: list[float], q: float) -> float:
 
 def report(paths: list[str]) -> str:
     segs, dyn = [], defaultdict(list)
+    por_robot: dict = defaultdict(lambda: defaultdict(list))
     for p in paths:
         ticks = load(p)
         segs += free_ball_segments(ticks)
-        for k, v in robot_dynamics(ticks).items():
+        d = robot_dynamics(ticks)
+        for rid, mine in d.pop("por_robot").items():
+            for k, v in mine.items():
+                por_robot[rid][k] += v
+        for k, v in d.items():
             dyn[k] += v
     lines = [f"Registros: {len(paths)}"]
     if segs:
@@ -163,7 +177,15 @@ def report(paths: list[str]) -> str:
             f"Robots propios: rapidez p50 {pct(dyn['v'], .5):.2f}, p95 {pct(dyn['v'], .95):.2f}, máx {max(dyn['v']):.2f} m/s",
             f"  aceleración p95 {pct(dyn['a'], .95):.2f}, p99 {pct(dyn['a'], .99):.2f} m/s²; "
             f"giro p95 {pct(dyn['w'], .95):.1f}, máx {max(dyn['w']):.1f} rad/s",
+            "  por robot (ordenados por aceleración p95; `atacante` = fracción de ticks con ese rol):",
         ]
+        orden = sorted(por_robot.items(), key=lambda kv: -pct(kv[1]["a"], .95) if kv[1]["a"] else 0.0)
+        for rid, mine in orden:
+            lines.append(
+                f"    robot {rid}: rapidez p95 {pct(mine['v'], .95):.2f} m/s, aceleración p95 "
+                f"{pct(mine['a'], .95) if mine['a'] else float('nan'):.2f} m/s², giro p95 {pct(mine['w'], .95):.1f} rad/s, "
+                f"atacante {statistics.fmean(mine['striker']) if mine['striker'] else 0.0:.0%}"
+            )
     return "\n".join(lines)
 
 
