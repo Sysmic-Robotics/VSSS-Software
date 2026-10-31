@@ -273,6 +273,10 @@ pub struct SkillParams {
     pub keeper_contact_dist: f32,
     /// RailKeeper: cuánto más allá de la pelota apunta al barrerla de la boca del arco (m).
     pub keeper_sweep: f32,
+    /// RailKeeper: con la pelota quieta, un rival detrás de ella hasta esta distancia (m) ya
+    /// anticipa su empuje (penal rival: el pateador espera a 14 cm; en juego, un rival que se
+    /// acomoda). 0 = solo encima de la pelota (`keeper_contact_dist`).
+    pub keeper_still_rival_dist: f32,
     /// Dribble: radio de las espirales del campo "ir al arco" (m).
     pub dribble_de: f32,
     /// Dribble: suavizado de la espiral fuera de su círculo (m).
@@ -315,6 +319,7 @@ impl Default for SkillParams {
             keeper_rail_tol: 0.06,
             keeper_contact_dist: 0.12,
             keeper_sweep: 0.10,
+            keeper_still_rival_dist: 0.0,
             dribble_de: 0.10,
             dribble_kr: 0.05,
             dribble_speed: 0.8,

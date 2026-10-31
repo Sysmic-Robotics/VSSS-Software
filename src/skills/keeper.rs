@@ -81,6 +81,8 @@ pub struct RailKeeperSkill {
     pub contact_dist: f32,
     /// Cuánto más allá de la pelota (hacia su palo) apunta al barrerla de la boca (m).
     pub sweep: f32,
+    /// Con la pelota quieta, un rival detrás hasta esta distancia ya anticipa (m); 0 = apagado.
+    pub still_rival_dist: f32,
     v_prev: f64,
     last_target: Option<Vec2>,
     last_mode: KeeperMode,
@@ -100,6 +102,7 @@ impl RailKeeperSkill {
             rail_tol: p.keeper_rail_tol,
             contact_dist: p.keeper_contact_dist,
             sweep: p.keeper_sweep,
+            still_rival_dist: p.keeper_still_rival_dist,
             v_prev: 0.0,
             last_target: None,
             last_mode: KeeperMode::Angle,
@@ -184,11 +187,18 @@ impl RailKeeperSkill {
         }
 
         // Rival encima de la pelota y detrás de ella respecto de nuestro arco: el empuje
-        // sale en la dirección rival → pelota; pararse donde esa recta cruza el riel.
+        // sale en la dirección rival → pelota; pararse donde esa recta cruza el riel. Con la
+        // pelota quieta (un penal, un rival acomodándose) y `still_rival_dist`, también desde
+        // más lejos: el pateador de un penal espera a 14 cm y antes solo se lo veía al tocarla.
+        let reach = if ball_vel.length() < 0.05 && self.still_rival_dist > 0.0 {
+            self.still_rival_dist.max(self.contact_dist)
+        } else {
+            self.contact_dist
+        };
         let rival = rivals
             .iter()
             .copied()
-            .filter(|r| (*r - ball).length() <= self.contact_dist)
+            .filter(|r| (*r - ball).length() <= reach)
             .min_by(|a, b| (*a - ball).length().total_cmp(&(*b - ball).length()));
         if let Some(r) = rival {
             let dir = ball - r;
@@ -440,6 +450,24 @@ mod tests {
         // El mismo rival delante de la pelota (empujaría hacia su arco): sin anticipación.
         let (_, mode) = keeper().target_y(ball, Vec2::ZERO, &[Vec2::new(-0.48, 0.14)]);
         assert_eq!(mode, KeeperMode::Angle);
+    }
+
+    #[test]
+    fn a_still_ball_with_a_rival_lined_up_behind_it_is_anticipated_from_farther_away() {
+        // Penal rival: pelota quieta en la cruz, pateador a 14 cm detrás, apuntando al palo de
+        // abajo. Apagado (default), a esa distancia no cuenta como encima: bisectriz. Con 0.30,
+        // anticipa la recta pateador → pelota.
+        let ball = Vec2::new(-0.375, 0.0);
+        let kicker = Vec2::new(-0.375 + 0.14 * 0.937, 0.14 * 0.349); // ~20° hacia −y al empujar
+        let (_, mode) = keeper().target_y(ball, Vec2::ZERO, &[kicker]);
+        assert_eq!(mode, KeeperMode::Angle);
+        let mut k = keeper();
+        k.still_rival_dist = 0.30;
+        let (y, mode) = k.target_y(ball, Vec2::ZERO, &[kicker]);
+        assert_eq!(mode, KeeperMode::Rival);
+        assert!(y < -0.08, "hacia el palo de abajo: {y}");
+        // Pelota en movimiento: solo encima de ella, como siempre.
+        assert_eq!(k.target_y(ball, Vec2::new(0.3, 0.0), &[kicker]).1, KeeperMode::Angle);
     }
 
     #[test]
