@@ -113,10 +113,8 @@ pub struct CoachParams {
     pub estilo: String,
     /// Adaptativo: segundos de juego abierto que dura el episodio de un estilo si no hay gol.
     pub playbook_episodio_s: f32,
-    /// Free ball: al silbato el atacante saca la pelota en diagonal hacia el centro y adelante
-    /// (1.5 s) en vez de empujarla de frente contra el pateador rival (hoy el primer toque es
-    /// un choque de frente: 51 %, y la pelota no avanza).
-    pub free_ball_lateral: bool,
+    /// Cuánto adentro del palo apunta el atacante (m): penal propio y tiro al palo lejano.
+    pub aim_post_margin: f32,
 }
 
 impl Default for CoachParams {
@@ -159,7 +157,7 @@ impl Default for CoachParams {
             gk_rail: true,
             estilo: "equilibrado".to_string(),
             playbook_episodio_s: 15.0,
-            free_ball_lateral: false,
+            aim_post_margin: 0.06,
         }
     }
 }
