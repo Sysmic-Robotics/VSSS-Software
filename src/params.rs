@@ -107,9 +107,6 @@ pub struct CoachParams {
     /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
     /// él, con anticipación) en vez de `GoalKeep`.
     pub gk_rail: bool,
-    /// Con el arquero rival centrado (|y| ≤ 3 cm), el atacante apunta al palo lejano a la
-    /// pelota en vez de al centro del arco (donde está el arquero).
-    pub aim_post_centered_keeper: bool,
     /// Estilo de juego abierto (`coach::playbook`): `equilibrado` (el de siempre), `defensivo`,
     /// `ofensivo`, o `adaptativo` (elige entre los tres durante el partido según cómo le va a
     /// cada uno, como el playbook de CMDragons).
@@ -156,7 +153,6 @@ impl Default for CoachParams {
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
             gk_rail: true,
-            aim_post_centered_keeper: false,
             estilo: "equilibrado".to_string(),
             playbook_episodio_s: 15.0,
         }

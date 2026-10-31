@@ -27,7 +27,7 @@ use crate::coach::coach_trait::Coach;
 use crate::coach::debug::{CoachDebug, TipoObjetivo};
 use crate::coach::observation::{FIELD_HALF_X, FIELD_HALF_Y, Observation, RobotObs};
 use crate::coach::playbook::{Estilo, Playbook};
-use crate::coach::plays::{Play, ball_spot, formation};
+use crate::coach::plays::{Play, formation};
 use crate::coach::referee::SharedReferee;
 use crate::coach::skill_choice::SkillChoice;
 use crate::motion::MotionConfig;
@@ -35,7 +35,6 @@ use crate::params::{CoachParams, params};
 use crate::skills::{SkillId, shoot_push_feasible_now};
 use glam::Vec2;
 use std::f32::consts::{FRAC_PI_2, PI};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 mod depuracion;
 
@@ -136,8 +135,6 @@ pub struct HeuristicCoach {
     push_stall: Stall,
     /// Depuración de las decisiones (GUI y CSV de partido; no decide nada).
     depuracion: depuracion::Registro,
-    /// Con el arquero rival centrado apunta al palo de +y (o al de −y), con `aim_post_centered_keeper`.
-    aim_up: AtomicBool,
     /// Con `estilo = adaptativo`: elige el estilo de juego abierto durante el partido.
     playbook: Option<Playbook>,
     /// Pelota en la última decisión de juego abierto (el playbook reconoce un gol por el saque
@@ -205,7 +202,6 @@ impl HeuristicCoach {
             side_checked: false,
             push_stall: Stall::None,
             depuracion: depuracion::Registro::default(),
-            aim_up: AtomicBool::new(true),
             playbook: (p.estilo == "adaptativo").then(|| {
                 let largo = (p.playbook_episodio_s * p.decision_hz).round() as u32;
                 Playbook::new(largo, 0x9E37_79B9_7F4A_7C15 ^ u64::from(attack_goal.x.to_bits()))
@@ -254,7 +250,7 @@ impl HeuristicCoach {
     /// que la play le dé un punto explícito (goal kick propio: lo saca él).
     fn set_piece_choices(&mut self, play: Play, own: &[RobotView], opp: &[RobotView]) -> Vec<SkillChoice> {
         let s = self.attack_sign();
-        let aim = self.aim_point(opp, ball_spot(play, s).unwrap_or(Vec2::ZERO));
+        let aim = self.aim_point(opp);
         let staging = params().skills.approach_staging_offset;
         let Some(f) = formation(play, s, aim, staging) else {
             return Vec::new();
@@ -422,7 +418,7 @@ impl HeuristicCoach {
 
     /// Punto del arco rival al que apuntar: centro, o el palo lejano si hay un
     /// rival parado en el arco.
-    fn aim_point(&self, opp: &[RobotView], ball: Vec2) -> Vec2 {
+    fn aim_point(&self, opp: &[RobotView]) -> Vec2 {
         let keeper = opp
             .iter()
             .filter(|o| o.active)
@@ -438,18 +434,10 @@ impl HeuristicCoach {
             Some(k) if k.pos.y.abs() > 0.03 => {
                 (Vec2::new(self.attack_goal.x, -k.pos.y.signum() * post_y), TipoObjetivo::PaloLejano)
             }
-            // Arquero centrado: al centro le pegábamos (en penales, 10 % contra 79 % al palo).
-            // Al palo lejano a la pelota, del que el arquero en la bisectriz se aleja; con la
-            // pelota cerca del eje, el lado anterior.
-            Some(_) if self.p.aim_post_centered_keeper => {
-                if ball.y.abs() > 0.05 {
-                    self.aim_up.store(ball.y < 0.0, Ordering::Relaxed);
-                }
-                let side = if self.aim_up.load(Ordering::Relaxed) { 1.0 } else { -1.0 };
-                (Vec2::new(self.attack_goal.x, side * post_y), TipoObjetivo::PaloLejano)
-            }
-            // Sin arquero rival visible: al centro, salvo que los contadores digan
-            // que por el centro no está entrando y otro carril rinde mejor.
+            // Arquero centrado o sin arquero rival visible: al centro, salvo que los contadores
+            // digan que por el centro no está entrando y otro carril rinde mejor. (Se probó, como
+            // en el penal, ir al palo lejano a la pelota con el arquero centrado: contra el actual
+            // +0.05 ± 0.09 goles en 120 partidos y contra rule_based +0.16 ± 0.3; sin efecto.)
             _ => (Vec2::new(self.attack_goal.x, self.adaptation.preferred_aim_y(0.0, post_y)), TipoObjetivo::Arco),
         };
         self.depuracion.tipo_objetivo(tipo);
@@ -528,7 +516,7 @@ impl HeuristicCoach {
         // conducciones contra un rival, pero el rival la cortaba igual (30 % y 30 %) y cara a
         // cara quedó +0.38 ± 0.27 para ir derecho; se descartó. Lo que más pierde la pelota es
         // empujarla descentrada en la cara.)
-        self.aim_point(opp, ball)
+        self.aim_point(opp)
     }
 
     // ── Compromiso por skill ─────────────────────────────────────────────────
@@ -2057,27 +2045,6 @@ mod tests {
         c.decide(&o);
         let pesos = c.playbook.as_ref().unwrap().pesos();
         assert!(pesos.iter().any(|&w| w > 1.0), "gol a favor: {pesos:?}");
-    }
-
-    #[test]
-    fn with_the_keeper_centered_it_aims_at_the_post_away_from_the_ball() {
-        let post_y = GOAL_HALF_Y - 0.06;
-        let mut o = obs(Vec2::new(0.20, 0.20), Vec2::ZERO, [Vec2::new(0.10, 0.20), Vec2::new(-0.2, -0.3), Vec2::new(-0.63, 0.0)]);
-        o.opp_robots[2] = robot(Vec2::new(0.70, 0.0), 90.0);
-        let mut c = coach();
-        assert_eq!(choice_of(&c.decide(&o), 0).target.y, c.adaptation.preferred_aim_y(0.0, post_y));
-        let mut c = coach();
-        c.p.aim_post_centered_keeper = true;
-        assert_eq!(choice_of(&c.decide(&o), 0).target, Vec2::new(0.75, -post_y));
-        // Con la pelota cerca del eje mantiene el palo; al otro lado, cambia.
-        o.ball.y = 0.02 / FIELD_HALF_Y;
-        assert_eq!(choice_of(&c.decide(&o), 0).target, Vec2::new(0.75, -post_y));
-        o.ball.y = -0.20 / FIELD_HALF_Y;
-        o.own_robots[0] = robot(Vec2::new(0.10, -0.20), 0.0);
-        assert_eq!(choice_of(&c.decide(&o), 0).target, Vec2::new(0.75, post_y));
-        // Arquero corrido: el palo contrario a él, como siempre.
-        o.opp_robots[2] = robot(Vec2::new(0.70, -0.06), 90.0);
-        assert_eq!(choice_of(&c.decide(&o), 0).target, Vec2::new(0.75, post_y));
     }
 
     #[test]
