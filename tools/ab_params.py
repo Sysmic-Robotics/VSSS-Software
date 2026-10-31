@@ -55,12 +55,14 @@ def resolve_params(arg: str, label: str, out: Path) -> Path:
 
 
 def schedule(rounds: int, a: Path, b: Path, rival_params: Path | None = None,
-             vs_rule_based: bool = True, first_seed: int = 0) -> list[Job]:
+             vs_rule_based: bool = True, first_seed: int = 0, rival_coach: str = "rule_based") -> list[Job]:
     jobs = []
+    # Tercer rival: rule_based, o el heurístico con otros parámetros (un rival del panel).
+    rival_name = "rule_based" if rival_coach == "rule_based" else (rival_params.stem if rival_params else rival_coach)
     for i in range(first_seed, first_seed + rounds):
         kickoff = "blue" if i % 2 == 0 else "yellow"
         if vs_rule_based:
-            rb = Rival("rule_based", "rule_based", rival_params)
+            rb = Rival(rival_name, rival_coach, rival_params)
             jobs += [Job(f"r{i}_A_rb", "A", a, rb, i, kickoff), Job(f"r{i}_B_rb", "B", b, rb, i, kickoff)]
         jobs += [
             Job(f"r{i}_A_vs_B", "A", a, Rival("B", "heuristic", b), i, kickoff),
@@ -86,26 +88,27 @@ def record_line(blue: str, rival: str, r: MatchResult) -> str:
 
 def summarize(results: list[dict], names: dict[str, str]) -> str:
     lines = []
+    third = next((r["rival"] for r in results if r["rival"] not in ("A", "B")), "rule_based")
     for side in ("A", "B"):
         lines.append(f"{side} = {names[side]}")
-        vs_rb = [r for r in results if r["blue"] == side and r["rival"] == "rule_based"]
+        vs_rb = [r for r in results if r["blue"] == side and r["rival"] == third]
         if not vs_rb:
             continue
         fits = [r["fitness"] for r in vs_rb]
         gd = [r["goals_for"] - r["goals_against"] for r in vs_rb]
         w = sum(1 for g in gd if g > 0); d = sum(1 for g in gd if g == 0)
         m, s = mean_sem(fits); gm, gs = mean_sem([float(g) for g in gd])
-        lines.append(f"  vs rule_based ({len(vs_rb)} partidos): V{w} E{d} D{len(gd) - w - d}  "
+        lines.append(f"  vs {third} ({len(vs_rb)} partidos): V{w} E{d} D{len(gd) - w - d}  "
                      f"aptitud {m:+.2f} ± {s:.2f}  dif. goles {gm:+.2f} ± {gs:.2f}  "
                      f"posesión {statistics.mean(r['possession_pct'] for r in vs_rb):.0f} %  "
                      f"faltas/partido {statistics.mean(r['area_fouls'] for r in vs_rb):.2f}")
     # Pareado por semilla contra rule_based: aptitud(B) − aptitud(A) en la misma ronda.
-    by_seed_a = {r["seed"]: r["fitness"] for r in results if r["blue"] == "A" and r["rival"] == "rule_based"}
-    by_seed_b = {r["seed"]: r["fitness"] for r in results if r["blue"] == "B" and r["rival"] == "rule_based"}
+    by_seed_a = {r["seed"]: r["fitness"] for r in results if r["blue"] == "A" and r["rival"] == third}
+    by_seed_b = {r["seed"]: r["fitness"] for r in results if r["blue"] == "B" and r["rival"] == third}
     paired = [by_seed_b[k] - by_seed_a[k] for k in by_seed_a if k in by_seed_b]
     pm, ps = mean_sem(paired)
     if paired:
-        lines.append(f"Pareado vs rule_based (B − A, {len(paired)} rondas): {pm:+.2f} ± {ps:.2f} por partido")
+        lines.append(f"Pareado vs {third} (B − A, {len(paired)} rondas): {pm:+.2f} ± {ps:.2f} por partido")
     # Cara a cara, desde A: A azul vs B, y B azul vs A (invertido).
     h2h = []
     for r in results:
@@ -149,7 +152,9 @@ def main() -> int:
     ap.add_argument("--penalties", type=int, default=0,
                     help="en vez de partidos, tandas de N penales alternados; los goles son penales convertidos")
     ap.add_argument("--rival-params", type=Path, default=None,
-                    help="VSSL_PARAMS de rule_based (p. ej. el mismo tope de ruedas que A y B)")
+                    help="VSSL_PARAMS del tercer rival (p. ej. el mismo tope de ruedas que A y B)")
+    ap.add_argument("--rival-coach", choices=("rule_based", "heuristic"), default="rule_based",
+                    help="coach del tercer rival: rule_based o el heurístico con --rival-params (panel)")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -158,7 +163,7 @@ def main() -> int:
     b = resolve_params(args.b, "B", args.out)
     names = {"A": str(args.a), "B": str(args.b)}
     jobs = schedule(args.rounds, a, b, args.rival_params, vs_rule_based=not args.solo_cara_a_cara,
-                    first_seed=args.semilla_inicial)
+                    first_seed=args.semilla_inicial, rival_coach=args.rival_coach)
 
     sims = [Simulator(args.fps, args.vision_port + 10 * k, args.cmd_port + 10 * k, args.out / f"firasim_{k}.log")
             for k in range(max(1, args.sims))]

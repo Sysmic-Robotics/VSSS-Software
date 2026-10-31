@@ -3,6 +3,7 @@ mod coach_trait;
 pub mod debug;
 pub mod heuristic_coach;
 mod observation;
+pub mod playbook;
 pub mod plays;
 pub mod referee;
 mod robot_target;

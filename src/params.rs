@@ -107,6 +107,15 @@ pub struct CoachParams {
     /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
     /// él, con anticipación) en vez de `GoalKeep`.
     pub gk_rail: bool,
+    /// Con el arquero rival centrado (|y| ≤ 3 cm), el atacante apunta al palo lejano a la
+    /// pelota en vez de al centro del arco (donde está el arquero).
+    pub aim_post_centered_keeper: bool,
+    /// Estilo de juego abierto (`coach::playbook`): `equilibrado` (el de siempre), `defensivo`,
+    /// `ofensivo`, o `adaptativo` (elige entre los tres durante el partido según cómo le va a
+    /// cada uno, como el playbook de CMDragons).
+    pub estilo: String,
+    /// Adaptativo: segundos de juego abierto que dura el episodio de un estilo si no hay gol.
+    pub playbook_episodio_s: f32,
 }
 
 impl Default for CoachParams {
@@ -147,6 +156,9 @@ impl Default for CoachParams {
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
             gk_rail: true,
+            aim_post_centered_keeper: false,
+            estilo: "equilibrado".to_string(),
+            playbook_episodio_s: 20.0,
         }
     }
 }
@@ -648,6 +660,12 @@ impl TeamParams {
             ));
         }
         let p: Self = serde_json::from_value(crudo).map_err(|e| e.to_string())?;
+        if p.coach.estilo != "adaptativo" && crate::coach::playbook::Estilo::from_nombre(&p.coach.estilo).is_none() {
+            return Err(format!(
+                "coach.estilo = \"{}\" no existe: equilibrado, defensivo, ofensivo o adaptativo",
+                p.coach.estilo
+            ));
+        }
         p.validate_tolerances()?;
         p.validate_rutinas()?;
         p.manual.validate()?;
@@ -928,6 +946,17 @@ mod tests {
         // Y también lo cumple el JSON del repo.
         let repo = TeamParams::from_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH)).unwrap();
         repo.coach.check_style_ranges(&text).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn open_play_style_must_be_a_known_one() {
+        assert_eq!(TeamParams::default().coach.estilo, "equilibrado");
+        for ok in ["equilibrado", "defensivo", "ofensivo", "adaptativo"] {
+            let p = TeamParams::from_json(&format!(r#"{{ "coach": {{ "estilo": "{ok}" }} }}"#)).unwrap();
+            assert_eq!(p.coach.estilo, ok);
+        }
+        let err = TeamParams::from_json(r#"{ "coach": { "estilo": "loco" } }"#).unwrap_err();
+        assert!(err.contains("coach.estilo") && err.contains("loco"), "{err}");
     }
 
     #[test]
