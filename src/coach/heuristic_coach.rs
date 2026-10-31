@@ -1488,10 +1488,11 @@ mod tests {
     #[test]
     fn keeper_blocks_a_ball_rolling_into_the_goal_instead_of_clearing_it() {
         let old = CoachParams { gk_block_incoming_speed: 9.9, ..CoachParams::default() };
-        // Pelota lenta en el área rodando hacia la boca del arco: antes se despejaba
-        // ("parada" a 0.14 m/s); ahora el arquero la bloquea desde la línea.
+        // Pelota lenta en el área (fuera de la franja del riel, 0.11 m) rodando hacia la boca
+        // del arco: antes se despejaba ("parada" a 0.14 m/s); ahora el arquero la bloquea
+        // desde la línea.
         let rolling = obs(
-            Vec2::new(-0.66, 0.05),
+            Vec2::new(-0.62, 0.05),
             Vec2::new(-0.14, 0.0),
             [Vec2::new(-0.35, -0.20), Vec2::new(0.2, -0.3), Vec2::new(-0.70, -0.10)],
         );
@@ -1634,9 +1635,10 @@ mod tests {
             ..CoachParams::default()
         };
         let mut c = HeuristicCoach::from_params(ATTACK, OWN, p, true);
-        // Pelota moviéndose dentro del área (no "parada") → GoalKeep al principio...
+        // Pelota moviéndose dentro del área (no "parada", fuera de la franja del riel) →
+        // RailKeeper al principio...
         let o = obs(
-            Vec2::new(-0.65, 0.05),
+            Vec2::new(-0.62, 0.05),
             Vec2::new(0.0, 0.3),
             [Vec2::new(0.0, 0.3), Vec2::new(0.2, -0.3), Vec2::new(-0.70, 0.0)],
         );

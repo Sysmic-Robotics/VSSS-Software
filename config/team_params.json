@@ -61,7 +61,7 @@
     "spin_pos_tol": 0.05,
     "spin_release_ball_speed": 0.4,
     "spin_max_time_s": 1.0,
-    "keeper_depth": 0.05,
+    "keeper_depth": 0.08,
     "keeper_gain": 8.0,
     "keeper_horizon_s": 1.5,
     "keeper_lead_s": 0.1,

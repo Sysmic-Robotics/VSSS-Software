@@ -3,9 +3,14 @@
 //! (`docs/investigacion/01_arquero.md`) y con lo que mostraron nuestros registros.
 //!
 //! - **Riel cerca del arco.** Vive en una recta paralela a la línea de gol, a
-//!   `keeper_depth` de ella (5 cm: el cuerpo llega a 1 cm de la línea). Con la línea a
-//!   12 cm, la pelota que rodaba por la línea de gol le pasaba por detrás: 22 de 41 goles
-//!   en contra en 48 partidos.
+//!   `keeper_depth` de ella (8 cm: el cuerpo queda a 4 cm de la línea y la pelota, de 4.27,
+//!   no pasa por detrás). Con la línea a 12 cm, la pelota que rodaba por la línea de gol le
+//!   pasaba por detrás: 22 de 41 goles en contra en 48 partidos. A 5 cm (el cuerpo a 1 cm),
+//!   en la cancha real cualquier sobrepaso lo metía dentro del arco, que está hundido, y no
+//!   podía volver.
+//! - **Vuelve a navegar desde cero.** Al salir del riel reinicia el estado de motion para ese
+//!   robot: su rampa guardaba el último avance de antes del riel y el arquero arrancaba con
+//!   esa velocidad, a veces de frente hacia el arco.
 //! - **Orientado a lo largo del riel (±90°).** Un diferencial solo avanza hacia donde
 //!   mira; mirando la pelota, cada corrección lateral exigía girar hasta 90° antes de
 //!   moverse. A lo largo del riel, todo movimiento es avanzar o retroceder (dos caras).
@@ -79,6 +84,8 @@ pub struct RailKeeperSkill {
     v_prev: f64,
     last_target: Option<Vec2>,
     last_mode: KeeperMode,
+    /// Fuera del riel, volviendo con la navegación de motion.
+    navigating: bool,
 }
 
 impl RailKeeperSkill {
@@ -96,6 +103,7 @@ impl RailKeeperSkill {
             v_prev: 0.0,
             last_target: None,
             last_mode: KeeperMode::Angle,
+            navigating: false,
         }
     }
 
@@ -244,10 +252,16 @@ impl Skill for RailKeeperSkill {
         // Fuera del riel: volver con la navegación normal, terminando a lo largo del riel.
         let off = rail_x - robot.position.x;
         if off.abs() > self.rail_tol {
+            if !self.navigating {
+                // La rampa de motion guardaba el avance de antes del riel: desde cero.
+                motion.reset_robot(robot.team, robot.id);
+                self.navigating = true;
+            }
             self.v_prev = 0.0;
             let along = target + Vec2::new(0.0, 1.0);
             return motion.move_and_face_contact(robot, target, along, world, BACK_KP, BACK_KI, BACK_KD);
         }
+        self.navigating = false;
 
         let cfg = &motion.config;
         // (Se probó, ante un tiro, pedir la velocidad para llegar al cruce a tiempo sin reservar
@@ -296,6 +310,7 @@ impl Skill for RailKeeperSkill {
     fn reset(&mut self) {
         self.v_prev = 0.0;
         self.last_target = None;
+        self.navigating = false;
     }
 }
 
@@ -303,9 +318,12 @@ impl Skill for RailKeeperSkill {
 mod tests {
     use super::*;
 
-    /// Arco propio a la izquierda (−x): el riel queda en x = −0.70.
+    /// Arco propio a la izquierda (−x) con el riel a 5 cm (x = −0.70): las cifras de los
+    /// tests de geometría están calculadas con ese riel; el default es `keeper_depth`.
     fn keeper() -> RailKeeperSkill {
-        RailKeeperSkill::new(Vec2::new(-0.75, 0.0))
+        let mut k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+        k.depth = 0.05;
+        k
     }
 
     #[test]
@@ -345,8 +363,39 @@ mod tests {
 
     #[test]
     fn rail_sits_close_to_the_goal_on_either_side() {
+        // Default 8 cm: el cuerpo (4 cm de medio lado) queda a 4 cm de la línea, menos que el
+        // diámetro de la pelota.
+        let k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+        assert_eq!(k.depth, 0.08);
+        assert!(k.depth - ROBOT_HALF < 2.0 * BALL_RADIUS);
+        assert!((k.rail_x() - (-0.67)).abs() < 1e-6);
+        assert!((RailKeeperSkill::new(Vec2::new(0.75, 0.0)).rail_x() - 0.67).abs() < 1e-6);
         assert!((keeper().rail_x() - (-0.70)).abs() < 1e-6);
-        assert!((RailKeeperSkill::new(Vec2::new(0.75, 0.0)).rail_x() - 0.70).abs() < 1e-6);
+    }
+
+    #[test]
+    fn returning_to_navigation_restarts_the_motion_ramp() {
+        // Motion guarda el último avance de este robot (de antes de entrar al riel); al salir
+        // del riel el arquero arranca desde cero, no desde ese avance.
+        let mut k = keeper();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let motion = Motion::new();
+        // Mirando a −x (hacia el arco), avanzando hacia un punto lejano de ese lado.
+        let behind = Vec2::new(-1.2, 0.10);
+        let r = robot(-0.45, 0.10, 180.0);
+        for _ in 0..50 {
+            motion.move_and_face_contact(&r, behind, behind, &world, BACK_KP, BACK_KI, BACK_KD);
+        }
+        // En el riel un tick (no navega), luego lejos del riel.
+        k.tick(&robot(-0.70, 0.0, 90.0), &world, &motion);
+        let c = k.tick(&r, &world, &motion);
+        let v = (c.vx * c.vx + c.vy * c.vy).sqrt();
+        assert!(v <= motion.config.max_linear_accel * CONTROL_DT + 1e-9, "v={v}");
+        // Y sigue acelerando con la rampa en los ticks siguientes.
+        let c2 = k.tick(&r, &world, &motion);
+        let v2 = (c2.vx * c2.vx + c2.vy * c2.vy).sqrt();
+        assert!(v2 > v, "{v2} > {v}");
     }
 
     #[test]
