@@ -2285,6 +2285,31 @@ mod tests {
     }
 
     #[test]
+    fn reflexes_never_take_the_keeper_into_its_goal_mouth() {
+        // Arquero (el 0) trabado junto a la boca de su arco, con heading diagonal hacia el
+        // arco y un avance lento que no alcanza a tocarla: tras la gracia y la ventana, la
+        // recuperación escapa. Junto al arco el escape va hacia la cancha, y ningún comando
+        // que sale de los reflejos (guardia → recuperación → guardia) lleva a tocar la boca.
+        let guard = ZoneGuard::new(1.0, 0);
+        let mut recovery = BorderRecovery::new(true);
+        let th = 135f64.to_radians();
+        let p = Vec2::new(-0.66, 0.05);
+        let h = Vec2::new(th.cos() as f32, th.sin() as f32);
+        let boca = guard.boca_propia();
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, p, th, Vec2::ZERO, 0.0);
+        let mut escaped = false;
+        for k in 0..90 {
+            let mut cmds = vec![own_cmd(0.15, th)];
+            let esc = apply_reflexes(&mut cmds, &world, &mut recovery, &guard, &HashSet::new(), 0);
+            escaped |= esc[0];
+            let v = (cmds[0].vx * th.cos() + cmds[0].vy * th.sin()) as f32;
+            assert!(!boca.touches(p + h * v * 0.30), "tick {k}: el avance lo lleva a la boca: {:?}", cmds[0]);
+        }
+        assert!(escaped, "la recuperación debía disparar");
+    }
+
+    #[test]
     fn fixed_skill_decider_emits_same_choice_each_tick() {
         let mut decider = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.3, 0.0));
         let world = World::new(3, 3);
@@ -2734,20 +2759,37 @@ mod tests {
     /// robots 0 y 1, sin el 2, con la pelota quieta en (0.20, 0.05). Solo el 0 se mueve.
     /// Devuelve la planta del 0 al final y los ticks en que el guardia lo frenó o lo sacó.
     fn correr_en_planta(d: &mut dyn TickDecider, ticks: u32) -> (crate::motion::test_plant::Plant, usize) {
-        let cfg = MotionConfig { bidirectional: true, ..MotionConfig::default() };
+        let c = correr_en_planta_desde(d, ticks, (-0.45, 0.10, 0.0), true);
+        (c.planta, c.guardia)
+    }
+
+    /// Lo que deja una corrida de `correr_en_planta_desde`.
+    struct Corrida {
+        planta: crate::motion::test_plant::Plant,
+        /// Ticks en que el guardia frenó o sacó al 0.
+        guardia: usize,
+        /// x mínima del 0: lo más hondo que llegó hacia el arco propio (a la izquierda).
+        x_min: f32,
+        /// Ticks del 0 en maniobra de escape.
+        escapes: usize,
+    }
+
+    /// `correr_en_planta` con la pose inicial del 0 (x, y, heading en grados) y el modo.
+    fn correr_en_planta_desde(d: &mut dyn TickDecider, ticks: u32, pose: (f32, f32, f64), bidirectional: bool) -> Corrida {
+        let cfg = MotionConfig { bidirectional, ..MotionConfig::default() };
         let mut motion = Motion::with_config(cfg).with_areas(1.0, 2);
         let mut guard = ZoneGuard::new(1.0, 2);
         let mut catalog = SkillCatalog::new(3);
         let mut recovery = BorderRecovery::new(true);
         let (manual, gui) = (HashMap::new(), HashMap::new());
-        let mut planta = crate::motion::test_plant::Plant::new(-0.45, 0.10, 0.0);
-        let mut guardia = 0;
+        let mut planta = crate::motion::test_plant::Plant::new(pose.0, pose.1, pose.2);
+        let (mut guardia, mut x_min, mut escapes) = (0, planta.x, 0);
         for t in 0..ticks {
             let mut w = World::new(3, 3);
             w.update_robot(0, 0, Vec2::new(planta.x, planta.y), planta.th, planta.velocity(), 0.0);
             w.update_robot(1, 0, Vec2::new(0.10, -0.20), 0.0, Vec2::ZERO, 0.0);
             w.update_ball(Vec2::new(0.20, 0.05), Vec2::ZERO);
-            let (cmds, _, _, _, g) = tick_commands(
+            let (cmds, _, _, esc, g) = tick_commands(
                 TickMode::Play,
                 &w,
                 d,
@@ -2763,9 +2805,34 @@ mod tests {
             );
             let k = cmds.iter().position(|c| c.id == 0).expect("comando del 0");
             guardia += usize::from(g[k].is_some_and(|g| g.accion.is_some()));
+            escapes += usize::from(esc[k]);
             planta.step(&cmds[k]);
+            x_min = x_min.min(planta.x);
         }
-        (planta, guardia)
+        Corrida { planta, guardia, x_min, escapes }
+    }
+
+    /// `guardia-linea-de-gol`: el arquero con un destino dentro de su arco no cruza la línea
+    /// de gol (la planta tiene la boca abierta), ni lanzado desde la cancha ni arrancando
+    /// junto al riel mirando al arco, en los dos modos, y la recuperación no lo toma por
+    /// atascado.
+    #[test]
+    fn a_keeper_sent_into_its_goal_never_crosses_the_line() {
+        let boca = ZoneGuard::new(1.0, 2).boca_propia();
+        for bidirectional in [false, true] {
+            for pose in [(-0.50, 0.05, 0.0), (-0.67, 0.0, 180.0)] {
+                let mut d = ConArquero {
+                    fijo: FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(-0.80, 0.0)),
+                    arquero: Some(0),
+                };
+                let c = correr_en_planta_desde(&mut d, 240, pose, bidirectional);
+                let caso = format!("desde {pose:?}, bidireccional {bidirectional}");
+                assert!(c.x_min > -0.71, "{caso}: el centro llegó a x = {:.3}", c.x_min);
+                assert!(!boca.touches(Vec2::new(c.planta.x, c.planta.y)), "{caso}: terminó tocando la boca");
+                assert!(c.guardia > 0, "{caso}: el guardia tenía que frenarlo");
+                assert_eq!(c.escapes, 0, "{caso}: escape espurio frente a la boca");
+            }
+        }
     }
 
     /// x del riel de RailKeeper con el arco propio a la izquierda, y su tolerancia.

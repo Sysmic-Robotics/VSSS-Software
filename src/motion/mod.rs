@@ -256,7 +256,8 @@ impl Motion {
     /// regla de la tangente (`avoid`).
     ///
     /// No hay paredes virtuales: el robot va hacia su destino, que está dentro de la
-    /// cancha; el borde lo cubren el `ZoneGuard` (áreas) y la recuperación de atasco.
+    /// cancha; el borde lo cubren el `ZoneGuard` (áreas y boca del arco propio) y la
+    /// recuperación de atasco.
     #[cfg(test)]
     fn uvf_heading(&self, robot_state: &RobotState, target: Vec2, world: &World) -> f32 {
         self.uvf_toward(robot_state, target, target, world)

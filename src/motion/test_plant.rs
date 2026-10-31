@@ -8,7 +8,9 @@
 //!   el torque limitado). Acelera a 1.2 m/s² y frena a 3.0 m/s², como lo medido en
 //!   FIRASim (frenado de 2.6–3.6 m/s² cuando el comando cae a cero);
 //! - latencia de N ticks entre el comando y las ruedas;
-//! - paredes físicas: el centro no sale de ±(0.75 − 0.04) × ±(0.65 − 0.04).
+//! - paredes físicas: el centro no sale de ±(0.75 − 0.04) × ±(0.65 − 0.04), salvo por la
+//!   boca de cada arco: con |y| ≤ 0.20 − 0.04 (el robot cabe) entra hasta el fondo,
+//!   |x| ≤ 0.85 − 0.04, y adentro lo contienen las paredes laterales del arco.
 //!
 //! Con `VSSL_REAL_ACTUATOR`, la planta usa el robot medido (`radio::actuator`, el modelo
 //! completo, sin descontar nada) en lugar de su latencia, su aceleración y su tope.
@@ -31,6 +33,12 @@ use crate::world::World;
 
 /// Paso de integración (s): la planta corre a 60 Hz, como el loop.
 pub(crate) const DT: f64 = 1.0 / 60.0;
+/// Límites del centro del robot (m): las paredes de la cancha (0.75 × 0.65 menos medio
+/// robot) y el arco (boca de 0.40 y fondo de 0.10, menos medio robot).
+const PARED_X: f32 = 0.71;
+const PARED_Y: f32 = 0.61;
+const BOCA_Y: f32 = 0.16;
+const FONDO_X: f32 = 0.81;
 
 pub(crate) struct Plant {
     pub x: f32,
@@ -120,8 +128,14 @@ impl Plant {
     }
 
     fn integrate(&mut self, v: f64, w: f64) {
-        self.x = (self.x + (v * self.th.cos() * DT) as f32).clamp(-0.71, 0.71);
-        self.y = (self.y + (v * self.th.sin() * DT) as f32).clamp(-0.61, 0.61);
+        let mut y = (self.y + (v * self.th.sin() * DT) as f32).clamp(-PARED_Y, PARED_Y);
+        if self.x.abs() > PARED_X {
+            // Dentro del arco: las paredes laterales.
+            y = y.clamp(-BOCA_Y, BOCA_Y);
+        }
+        let x_max = if y.abs() <= BOCA_Y { FONDO_X } else { PARED_X };
+        self.x = (self.x + (v * self.th.cos() * DT) as f32).clamp(-x_max, x_max);
+        self.y = y;
         self.th = Motion::normalize_angle(self.th + w * DT);
     }
 }
@@ -273,5 +287,30 @@ mod tests {
             q.step(&c);
         }
         assert!(q.th.abs() > 1.0, "con ruedas sin saturar gira: θ={:.3}", q.th);
+    }
+
+    #[test]
+    fn the_goal_mouth_lets_the_robot_in_and_the_wall_does_not() {
+        // Sin guardia, avanzando hacia el arco izquierdo: por el centro entra hasta el fondo;
+        // al costado de la boca lo detiene la pared.
+        let avanzar = |y: f32| {
+            let mut p = Plant::new(-0.55, y, 180.0);
+            for _ in 0..180 {
+                let c = cmd(0.4, 0.0, p.th);
+                p.step(&c);
+            }
+            p
+        };
+        let p = avanzar(0.0);
+        assert!((p.x + FONDO_X).abs() < 1e-6, "entra hasta el fondo: x={}", p.x);
+        let p = avanzar(0.30);
+        assert!((p.x + PARED_X).abs() < 1e-6, "la pared lo detiene: x={}", p.x);
+        // Adentro del arco, las paredes laterales lo contienen.
+        let mut p = Plant::new(-0.78, 0.0, 90.0);
+        for _ in 0..120 {
+            let c = cmd(0.4, 0.0, p.th);
+            p.step(&c);
+        }
+        assert!((p.y - BOCA_Y).abs() < 1e-6 && p.x < -PARED_X, "queda contra el lateral: ({}, {})", p.x, p.y);
     }
 }
