@@ -235,7 +235,10 @@ pub struct SkillParams {
     pub intercept_horizon: f32,
     /// Intercept: bajo esta velocidad la pelota se considera quieta (m/s).
     pub intercept_min_ball_speed: f32,
-    /// Intercept: constante de frenado exponencial de la pelota (1/s). MEDIR (M3).
+    /// Intercept: constante de frenado exponencial de la pelota (1/s). Medir en la cancha real
+    /// (`tools/medir_salita.py`). En FIRASim la pelota frena a 0.39, pero poner 0.39 o 0.45
+    /// aquí no cambió nada cara a cara (0.39: +0.46 en una serie y −0.12 en la confirmación,
+    /// +0.17 ± 0.10 en 96 partidos); 0.30 queda hasta tener la medición real.
     pub intercept_ball_decay_per_s: f32,
     /// Intercept: retardo de reacción sumado al tiempo de viaje (s).
     pub intercept_reaction_delay: f32,
