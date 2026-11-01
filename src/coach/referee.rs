@@ -155,8 +155,13 @@ fn read_varint(b: &[u8], i: &mut usize) -> Option<u64> {
 }
 
 /// Parsea un `VSSRef_Command` (proto3). Campos desconocidos se saltan.
+///
+/// proto3 omite todo campo que vale 0: `FREE_KICK` (foul 0), `BLUE` (teamcolor 0) y
+/// `NO_QUADRANT`. Por eso el mensaje se arma desde esos ceros, no desde `GAME_ON`: con el
+/// VSSReferee oficial, el saque del azul tras un gol llegaba como "equipo None" y los dos
+/// equipos lo jugaban como saque rival.
 pub fn parse_vssref_command(bytes: &[u8]) -> Option<RefereeCommand> {
-    let mut cmd = RefereeCommand::GAME_ON;
+    let mut cmd = RefereeCommand { foul: Foul::FreeKick, team: RefTeam::Blue, ..RefereeCommand::GAME_ON };
     let mut seen_foul = false;
     let mut i = 0;
     while i < bytes.len() {
@@ -194,13 +199,9 @@ pub fn parse_vssref_command(bytes: &[u8]) -> Option<RefereeCommand> {
             _ => return None,
         }
     }
-    // proto3 omite el campo 1 cuando vale 0 (FREE_KICK): un mensaje sin foul
-    // explícito con otros campos presentes sigue siendo válido.
+    // Un datagrama vacío no es un comando (un FREE_KICK para BLUE trae al menos el tiempo).
     if !seen_foul && bytes.is_empty() {
         return None;
-    }
-    if !seen_foul {
-        cmd.foul = Foul::FreeKick;
     }
     Some(cmd)
 }
@@ -415,6 +416,15 @@ mod tests {
         let c = parse_vssref_command(&encode(0, 1, 0, 0.0, 0)).unwrap();
         assert_eq!(c.foul, Foul::FreeKick);
         assert_eq!(c.team, RefTeam::Yellow);
+        // BLUE = 0 también se omite: el saque, el penal y el tiro libre del azul llegan sin
+        // el campo del equipo (así los manda el VSSReferee oficial).
+        for (foul, esperado) in [(4, Foul::Kickoff), (1, Foul::PenaltyKick), (2, Foul::GoalKick), (0, Foul::FreeKick)] {
+            let c = parse_vssref_command(&encode(foul, 0, 0, 10.0, 1)).unwrap();
+            assert_eq!((c.foul, c.team), (esperado, RefTeam::Blue));
+        }
+        // GAME_ON, STOP y HALT vienen con NONE (2) explícito.
+        let c = parse_vssref_command(&encode(6, 2, 0, 10.0, 1)).unwrap();
+        assert_eq!((c.foul, c.team), (Foul::GameOn, RefTeam::None));
 
         assert!(parse_vssref_command(&[0x08, 0x2a]).is_none()); // foul 42 inválido
     }
