@@ -113,7 +113,9 @@ pub struct CoachParams {
     pub estilo: String,
     /// Adaptativo: segundos de juego abierto que dura el episodio de un estilo si no hay gol.
     pub playbook_episodio_s: f32,
-    /// Cuánto adentro del palo apunta el atacante (m): penal propio y tiro al palo lejano.
+    /// Cuánto adentro del palo apunta el atacante (m): penal propio y tiro al palo lejano. En
+    /// penales contra el arquero de rule_based (sigue la y de la pelota): 0.09 convierte 51 %
+    /// contra 82 % de 0.06 (240 penales); 0.04, 84 % contra 79 % (sin diferencia).
     pub aim_post_margin: f32,
 }
 
