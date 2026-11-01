@@ -109,16 +109,22 @@ def summarize(results: list[dict], names: dict[str, str]) -> str:
     pm, ps = mean_sem(paired)
     if paired:
         lines.append(f"Pareado vs {third} (B − A, {len(paired)} rondas): {pm:+.2f} ± {ps:.2f} por partido")
-    # Cara a cara, desde A: A azul vs B, y B azul vs A (invertido).
-    h2h = []
+    # Cara a cara, desde A: A azul vs B, y B azul vs A (invertido). Los dos partidos de una
+    # ronda comparten la semilla de ruido (son la misma simulación con los colores cambiados),
+    # así que no son independientes: el error estándar se calcula sobre las rondas, no sobre
+    # los partidos. Con el de partidos, en una serie de control (A = B) salió −0.23 ± 0.08.
+    h2h, by_seed = [], {}
     for r in results:
         if r["rival"] in ("A", "B"):
             diff = r["goals_for"] - r["goals_against"]
-            h2h.append(diff if r["blue"] == "A" else -diff)
+            from_a = diff if r["blue"] == "A" else -diff
+            h2h.append(from_a)
+            by_seed.setdefault(r["seed"], []).append(float(from_a))
     w = sum(1 for g in h2h if g > 0); d = sum(1 for g in h2h if g == 0)
-    hm, hs = mean_sem([float(g) for g in h2h])
+    rounds = [statistics.mean(v) for v in by_seed.values()]
+    hm, hs = mean_sem(rounds)
     lines.append(f"Cara a cara A contra B ({len(h2h)} partidos, ambos lados): A gana {w}, empata {d}, pierde "
-                 f"{len(h2h) - w - d}; dif. goles A−B {hm:+.2f} ± {hs:.2f} por partido")
+                 f"{len(h2h) - w - d}; dif. goles A−B {hm:+.2f} ± {hs:.2f} por partido (error sobre {len(rounds)} rondas)")
     verdict = "sin diferencia detectable con estos partidos"
     if not paired:
         if not math.isnan(hm) and abs(hm) > 2 * hs:
