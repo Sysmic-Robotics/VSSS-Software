@@ -35,6 +35,9 @@ use std::f64::consts::FRAC_PI_2;
 
 /// Mitad del ancho de la boca del arco (m).
 const GOAL_HALF_Y: f32 = 0.20;
+/// Mitad del ancho del área (m) y de la cancha (m).
+const AREA_HALF_Y: f32 = crate::skills::zones::AREA_HALF_Y;
+const FIELD_HALF_Y: f32 = 0.65;
 /// Radio de la pelota (m).
 const BALL_RADIUS: f32 = 0.021;
 /// Medio lado del robot (m).
@@ -159,11 +162,15 @@ impl RailKeeperSkill {
 
         // Pelota entre el riel y la línea de gol: ya está "detrás" del arquero.
         if d_ball < self.depth + BALL_RADIUS {
-            if ball_ahead.y.abs() <= GOAL_HALF_Y + BALL_RADIUS {
-                // Frente a la boca: barrerla a lo largo de la línea hacia su palo, desde el
-                // lado del centro. Puede pasar el palo lo necesario para sacarla de la boca.
+            if ball_ahead.y.abs() <= AREA_HALF_Y + BALL_RADIUS {
+                // Dentro del ancho del área: barrerla a lo largo de la línea hacia afuera, desde
+                // el lado del centro. Frente a la boca la saca por el palo; en el rincón del área
+                // (|y| entre la boca y 0.35) la saca del área: ahí nadie más puede jugarla (el
+                // guardia no deja entrar a los de campo) y el VSSReferee pita PENAL a los 5 s de
+                // pelota trabada dentro del área si solo el defensor está cerca (dos penales en
+                // contra en 200 s de prueba; antes el riel cerraba el palo y la dejaba).
                 let side = if ball_ahead.y >= 0.0 { 1.0 } else { -1.0 };
-                let reach = GOAL_HALF_Y + ROBOT_HALF + BALL_RADIUS;
+                let reach = FIELD_HALF_Y - ROBOT_HALF;
                 let y = (ball_ahead.y + side * self.sweep).clamp(-reach, reach);
                 return (y, KeeperMode::SweepLine);
             }
@@ -423,6 +430,18 @@ mod tests {
         assert!(y > 0.08 && y <= GOAL_HALF_Y + ROBOT_HALF + BALL_RADIUS, "{y}");
         let (y, _) = keeper().target_y(Vec2::new(-0.73, -0.15), Vec2::ZERO, &[]);
         assert!(y < -0.15, "hacia su palo: {y}");
+    }
+
+    #[test]
+    fn ball_on_the_line_in_the_area_corner_is_swept_out_of_the_area() {
+        // Rincón del área (|y| entre la boca y 0.35): antes cerraba el palo (NearPost) y la
+        // pelota quedaba trabada ahí hasta el penal del árbitro oficial.
+        let (y, mode) = keeper().target_y(Vec2::new(-0.68, 0.31), Vec2::ZERO, &[]);
+        assert_eq!(mode, KeeperMode::SweepLine);
+        assert!(y > 0.31 && y <= FIELD_HALF_Y - ROBOT_HALF, "hacia afuera del área: {y}");
+        // Ya fuera del ancho del área sigue cerrando el palo.
+        let (y, mode) = keeper().target_y(Vec2::new(-0.68, 0.45), Vec2::ZERO, &[]);
+        assert_eq!((y, mode), (GOAL_HALF_Y, KeeperMode::NearPost));
     }
 
     #[test]

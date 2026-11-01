@@ -136,7 +136,9 @@ impl Default for CoachParams {
             decision_hz: 10.0,
             spin_engage_radius: 0.25,
             spin_when_opponent_within: 0.10,
-            gk_force_clear_s: 6.0,
+            // El VSSReferee pita penal a los 5 s de pelota trabada en el área con solo el
+            // defensor cerca (su `stuckedBallTime`); 6 s llegaba tarde.
+            gk_force_clear_s: 3.0,
             mark_distance: 0.30,
             score_hysteresis: 0.15,
             score_approach_base: 0.30,

@@ -14,7 +14,7 @@
     "decision_hz": 10.0,
     "spin_engage_radius": 0.25,
     "spin_when_opponent_within": 0.1,
-    "gk_force_clear_s": 6.0,
+    "gk_force_clear_s": 3.0,
     "mark_distance": 0.30,
     "score_hysteresis": 0.15,
     "score_approach_base": 0.3,
