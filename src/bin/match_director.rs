@@ -3,7 +3,7 @@
 //! FIRASim no repone la pelota tras un gol ni lleva el marcador. Este binario escucha la
 //! visión del simulador, detecta los goles, repone pelota y robots con el replacement
 //! FIRA y pita a los dos engines por el canal del árbitro (texto a `VSSL_REFEREE_ADDR`):
-//! `STOP` → reposición → `KICKOFF <equipo>` → `GAME_ON`. Pelota trabada 10 s → `FREE_BALL`
+//! `STOP` → reposición → `KICKOFF <equipo>` → `GAME_ON`. Pelota trabada 5 s → `FREE_BALL`
 //! en la cruz del cuadrante (un robot por equipo a 0.20 m del lado propio). Termina por
 //! tiempo de juego o por goles y deja el resultado en la salida (y en `--out`, JSON).
 //!
@@ -39,8 +39,10 @@ const GOAL_HALF_Y: f64 = 0.20;
 const BALL_RADIUS: f64 = 0.021;
 /// Frames de visión por segundo de simulación.
 const FRAMES_PER_S: f64 = 60.0;
-/// Pelota trabada: no se movió más de `STUCK_DIST` en `STUCK_S` segundos de juego.
-const STUCK_S: f64 = 10.0;
+/// Pelota trabada: no se movió más de `STUCK_DIST` en `STUCK_S` segundos de juego. 5 s como el
+/// VSSReferee oficial (`stuckedBallTime`); con 10 s las series tenían la mitad de free balls
+/// que un partido real.
+const STUCK_S: f64 = 5.0;
 const STUCK_DIST: f64 = 0.05;
 /// Cruces de free ball (|x|, |y|) y distancia del robot colocado a la cruz.
 const MARK_X: f64 = 0.375;
@@ -611,16 +613,16 @@ mod tests {
     }
 
     #[test]
-    fn stuck_ball_needs_ten_still_seconds() {
+    fn stuck_ball_needs_five_still_seconds() {
         let mut game = m(1.0);
         let still = (0.61, 0.63);
-        for _ in 0..600 {
+        for _ in 0..300 {
             assert!(!game.ball_stuck(still));
         }
         assert!(game.ball_stuck((0.62, 0.64)));
         // Se movió más de 5 cm en la ventana: no está trabada.
         let mut rolling = m(1.0);
-        for i in 0..601 {
+        for i in 0..301 {
             let moved = rolling.ball_stuck((0.61 + 0.0002 * i as f64, 0.63));
             assert!(!moved, "frame {i}");
         }
