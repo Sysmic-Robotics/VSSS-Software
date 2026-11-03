@@ -504,7 +504,9 @@ mod tests {
 
     #[test]
     fn frase_fila_sin_patron() {
-        assert_eq!(frase_fila(4, &Identidad::default(), &[]), "sin patrón: no recibe comandos");
+        let mut i = Identidad::default();
+        i.robots[4].patron = None;
+        assert_eq!(frase_fila(4, &i, &[]), "sin patrón: no recibe comandos");
     }
 
     #[test]
@@ -547,7 +549,8 @@ mod tests {
 
     #[test]
     fn lineas_propuesta_solo_cambios() {
-        let actual = Identidad::default();
+        let mut actual = Identidad::default();
+        actual.robots[4].patron = None;
         let mut p = actual.clone();
         p.robots[0].patron = Some(1);
         p.robots[1].patron = Some(0);

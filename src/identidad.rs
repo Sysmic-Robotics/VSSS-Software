@@ -2,8 +2,9 @@
 //!
 //! El robot real tiene dos números:
 //! - el **patrón** que ve la cámara (id de visión): ssl-vision numera los patrones por su
-//!   celda en `VsssPatern.png`, 4 por color de equipo (0–3). Con él aparece en `World`,
-//!   en el coach y en la GUI;
+//!   celda en la imagen de patrones: 6 por color de equipo (0–5) con la imagen del rojo
+//!   (`VsssPatern-rojo.png`, 3 × 2 celdas, el 4 y el 5 con rojo) y 4 (0–3) con la de antes.
+//!   Con él aparece en `World`, en el coach y en la GUI;
 //! - la **posición de radio** que escucha el firmware (`MI_ROBOT_ID − 1`, 5 posiciones en
 //!   el frame de la base).
 //!
@@ -22,8 +23,9 @@ use crate::radio::base_station::SLOT_COUNT;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Patrones de ssl-vision por color de equipo.
-pub const PATRONES: u8 = 4;
+/// Patrones de ssl-vision por color de equipo: los 6 de la imagen con rojo, para que los
+/// repuestos tengan patrón propio. Con la imagen de 4 patrones, el 4 y el 5 no aparecen.
+pub const PATRONES: u8 = 6;
 
 /// Ruta por defecto del archivo, relativa al directorio de trabajo.
 pub const DEFAULT_PATH: &str = "config/identidad_robots.json";
@@ -46,7 +48,7 @@ pub struct Identidad {
 }
 
 impl Default for Identidad {
-    /// Radio N ↔ patrón N para N en 0..3, la radio 4 sin patrón, todas activas: con
+    /// Radio N ↔ patrón N en las 5 radios (el patrón 5 queda sin radio), todas activas: con
     /// cualquier patrón que da la cámara, el mismo frame que antes sin mapa.
     fn default() -> Self {
         Self {
@@ -149,7 +151,7 @@ impl Identidad {
     }
 
     /// Patrones de `0..PATRONES` cuyos comandos no llegan a ningún robot (desactivado, sin
-    /// robot o repetido). Con la identidad por defecto, vacía.
+    /// robot o repetido). Con la identidad por defecto, solo el 5: hay 5 radios para 6 patrones.
     pub fn sin_comandos(&self) -> Vec<i32> {
         (0..i32::from(PATRONES)).filter(|p| self.radio_de(*p).is_err()).collect()
     }
@@ -213,7 +215,7 @@ impl Identidad {
         out
     }
 
-    /// Lee el JSON del archivo y lo valida (radio en 0..4 sin repetir, patrón en 0..3). Una
+    /// Lee el JSON del archivo y lo valida (radio en 0..4 sin repetir, patrón en 0..5). Una
     /// radio que no aparece queda sin patrón y activa; un patrón repetido es válido.
     pub fn desde_json(text: &str) -> Result<Self, String> {
         let archivo: Archivo = serde_json::from_str(text).map_err(|e| e.to_string())?;
@@ -397,11 +399,22 @@ mod tests {
     #[test]
     fn por_defecto_es_radio_n_patron_n() {
         let i = Identidad::default();
-        for n in 0..4 {
+        for n in 0..SLOT_COUNT {
             assert_eq!(i.robots[n], RobotFisico { patron: Some(n as u8), activo: true });
             assert_eq!(i.radio_de(n as i32), Ok(n));
         }
-        assert_eq!(i.robots[4], RobotFisico { patron: None, activo: true });
+        // 6 patrones (con el rojo) y 5 radios: el 5 queda sin robot.
+        assert_eq!(i.radio_de(5), Err(SinRadio::SinRobot));
+        assert_eq!(i.sin_comandos(), vec![5]);
+    }
+
+    #[test]
+    fn los_patrones_rojos_son_validos() {
+        // Imagen con rojo: 6 patrones por equipo, el 4 y el 5 con rojo (repuestos).
+        let i = Identidad::desde_json(r#"{ "robots": [ { "radio": 3, "patron": 4 }, { "radio": 4, "patron": 5 } ] }"#)
+            .unwrap();
+        assert_eq!(i.radio_de(4), Ok(3));
+        assert_eq!(i.radio_de(5), Ok(4));
     }
 
     #[test]
@@ -435,21 +448,22 @@ mod tests {
     fn radio_de_fuera_de_rango() {
         let i = Identidad::default();
         assert_eq!(i.radio_de(-1), Err(SinRadio::SinRobot));
-        assert_eq!(i.radio_de(4), Err(SinRadio::SinRobot));
+        assert_eq!(i.radio_de(6), Err(SinRadio::SinRobot));
         assert_eq!(i.radio_de(9), Err(SinRadio::SinRobot));
     }
 
     #[test]
-    fn sin_comandos_vacia_por_defecto() {
-        assert!(Identidad::default().sin_comandos().is_empty());
+    fn sin_comandos_por_defecto_solo_el_patron_sin_radio() {
+        // 6 patrones y 5 radios: por defecto solo el 5 no llega a ningún robot.
+        assert_eq!(Identidad::default().sin_comandos(), vec![5]);
     }
 
     #[test]
     fn sin_comandos_las_tres_causas() {
         // La radio 1 (patrón 1) desactivada y la radio 2 pasa al patrón 0: el 0 repetido,
-        // el 1 desactivado y el 2 sin robot; el 3 sigue en la radio 3.
+        // el 1 desactivado y el 2 sin robot; el 3 y el 4 siguen en su radio, y el 5 no tiene.
         let i = con(&[(1, Some(1), false), (2, Some(0), true)]);
-        assert_eq!(i.sin_comandos(), vec![0, 1, 2]);
+        assert_eq!(i.sin_comandos(), vec![0, 1, 2, 5]);
     }
 
     #[test]
@@ -466,10 +480,10 @@ mod tests {
     }
 
     #[test]
-    fn rechaza_patron_4() {
-        let e = Identidad::desde_json(r#"{ "robots": [ { "radio": 2, "patron": 4, "activo": true } ] }"#)
+    fn rechaza_patron_6() {
+        let e = Identidad::desde_json(r#"{ "robots": [ { "radio": 2, "patron": 6, "activo": true } ] }"#)
             .unwrap_err();
-        assert!(e.contains("radio 2") && e.contains("patrón 4") && e.contains("0..3"), "{e}");
+        assert!(e.contains("radio 2") && e.contains("patrón 6") && e.contains("0..5"), "{e}");
     }
 
     #[test]
@@ -572,17 +586,18 @@ mod tests {
         assert_eq!(l.len(), 5);
         assert_eq!(l[0], "radio 0 (MI_ROBOT_ID 1): patrón 1");
         assert_eq!(l[2], "radio 2 (MI_ROBOT_ID 3): patrón 2, desactivado");
-        assert_eq!(l[4], "radio 4 (MI_ROBOT_ID 5): sin patrón");
+        assert_eq!(l[3], "radio 3 (MI_ROBOT_ID 4): sin patrón");
+        assert_eq!(l[4], "radio 4 (MI_ROBOT_ID 5): patrón 4");
         assert!(l.iter().all(|x| !x.contains('←') && !x.contains('→')));
     }
 
     #[test]
     fn describir_por_defecto() {
         let l = Identidad::default().describir();
-        for (n, linea) in l.iter().enumerate().take(4) {
+        assert_eq!(l.len(), SLOT_COUNT);
+        for (n, linea) in l.iter().enumerate() {
             assert_eq!(*linea, format!("radio {n} (MI_ROBOT_ID {}): patrón {n}", n + 1));
         }
-        assert_eq!(l[4], "radio 4 (MI_ROBOT_ID 5): sin patrón");
     }
 
     #[test]

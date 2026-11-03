@@ -770,7 +770,8 @@ mod tests {
         let mut ident = crate::identidad::Identidad::default();
         ident.robots[1].patron = None;
         let snap = tres_robots(Some(ident));
-        assert_eq!(sin_comandos_de(&snap), vec![1]);
+        // El 1 sin radio, y el 5 que por defecto no tiene (6 patrones, 5 radios).
+        assert_eq!(sin_comandos_de(&snap), vec![1, 5]);
         assert_eq!(asignacion_prevista(&rutina, &snap, 0, 3, 2, &Eleccion::Automatica), Ok(vec![2]));
     }
 

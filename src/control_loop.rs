@@ -3241,11 +3241,12 @@ mod tests {
     #[tokio::test]
     async fn lazo_entrega_sin_comandos_al_arrancar_y_con_usar() {
         let mut b = BancoIdentidad::new(true);
-        assert_eq!(b.decisor.listas, vec![Vec::<i32>::new()], "al arrancar, la lista de la identidad");
+        // Por defecto, el patrón 5 no tiene radio (6 patrones, 5 radios).
+        assert_eq!(b.decisor.listas, vec![vec![5]], "al arrancar, la lista de la identidad");
         let mut sin_el_2 = Identidad::default();
         sin_el_2.robots[2].activo = false;
         b.tick(vec![OrdenIdentidad::Usar(sin_el_2)], TickMode::Play, &ceros()).await;
-        assert_eq!(b.decisor.listas.last(), Some(&vec![2]));
+        assert_eq!(b.decisor.listas.last(), Some(&vec![2, 5]));
         // Repetir la misma identidad no la vuelve a entregar.
         let n = b.decisor.listas.len();
         let misma = (*b.identidad.para_foto().unwrap()).clone();

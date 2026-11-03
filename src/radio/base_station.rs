@@ -458,10 +458,16 @@ mod tests {
     }
 
     #[test]
-    fn frame_patron_4_por_defecto_se_descarta() {
-        // ssl-vision no tiene el patrón 4: por defecto la radio 4 no lleva ninguno.
-        let cmds = vec![make_cmd(0, 4, 0.0, 0.0, -FRAC_PI_2, 0.0)];
+    fn frame_patron_5_por_defecto_se_descarta() {
+        // 6 patrones (imagen con rojo) y 5 radios: por defecto el patrón 5 no tiene radio.
+        let cmds = vec![make_cmd(0, 5, 0.0, 0.0, -FRAC_PI_2, 0.0)];
         assert_eq!(build_frame(&cmds, TeamColor::Blue, &Identidad::default()), "0,0,0,0,0,0,0,0,0,0\n");
+    }
+
+    #[test]
+    fn frame_patron_4_por_defecto_va_a_la_radio_4() {
+        let cmds = vec![make_cmd(0, 4, 0.0, 0.0, -FRAC_PI_2, 0.0)];
+        assert_eq!(build_frame(&cmds, TeamColor::Blue, &Identidad::default()), "0,0,0,0,0,0,0,0,0,-90\n");
     }
 
     // ---------- Filtro de team y descarte ----------
@@ -510,8 +516,8 @@ mod tests {
 
     #[test]
     fn frame_por_defecto_igual_al_de_hoy() {
-        // Sin archivo, los patrones 0–3 van a su propia posición, como sin mapa.
-        for id in 0..4 {
+        // Sin archivo, los patrones 0–4 van a su propia posición, como sin mapa.
+        for id in 0..SLOT_COUNT as i32 {
             let cmds = vec![make_cmd(0, id, 0.5, 0.0, 0.0, 0.0)];
             let mut slots = [(0i16, 0i16); SLOT_COUNT];
             slots[id as usize] = (500, 0);

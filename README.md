@@ -725,7 +725,7 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 | Identidad de los robots (`config/identidad_robots.json`) | sin archivo: radio N ↔ patrón N | Qué patrón lleva cada robot físico y si está activo (ver abajo) |
 
 **Patrones y radios.** Cada robot real tiene dos números:
-- **patrón** (id de visión): el de su parche de colores. ssl-vision numera los patrones por su celda en `VsssPatern.png`, 4 por color de equipo (0 a 3). Con él aparece en el `World` y en la GUI, y es el número que se elige en la GUI y en `skill_test --mode skill --robot`. El coach manda los patrones 0 a 2.
+- **patrón** (id de visión): el de su parche de colores. ssl-vision numera los patrones por su celda en la imagen de patrones: 6 por color de equipo (0 a 5) con la imagen del rojo (`VsssPatern-rojo.png`, 3 × 2 celdas; el 4 y el 5 llevan rojo, para los repuestos), y 4 (0 a 3) con la de antes. Con él aparece en el `World` y en la GUI, y es el número que se elige en la GUI y en `skill_test --mode skill --robot`. El coach manda los patrones 0 a 2.
 - **radio**: la posición del frame que escucha el robot, `MI_ROBOT_ID − 1` del firmware (0 a 4).
 
 **La identidad de los robots** dice, por cada radio, qué patrón lleva el robot (o ninguno) y si está activo. Vive en `config/identidad_robots.json`, que **no se versiona** (es el estado de los robots de la salita, no una configuración del equipo):
@@ -738,9 +738,9 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 ] }
 ```
 
-- **Sin archivo:** la radio N lleva el patrón N (la radio 4, ninguno), todas activas: el mismo frame de siempre. El archivo se crea la primera vez que se guarda desde la GUI.
+- **Sin archivo:** la radio N lleva el patrón N, todas activas: el mismo frame de siempre. Con 6 patrones y 5 radios, el patrón 5 queda sin radio. El archivo se crea la primera vez que se guarda desde la GUI.
 - **Otro archivo:** `VSSL_IDENTIDAD=<ruta>` (por ejemplo, uno por engine). La GUI guarda en esa misma ruta.
-- **Validación al arrancar:** radio en 0 a 4 sin repetir, patrón en 0 a 3. Con un archivo inválido, `main` y `skill_test` no arrancan y dicen qué corregir. Una radio que no aparece queda sin patrón y activa.
+- **Validación al arrancar:** radio en 0 a 4 sin repetir, patrón en 0 a 5. Con un archivo inválido, `main` y `skill_test` no arrancan y dicen qué corregir. Una radio que no aparece queda sin patrón y activa.
 - **Solo con la base station:** en FIRASim y grSim cada robot es su patrón, y el archivo no se lee.
 
 **Cuándo un patrón no recibe comandos:** si su robot está desactivado, si ninguna radio lo tiene o si dos radios lo tienen. Entonces:
@@ -750,7 +750,7 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 
 **Pestaña Robots de la GUI** (solo con la base station):
 - una fila por radio, con el patrón y el interruptor de activo, editables en vivo (rigen desde el tick siguiente y se guardan en el archivo), y una frase con lo que ve la cámara;
-- avisos: dos radios con el mismo patrón, un patrón que el coach no manda (el 3) visto en la cámara, un patrón visto que ningún robot tiene;
+- avisos: dos radios con el mismo patrón, un patrón que el coach no manda (del 3 al 5) visto en la cámara, un patrón visto que ningún robot tiene;
 - **Identificar:** con el coach en pausa (P), sin rutina, sin el manual ni una skill de la GUI, gira cada robot activo de a uno (90 °/s, 0.6 s de ida y 0.6 s de vuelta: termina donde empezó), ve qué patrón giró y propone la identidad. "Aplicar" la usa y la guarda; "Descartar" no cambia nada. Si no gira ninguno, giran dos con la misma radio (dos robots con el mismo `MI_ROBOT_ID`) o dos radios hacen girar el mismo patrón, lo dice en frase. Mientras gira, solo se mueve ese robot (el frame pone en cero a los demás); la parada de emergencia y HALT lo cortan en el acto, y sin refresco de la GUI se corta a los 250 ms.
 
 La terminal imprime la identidad al arrancar y en cada cambio (`[control_loop] identidad: radio 0 (MI_ROBOT_ID 1): patrón 1`), y la sección Radio del Inspector la muestra. `skill_test --mode vw --robot N` **no** pasa por la identidad: ahí N es la posición de radio cruda (bring-up sin visión).
