@@ -264,7 +264,11 @@ pub struct SkillParams {
     /// SpinKick: ángulo, en el sentido del giro, entre la recta centro del robot → pelota y
     /// la dirección en que sale la pelota (grados). 90 = sale tangente (modelo de robot
     /// redondo). El robot es cuadrado: la pelota sale por la normal de la cara que la golpea,
-    /// cos φ = (medio lado + radio de la pelota) / spin_contact_radius ≈ 26°.
+    /// cos φ = (medio lado + radio de la pelota) / spin_contact_radius ≈ 26°, aunque en FIRASim
+    /// sale a ~38° (`tools/medir_spinkick.py`, con 90 y con 26). Con 26, en motion_bench (tope
+    /// real) el error del tiro baja de −48..−68° a −16..+6°, pero en partidos no se detecta
+    /// diferencia contra 90: cara a cara +0.25 ± 0.16 y +0.04 ± 0.12 (96 partidos). Queda en 90
+    /// hasta medir el robot real y usarlo donde importa la puntería (tiro de banda).
     pub spin_exit_angle_deg: f32,
     /// SpinKick: a esta distancia del punto de contacto deja de navegar a él y cierra
     /// sobre la pelota hasta tenerla al alcance (gira solo tocándola) (m). Mayor que
