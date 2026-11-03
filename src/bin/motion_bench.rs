@@ -222,6 +222,11 @@ const CASES: &[Case] = &[
     // rasante; de giro llega a ~0.1 m/s. El coach no lo usa (ver `striker_target`).
     c("banda_empuje", SkillId::Dribble, (0.483, 0.6285), (0.371, 0.184, 75.8), (0.40, 0.30), 5.0, 0.0, Goal::Score),
     c("banda_giro", SkillId::SpinKick, (0.483, 0.6285), (0.30, 0.25, 0.0), (0.40, 0.30), 5.0, 0.0, Goal::Score),
+    // La misma pelota lanzada sola hacia el punto de rebote (robot quieto lejos), para separar
+    // la física del rebote de las skills: 0.6, 1.0 y 1.5 m/s.
+    Case { ball_vel: (0.147, 0.582), ..c("banda_libre_06", SkillId::Hold, (0.0, 0.0), (-0.5, -0.5, 0.0), (0.40, 0.30), 4.0, 0.0, Goal::Score) },
+    Case { ball_vel: (0.245, 0.970), ..c("banda_libre_10", SkillId::Hold, (0.0, 0.0), (-0.5, -0.5, 0.0), (0.40, 0.30), 4.0, 0.0, Goal::Score) },
+    Case { ball_vel: (0.368, 1.454), ..c("banda_libre_15", SkillId::Hold, (0.0, 0.0), (-0.5, -0.5, 0.0), (0.40, 0.30), 4.0, 0.0, Goal::Score) },
     // Girando junto a la pelota → GoTo a 0.16 m (dentro del radio en que SpinKick daba el
     // giro por vigente) → SpinKick de nuevo: la segunda activación debe acercarse y patear.
     Case {
@@ -307,7 +312,7 @@ const KEEPER_CASES: &[&str] = &[
 const PENALTY_CASES: &[&str] = &["penal_giro_arriba", "penal_giro_abajo", "penal_empuje_arriba", "penal_empuje_abajo"];
 
 /// Tiro de banda (alias `banda`): empujando y de giro hacia el punto de rebote.
-const BANK_CASES: &[&str] = &["banda_empuje", "banda_giro"];
+const BANK_CASES: &[&str] = &["banda_empuje", "banda_giro", "banda_libre_06", "banda_libre_10", "banda_libre_15"];
 
 /// Banco de conducción (alias `conduccion`): Dribble y la combinación de hoy desde las mismas poses.
 const DRIBBLE_CASES: &[&str] = &[

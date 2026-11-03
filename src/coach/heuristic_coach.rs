@@ -523,7 +523,10 @@ impl HeuristicCoach {
         // directo tapado, apuntar al punto de la banda donde el rebote medido en FIRASim la lleva
         // al arco. En motion_bench (`banda`) toca la banda donde corresponde pero no entra nunca,
         // 0/20 con el tope real y 0/10 a 0.8 m/s por rueda: empujando, el robot la aprieta contra
-        // la pared y sale rasante a lo largo de ella; de giro, llega a ~0.1 m/s y muere ahí.)
+        // la pared y sale rasante a lo largo de ella; de giro, llega a ~0.1 m/s y muere ahí. El
+        // ángulo sirve: lanzada sola a 1.5 m/s (`banda_libre_15`) rebota hacia el arco y se
+        // detiene 7 cm antes de la línea; falta fuerza (en FIRASim la pelota frena mucho: 0.6 m/s
+        // llegan a 0.17 a la banda) y el rebote sale más rasante que el modelo (k ≈ 0.36).)
         self.aim_point(opp)
     }
 
