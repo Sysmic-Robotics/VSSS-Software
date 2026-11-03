@@ -3,9 +3,14 @@
 //! (`docs/investigacion/01_arquero.md`) y con lo que mostraron nuestros registros.
 //!
 //! - **Riel cerca del arco.** Vive en una recta paralela a la línea de gol, a
-//!   `keeper_depth` de ella (5 cm: el cuerpo llega a 1 cm de la línea). Con la línea a
-//!   12 cm, la pelota que rodaba por la línea de gol le pasaba por detrás: 22 de 41 goles
-//!   en contra en 48 partidos.
+//!   `keeper_depth` de ella (8 cm: el cuerpo queda a 4 cm de la línea y la pelota, de 4.27,
+//!   no pasa por detrás). Con la línea a 12 cm, la pelota que rodaba por la línea de gol le
+//!   pasaba por detrás: 22 de 41 goles en contra en 48 partidos. A 5 cm (el cuerpo a 1 cm),
+//!   en la cancha real cualquier sobrepaso lo metía dentro del arco, que está hundido, y no
+//!   podía volver.
+//! - **Vuelve a navegar desde cero.** Al salir del riel reinicia el estado de motion para ese
+//!   robot: su rampa guardaba el último avance de antes del riel y el arquero arrancaba con
+//!   esa velocidad, a veces de frente hacia el arco.
 //! - **Orientado a lo largo del riel (±90°).** Un diferencial solo avanza hacia donde
 //!   mira; mirando la pelota, cada corrección lateral exigía girar hasta 90° antes de
 //!   moverse. A lo largo del riel, todo movimiento es avanzar o retroceder (dos caras).
@@ -30,6 +35,9 @@ use std::f64::consts::FRAC_PI_2;
 
 /// Mitad del ancho de la boca del arco (m).
 const GOAL_HALF_Y: f32 = 0.20;
+/// Mitad del ancho del área (m) y de la cancha (m).
+const AREA_HALF_Y: f32 = crate::skills::zones::AREA_HALF_Y;
+const FIELD_HALF_Y: f32 = 0.65;
 /// Radio de la pelota (m).
 const BALL_RADIUS: f32 = 0.021;
 /// Medio lado del robot (m).
@@ -76,9 +84,13 @@ pub struct RailKeeperSkill {
     pub contact_dist: f32,
     /// Cuánto más allá de la pelota (hacia su palo) apunta al barrerla de la boca (m).
     pub sweep: f32,
+    /// Con la pelota quieta, un rival detrás hasta esta distancia ya anticipa (m); 0 = apagado.
+    pub still_rival_dist: f32,
     v_prev: f64,
     last_target: Option<Vec2>,
     last_mode: KeeperMode,
+    /// Fuera del riel, volviendo con la navegación de motion.
+    navigating: bool,
 }
 
 impl RailKeeperSkill {
@@ -93,9 +105,11 @@ impl RailKeeperSkill {
             rail_tol: p.keeper_rail_tol,
             contact_dist: p.keeper_contact_dist,
             sweep: p.keeper_sweep,
+            still_rival_dist: p.keeper_still_rival_dist,
             v_prev: 0.0,
             last_target: None,
             last_mode: KeeperMode::Angle,
+            navigating: false,
         }
     }
 
@@ -148,15 +162,22 @@ impl RailKeeperSkill {
 
         // Pelota entre el riel y la línea de gol: ya está "detrás" del arquero.
         if d_ball < self.depth + BALL_RADIUS {
-            if ball_ahead.y.abs() <= GOAL_HALF_Y + BALL_RADIUS {
-                // Frente a la boca: barrerla a lo largo de la línea hacia su palo, desde el
-                // lado del centro. Puede pasar el palo lo necesario para sacarla de la boca.
+            if ball_ahead.y.abs() <= AREA_HALF_Y + BALL_RADIUS {
+                // Dentro del ancho del área: barrerla a lo largo de la línea hacia afuera, desde
+                // el lado del centro. Frente a la boca la saca por el palo; en el rincón del área
+                // (|y| entre la boca y 0.35) la saca del área: ahí nadie más puede jugarla (el
+                // guardia no deja entrar a los de campo) y el VSSReferee pita PENAL a los 5 s de
+                // pelota trabada dentro del área si solo el defensor está cerca (dos penales en
+                // contra en 200 s de prueba; antes el riel cerraba el palo y la dejaba).
                 let side = if ball_ahead.y >= 0.0 { 1.0 } else { -1.0 };
-                let reach = GOAL_HALF_Y + ROBOT_HALF + BALL_RADIUS;
+                let reach = FIELD_HALF_Y - ROBOT_HALF;
                 let y = (ball_ahead.y + side * self.sweep).clamp(-reach, reach);
                 return (y, KeeperMode::SweepLine);
             }
-            // Abierta, rodando por la línea de fondo hacia la boca: cerrar ese palo.
+            // Abierta, rodando por la línea de fondo hacia la boca: cerrar ese palo. (Se probó
+            // pararse a |y| 0.13 en este modo, Rival y Angle, con el cuerpo tapando igual el
+            // palo y 7 cm más cerca del centro: 48 partidos cara a cara a velocidad real,
+            // 16-18-14 y 29 goles en contra contra 27; los goles no vienen del arquero en el palo.)
             return (ball_ahead.y.signum() * GOAL_HALF_Y, KeeperMode::NearPost);
         }
 
@@ -173,11 +194,18 @@ impl RailKeeperSkill {
         }
 
         // Rival encima de la pelota y detrás de ella respecto de nuestro arco: el empuje
-        // sale en la dirección rival → pelota; pararse donde esa recta cruza el riel.
+        // sale en la dirección rival → pelota; pararse donde esa recta cruza el riel. Con la
+        // pelota quieta (un penal, un rival acomodándose) y `still_rival_dist`, también desde
+        // más lejos: el pateador de un penal espera a 14 cm y antes solo se lo veía al tocarla.
+        let reach = if ball_vel.length() < 0.05 && self.still_rival_dist > 0.0 {
+            self.still_rival_dist.max(self.contact_dist)
+        } else {
+            self.contact_dist
+        };
         let rival = rivals
             .iter()
             .copied()
-            .filter(|r| (*r - ball).length() <= self.contact_dist)
+            .filter(|r| (*r - ball).length() <= reach)
             .min_by(|a, b| (*a - ball).length().total_cmp(&(*b - ball).length()));
         if let Some(r) = rival {
             let dir = ball - r;
@@ -241,10 +269,16 @@ impl Skill for RailKeeperSkill {
         // Fuera del riel: volver con la navegación normal, terminando a lo largo del riel.
         let off = rail_x - robot.position.x;
         if off.abs() > self.rail_tol {
+            if !self.navigating {
+                // La rampa de motion guardaba el avance de antes del riel: desde cero.
+                motion.reset_robot(robot.team, robot.id);
+                self.navigating = true;
+            }
             self.v_prev = 0.0;
             let along = target + Vec2::new(0.0, 1.0);
             return motion.move_and_face_contact(robot, target, along, world, BACK_KP, BACK_KI, BACK_KD);
         }
+        self.navigating = false;
 
         let cfg = &motion.config;
         // (Se probó, ante un tiro, pedir la velocidad para llegar al cruce a tiempo sin reservar
@@ -293,6 +327,7 @@ impl Skill for RailKeeperSkill {
     fn reset(&mut self) {
         self.v_prev = 0.0;
         self.last_target = None;
+        self.navigating = false;
     }
 }
 
@@ -300,9 +335,12 @@ impl Skill for RailKeeperSkill {
 mod tests {
     use super::*;
 
-    /// Arco propio a la izquierda (−x): el riel queda en x = −0.70.
+    /// Arco propio a la izquierda (−x) con el riel a 5 cm (x = −0.70): las cifras de los
+    /// tests de geometría están calculadas con ese riel; el default es `keeper_depth`.
     fn keeper() -> RailKeeperSkill {
-        RailKeeperSkill::new(Vec2::new(-0.75, 0.0))
+        let mut k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+        k.depth = 0.05;
+        k
     }
 
     #[test]
@@ -342,8 +380,39 @@ mod tests {
 
     #[test]
     fn rail_sits_close_to_the_goal_on_either_side() {
+        // Default 8 cm: el cuerpo (4 cm de medio lado) queda a 4 cm de la línea, menos que el
+        // diámetro de la pelota.
+        let k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+        assert_eq!(k.depth, 0.08);
+        assert!(k.depth - ROBOT_HALF < 2.0 * BALL_RADIUS);
+        assert!((k.rail_x() - (-0.67)).abs() < 1e-6);
+        assert!((RailKeeperSkill::new(Vec2::new(0.75, 0.0)).rail_x() - 0.67).abs() < 1e-6);
         assert!((keeper().rail_x() - (-0.70)).abs() < 1e-6);
-        assert!((RailKeeperSkill::new(Vec2::new(0.75, 0.0)).rail_x() - 0.70).abs() < 1e-6);
+    }
+
+    #[test]
+    fn returning_to_navigation_restarts_the_motion_ramp() {
+        // Motion guarda el último avance de este robot (de antes de entrar al riel); al salir
+        // del riel el arquero arranca desde cero, no desde ese avance.
+        let mut k = keeper();
+        let mut world = World::new(3, 3);
+        world.update_ball(Vec2::ZERO, Vec2::ZERO);
+        let motion = Motion::new();
+        // Mirando a −x (hacia el arco), avanzando hacia un punto lejano de ese lado.
+        let behind = Vec2::new(-1.2, 0.10);
+        let r = robot(-0.45, 0.10, 180.0);
+        for _ in 0..50 {
+            motion.move_and_face_contact(&r, behind, behind, &world, BACK_KP, BACK_KI, BACK_KD);
+        }
+        // En el riel un tick (no navega), luego lejos del riel.
+        k.tick(&robot(-0.70, 0.0, 90.0), &world, &motion);
+        let c = k.tick(&r, &world, &motion);
+        let v = (c.vx * c.vx + c.vy * c.vy).sqrt();
+        assert!(v <= motion.config.max_linear_accel * CONTROL_DT + 1e-9, "v={v}");
+        // Y sigue acelerando con la rampa en los ticks siguientes.
+        let c2 = k.tick(&r, &world, &motion);
+        let v2 = (c2.vx * c2.vx + c2.vy * c2.vy).sqrt();
+        assert!(v2 > v, "{v2} > {v}");
     }
 
     #[test]
@@ -361,6 +430,18 @@ mod tests {
         assert!(y > 0.08 && y <= GOAL_HALF_Y + ROBOT_HALF + BALL_RADIUS, "{y}");
         let (y, _) = keeper().target_y(Vec2::new(-0.73, -0.15), Vec2::ZERO, &[]);
         assert!(y < -0.15, "hacia su palo: {y}");
+    }
+
+    #[test]
+    fn ball_on_the_line_in_the_area_corner_is_swept_out_of_the_area() {
+        // Rincón del área (|y| entre la boca y 0.35): antes cerraba el palo (NearPost) y la
+        // pelota quedaba trabada ahí hasta el penal del árbitro oficial.
+        let (y, mode) = keeper().target_y(Vec2::new(-0.68, 0.31), Vec2::ZERO, &[]);
+        assert_eq!(mode, KeeperMode::SweepLine);
+        assert!(y > 0.31 && y <= FIELD_HALF_Y - ROBOT_HALF, "hacia afuera del área: {y}");
+        // Ya fuera del ancho del área sigue cerrando el palo.
+        let (y, mode) = keeper().target_y(Vec2::new(-0.68, 0.45), Vec2::ZERO, &[]);
+        assert_eq!((y, mode), (GOAL_HALF_Y, KeeperMode::NearPost));
     }
 
     #[test]
@@ -388,6 +469,24 @@ mod tests {
         // El mismo rival delante de la pelota (empujaría hacia su arco): sin anticipación.
         let (_, mode) = keeper().target_y(ball, Vec2::ZERO, &[Vec2::new(-0.48, 0.14)]);
         assert_eq!(mode, KeeperMode::Angle);
+    }
+
+    #[test]
+    fn a_still_ball_with_a_rival_lined_up_behind_it_is_anticipated_from_farther_away() {
+        // Penal rival: pelota quieta en la cruz, pateador a 14 cm detrás, apuntando al palo de
+        // abajo. Apagado (default), a esa distancia no cuenta como encima: bisectriz. Con 0.30,
+        // anticipa la recta pateador → pelota.
+        let ball = Vec2::new(-0.375, 0.0);
+        let kicker = Vec2::new(-0.375 + 0.14 * 0.937, 0.14 * 0.349); // ~20° hacia −y al empujar
+        let (_, mode) = keeper().target_y(ball, Vec2::ZERO, &[kicker]);
+        assert_eq!(mode, KeeperMode::Angle);
+        let mut k = keeper();
+        k.still_rival_dist = 0.30;
+        let (y, mode) = k.target_y(ball, Vec2::ZERO, &[kicker]);
+        assert_eq!(mode, KeeperMode::Rival);
+        assert!(y < -0.08, "hacia el palo de abajo: {y}");
+        // Pelota en movimiento: solo encima de ella, como siempre.
+        assert_eq!(k.target_y(ball, Vec2::new(0.3, 0.0), &[kicker]).1, KeeperMode::Angle);
     }
 
     #[test]

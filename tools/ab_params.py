@@ -7,6 +7,8 @@ En cada ronda i, con la misma semilla de ruido para las dos configuraciones:
 Informa, para cada configuración, aptitud media ± error estándar contra rule_based y el
 cara a cara entre ambas (diferencia de goles desde el punto de vista de A, en los dos
 sentidos de cancha). La palabra `default` como archivo usa config/team_params.json.
+Con `--solo-cara-a-cara` no juega contra rule_based (le ganamos siempre por ~4 goles: ya no
+distingue variantes) y cada ronda son solo los dos partidos A contra B.
 
     python3 tools/ab_params.py default logs/annealing/corrida2/best.json --rounds 12 --sims 3 --out logs/annealing/ab_88
 """
@@ -52,14 +54,17 @@ def resolve_params(arg: str, label: str, out: Path) -> Path:
     return path
 
 
-def schedule(rounds: int, a: Path, b: Path) -> list[Job]:
+def schedule(rounds: int, a: Path, b: Path, rival_params: Path | None = None,
+             vs_rule_based: bool = True, first_seed: int = 0, rival_coach: str = "rule_based") -> list[Job]:
     jobs = []
-    for i in range(rounds):
+    # Tercer rival: rule_based, o el heurístico con otros parámetros (un rival del panel).
+    rival_name = "rule_based" if rival_coach == "rule_based" else (rival_params.stem if rival_params else rival_coach)
+    for i in range(first_seed, first_seed + rounds):
         kickoff = "blue" if i % 2 == 0 else "yellow"
-        rb = Rival("rule_based", "rule_based", None)
+        if vs_rule_based:
+            rb = Rival(rival_name, rival_coach, rival_params)
+            jobs += [Job(f"r{i}_A_rb", "A", a, rb, i, kickoff), Job(f"r{i}_B_rb", "B", b, rb, i, kickoff)]
         jobs += [
-            Job(f"r{i}_A_rb", "A", a, rb, i, kickoff),
-            Job(f"r{i}_B_rb", "B", b, rb, i, kickoff),
             Job(f"r{i}_A_vs_B", "A", a, Rival("B", "heuristic", b), i, kickoff),
             Job(f"r{i}_B_vs_A", "B", b, Rival("A", "heuristic", a), i, kickoff),
         ]
@@ -83,35 +88,48 @@ def record_line(blue: str, rival: str, r: MatchResult) -> str:
 
 def summarize(results: list[dict], names: dict[str, str]) -> str:
     lines = []
+    third = next((r["rival"] for r in results if r["rival"] not in ("A", "B")), "rule_based")
     for side in ("A", "B"):
-        vs_rb = [r for r in results if r["blue"] == side and r["rival"] == "rule_based"]
+        lines.append(f"{side} = {names[side]}")
+        vs_rb = [r for r in results if r["blue"] == side and r["rival"] == third]
+        if not vs_rb:
+            continue
         fits = [r["fitness"] for r in vs_rb]
         gd = [r["goals_for"] - r["goals_against"] for r in vs_rb]
         w = sum(1 for g in gd if g > 0); d = sum(1 for g in gd if g == 0)
         m, s = mean_sem(fits); gm, gs = mean_sem([float(g) for g in gd])
-        lines.append(f"{side} = {names[side]}")
-        lines.append(f"  vs rule_based ({len(vs_rb)} partidos): V{w} E{d} D{len(gd) - w - d}  "
+        lines.append(f"  vs {third} ({len(vs_rb)} partidos): V{w} E{d} D{len(gd) - w - d}  "
                      f"aptitud {m:+.2f} ± {s:.2f}  dif. goles {gm:+.2f} ± {gs:.2f}  "
                      f"posesión {statistics.mean(r['possession_pct'] for r in vs_rb):.0f} %  "
                      f"faltas/partido {statistics.mean(r['area_fouls'] for r in vs_rb):.2f}")
     # Pareado por semilla contra rule_based: aptitud(B) − aptitud(A) en la misma ronda.
-    by_seed_a = {r["seed"]: r["fitness"] for r in results if r["blue"] == "A" and r["rival"] == "rule_based"}
-    by_seed_b = {r["seed"]: r["fitness"] for r in results if r["blue"] == "B" and r["rival"] == "rule_based"}
+    by_seed_a = {r["seed"]: r["fitness"] for r in results if r["blue"] == "A" and r["rival"] == third}
+    by_seed_b = {r["seed"]: r["fitness"] for r in results if r["blue"] == "B" and r["rival"] == third}
     paired = [by_seed_b[k] - by_seed_a[k] for k in by_seed_a if k in by_seed_b]
     pm, ps = mean_sem(paired)
-    lines.append(f"Pareado vs rule_based (B − A, {len(paired)} rondas): {pm:+.2f} ± {ps:.2f} por partido")
-    # Cara a cara, desde A: A azul vs B, y B azul vs A (invertido).
-    h2h = []
+    if paired:
+        lines.append(f"Pareado vs {third} (B − A, {len(paired)} rondas): {pm:+.2f} ± {ps:.2f} por partido")
+    # Cara a cara, desde A: A azul vs B, y B azul vs A (invertido). Los dos partidos de una
+    # ronda comparten la semilla de ruido (son la misma simulación con los colores cambiados),
+    # así que no son independientes: el error estándar se calcula sobre las rondas, no sobre
+    # los partidos. Con el de partidos, en una serie de control (A = B) salió −0.23 ± 0.08.
+    h2h, by_seed = [], {}
     for r in results:
         if r["rival"] in ("A", "B"):
             diff = r["goals_for"] - r["goals_against"]
-            h2h.append(diff if r["blue"] == "A" else -diff)
+            from_a = diff if r["blue"] == "A" else -diff
+            h2h.append(from_a)
+            by_seed.setdefault(r["seed"], []).append(float(from_a))
     w = sum(1 for g in h2h if g > 0); d = sum(1 for g in h2h if g == 0)
-    hm, hs = mean_sem([float(g) for g in h2h])
+    rounds = [statistics.mean(v) for v in by_seed.values()]
+    hm, hs = mean_sem(rounds)
     lines.append(f"Cara a cara A contra B ({len(h2h)} partidos, ambos lados): A gana {w}, empata {d}, pierde "
-                 f"{len(h2h) - w - d}; dif. goles A−B {hm:+.2f} ± {hs:.2f} por partido")
+                 f"{len(h2h) - w - d}; dif. goles A−B {hm:+.2f} ± {hs:.2f} por partido (error sobre {len(rounds)} rondas)")
     verdict = "sin diferencia detectable con estos partidos"
-    if not math.isnan(pm) and abs(pm) > 2 * ps and not math.isnan(hm) and abs(hm) > 2 * hs and (pm > 0) == (hm < 0):
+    if not paired:
+        if not math.isnan(hm) and abs(hm) > 2 * hs:
+            verdict = f"{'A' if hm > 0 else 'B'} es mejor cara a cara (más de 2 errores estándar)"
+    elif not math.isnan(pm) and abs(pm) > 2 * ps and not math.isnan(hm) and abs(hm) > 2 * hs and (pm > 0) == (hm < 0):
         verdict = f"{'B' if pm > 0 else 'A'} es mejor en ambas medidas (más de 2 errores estándar)"
     elif (not math.isnan(pm) and abs(pm) > 2 * ps) or (not math.isnan(hm) and abs(hm) > 2 * hs):
         verdict = "diferencia en una sola medida: no concluyente"
@@ -123,7 +141,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="comparación A/B de dos configuraciones de estilo")
     ap.add_argument("a", help="archivo VSSL_PARAMS de A, o 'default'")
     ap.add_argument("b", help="archivo VSSL_PARAMS de B, o 'default'")
-    ap.add_argument("--rounds", type=int, default=12, help="rondas de 4 partidos")
+    ap.add_argument("--rounds", type=int, default=12, help="rondas de 4 partidos (2 con --solo-cara-a-cara)")
+    ap.add_argument("--solo-cara-a-cara", action="store_true",
+                    help="sin partidos contra rule_based: decide solo el cara a cara A contra B")
+    ap.add_argument("--semilla-inicial", type=int, default=0,
+                    help="semilla de la primera ronda (una serie de confirmación usa semillas nuevas)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--fps", type=int, default=480)
     ap.add_argument("--minutes", type=float, default=3.0)
@@ -133,6 +155,12 @@ def main() -> int:
     ap.add_argument("--cmd-port", type=int, default=20011)
     ap.add_argument("--referee-port", type=int, default=10003)
     ap.add_argument("--keep-work", action="store_true", help="conservar CSV y logs de cada partido en WORK")
+    ap.add_argument("--penalties", type=int, default=0,
+                    help="en vez de partidos, tandas de N penales alternados; los goles son penales convertidos")
+    ap.add_argument("--rival-params", type=Path, default=None,
+                    help="VSSL_PARAMS del tercer rival (p. ej. el mismo tope de ruedas que A y B)")
+    ap.add_argument("--rival-coach", choices=("rule_based", "heuristic"), default="rule_based",
+                    help="coach del tercer rival: rule_based o el heurístico con --rival-params (panel)")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -140,13 +168,15 @@ def main() -> int:
     a = resolve_params(args.a, "A", args.out)
     b = resolve_params(args.b, "B", args.out)
     names = {"A": str(args.a), "B": str(args.b)}
-    jobs = schedule(args.rounds, a, b)
+    jobs = schedule(args.rounds, a, b, args.rival_params, vs_rule_based=not args.solo_cara_a_cara,
+                    first_seed=args.semilla_inicial, rival_coach=args.rival_coach)
 
     sims = [Simulator(args.fps, args.vision_port + 10 * k, args.cmd_port + 10 * k, args.out / f"firasim_{k}.log")
             for k in range(max(1, args.sims))]
     runners: "queue.Queue[MatchRunner]" = queue.Queue()
     for k, sim in enumerate(sims):
-        runners.put(MatchRunner(sim, args.minutes, args.goals, args.referee_port + k, keep_work=args.keep_work))
+        runners.put(MatchRunner(sim, args.minutes, args.goals, args.referee_port + k, keep_work=args.keep_work,
+                                penalties=args.penalties))
     pool = ThreadPoolExecutor(max_workers=len(sims))
     results: list[dict] = []
     log = open(args.out / "partidos.jsonl", "a", encoding="utf-8")

@@ -44,4 +44,9 @@ pub trait Coach: Send + Sync {
     fn debug(&self) -> Option<CoachDebug> {
         None
     }
+
+    /// Cambia el lado de ataque sin relanzar (entretiempo): `attack_sign` +1 ataca hacia +x.
+    /// El lazo tiene que cambiar también el guardia de zonas y las áreas de motion. Un coach
+    /// que no mira el lado no hace nada.
+    fn set_side(&mut self, _attack_sign: f32) {}
 }

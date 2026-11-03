@@ -271,7 +271,7 @@ class Simulator:
 class Rival:
     name: str
     coach: str                 # "rule_based" | "heuristic"
-    params_file: Path | None   # VSSL_PARAMS del amarillo (solo heuristic)
+    params_file: Path | None   # VSSL_PARAMS del amarillo
 
 
 FRAME_CLOCK_LINE = re.compile(r"reloj por frames: frames (\d+), ticks (\d+)")
@@ -294,10 +294,13 @@ def frames_lost_pct(log: Path) -> float:
 
 
 class MatchRunner:
-    def __init__(self, sim: Simulator, minutes: float, goals: int, referee_port: int, keep_work: bool = False):
+    def __init__(self, sim: Simulator, minutes: float, goals: int, referee_port: int, keep_work: bool = False,
+                 penalties: int = 0):
         self.sim = sim
         self.minutes = minutes
         self.goals = goals
+        # > 0: en vez de un partido, una tanda de penales alternados (match_director --penalties).
+        self.penalties = penalties
         self.referee_addr = f"224.5.23.2:{referee_port}"
         self.keep_work = keep_work
 
@@ -334,7 +337,8 @@ class MatchRunner:
             director = subprocess.run(
                 [str(DIRECTOR), "--minutes", str(self.minutes), "--goals", str(self.goals), "--kickoff", kickoff,
                  "--speed", str(max(1, self.sim.fps // 60)), "--out", str(out),
-                 "--vision-port", str(self.sim.vision_port), "--cmd-port", str(self.sim.cmd_port)],
+                 "--vision-port", str(self.sim.vision_port), "--cmd-port", str(self.sim.cmd_port)]
+                + (["--penalties", str(self.penalties)] if self.penalties else []),
                 env=dict(os.environ, VSSL_REFEREE_ADDR=self.referee_addr), cwd=REPO,
                 stdout=open(work / "director.log", "w"), stderr=subprocess.STDOUT,
                 timeout=limit,

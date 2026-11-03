@@ -107,6 +107,16 @@ pub struct CoachParams {
     /// Arquero: cuida el arco con `RailKeeper` (riel cerca del arco, orientado a lo largo de
     /// él, con anticipación) en vez de `GoalKeep`.
     pub gk_rail: bool,
+    /// Estilo de juego abierto (`coach::playbook`): `equilibrado` (el de siempre), `defensivo`,
+    /// `ofensivo`, o `adaptativo` (elige entre los tres durante el partido según cómo le va a
+    /// cada uno, como el playbook de CMDragons).
+    pub estilo: String,
+    /// Adaptativo: segundos de juego abierto que dura el episodio de un estilo si no hay gol.
+    pub playbook_episodio_s: f32,
+    /// Cuánto adentro del palo apunta el atacante (m): penal propio y tiro al palo lejano. En
+    /// penales contra el arquero de rule_based (sigue la y de la pelota): 0.09 convierte 51 %
+    /// contra 82 % de 0.06 (240 penales); 0.04, 84 % contra 79 % (sin diferencia).
+    pub aim_post_margin: f32,
 }
 
 impl Default for CoachParams {
@@ -126,7 +136,9 @@ impl Default for CoachParams {
             decision_hz: 10.0,
             spin_engage_radius: 0.25,
             spin_when_opponent_within: 0.10,
-            gk_force_clear_s: 6.0,
+            // El VSSReferee pita penal a los 5 s de pelota trabada en el área con solo el
+            // defensor cerca (su `stuckedBallTime`); 6 s llegaba tarde.
+            gk_force_clear_s: 3.0,
             mark_distance: 0.30,
             score_hysteresis: 0.15,
             score_approach_base: 0.30,
@@ -147,6 +159,9 @@ impl Default for CoachParams {
             gk_engage_max_ball_speed: 0.40,
             gk_block_incoming_speed: 0.10,
             gk_rail: true,
+            estilo: "equilibrado".to_string(),
+            playbook_episodio_s: 15.0,
+            aim_post_margin: 0.06,
         }
     }
 }
@@ -222,7 +237,10 @@ pub struct SkillParams {
     pub intercept_horizon: f32,
     /// Intercept: bajo esta velocidad la pelota se considera quieta (m/s).
     pub intercept_min_ball_speed: f32,
-    /// Intercept: constante de frenado exponencial de la pelota (1/s). MEDIR (M3).
+    /// Intercept: constante de frenado exponencial de la pelota (1/s). Medir en la cancha real
+    /// (`tools/medir_salita.py`). En FIRASim la pelota frena a 0.39, pero poner 0.39 o 0.45
+    /// aquí no cambió nada cara a cara (0.39: +0.46 en una serie y −0.12 en la confirmación,
+    /// +0.17 ± 0.10 en 96 partidos); 0.30 queda hasta tener la medición real.
     pub intercept_ball_decay_per_s: f32,
     /// Intercept: retardo de reacción sumado al tiempo de viaje (s).
     pub intercept_reaction_delay: f32,
@@ -265,6 +283,12 @@ pub struct SkillParams {
     pub keeper_contact_dist: f32,
     /// RailKeeper: cuánto más allá de la pelota apunta al barrerla de la boca del arco (m).
     pub keeper_sweep: f32,
+    /// RailKeeper: con la pelota quieta, un rival detrás de ella hasta esta distancia (m) ya
+    /// anticipa su empuje (penal rival: el pateador espera a 14 cm; en juego, un rival que se
+    /// acomoda). 0 = solo encima de la pelota (`keeper_contact_dist`). En el simulador no
+    /// cambió nada (con 0.30: nuestro pateador convierte 0.8 % en vez de 3.3 %, juego abierto
+    /// +0.08 ± 0.17): queda apagado, como palanca para un rival que se alinea temprano.
+    pub keeper_still_rival_dist: f32,
     /// Dribble: radio de las espirales del campo "ir al arco" (m).
     pub dribble_de: f32,
     /// Dribble: suavizado de la espiral fuera de su círculo (m).
@@ -300,13 +324,14 @@ impl Default for SkillParams {
             spin_pos_tol: 0.05,
             spin_release_ball_speed: 0.4,
             spin_max_time_s: 1.0,
-            keeper_depth: 0.05,
+            keeper_depth: 0.08,
             keeper_gain: 8.0,
             keeper_horizon_s: 1.5,
             keeper_lead_s: 0.10,
             keeper_rail_tol: 0.06,
             keeper_contact_dist: 0.12,
             keeper_sweep: 0.10,
+            keeper_still_rival_dist: 0.0,
             dribble_de: 0.10,
             dribble_kr: 0.05,
             dribble_speed: 0.8,
@@ -648,6 +673,12 @@ impl TeamParams {
             ));
         }
         let p: Self = serde_json::from_value(crudo).map_err(|e| e.to_string())?;
+        if p.coach.estilo != "adaptativo" && crate::coach::playbook::Estilo::from_nombre(&p.coach.estilo).is_none() {
+            return Err(format!(
+                "coach.estilo = \"{}\" no existe: equilibrado, defensivo, ofensivo o adaptativo",
+                p.coach.estilo
+            ));
+        }
         p.validate_tolerances()?;
         p.validate_rutinas()?;
         p.manual.validate()?;
@@ -928,6 +959,17 @@ mod tests {
         // Y también lo cumple el JSON del repo.
         let repo = TeamParams::from_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join(TeamParams::DEFAULT_PATH)).unwrap();
         repo.coach.check_style_ranges(&text).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn open_play_style_must_be_a_known_one() {
+        assert_eq!(TeamParams::default().coach.estilo, "equilibrado");
+        for ok in ["equilibrado", "defensivo", "ofensivo", "adaptativo"] {
+            let p = TeamParams::from_json(&format!(r#"{{ "coach": {{ "estilo": "{ok}" }} }}"#)).unwrap();
+            assert_eq!(p.coach.estilo, ok);
+        }
+        let err = TeamParams::from_json(r#"{ "coach": { "estilo": "loco" } }"#).unwrap_err();
+        assert!(err.contains("coach.estilo") && err.contains("loco"), "{err}");
     }
 
     #[test]

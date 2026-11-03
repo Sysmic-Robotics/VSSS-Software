@@ -32,7 +32,10 @@
 //!
 //! (Se probó frenar cerca de la pelota hasta tenerla centrada en la cara, porque las
 //! conducciones que la perdían empezaban con ella a ~3 cm del centro: llegaba más tarde y cara
-//! a cara quedó +0.58 ± 0.29 para no frenar; se descartó. En partido pesa más llegar primero.)
+//! a cara quedó +0.58 ± 0.29 para no frenar; se descartó. En partido pesa más llegar primero.
+//! `dribble_speed` a velocidad real (tope 0.45 m/s): 1.1 y 0.5 neutros contra 0.8 (0.5:
+//! +0.27 en una serie y −0.02 en la confirmación, +0.13 ± 0.11 en 96 partidos), 0.4 peor
+//! (−0.25 ± 0.18). Queda 0.8: pedir más de lo que da el robot no cuesta nada.)
 
 use super::{Face, MarkSkill, Skill, SkillStatus};
 use crate::motion::{CONTROL_DT, Motion, MotionCommand};
