@@ -1,0 +1,116 @@
+PRUEBA DE LOS ROBOTS REALES: QUÉ MEDIR PARA QUE EL SIMULADOR JUEGUE COMO LA CANCHA
+====================================================================================
+
+Seis bloques, del más valioso al menos. Cada uno dice qué correr, qué anotar y dónde
+queda el dato. Todo lo medido va a ~/uni/ (más ~/sysid/ y logs/salita/<fecha>/) y se le
+pasa a Benja al final. Si falta tiempo, cortar desde el final.
+
+-------------------------------------------------------------------------------------
+ 0. SEGURIDAD Y PREPARACIÓN (antes de encender un robot)
+-------------------------------------------------------------------------------------
+ * La base NO tiene timeout de serial: si un programa muere sin mandar ceros, el
+   robot sigue andando. Siempre alguien listo para LEVANTAR EL ROBOT o DESENCHUFAR
+   LA BASE. Cortar solo con Ctrl+C (manda ceros); nunca kill -9 ni cerrar la ventana.
+ * No tocar la configuración del SSL-Vision de la sala.
+ * Un solo programa con la base a la vez (rustengine, GUI, skill_test, scenario).
+
+ 1. Traer la rama de Benja al main del notebook (herramientas de esta prueba y la
+    opción del SpinKick):
+      git fetch origin
+      git merge origin/feature/estrategia-competitiva
+      cargo build --release
+ 2. mkdir -p ~/uni
+ 3. Si el engine no ve robots con la visión de la sala:
+      export VSSL_VISION_PORT=10006
+ 4. Base por USB. Si no es /dev/ttyUSB0: export VSSL_BASESTATION_DEVICE=/dev/ttyUSBn
+ 5. Baterías cargadas; anotar el voltaje de cada una con el tester.
+
+-------------------------------------------------------------------------------------
+ 1. VISIÓN E IDENTIDAD (tareas 6.1 y 6.2), ~10 min
+-------------------------------------------------------------------------------------
+ 1. Abrir la interfaz con el coach en pausa: tools/iniciar.sh real --sin-coach
+ 2. Un robot a la vez bajo la cámara. En la pestaña Robots, anotar qué patrón le
+    aparece a cada robot, incluidos los rojos (deben salir 4 y 5).
+ 3. Girar el robot a mano: la flecha de la GUI debe girar igual y apuntar a su
+    frente. Si apunta al revés, la barra de equipo está atrás (6.1).
+ 4. Confirmar que los tres titulares quedan en los patrones 0, 1 y 2 (el coach solo
+    controla esos). Con "Identificar", guardar identidad_robots.json.
+ ANOTAR en ~/uni/notas.txt: robot → patrón → MI_ROBOT_ID, y si la flecha coincide.
+
+-------------------------------------------------------------------------------------
+ 2. SYSID DE UN ROBOT, ~25 min (lo que hace que el simulador se mueva como el real)
+-------------------------------------------------------------------------------------
+ 1. Leer tools/sysid_procedimiento.txt (seguridad y bring-up previo).
+ 2. Cancha sin pelota ni otros robots. Robot encendido QUIETO (calibra el giroscopio).
+ 3. tools/sysid_sesion.sh <posición de radio> <id de visión> full
+    (con firmware NORMAL: es el robot que va a jugar).
+ 4. Si sobra tiempo: el mismo robot con la batería a medias (half), u otro robot.
+ QUEDA en ~/sysid/<id>/<batería>/. El ajuste (sysid_ajuste.py) lo corre Benja.
+
+-------------------------------------------------------------------------------------
+ 3. SPINKICK REAL, ~10 min (hacia dónde sale la pelota de verdad)
+-------------------------------------------------------------------------------------
+ En FIRASim la pelota sale ~38° desde la recta centro del robot → pelota, no tangente
+ (90°). Hay que saber cuánto es en el robot real.
+ 1. Pelota en (0, 0). Robot a unos 10 cm a su izquierda, por ejemplo en (-0.10, 0.065),
+    mirando hacia +y.
+ 2. Correr (N = patrón del robot):
+      cargo run --release --bin skill_test -- --transport base-station --mode skill \
+        --skill spinkick --team blue --robot N --target 0.75,0 --dur 5 --log ~/uni/spin_r1.csv
+ 3. Repetir 5 veces (spin_r1 a spin_r5), volviendo a poner pelota y robot. Grabar con
+    el celular desde arriba.
+ 4. Medir:
+      python3 tools/medir_spinkick.py ~/uni/spin_r*.csv
+    La última línea dice el ángulo real (φ mediana).
+ 5. Con ese φ, 5 tiros más con la corrección (cambiar 38 por el φ medido):
+      echo '{"skills": {"spin_exit_angle_deg": 38}}' > ~/uni/spin_real.json
+      VSSL_PARAMS=~/uni/spin_real.json cargo run --release --bin skill_test -- \
+        --transport base-station --mode skill --skill spinkick --team blue --robot N \
+        --target 0.75,0 --dur 5 --log ~/uni/spinfix_r1.csv          (r1 a r5)
+      python3 tools/medir_spinkick.py ~/uni/spinfix_r*.csv
+    El "error" debería bajar a menos de ~15°.
+
+-------------------------------------------------------------------------------------
+ 4. TOPE DEL MOTOR, ~15 min (¿pueden ir más rápido que 0.45 m/s?)
+-------------------------------------------------------------------------------------
+ Hoy el firmware topa cada rueda en MAX_WHEEL_MM_S = 450 mm/s. Si el motor da más,
+ es lo que más acelera al equipo.
+ 1. Flashear UN robot con un firmware de prueba con MAX_WHEEL_MM_S = 1000.
+ 2. Perfil de escalones hasta 600 mm/s, con la visión registrando:
+      tools/sysid_sesion.sh <posición de radio> <id de visión> full
+    (o solo v_steps: skill_test --mode vw --profile v_steps ... ver sysid_procedimiento)
+    Si llega a 600 mm/s sin saturar, el motor da más de 450.
+ 3. Más arriba, rectas de 1.2 s desde un extremo (posición de radio P):
+      cargo run --release --bin skill_test -- --transport base-station --mode vw \
+        --team blue --robot P --v 700 --w 0 --dur 1.2
+    y luego --v 800, 900, 1000. Anotar la x inicial y final que muestra la GUI:
+    cuando la distancia deja de crecer, ese es el techo.
+ 4. Mirar también que el PID siga el comando: que no oscile ni se quede una rueda atrás.
+ 5. VOLVER AL FIRMWARE NORMAL antes de seguir.
+ ANOTAR en ~/uni/notas.txt: v pedida → distancia recorrida; techo estimado.
+ (Para medirlo fino, un perfil v_tope hasta 1000 mm/s en src/sysid.rs.)
+
+-------------------------------------------------------------------------------------
+ 5. ÁRBITRO CON LOS ROBOTS REALES (tareas 6.3 a 6.7), ~15 min
+-------------------------------------------------------------------------------------
+ 1. Terminal 1: tools/salita_equipo.sh blue /dev/ttyUSB0 arbitro
+    Terminal 2: python3 tools/referee_cli.py
+ 2. Activar el coach (P). Mandar, a favor y en contra: HALT, STOP, GAME_ON, saque,
+    penal, free ball y tiro de meta.
+ 3. Mirar: en STOP y HALT quedan quietos; se ubican sin entrar al área; GAME_ON
+    retoma; el arquero no cruza su línea.
+ ANOTAR en ~/uni/notas.txt cada comando: OK o qué hizo mal.
+
+-------------------------------------------------------------------------------------
+ 6. UN PARTIDO CON REGISTRO, con el tiempo que quede
+-------------------------------------------------------------------------------------
+ 1. tools/salita_equipo.sh blue /dev/ttyUSB0 uni1   (y el amarillo con la otra base,
+    si hay dos: tools/salita_equipo.sh yellow /dev/ttyUSB1 uni1).
+ 2. Coach activo (P), al menos 5 minutos de juego.
+ 3. Medir (frenado de la pelota en esa cancha y velocidades reales en juego):
+      python3 tools/medir_salita.py logs/salita/<fecha>/uni1_blue.csv
+
+-------------------------------------------------------------------------------------
+ AL TERMINAR: PASARLE A BENJA
+-------------------------------------------------------------------------------------
+ ~/uni/ (notas.txt y CSV), ~/sysid/ y logs/salita/<fecha>/, por pendrive o scp.
