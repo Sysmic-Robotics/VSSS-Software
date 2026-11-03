@@ -695,6 +695,10 @@ impl HeuristicCoach {
         let dist = (ball - pos).length();
         let pinned = dist < 0.15 && ball_vel.length() < 0.05;
         let freed = ball_vel.length() > 0.15 || dist > 0.25;
+        // Contar también `ApproachAligned` (que se ejecuta como `Dribble` y empuja) se probó y
+        // se descartó: en la boca del arco las trabas bajaron de 46 a 19 s, pero en el resto
+        // subieron del 8 al 10 % del juego abierto, con más tiempo en las esquinas de ataque y
+        // 27 goles en contra contra 22. Cara a cara, -0.10 ± 0.14 y -0.08 ± 0.15 (96 partidos).
         let pushing = matches!(current, Some(SkillId::ShootPush | SkillId::Clear));
         let spinning = current == Some(SkillId::SpinKick);
         self.push_stall = match self.push_stall {
