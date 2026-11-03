@@ -261,6 +261,11 @@ pub struct SkillParams {
     pub spin_contact_radius: f32,
     /// SpinKick: velocidad angular del giro (rad/s).
     pub spin_omega: f64,
+    /// SpinKick: ángulo, en el sentido del giro, entre la recta centro del robot → pelota y
+    /// la dirección en que sale la pelota (grados). 90 = sale tangente (modelo de robot
+    /// redondo). El robot es cuadrado: la pelota sale por la normal de la cara que la golpea,
+    /// cos φ = (medio lado + radio de la pelota) / spin_contact_radius ≈ 26°.
+    pub spin_exit_angle_deg: f32,
     /// SpinKick: a esta distancia del punto de contacto deja de navegar a él y cierra
     /// sobre la pelota hasta tenerla al alcance (gira solo tocándola) (m). Mayor que
     /// `motion.arrival_threshold`: si no, motion lo detiene antes y queda quieto.
@@ -321,6 +326,7 @@ impl Default for SkillParams {
             clear_release_ball_speed: 0.5,
             spin_contact_radius: 0.065,
             spin_omega: 20.0,
+            spin_exit_angle_deg: 90.0,
             spin_pos_tol: 0.05,
             spin_release_ball_speed: 0.4,
             spin_max_time_s: 1.0,

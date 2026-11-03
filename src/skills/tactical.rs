@@ -859,6 +859,9 @@ pub struct SpinKickSkill {
     pub target: Vec2,
     /// Distancia centro del robot–pelota en el contacto (m).
     pub contact_radius: f32,
+    /// Ángulo de salida de la pelota respecto de la recta centro → pelota, en el sentido
+    /// del giro (rad). π/2 = tangente.
+    pub exit_angle: f32,
     /// Velocidad angular del giro (rad/s).
     pub omega: f64,
     pub pos_tol: f32,
@@ -878,6 +881,7 @@ impl SpinKickSkill {
         Self {
             target,
             contact_radius: p.spin_contact_radius,
+            exit_angle: p.spin_exit_angle_deg.to_radians(),
             omega: p.spin_omega,
             pos_tol: p.spin_pos_tol,
             release_ball_speed: p.spin_release_ball_speed,
@@ -904,21 +908,34 @@ impl SpinKickSkill {
         (d.length_squared() > f32::EPSILON).then_some(d)
     }
 
-    /// Centros de giro que lanzan la pelota en `dir`: `(ccw, cw)`. Con giro CCW la
-    /// velocidad tangencial en la pelota es ω·perp(pelota − centro), así que el
-    /// centro va del lado `(dir.y, −dir.x)` de la pelota; con CW, del opuesto.
+    /// Centros de giro que lanzan la pelota en `dir`: `(ccw, cw)`. La pelota sale girada
+    /// `exit_angle` desde la recta centro → pelota, en el sentido del giro: con CCW esa recta
+    /// es `dir` girado −`exit_angle`; con CW, +`exit_angle`. Con `exit_angle` = π/2 (tangente)
+    /// el centro CCW queda del lado `(dir.y, −dir.x)` de la pelota y el CW del opuesto.
     pub fn contact_centers(&self, ball: Vec2, dir: Vec2) -> (Vec2, Vec2) {
-        let ccw = ball - Vec2::new(dir.y, -dir.x) * self.contact_radius;
-        let cw = ball - Vec2::new(-dir.y, dir.x) * self.contact_radius;
+        let ccw = ball - Vec2::from_angle(-self.exit_angle).rotate(dir) * self.contact_radius;
+        let cw = ball - Vec2::from_angle(self.exit_angle).rotate(dir) * self.contact_radius;
         (ccw, cw)
+    }
+
+    /// Primer centro dentro del campo lógico corriendo `center` alrededor de la pelota, de a
+    /// 5° hacia uno y otro lado, y cuánto se corrió (rad): la pelota sale desviada lo mismo.
+    fn slide_inside(ball: Vec2, center: Vec2) -> Option<(Vec2, f32)> {
+        (1..=36).flat_map(|k| [k, -k]).find_map(|k| {
+            let a = (5.0 * k as f32).to_radians();
+            let c = ball + Vec2::from_angle(a).rotate(center - ball);
+            is_inside_logical_field(c).then_some((c, a.abs()))
+        })
     }
 
     /// Centro de contacto y sentido de giro. Mientras gira, el sentido ya elegido; si no,
     /// el centro más cercano al robot entre los que quedan dentro del campo lógico (con la
     /// pelota contra la pared, uno de los dos queda detrás de ella), o el más cercano si
-    /// ninguno lo está.
+    /// ninguno lo está. Con `exit_angle` < 90° (cara cuadrada), contra la pared suelen quedar
+    /// los dos afuera y fuera de alcance: entonces cada uno se corre alrededor de la pelota
+    /// hasta entrar al campo y se elige el que menos desvía la salida.
     fn choose_center(&self, robot_pos: Vec2, ball: Vec2, dir: Vec2) -> (Vec2, f32) {
-        let (ccw, cw) = self.contact_centers(ball, dir);
+        let (mut ccw, mut cw) = self.contact_centers(ball, dir);
         if self.spin_sign > 0.0 {
             return (ccw, 1.0);
         }
@@ -928,6 +945,16 @@ impl SpinKickSkill {
         let ccw_first = match (is_inside_logical_field(ccw), is_inside_logical_field(cw)) {
             (true, false) => true,
             (false, true) => false,
+            (false, false) if self.exit_angle < std::f32::consts::FRAC_PI_2 - 1e-3 => {
+                let (a, b) = (Self::slide_inside(ball, ccw), Self::slide_inside(ball, cw));
+                (ccw, cw) = (a.map_or(ccw, |s| s.0), b.map_or(cw, |s| s.0));
+                match (a, b) {
+                    (Some((_, da)), Some((_, db))) if da != db => da < db,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    _ => (ccw - robot_pos).length() <= (cw - robot_pos).length(),
+                }
+            }
             _ => (ccw - robot_pos).length() <= (cw - robot_pos).length(),
         };
         if ccw_first { (ccw, 1.0) } else { (cw, -1.0) }
@@ -1668,6 +1695,42 @@ mod tests {
             assert!(v_cw.normalize().dot(dir) > 0.999, "CW dir={dir:?} v={v_cw:?}");
             assert!(((ccw - ball).length() - skill.contact_radius).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn spin_kick_contact_centers_follow_exit_angle() {
+        // Robot cuadrado: la pelota sale por la normal de la cara, ~26° desde la recta
+        // centro → pelota en el sentido del giro (no tangente).
+        let mut skill = SpinKickSkill::new(Vec2::new(0.75, 0.0));
+        skill.exit_angle = 26f32.to_radians();
+        let rot = |v: Vec2, a: f32| Vec2::new(v.x * a.cos() - v.y * a.sin(), v.x * a.sin() + v.y * a.cos());
+        let ball = Vec2::new(0.1, -0.2);
+        for dir in [Vec2::X, Vec2::Y, Vec2::new(-0.6, 0.8)] {
+            let (ccw, cw) = skill.contact_centers(ball, dir);
+            assert!(rot((ball - ccw).normalize(), skill.exit_angle).dot(dir) > 0.999, "CCW dir={dir:?}");
+            assert!(rot((ball - cw).normalize(), -skill.exit_angle).dot(dir) > 0.999, "CW dir={dir:?}");
+            assert!(((ccw - ball).length() - skill.contact_radius).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn spin_kick_slides_center_inside_against_the_wall() {
+        // Caso `spinkick_wall` del banco: con 26° los dos centros ideales quedan detrás de la
+        // banda y el robot nunca llegaba a la pelota. Se corre el CW (menos desvío) al campo.
+        let ball = Vec2::new(0.2, -0.6);
+        let mut skill = SpinKickSkill::new(Vec2::ZERO);
+        skill.exit_angle = 26f32.to_radians();
+        let dir = (Vec2::ZERO - ball).normalize();
+        let (ccw, cw) = skill.contact_centers(ball, dir);
+        assert!(!is_inside_logical_field(ccw) && !is_inside_logical_field(cw));
+        let (c, sign) = skill.choose_center(Vec2::new(-0.2, -0.3), ball, dir);
+        assert_eq!(sign, -1.0);
+        assert!(is_inside_logical_field(c), "centro {c:?}");
+        assert!(((c - ball).length() - skill.contact_radius).abs() < 1e-5);
+        // Tangente (por defecto): sin cambios, el CW ideal ya está adentro.
+        skill.exit_angle = std::f32::consts::FRAC_PI_2;
+        let (_, cw) = skill.contact_centers(ball, dir);
+        assert_eq!(skill.choose_center(Vec2::new(-0.2, -0.3), ball, dir), (cw, -1.0));
     }
 
     #[test]
