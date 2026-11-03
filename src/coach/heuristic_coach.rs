@@ -519,7 +519,11 @@ impl HeuristicCoach {
         // (Se probó conducir por una dirección libre cercana con un rival en el camino: menos
         // conducciones contra un rival, pero el rival la cortaba igual (30 % y 30 %) y cara a
         // cara quedó +0.38 ± 0.27 para ir derecho; se descartó. Lo que más pierde la pelota es
-        // empujarla descentrada en la cara.)
+        // empujarla descentrada en la cara. También se probó el tiro de banda: con el tiro
+        // directo tapado, apuntar al punto de la banda donde el rebote medido en FIRASim la lleva
+        // al arco. En motion_bench (`banda`) toca la banda donde corresponde pero no entra nunca,
+        // 0/20 con el tope real y 0/10 a 0.8 m/s por rueda: empujando, el robot la aprieta contra
+        // la pared y sale rasante a lo largo de ella; de giro, llega a ~0.1 m/s y muere ahí.)
         self.aim_point(opp)
     }
 

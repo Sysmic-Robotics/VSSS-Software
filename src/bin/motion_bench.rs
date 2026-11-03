@@ -215,6 +215,13 @@ const CASES: &[Case] = &[
     c("penal_giro_abajo", SkillId::SpinKick, (0.75, -0.14), (0.352, -0.061, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
     c("penal_empuje_arriba", SkillId::Dribble, (0.75, 0.14), (0.235, 0.0, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
     c("penal_empuje_abajo", SkillId::Dribble, (0.75, -0.14), (0.235, 0.0, 0.0), (0.375, 0.0), 4.0, 0.0, Goal::Score),
+    // Tiro de banda (alias `banda`): pelota en (0.40, 0.30) y objetivo en el punto de la banda de
+    // arriba que, con el rebote de FIRASim, la lleva al centro del arco. Empujando desde detrás y
+    // de giro; la pelota tiene que entrar. Toca la banda en x 0.44-0.58, pero 0/20 con el tope
+    // real (90° y 38°) y 0/10 a 0.8 m/s por rueda: empujando la aprieta contra la pared y sale
+    // rasante; de giro llega a ~0.1 m/s. El coach no lo usa (ver `striker_target`).
+    c("banda_empuje", SkillId::Dribble, (0.483, 0.6285), (0.371, 0.184, 75.8), (0.40, 0.30), 5.0, 0.0, Goal::Score),
+    c("banda_giro", SkillId::SpinKick, (0.483, 0.6285), (0.30, 0.25, 0.0), (0.40, 0.30), 5.0, 0.0, Goal::Score),
     // Girando junto a la pelota → GoTo a 0.16 m (dentro del radio en que SpinKick daba el
     // giro por vigente) → SpinKick de nuevo: la segunda activación debe acercarse y patear.
     Case {
@@ -298,6 +305,9 @@ const KEEPER_CASES: &[&str] = &[
 
 /// Penales sin arquero (alias `penal`): de giro y empujando, a cada palo.
 const PENALTY_CASES: &[&str] = &["penal_giro_arriba", "penal_giro_abajo", "penal_empuje_arriba", "penal_empuje_abajo"];
+
+/// Tiro de banda (alias `banda`): empujando y de giro hacia el punto de rebote.
+const BANK_CASES: &[&str] = &["banda_empuje", "banda_giro"];
 
 /// Banco de conducción (alias `conduccion`): Dribble y la combinación de hoy desde las mismas poses.
 const DRIBBLE_CASES: &[&str] = &[
@@ -1016,6 +1026,7 @@ async fn main() {
     let keeper_alias = names.iter().any(|n| n == "arquero");
     let dribble_alias = names.iter().any(|n| n == "conduccion");
     let penalty_alias = names.iter().any(|n| n == "penal");
+    let bank_alias = names.iter().any(|n| n == "banda");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
@@ -1027,6 +1038,7 @@ async fn main() {
                 || (keeper_alias && KEEPER_CASES.contains(&c.name))
                 || (dribble_alias && DRIBBLE_CASES.contains(&c.name))
                 || (penalty_alias && PENALTY_CASES.contains(&c.name))
+                || (bank_alias && BANK_CASES.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {
