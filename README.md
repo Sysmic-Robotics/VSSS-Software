@@ -47,10 +47,11 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro y avanza de espaldas cuando conviene. |
 | `VSSL_BORDER_RECOVERY` | (on) | `0`: apaga la recuperación de atasco. Hay atasco si durante 30 ticks se le comanda avanzar (> 0.1 m/s a lo largo del heading) y todas sus poses medidas quedan a menos de 0.03 m de la primera de la ventana (un salto de la pose estimada, como el sobrepaso del estimador al chocar la pelota, cuenta como movimiento); entonces hace una maniobra de escape de 25 ticks. Si la racha de avance arranca desde el reposo (las últimas 30 poses a menos de 0.01 m de la más vieja, aunque gire en el lugar, o el robot recién aparece), los primeros 30 ticks no cuentan: al alinearse y acelerar, la latencia y el torque limitado le impiden recorrer 3 cm en 0.5 s. Un robot trabado desde quieto escapa a los 60 ticks; uno que venía andando, a los 30. |
 | `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |
-| `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota y la depuración por tick). |
+| `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota y la depuración por tick). La última columna, `lado`, es el signo de ataque del tick (`1` = atacamos hacia +X, `-1` hacia −X): cambia con el cambio de lado y separa los dos tiempos. |
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
 | `VSSL_VISION_RECORD` | (off) | Ruta donde grabar los paquetes crudos de visión, para `vision_replay`. |
 | `VSSL_REFEREE_ADDR` | `224.5.23.2:10003` | Dónde escucha el engine los comandos del árbitro (VSSReferee o texto de `tools/referee_cli.py`). |
+| `VSSL_ESPERAR_ARBITRO` | `1` | `rustengine` arranca con el equipo detenido (camino de HALT) hasta el primer comando del árbitro, o hasta el botón **Jugar sin esperar al árbitro** de la GUI. `0`, `false` u `off`: juega desde el arranque (para correr sin árbitro y sin GUI). Otro valor que no sea `1`, `true` u `on` no arranca. Ver **Árbitro y pelota parada**. |
 | `VSSL_REAL_ACTUATOR` | (off) | `<id de visión>:<full\|half>`: capa de actuador real (sysid) en el transporte de FIRASim, la planta de test y `skill_test --transport plant`. El robot simulado anda con la latencia, la dinámica, el tope por rueda y la zona muerta medidos de ese robot con esa batería (`config/real_calibration.json`). Se aplica a todos los robots del engine. |
 | `VSSL_REAL_CALIBRATION` | `config/real_calibration.json` | Otro archivo de calibración del robot real (ensayos). |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
@@ -80,9 +81,10 @@ La interfaz se ve como la mesa de la salita: es neutra, y el único color es el 
 - **Barra de estado** (arriba): frases con el modo (simulación o robots reales, frontal o
   bidireccional, ruido de cámara), el coach, el árbitro y la salud del sistema: cuadros/s y
   latencia de visión, pérdidas, frecuencia y jitter del lazo, envíos de radio y la velocidad
-  real de FIRASim. Lo anormal va en color alerta. A la derecha, el botón **Arco propio**
-  (cambio de lado), el interruptor **Coach: activo / en pausa (P)** (no aparece sin coach) y
-  **Detener todo** (o Espacio).
+  real de FIRASim. Lo anormal va en color alerta. A la derecha, **Jugar sin esperar al
+  árbitro** (solo mientras el lazo espera el primer comando del árbitro), el botón **Arco
+  propio** (cambio de lado), el interruptor **Coach: activo / en pausa (P)** (no aparece sin
+  coach) y **Detener todo** (o Espacio).
 - **Nuestros robots** (izquierda): una fila por robot propio con su parche, rol, skill y
   progreso, cara, v y ω **pedidos** (lo que va en el frame, `command_to_vw`) y **medidos**
   (visión), y avisos: tope del frame, skill que no corre, no visto, escape de atasco. Con el
@@ -615,6 +617,14 @@ leyendo el estado del árbitro (`ControlLoopConfig.referee`):
   coach heurístico, en STOP las skills son `Hold` y los robots quedan quietos del todo.
 - Al volver a `GAME_ON`, cada robot retoma sin estado heredado (sin escape interrumpido, rampa
   desde cero, skill reiniciada). La terminal avisa al entrar y al salir de HALT.
+- **Espera del primer comando** (`VSSL_ESPERAR_ARBITRO`, encendida por defecto en `rustengine`):
+  el VSSReferee manda cada comando una sola vez, así que un engine que arranca (o se reinicia)
+  después de un STOP jugaría hasta el comando siguiente. Por eso el equipo arranca detenido, por
+  el mismo camino que HALT (el coach no decide), hasta que llega cualquier comando del árbitro;
+  desde ahí manda el árbitro. Si el engine se reinicia en pleno juego, o se prueba sin árbitro, el
+  botón **Jugar sin esperar al árbitro** de la barra de la GUI suelta la espera; la barra dice
+  "Árbitro: esperando su primer comando" mientras tanto. Sin GUI y sin árbitro, usar
+  `VSSL_ESPERAR_ARBITRO=0`. `motion_bench`, `scenario` y `skill_test` no esperan.
 
 Fuentes, por el mismo puerto (`VSSL_REFEREE_ADDR`): **VSSReferee** (simulador, protobuf
 `VSSRef_Command`) o **texto del operador** para el árbitro humano de la cancha:

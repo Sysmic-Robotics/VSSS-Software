@@ -335,7 +335,7 @@ score_spin,score_intercept,score_approach,pick_score,pick,bonus_skill,commit_lef
 adapt_shot_upper,adapt_shot_center,adapt_shot_lower,adapt_duel,\
 play,shot_feasible,shot_blocked,shot_factor,shot_lane,aim_x,aim_y,aim_kind,\
 switch_best,switch_best_s,switch_threshold_s,keeper_mode,\
-rutina,rutina_fase,puesto,repeticion,paso,accion\n";
+rutina,rutina_fase,puesto,repeticion,paso,accion,lado\n";
 
 /// Cantidad de columnas de depuración después de las 21 de base de `MATCH_CSV_HEADER`.
 const MATCH_DEBUG_COLS: usize = 46;
@@ -469,6 +469,13 @@ fn columnas_depuracion(debug: Option<&TickDebug>, id: i32) -> String {
     .join(",")
 }
 
+/// Columna `lado`: el signo de ataque del tick, `1` (atacamos hacia +x) o `-1`. Va en
+/// todas las filas, también las de los rivales, para separar los tiempos de un partido con
+/// cambio de lado.
+fn lado(attack_sign: f32) -> &'static str {
+    if attack_sign >= 0.0 { "1" } else { "-1" }
+}
+
 fn play_label(play: Play) -> String {
     match play {
         Play::Open => "open".into(),
@@ -567,7 +574,7 @@ impl MatchLogger {
             let robot = rec.world.get_robot_state(cmd.id, cmd.team);
             writeln!(
                 self.file,
-                "{},{},{},{},1,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},1,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 rec.t_ms,
                 rec.tick,
                 cmd.team,
@@ -586,7 +593,8 @@ impl MatchLogger {
                 cmd.omega,
                 ball_cols,
                 columnas_depuracion(rec.debug, cmd.id),
-                columnas_rutina(rec.rutina, cmd.id)
+                columnas_rutina(rec.rutina, cmd.id),
+                lado(rec.attack_sign)
             )?;
         }
         // Rivales: solo pose.
@@ -599,7 +607,7 @@ impl MatchLogger {
         for r in opps {
             writeln!(
                 self.file,
-                "{},{},{},{},0,,,,{},{},{},{},{},{},,,,{},{}",
+                "{},{},{},{},0,,,,{},{},{},{},{},{},,,,{},{},{}",
                 rec.t_ms,
                 rec.tick,
                 r.team,
@@ -611,7 +619,8 @@ impl MatchLogger {
                 r.velocity.y,
                 r.angular_velocity,
                 ball_cols,
-                ",".repeat(MATCH_DEBUG_COLS - 1 + MATCH_RUTINA_COLS)
+                ",".repeat(MATCH_DEBUG_COLS - 1 + MATCH_RUTINA_COLS),
+                lado(rec.attack_sign)
             )?;
         }
         Ok(())
@@ -677,6 +686,7 @@ mod tests {
             escaping: &[],
             debug: None,
             rutina: None,
+            attack_sign: 1.0,
         }
     }
 
@@ -872,12 +882,12 @@ mod tests {
         };
         assert_eq!(col(lines[2], "ball_vx"), "0.2", "pelota en fila rival: {}", lines[2]);
         assert!(
-            lines[2].ends_with(&",".repeat(MATCH_DEBUG_COLS + MATCH_RUTINA_COLS)),
-            "depuración y rutina vacías en el rival"
+            lines[2].ends_with(&format!("{}1", ",".repeat(MATCH_DEBUG_COLS + MATCH_RUTINA_COLS + 1))),
+            "depuración y rutina vacías en el rival, y el lado"
         );
         assert_eq!(col(lines[1], "role"), "", "sin depuración, vacía");
         assert_eq!(col(lines[1], "rutina"), "", "sin rutina, vacía");
-        assert!(MATCH_CSV_HEADER.trim_end().ends_with(",keeper_mode,rutina,rutina_fase,puesto,repeticion,paso,accion"));
+        assert!(MATCH_CSV_HEADER.trim_end().ends_with(",keeper_mode,rutina,rutina_fase,puesto,repeticion,paso,accion,lado"));
     }
 
     #[test]
@@ -926,9 +936,34 @@ mod tests {
         for l in &lines {
             assert_eq!(l.split(',').count(), ncols, "columnas en '{l}'");
         }
-        assert!(lines[2].ends_with(",triangulo,ejecutando,A,3,2,ir"), "robot en rutina: {}", lines[2]);
-        assert!(lines[1].ends_with(&",".repeat(MATCH_RUTINA_COLS)), "robot sin puesto: {}", lines[1]);
-        assert!(lines[3].ends_with(&",".repeat(MATCH_RUTINA_COLS)), "rival: {}", lines[3]);
+        assert!(lines[2].ends_with(",triangulo,ejecutando,A,3,2,ir,1"), "robot en rutina: {}", lines[2]);
+        let sin_rutina = format!("{}1", ",".repeat(MATCH_RUTINA_COLS + 1));
+        assert!(lines[1].ends_with(&sin_rutina), "robot sin puesto: {}", lines[1]);
+        assert!(lines[3].ends_with(&sin_rutina), "rival: {}", lines[3]);
+    }
+
+    /// La columna `lado` lleva el signo de ataque del tick en todas las filas (propias y
+    /// rivales), para separar los tiempos de un partido con cambio de lado.
+    #[test]
+    fn match_csv_carries_the_side_of_the_tick() {
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, Vec2::new(0.1, 0.0), 0.0, Vec2::ZERO, 0.0);
+        world.update_robot(1, 1, Vec2::new(0.4, 0.2), 0.0, Vec2::ZERO, 0.0);
+        let commands = [MotionCommand { id: 0, team: 0, vx: 0.0, vy: 0.0, omega: 0.0, orientation: 0.0 }];
+        let targets = [None];
+        let path = std::env::temp_dir().join(format!("vsss_match_lado_test_{}.csv", std::process::id()));
+        {
+            let mut logger = MatchLogger::new(&path, 0).unwrap();
+            let mut rec = empty_tick_record(&world, &commands, &targets, &[]);
+            logger.write_tick(&rec).unwrap();
+            rec.attack_sign = -1.0;
+            logger.write_tick(&rec).unwrap();
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let i = MATCH_CSV_HEADER.trim_end().split(',').position(|h| h == "lado").unwrap();
+        let lados: Vec<&str> = text.lines().skip(1).map(|l| l.split(',').nth(i).unwrap()).collect();
+        assert_eq!(lados, vec!["1", "1", "-1", "-1"], "propio y rival de cada tick");
     }
 
     #[test]
@@ -988,7 +1023,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let lines: Vec<&str> = text.lines().collect();
         let header: Vec<&str> = lines[0].split(',').collect();
-        assert_eq!(header.len(), 21 + MATCH_DEBUG_COLS + MATCH_RUTINA_COLS);
+        assert_eq!(header.len(), 21 + MATCH_DEBUG_COLS + MATCH_RUTINA_COLS + 1, "con la columna lado");
         let col = |l: &str, nombre: &str| -> String {
             let i = header.iter().position(|h| *h == nombre).unwrap();
             l.split(',').nth(i).unwrap().to_string()

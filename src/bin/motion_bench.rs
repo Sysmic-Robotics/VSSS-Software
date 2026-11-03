@@ -983,6 +983,8 @@ async fn run_case(
         // La depuración del tick trae lo que hizo el guardia (no cambia ningún comando).
         exportar_depuracion: true,
         identidad: rustengine::identidad::Identidad::default(),
+        // Los casos de árbitro mandan sus comandos ellos mismos, desde el primer tick.
+        esperar_arbitro: false,
     };
     let decider = Box::new(ScriptDecider { case: *case, robot_id: rid as i32 });
     run_control_loop(cfg, decider, Some(hook), None, Arc::new(AtomicBool::new(false)))

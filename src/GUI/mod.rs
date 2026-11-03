@@ -435,6 +435,8 @@ pub enum Message {
     ToggleEstop,
     /// Cambio de lado (entretiempo), solo con el equipo detenido (`puede_cambiar_lado`).
     CambiarLado,
+    /// Jugar sin esperar el primer comando del árbitro (`EsperaArbitro` del lazo).
+    SoltarEspera,
     TpRobotXChanged(String),
     TpRobotYChanged(String),
     TpRobotThetaChanged(String),
@@ -506,6 +508,9 @@ pub struct GuiSetup {
     /// Cambio de lado → lazo (`GuiChannels::lado_rx`). `None` (p. ej. `scenario`): sin
     /// botón, el lado de `VSSL_SIDE` queda fijo.
     pub lado_tx: Option<mpsc::Sender<f32>>,
+    /// Soltar la espera del primer comando del árbitro → lazo
+    /// (`GuiChannels::soltar_espera_rx`). `None`: sin botón.
+    pub soltar_espera_tx: Option<mpsc::Sender<()>>,
     /// Flag de parada de emergencia compartido con el lazo.
     pub estop: Arc<AtomicBool>,
     /// Interruptor del coach (en pausa = `true`), compartido con el conmutador de `main`.
@@ -567,6 +572,8 @@ pub struct DebugGui {
     skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
     /// Cambio de lado → lazo (ver `GuiSetup::lado_tx`).
     lado_tx: Option<mpsc::Sender<f32>>,
+    /// Soltar la espera del árbitro → lazo (ver `GuiSetup::soltar_espera_tx`).
+    soltar_espera_tx: Option<mpsc::Sender<()>>,
     /// Lado con que se validó la carpeta de rutinas: al cambiar el de la foto, se recarga.
     lado_rutinas: f32,
     /// `coach.keeper_id` de los parámetros: el arquero de los puestos `arquero` de las
@@ -665,6 +672,7 @@ impl DebugGui {
                 skill_target: Vec2::ZERO,
                 skill_tx: setup.skill_tx,
                 lado_tx: setup.lado_tx,
+                soltar_espera_tx: setup.soltar_espera_tx,
                 lado_rutinas,
                 keeper_id: crate::params::params().coach.keeper_id,
                 spin_omega: SPIN_OMEGA_DEFAULT,
@@ -868,6 +876,13 @@ impl DebugGui {
                 self.paso_identificacion(Instant::now(), false);
             }
             Message::CambiarLado => self.cambiar_lado(),
+            Message::SoltarEspera => {
+                if let Some(tx) = &self.soltar_espera_tx
+                    && self.snap.esperando_arbitro
+                {
+                    let _ = tx.try_send(());
+                }
+            }
             Message::TpRobotXChanged(s) => self.tp_robot_x = s,
             Message::TpRobotYChanged(s) => self.tp_robot_y = s,
             Message::TpRobotThetaChanged(s) => self.tp_robot_theta = s,
@@ -1553,6 +1568,7 @@ mod tests {
             rutina_tx: None,
             identidad_tx: None,
             lado_tx: None,
+            soltar_espera_tx: None,
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: Some(pausa.clone()),
             run: run_info::run_info_de_prueba(),
@@ -2032,8 +2048,15 @@ mod tests {
 
     /// GUI de prueba con el canal del cambio de lado (arranca defendiendo la izquierda).
     fn gui_con_lado() -> (DebugGui, mpsc::Receiver<f32>) {
+        let (g, lado_rx, _soltar) = gui_con_lado_y_espera();
+        (g, lado_rx)
+    }
+
+    /// Como `gui_con_lado`, también con el botón que suelta la espera del árbitro.
+    fn gui_con_lado_y_espera() -> (DebugGui, mpsc::Receiver<f32>, mpsc::Receiver<()>) {
         let (_fotos, snapshot_rx) = crate::snapshot::snapshot_channel();
         let (lado_tx, lado_rx) = mpsc::channel(8);
+        let (soltar_tx, soltar_rx) = mpsc::channel(8);
         let setup = GuiSetup {
             snapshot_rx,
             manual_tx: None,
@@ -2043,11 +2066,24 @@ mod tests {
             rutina_tx: None,
             identidad_tx: None,
             lado_tx: Some(lado_tx),
+            soltar_espera_tx: Some(soltar_tx),
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: None,
             run: run_info::run_info_de_prueba(),
         };
-        (DebugGui::new(setup).0, lado_rx)
+        (DebugGui::new(setup).0, lado_rx, soltar_rx)
+    }
+
+    #[test]
+    fn soltar_la_espera_solo_manda_mientras_el_lazo_espera() {
+        let (mut g, _lado, mut rx) = gui_con_lado_y_espera();
+        g.snap = Arc::new(LoopSnapshot { esperando_arbitro: false, ..LoopSnapshot::default() });
+        let _ = g.update(Message::SoltarEspera);
+        assert!(rx.try_recv().is_err(), "sin espera no hay nada que soltar");
+        g.snap = Arc::new(LoopSnapshot { mode: TickMode::Halt, esperando_arbitro: true, ..LoopSnapshot::default() });
+        let _ = g.update(Message::SoltarEspera);
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert!(puede_cambiar_lado(&g.snap), "esperando, el equipo está detenido");
     }
 
     fn foto_lado(modo: TickMode, estop: bool, attack_sign: Option<f32>) -> Arc<LoopSnapshot> {

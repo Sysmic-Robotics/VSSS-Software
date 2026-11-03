@@ -184,6 +184,7 @@ fn run_bench(
         rutina_tx: None, // las rutinas se lanzan desde main con GUI
         identidad_tx: None, // la identidad se edita desde main con GUI
         lado_tx: None,      // una skill fija: el lado de VSSL_SIDE queda
+        soltar_espera_tx: None, // sin árbitro: no hay espera
         estop,
         coach_pausa: None, // una skill fija: no hay coach que pausar
         run: GUI::RunInfo::from_env(
@@ -240,6 +241,7 @@ async fn async_run(
         referee: None,
         exportar_depuracion: false,
         identidad,
+        esperar_arbitro: false,
     };
 
     let mut csv: Option<CsvLogger> = match &log {
@@ -286,6 +288,7 @@ async fn async_run(
         teleport_rx: None,
         identidad_rx: None,
         lado_rx: None,
+        soltar_espera_rx: None,
     });
 
     if let Err(err) = run_control_loop(config, decider, Some(on_tick), gui, shutdown).await {

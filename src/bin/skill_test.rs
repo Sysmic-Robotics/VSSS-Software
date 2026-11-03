@@ -1279,6 +1279,7 @@ async fn run_skill_mode(args: &Args, shutdown: Arc<AtomicBool>) -> Result<(), St
         referee: None,
         exportar_depuracion: false,
         identidad: cargada.identidad,
+        esperar_arbitro: false,
     };
 
     // Logger compartido (si --log presente).
@@ -1454,6 +1455,7 @@ async fn run_rutina_mode(args: &Args, shutdown: Arc<AtomicBool>, detener: Arc<At
         // Con la base station, la identidad de los robots: la asignación automática no
         // elige a los que no reciben comandos.
         identidad: identidad::para_transporte("skill_test", !simulacion).identidad,
+        esperar_arbitro: false,
     };
 
     let mut logger = match &args.log {

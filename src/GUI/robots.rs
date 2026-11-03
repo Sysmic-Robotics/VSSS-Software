@@ -468,6 +468,7 @@ mod tests {
             rutina_tx: None,
             identidad_tx: Some(tx),
             lado_tx: None,
+            soltar_espera_tx: None,
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: Some(pausa.clone()),
             run,

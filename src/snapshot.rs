@@ -85,6 +85,9 @@ pub struct LoopSnapshot {
     /// `VSSL_SIDE` hasta un cambio de lado. `None` antes de la primera foto: la GUI usa el
     /// de `VSSL_SIDE`.
     pub attack_sign: Option<f32>,
+    /// El lazo espera el primer comando del árbitro (`EsperaArbitro`): equipo detenido por
+    /// el camino de HALT hasta que llegue o la GUI lo suelte.
+    pub esperando_arbitro: bool,
 }
 
 impl Default for LoopSnapshot {
@@ -107,6 +110,7 @@ impl Default for LoopSnapshot {
             arquero: crate::params::params().coach.keeper_id,
             identidad: None,
             attack_sign: None,
+            esperando_arbitro: false,
         }
     }
 }
