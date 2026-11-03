@@ -32,8 +32,16 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
  2. Los robots bajo la cámara, uno a la vez. En la pestaña Robots, anotar el patrón de cada
     uno: los rojos deben salir como 4 y 5; los titulares, en 0, 1 y 2.
  3. Girar cada robot a mano: la flecha de la GUI debe apuntar a su frente.
- 4. 6.1: poner un parche con la barra de equipo ADELANTE y otro con la barra ATRÁS. Anotar
-    si los reconoce y hacia dónde apunta la flecha en cada caso (adelante, atrás, costado).
+ 4. 6.1 (barra de equipo ADELANTE o ATRÁS): SSL-Vision reconoce el parche girado igual (el
+    patrón no depende de la orientación); lo que cambia es la flecha. Hoy el engine suma
+    vision.real_theta_offset_deg = 180, que corresponde a la barra al COSTADO. Con la barra
+    adelante o atrás el valor correcto es 90 o 270. Con el parche nuevo puesto:
+      echo '{"vision": {"real_theta_offset_deg": 90}}' > ~/uni/giro.json
+      export VSSL_PARAMS=~/uni/giro.json
+      tools/iniciar.sh real --sin-coach
+    Girar el robot: si la flecha apunta a su frente, listo; si apunta atrás, cambiar 90 por
+    270 en giro.json y relanzar. Anotar el valor. El export queda para todos los bloques
+    siguientes (todos los robots deben llevar la barra del mismo lado).
  5. Guardar la identidad con "Identificar" y cerrar la interfaz.
 
 -------------------------------------------------------------------------------------
