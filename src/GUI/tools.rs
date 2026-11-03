@@ -186,7 +186,7 @@ impl DebugGui {
             "Motion de una cara (bidireccional apagado)."
         };
         col.push(nota(motion))
-            .push(nota(nota_arco(self.own_goal.x < 0.0, self.snap.arquero)))
+            .push(nota(nota_arco(self.own_goal().x < 0.0, self.snap.arquero)))
             .push(nota(
                 "En Parámetros, el giro de Spin solo afecta a Spin, y el PID de heading solo a GoTo, \
                  FacePoint y ChaseBall.",

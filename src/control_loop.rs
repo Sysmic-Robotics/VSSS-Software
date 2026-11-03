@@ -63,6 +63,11 @@ pub trait TickDecider: Send {
     /// en cada cambio de identidad, solo con la base station.
     fn usar_sin_comandos(&mut self, _patrones: &[i32]) {}
 
+    /// Cambio de lado sin relanzar (entretiempo): `attack_sign` +1 = atacamos hacia +x. El
+    /// lazo la llama solo cuando el lado cambia, junto con el guardia y las áreas de motion
+    /// (`cambiar_lado`). Un decisor que no mira el lado no hace nada.
+    fn set_side(&mut self, _attack_sign: f32) {}
+
     /// Lo que pasó en el tick, al final de cada tick y en todos los modos (también en
     /// HALT y en el corte sin visión, cuando el lazo no llama a `decide`). Lo usa la
     /// rutina para sus abortos y su resumen.
@@ -398,6 +403,9 @@ pub struct CoachDecider {
     last_choices: Vec<SkillChoice>,
     /// Patrones sin comandos: el coach no los ve, igual que a un robot que no se ve.
     sin_comandos: Vec<i32>,
+    /// Decidir en el próximo `decide` aunque no toque (después de un cambio de lado, para
+    /// no seguir hasta 5 ticks con las elecciones del lado anterior).
+    decidir_ya: bool,
 }
 
 impl CoachDecider {
@@ -408,13 +416,15 @@ impl CoachDecider {
             decision_period,
             last_choices: Vec::new(),
             sin_comandos: Vec::new(),
+            decidir_ya: false,
         }
     }
 }
 
 impl TickDecider for CoachDecider {
     fn decide(&mut self, tick: u32, world: &World) -> Vec<SkillChoice> {
-        if tick.is_multiple_of(self.decision_period) {
+        if self.decidir_ya || tick.is_multiple_of(self.decision_period) {
+            self.decidir_ya = false;
             let mut obs = Observation::from_world(world, self.own_team);
             obs.quitar_propios(&self.sin_comandos);
             self.last_choices = self.coach.decide(&obs);
@@ -424,6 +434,13 @@ impl TickDecider for CoachDecider {
 
     fn usar_sin_comandos(&mut self, patrones: &[i32]) {
         self.sin_comandos = patrones.to_vec();
+    }
+
+    /// `Coach::set_side`, y el coach vuelve a decidir en el próximo `decide` (el lazo
+    /// aplica el cambio antes de decidir: en el mismo tick).
+    fn set_side(&mut self, attack_sign: f32) {
+        self.coach.set_side(attack_sign);
+        self.decidir_ya = true;
     }
 
     fn role(&self, robot_id: i32) -> Option<Role> {
@@ -545,6 +562,38 @@ pub struct GuiChannels {
     pub teleport_rx: Option<mpsc::Receiver<Vec<crate::radio::TeleportItem>>>,
     /// Órdenes de identidad (pestaña Robots) GUI→loop. `None` = sin pestaña.
     pub identidad_rx: Option<mpsc::Receiver<OrdenIdentidad>>,
+    /// Cambio de lado GUI→loop: el `attack_sign` nuevo (+1 = atacamos hacia +x), absoluto
+    /// para que repetirlo no haga nada (`cambiar_lado`). `None` = el lado de `VSSL_SIDE`
+    /// queda fijo.
+    pub lado_rx: Option<mpsc::Receiver<f32>>,
+}
+
+/// Cambio de lado sin relanzar (entretiempo): el guardia de zonas, las áreas de motion y
+/// el decisor (coach) pasan juntos al lado `attack_sign` (+1 = atacamos hacia +x), y las
+/// skills retoman sin estado heredado. Si el lado ya es ese, no hace nada y devuelve
+/// `false`. El lado vigente es el del guardia (`ZoneGuard::attack_sign`), el que publica
+/// la foto.
+pub(crate) fn cambiar_lado(
+    attack_sign: f32,
+    zone_guard: &mut ZoneGuard,
+    motion: &mut Motion,
+    catalog: &mut SkillCatalog,
+    decider: &mut dyn TickDecider,
+) -> bool {
+    let s = if attack_sign >= 0.0 { 1.0 } else { -1.0 };
+    if s == zone_guard.attack_sign() {
+        return false;
+    }
+    zone_guard.set_side(s);
+    motion.set_side(s);
+    catalog.forget_last_skills();
+    decider.set_side(s);
+    eprintln!(
+        "[control_loop] cambio de lado: defendemos el arco {} y atacamos hacia {}X",
+        if s > 0.0 { "izquierdo" } else { "derecho" },
+        if s > 0.0 { "+" } else { "-" }
+    );
+    true
 }
 
 /// Construye comandos de velocidad cero para todos los robots activos del equipo
@@ -1095,7 +1144,7 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(tracker_on_at_start));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (snapshot_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx, mut identidad_rx) =
+    let (snapshot_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx, mut identidad_rx, mut lado_rx) =
         match gui {
             Some(g) => (
                 Some(g.snapshot_tx),
@@ -1105,8 +1154,9 @@ pub async fn run_control_loop(
                 g.pid_rx,
                 g.teleport_rx,
                 g.identidad_rx,
+                g.lado_rx,
             ),
-            None => (None, None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None, None),
         };
     // Contadores de la visión (atómicos; no cambian ningún comando).
     let vision_stats = Arc::new(VisionStats::default());
@@ -1340,6 +1390,14 @@ pub async fn run_control_loop(
                 None => Vec::new(),
             };
             identidad.ordenes(ordenes, tick_counter, &mut *radio.lock().await, decider.as_mut());
+
+            // Cambio de lado (entretiempo), antes de decidir: el coach decide en este mismo
+            // tick con el lado nuevo, y el guardia y motion lo aplican desde este envío.
+            if let Some(rx) = lado_rx.as_mut()
+                && let Some(s) = std::iter::from_fn(|| rx.try_recv().ok()).last()
+            {
+                cambiar_lado(s, &mut zone_guard, &mut motion, &mut catalog, decider.as_mut());
+            }
 
             // Tuneo de PID de heading desde la GUI (aplica al catálogo en runtime).
             if let Some(rx) = pid_rx.as_mut() {
@@ -1579,6 +1637,7 @@ pub async fn run_control_loop(
                         rutina: rutina_vista.clone(),
                         arquero: zone_guard.keeper(),
                         identidad: identidad.para_foto(),
+                        attack_sign: Some(zone_guard.attack_sign()),
                     },
                 );
             }
@@ -2356,6 +2415,81 @@ mod tests {
         }
         // Debe haber sido llamado en ticks 0, 6, 12 → 3 veces.
         assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    /// Cambio de lado: el coach lo recibe y decide en el próximo `decide` aunque no toque
+    /// (sin seguir con las elecciones del lado anterior); después, su frame-skip de siempre.
+    #[test]
+    fn coach_decider_cambia_de_lado_y_decide_en_seguida() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Espia {
+            decisiones: Arc<AtomicU32>,
+            lados: Arc<Mutex<Vec<f32>>>,
+        }
+        impl Coach for Espia {
+            fn decide(&mut self, _obs: &Observation) -> Vec<SkillChoice> {
+                self.decisiones.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+            fn set_side(&mut self, attack_sign: f32) {
+                self.lados.lock().unwrap().push(attack_sign);
+            }
+        }
+
+        let decisiones = Arc::new(AtomicU32::new(0));
+        let lados = Arc::new(Mutex::new(Vec::new()));
+        let espia = Espia { decisiones: decisiones.clone(), lados: lados.clone() };
+        let mut d = CoachDecider::new(Box::new(espia), 0, 6);
+        let w = World::new(3, 3);
+        d.decide(0, &w);
+        d.decide(1, &w);
+        assert_eq!(decisiones.load(Ordering::Relaxed), 1);
+        d.set_side(-1.0);
+        assert_eq!(*lados.lock().unwrap(), vec![-1.0]);
+        d.decide(2, &w);
+        assert_eq!(decisiones.load(Ordering::Relaxed), 2, "decide en el tick del cambio");
+        for t in 3..6 {
+            d.decide(t, &w);
+        }
+        assert_eq!(decisiones.load(Ordering::Relaxed), 2, "y vuelve a su frame-skip");
+        d.decide(6, &w);
+        assert_eq!(decisiones.load(Ordering::Relaxed), 3);
+    }
+
+    /// `cambiar_lado` mueve juntos el guardia, las áreas de motion y el decisor; con el
+    /// mismo lado (solo cuenta el signo) no hace nada, así que repetir la orden es inocuo.
+    #[test]
+    fn cambiar_lado_mueve_guardia_motion_y_decisor_juntos() {
+        struct Lados(Vec<f32>);
+        impl TickDecider for Lados {
+            fn decide(&mut self, _tick: u32, _world: &World) -> Vec<SkillChoice> {
+                Vec::new()
+            }
+            fn set_side(&mut self, attack_sign: f32) {
+                self.0.push(attack_sign);
+            }
+        }
+
+        let mut guardia = ZoneGuard::new(1.0, 2);
+        let mut motion = Motion::new().with_areas(1.0, 2);
+        let mut catalogo = SkillCatalog::new(3);
+        let mut d = Lados(Vec::new());
+        assert!(!cambiar_lado(1.0, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert!(d.0.is_empty(), "el mismo lado no llega al decisor");
+
+        assert!(cambiar_lado(-1.0, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert_eq!(guardia.attack_sign(), -1.0);
+        assert_eq!(guardia.keeper(), 2);
+        assert_eq!(motion.attack_dir(), Some(Vec2::new(-1.0, 0.0)));
+        assert_eq!(d.0, vec![-1.0]);
+
+        assert!(!cambiar_lado(-0.5, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert_eq!(d.0, vec![-1.0], "repetir la orden no hace nada");
+
+        assert!(cambiar_lado(1.0, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert_eq!((guardia.attack_sign(), motion.attack_dir()), (1.0, Some(Vec2::X)));
+        assert_eq!(d.0, vec![-1.0, 1.0]);
     }
 
     /// 1.7 — Sin comandos manuales, `apply_manual_overrides` no toca nada.

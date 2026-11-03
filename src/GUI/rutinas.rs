@@ -171,14 +171,15 @@ impl EstadoRutinas {
             teletransportar: false,
             aviso: None,
         };
-        e.recargar(own_team);
+        e.recargar(crate::skills::zones::attack_sign_from_env(own_team));
         e
     }
 
-    /// Vuelve a leer la carpeta de rutinas (sin recompilar).
-    fn recargar(&mut self, own_team: i32) {
+    /// Vuelve a leer la carpeta de rutinas (sin recompilar), validada con el lado
+    /// `attack_sign` (el vigente del lazo: cambia con el cambio de lado).
+    pub(super) fn recargar(&mut self, attack_sign: f32) {
         let dir = crate::rutinas::carpeta();
-        match crate::rutinas::cargar_carpeta(&dir, &ContextoValidacion::vigente(own_team)) {
+        match crate::rutinas::cargar_carpeta(&dir, &ContextoValidacion::vigente_con_lado(attack_sign)) {
             Ok(entradas) => {
                 self.entradas = entradas;
                 self.error_carpeta = None;
@@ -210,7 +211,7 @@ impl DebugGui {
         let sim = !self.run.is_base_station();
         let r = &mut self.rutinas;
         match m {
-            MensajeRutina::Recargar => r.recargar(self.run.own_team),
+            MensajeRutina::Recargar => r.recargar(self.lado_rutinas),
             MensajeRutina::Seleccionar(id) => {
                 let puestos = r
                     .entradas

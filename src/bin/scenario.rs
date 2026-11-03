@@ -183,6 +183,7 @@ fn run_bench(
         teleport_tx: None,
         rutina_tx: None, // las rutinas se lanzan desde main con GUI
         identidad_tx: None, // la identidad se edita desde main con GUI
+        lado_tx: None,      // una skill fija: el lado de VSSL_SIDE queda
         estop,
         coach_pausa: None, // una skill fija: no hay coach que pausar
         run: GUI::RunInfo::from_env(
@@ -284,6 +285,7 @@ async fn async_run(
         pid_rx: None,
         teleport_rx: None,
         identidad_rx: None,
+        lado_rx: None,
     });
 
     if let Err(err) = run_control_loop(config, decider, Some(on_tick), gui, shutdown).await {

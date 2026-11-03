@@ -138,6 +138,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada) {
         mpsc::channel::<Vec<rustengine::radio::TeleportItem>>(16);
     let (rutina_tx, rutina_rx) = mpsc::channel::<OrdenRutina>(16);
     let (identidad_tx, identidad_rx) = mpsc::channel::<OrdenIdentidad>(16);
+    let (lado_tx, lado_rx) = mpsc::channel::<f32>(4);
     let estop = Arc::new(AtomicBool::new(false));
 
     // Configuración de la corrida para la barra de estado y el Inspector (solo lectura).
@@ -165,7 +166,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada) {
     let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(
-            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx, rutina_rx, identidad_rx)),
+            Some((snapshot_tx, manual_rx, skill_rx, estop_loop, pid_rx, teleport_rx, rutina_rx, identidad_rx, lado_rx)),
             coach_pausa_loop,
             shutdown_loop,
             identidad.identidad,
@@ -180,6 +181,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada) {
         teleport_tx: Some(teleport_tx),
         rutina_tx: Some(rutina_tx),
         identidad_tx: Some(identidad_tx),
+        lado_tx: Some(lado_tx),
         estop,
         coach_pausa,
         run,
@@ -210,6 +212,7 @@ type GuiChannelBundle = (
     mpsc::Receiver<Vec<rustengine::radio::TeleportItem>>,
     mpsc::Receiver<OrdenRutina>,
     mpsc::Receiver<OrdenIdentidad>,
+    mpsc::Receiver<f32>,
 );
 
 async fn async_main(
@@ -261,8 +264,8 @@ async fn async_main(
     };
     // Con GUI, las rutinas: el coach (o ninguno) hasta que la GUI prepara una.
     let (gui_channels, rutina_rx) = match gui_channels {
-        Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, rutina_rx, identidad_rx)) => (
-            Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, identidad_rx)),
+        Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, rutina_rx, identidad_rx, lado_rx)) => (
+            Some((snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, identidad_rx, lado_rx)),
             Some(rutina_rx),
         ),
         None => (None, None),
@@ -327,7 +330,7 @@ async fn async_main(
     };
 
     let gui = gui_channels.map(
-        |(snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, identidad_rx)| GuiChannels {
+        |(snapshot_tx, manual_rx, skill_rx, estop, pid_rx, teleport_rx, identidad_rx, lado_rx)| GuiChannels {
             snapshot_tx,
             manual_rx: Some(manual_rx),
             skill_rx: Some(skill_rx),
@@ -335,6 +338,7 @@ async fn async_main(
             pid_rx: Some(pid_rx),
             teleport_rx: Some(teleport_rx),
             identidad_rx: Some(identidad_rx),
+            lado_rx: Some(lado_rx),
         },
     );
 

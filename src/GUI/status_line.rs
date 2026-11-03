@@ -310,7 +310,29 @@ pub fn texto_boton_coach(en_pausa: bool) -> &'static str {
     if en_pausa { "Coach: en pausa (P)" } else { "Coach: activo (P)" }
 }
 
+/// Texto del botón de cambio de lado: el arco que defendemos ahora y, en juego, que hay
+/// que detener al equipo para cambiarlo.
+pub fn texto_boton_lado(attack_sign: f32, puede: bool) -> String {
+    let arco = if attack_sign > 0.0 { "izquierdo" } else { "derecho" };
+    if puede {
+        format!("Arco propio: {arco}, cambiar de lado")
+    } else {
+        format!("Arco propio: {arco} (detener para cambiar)")
+    }
+}
+
 impl DebugGui {
+    /// Cambio de lado (entretiempo), a la izquierda del interruptor del coach. Solo
+    /// responde con el equipo detenido (`puede_cambiar_lado`).
+    fn boton_lado(&self) -> Element<'_, Message> {
+        let puede = super::puede_cambiar_lado(&self.snap);
+        button(text(texto_boton_lado(self.attack_sign(), puede)).size(theme::TXT))
+            .padding([6, 12])
+            .style(theme::boton_opcion(false))
+            .on_press_maybe(puede.then_some(Message::CambiarLado))
+            .into()
+    }
+
     /// Interruptor del coach, inmediatamente a la izquierda de "Detener todo".
     fn boton_coach(&self) -> Element<'_, Message> {
         let en_pausa = self.coach_en_pausa();
@@ -364,6 +386,7 @@ impl DebugGui {
             // El container afloja los límites: a un hijo `Fill` de una fila, iced le
             // pasa `min = max`, y `Wrapping` se los pasaría a cada frase.
             row![container(fila.wrap()).width(Length::Fill)]
+                .push_maybe(self.lado_tx.is_some().then(|| self.boton_lado()))
                 .push_maybe(self.coach_pausa.is_some().then(|| self.boton_coach()))
                 .push(parada)
                 .spacing(theme::SP_LG)

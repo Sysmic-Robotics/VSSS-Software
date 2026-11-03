@@ -191,6 +191,14 @@ impl Motion {
         }
     }
 
+    /// Cambia el lado de las reglas de áreas (entretiempo), con el mismo `attack_sign` que
+    /// `ZoneGuard::set_side`; también cambia `attack_dir`. Sin `with_areas` no hace nada.
+    pub fn set_side(&mut self, attack_sign: f32) {
+        if let Some(rules) = self.areas.as_mut() {
+            rules.attack_sign = attack_sign;
+        }
+    }
+
     /// Dirección hacia el arco rival (`with_areas`); `None` sin reglas de áreas.
     pub fn attack_dir(&self) -> Option<Vec2> {
         self.areas.map(|r| Vec2::new(r.attack_sign, 0.0))
@@ -1113,6 +1121,28 @@ mod tests {
         let mut sin_areas = Motion::new();
         sin_areas.set_keeper(0);
         assert!(sin_areas.forbidden_areas(&viejo, &world).is_empty());
+    }
+
+    #[test]
+    fn set_side_pasa_el_area_propia_y_el_ataque_al_otro_lado() {
+        // Entretiempo: el área propia pasa a +x (el de campo la rodea allá y ya no en −x) y
+        // `attack_dir` apunta a −x. Sin reglas de áreas, `set_side` no hace nada.
+        let mut motion = Motion::new().with_areas(1.0, 2);
+        motion.set_side(-1.0);
+        assert_eq!(motion.attack_dir(), Some(Vec2::new(-1.0, 0.0)));
+        let mut world = World::new(3, 3);
+        world.update_ball(FAR_BALL, Vec2::ZERO);
+        let en_mas_x = robot_id(0, 0.66, -0.45, 1.57);
+        assert_eq!(motion.forbidden_areas(&en_mas_x, &world), vec![AreaRect::own(-1.0)]);
+        let aim = motion.aim_point(&en_mas_x, Vec2::new(0.66, 0.45), &world, true).0;
+        assert!(aim.x < 0.66, "rodea el área propia nueva por el frente: {aim:?}");
+        // La de −x ahora es la rival, sin nadie adentro: la cruza.
+        let en_menos_x = robot_id(0, -0.66, -0.45, 1.57);
+        let destino = Vec2::new(-0.66, 0.45);
+        assert_eq!(motion.aim_point(&en_menos_x, destino, &world, true).0, destino);
+        let mut sin_areas = Motion::new();
+        sin_areas.set_side(-1.0);
+        assert_eq!(sin_areas.attack_dir(), None);
     }
 
     #[test]

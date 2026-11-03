@@ -250,6 +250,18 @@ impl ZoneGuard {
         self.keeper_id
     }
 
+    /// Cambia el lado de la cancha (entretiempo): las dos áreas y la boca del arco propio
+    /// pasan al otro lado y el arquero queda. `attack_sign` +1 = atacamos hacia +x. El
+    /// control loop la llama junto con `Motion::set_side` y `TickDecider::set_side`.
+    pub fn set_side(&mut self, attack_sign: f32) {
+        *self = Self::new(attack_sign, self.keeper_id);
+    }
+
+    /// Signo de ataque vigente (+1 = atacamos hacia +x, el área rival está en +x).
+    pub fn attack_sign(&self) -> f32 {
+        self.opp_area.side
+    }
+
     pub fn own_area(&self) -> AreaRect {
         self.own_area
     }
@@ -727,6 +739,43 @@ mod tests {
         let manual: HashSet<(i32, i32)> = [(0, 2)].into_iter().collect();
         guard.guard_commands(&mut cmds, &w, 0, &manual);
         assert_eq!(cmds[0], c);
+    }
+
+    #[test]
+    fn set_side_lleva_las_areas_y_la_boca_al_otro_lado_y_deja_al_arquero() {
+        let mut guard = ZoneGuard::new(1.0, 2);
+        assert_eq!(guard.attack_sign(), 1.0);
+        // El 0 avanza hacia +x frente al área de ese lado: con el lado de partida es la
+        // rival (sin nadie adentro, libre).
+        let w0 = world_with(&[(0, 0, 0.52, 0.10, 0.0)]);
+        let c0 = along(0, 0.5, 0.0);
+        let mut cmds = vec![c0.clone()];
+        guard.guard_commands(&mut cmds, &w0, 0, &HashSet::new());
+        assert_eq!(cmds[0], c0);
+
+        guard.set_side(-1.0);
+        assert_eq!(guard.attack_sign(), -1.0);
+        assert_eq!(guard.keeper(), 2, "el arquero no cambia con el lado");
+        assert_eq!(
+            (guard.own_area(), guard.opp_area(), guard.boca_propia()),
+            (AreaRect::own(-1.0), AreaRect::opp(-1.0), BocaArco::own(-1.0))
+        );
+        // Ahora es la propia: frena.
+        let mut cmds = vec![c0.clone()];
+        guard.guard_commands(&mut cmds, &w0, 0, &HashSet::new());
+        assert_eq!((cmds[0].vx, cmds[0].vy), (0.0, 0.0), "el área propia pasó a +x");
+        // El arquero mirando al arco nuevo no cruza su línea.
+        let w2 = world_with(&[(0, 2, 0.67, 0.0, 0.0)]);
+        let mut cmds = vec![along(2, 0.5, 0.0)];
+        let g = guard.guard_commands(&mut cmds, &w2, 0, &HashSet::new())[0].expect("evaluado");
+        assert_eq!(g.accion, Some(AccionGuardia::Frena));
+        // Volver deja el guardia igual al del lado de partida.
+        guard.set_side(1.0);
+        let nuevo = ZoneGuard::new(1.0, 2);
+        assert_eq!(
+            (guard.own_area(), guard.opp_area(), guard.boca_propia()),
+            (nuevo.own_area(), nuevo.opp_area(), nuevo.boca_propia())
+        );
     }
 
     #[test]

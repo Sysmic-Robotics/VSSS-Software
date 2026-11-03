@@ -41,7 +41,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_MULTICAST_IFACE` | (auto) | IPv4 local para forzar la interfaz de multicast (útil si hay varias NICs). |
 | `VSSL_RADIO_TARGET` | `firasim` | `firasim`, `grsim` o `basestation`. Selecciona a quién se le envían los `MotionCommand`. |
 | `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Equipo que controla el engine (coach, skills) y, en `basestation`, qué comandos van al frame serial. Permite dos engines en la misma máquina, uno por equipo. |
-| `VSSL_SIDE` | azul `left`, amarillo `right` | Arco que defendemos (`left` = atacamos hacia +X). Cambia en el segundo tiempo y según cómo esté puesto el simulador; el coach avisa al arrancar si los robots están en la mitad contraria. |
+| `VSSL_SIDE` | azul `left`, amarillo `right` | Arco que defendemos al arrancar (`left` = atacamos hacia +X). Depende de cómo esté puesto el simulador; el coach avisa al arrancar si los robots están en la mitad contraria. En el entretiempo se cambia sin relanzar con el botón **Arco propio** de la GUI (ver **Cambio de lado**). |
 | `VSSL_COACH` | `heuristic` | `heuristic` (equipo STP de dos caras), `rule_based` (baseline de roles fijos) o `none`. |
 | `VSSL_COACH_PAUSA` | `0` | `1`, `true` u `on`: la GUI parte con el coach en pausa (los robots libres quedan quietos; P o el botón de la barra lo activan). Otro valor que no sea `0`, `false` u `off` no arranca. Solo con la GUI: sin ella, encendida, `main` no arranca (para correr sin coach, `VSSL_COACH=none`). Con `VSSL_COACH=none` no tiene efecto. |
 | `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro y avanza de espaldas cuando conviene. |
@@ -80,8 +80,9 @@ La interfaz se ve como la mesa de la salita: es neutra, y el único color es el 
 - **Barra de estado** (arriba): frases con el modo (simulación o robots reales, frontal o
   bidireccional, ruido de cámara), el coach, el árbitro y la salud del sistema: cuadros/s y
   latencia de visión, pérdidas, frecuencia y jitter del lazo, envíos de radio y la velocidad
-  real de FIRASim. Lo anormal va en color alerta. A la derecha, el interruptor **Coach: activo
-  / en pausa (P)** (no aparece sin coach) y **Detener todo** (o Espacio).
+  real de FIRASim. Lo anormal va en color alerta. A la derecha, el botón **Arco propio**
+  (cambio de lado), el interruptor **Coach: activo / en pausa (P)** (no aparece sin coach) y
+  **Detener todo** (o Espacio).
 - **Nuestros robots** (izquierda): una fila por robot propio con su parche, rol, skill y
   progreso, cara, v y ω **pedidos** (lo que va en el frame, `command_to_vw`) y **medidos**
   (visión), y avisos: tope del frame, skill que no corre, no visto, escape de atasco. Con el
@@ -176,6 +177,17 @@ manual ni skill de la GUI quedan en Hold; el manual, la skill de la GUI y las ru
 funcionando. Con el coach activo, un robot tomado en manual recibe Hold por dentro (su skill
 no corre detrás del manual) y, al soltarlo, el coach lo retoma con la rampa desde cero. Si
 un jugador toma al arquero del coach, Herramientas lo avisa.
+
+**Cambio de lado** (entretiempo, botón **Arco propio: izquierdo/derecho** de la barra): cambia
+el arco que defendemos sin relanzar. El botón solo responde con el equipo detenido (parada,
+HALT o STOP del árbitro, o sin visión); en juego dice "detener para cambiar", porque un clic de
+más mandaría a los robots al arco contrario. En el entretiempo: **Detener todo** (o el HALT del
+árbitro), **Arco propio**, y soltar. El lazo cambia juntos, en el mismo tick, el `ZoneGuard`
+(áreas y línea del arco), las áreas que rodea motion y el coach (`Coach::set_side`, que decide
+de nuevo en ese tick); cada skill retoma sin estado heredado. La orden lleva el lado absoluto:
+repetirla no hace nada. El lado vigente lo publica la foto del lazo; con él la GUI dibuja el
+arco propio de las skills de arquero y valida las rutinas. Sin GUI (y en `scenario`), el lado
+de `VSSL_SIDE` queda fijo.
 
 **Parada de emergencia:** **Detener todo** (o la tecla **Espacio**, en cualquier modo, aunque
 el cursor esté sobre un slider o un campo de texto tenga el foco)
