@@ -112,6 +112,18 @@ fn main() {
         std::process::exit(1);
     });
     let con_gui = std::env::var("VSSL_DEBUG_GUI").unwrap_or_default() == "1";
+    // `VSSL_ARBITRO_GUI` (por defecto no): pestaña Árbitro de práctica. Un valor inválido no
+    // arranca; sin la interfaz no hay pestaña.
+    let arbitro_gui = GUI::arbitro::arbitro_gui_from_env().unwrap_or_else(|e| {
+        eprintln!("[main] ✗ {e}");
+        std::process::exit(1);
+    });
+    if arbitro_gui && !con_gui {
+        eprintln!("[main] {} no tiene efecto sin la interfaz (VSSL_DEBUG_GUI=1)", GUI::arbitro::ARBITRO_GUI_ENV);
+    }
+    // Árbitro (VSSReferee o texto del operador, VSSL_REFEREE_ADDR): estado compartido que el
+    // coach heurístico lee en cada decisión y, con la pestaña encendida, también la GUI.
+    let referee = new_shared_referee();
     if pausa && !con_gui {
         eprintln!(
             "[main] ✗ {} solo vale con la interfaz (VSSL_DEBUG_GUI=1): sin ella nadie puede \
@@ -124,17 +136,24 @@ fn main() {
     // antes de abrir nada: un archivo inválido no arranca. En simulación no se lee.
     let identidad = rustengine::identidad::para_transporte("main", RadioTarget::from_env() == RadioTarget::BaseStation);
     if con_gui {
-        run_with_gui(shutdown, pausa, identidad, esperar_arbitro);
+        run_with_gui(shutdown, pausa, identidad, esperar_arbitro, referee, arbitro_gui);
     } else {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async_main(None, None, shutdown, identidad.identidad, esperar_arbitro));
+        rt.block_on(async_main(None, None, shutdown, identidad.identidad, esperar_arbitro, referee));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Modo debug: GUI en el hilo principal, tokio en background
 // ─────────────────────────────────────────────────────────────────────────────
-fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada, esperar_arbitro: bool) {
+fn run_with_gui(
+    shutdown: Arc<AtomicBool>,
+    pausa: bool,
+    identidad: Cargada,
+    esperar_arbitro: bool,
+    referee: SharedReferee,
+    arbitro_gui: bool,
+) {
     // Foto de cada tick, lazo → GUI (canal de "último valor": nunca frena el lazo).
     let (snapshot_tx, snapshot_rx) = rustengine::snapshot::snapshot_channel();
     let (manual_tx, manual_rx) = mpsc::channel::<ManualCommand>(32);
@@ -170,6 +189,10 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada, espe
     let estop_loop = estop.clone();
     let shutdown_loop = shutdown.clone();
     let coach_pausa_loop = coach_pausa.clone();
+    let arbitro = arbitro_gui.then(|| referee.clone());
+    if arbitro.is_some() {
+        eprintln!("[main] pestaña Árbitro de práctica encendida: sus comandos quedan en este engine");
+    }
     let lazo = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async_main(
@@ -189,6 +212,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada, espe
             shutdown_loop,
             identidad.identidad,
             esperar_arbitro,
+            referee,
         ));
     });
 
@@ -202,6 +226,7 @@ fn run_with_gui(shutdown: Arc<AtomicBool>, pausa: bool, identidad: Cargada, espe
         identidad_tx: Some(identidad_tx),
         lado_tx: Some(lado_tx),
         soltar_espera_tx: Some(soltar_espera_tx),
+        arbitro,
         estop,
         coach_pausa,
         run,
@@ -242,6 +267,7 @@ async fn async_main(
     shutdown: Arc<AtomicBool>,
     identidad: Identidad,
     esperar_arbitro: bool,
+    referee: SharedReferee,
 ) {
     if let Err(e) = rustengine::parada::al_recibir_senal(shutdown.clone()) {
         eprintln!("[main] no pude registrar las señales de terminación: {e}");
@@ -260,9 +286,7 @@ async fn async_main(
         "[main] equipo propio: {} (VSSL_TEAM_COLOR)",
         if own_team == 0 { "azul" } else { "amarillo" }
     );
-    // Árbitro (VSSReferee o texto del operador, VSSL_REFEREE_ADDR): estado
-    // compartido que el coach heurístico lee en cada decisión.
-    let referee = new_shared_referee();
+    // El listener del árbitro escribe en el estado que creó `main` (ver allí).
     tokio::spawn(run_referee_listener(referee.clone()));
 
     let coach = make_coach(own_team, &referee);
