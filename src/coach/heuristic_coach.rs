@@ -952,6 +952,15 @@ impl HeuristicCoach {
         if speed < min_speed {
             return None;
         }
+        // Uno solo por vez: el atacante y el apoyo calculaban el mismo punto e iban los dos.
+        let hz = self.p.decision_hz.max(1e-3);
+        let grace = (0.5 * hz).ceil() as u64;
+        let other_active = self.deflect_plans.iter().enumerate().any(|(j, p)| {
+            j != id && p.is_some_and(|p| self.decision_count <= p.contact_at + grace)
+        });
+        if other_active {
+            return None;
+        }
         // Pelota libre: ni el propio robot, ni nuestro atacante, ni un rival la llevan.
         let carried = (r.pos - ball).length() < 0.15
             || striker.is_some_and(|st| (st.pos - ball).length() < 0.15)
@@ -993,16 +1002,27 @@ impl HeuristicCoach {
             let quarter = std::f32::consts::FRAC_PI_2;
             let off = (r.theta - ph).rem_euclid(quarter);
             let (heading, rot) = if off <= quarter / 2.0 { (r.theta - off, off) } else { (r.theta + quarter - off, quarter - off) };
-            let need = self.time_to_reach(r, center) + rot / self.p.omega_ref;
+            let need = self.deflect_reach_time(r, center) + rot / self.p.omega_ref;
             if need + 0.2 <= t - 0.05 && best.map_or(true, |b| need < b.0) {
                 best = Some((need, center, heading, p, t - 0.05));
             }
         }
         let (_, center, heading, point, t_contact) = best?;
-        let hz = self.p.decision_hz.max(1e-3);
         let contact_at = self.decision_count + (t_contact * hz).ceil() as u64;
         self.deflect_plans[id] = Some(DeflectPlan { point, center, heading, contact_at });
         Some(self.deflect_command(r, center, heading))
+    }
+
+    /// Tiempo para llegar al centro del desvío: el giro de `time_to_reach` y el recorrido con
+    /// la rampa de `motion.max_linear_accel` (acelerar y frenar hasta `v_ref`). Con el recorrido
+    /// a velocidad tope, como en `time_to_reach`, el robot llegaba tarde: en los registros giraba
+    /// en el lugar y aceleraba mientras la pelota ya pasaba.
+    fn deflect_reach_time(&self, r: &RobotView, center: Vec2) -> f32 {
+        let d = (center - r.pos).length();
+        let v = self.p.v_ref.max(0.05);
+        let a = (params().motion.max_linear_accel as f32).max(0.1);
+        let travel = if d < v * v / a { 2.0 * (d / a).sqrt() } else { d / v + v / a };
+        self.time_to_reach(r, center) - d / v + travel
     }
 
     /// El desvío en curso sigue: la pelota no pasó el punto, su camino pasa a menos de 8 cm de
@@ -2158,6 +2178,9 @@ mod tests {
         let kept = c.deflect_choice(&moved, ball + vel * 0.1, ruido, Some(&st), &[]).expect("sigue");
         assert!(matches!(kept.skill_id, SkillId::GoTo | SkillId::FacePoint));
         assert_eq!(c.deflect_plans[1].map(|p| p.center), Some(plan.center), "mismo centro");
+        // Uno solo por vez: otro robot cerca del mismo camino no arma un segundo desvío.
+        let otro = RobotView { id: 0, pos: Vec2::new(0.45, 0.12), theta: 0.0, active: true };
+        assert!(c.deflect_choice(&otro, ball + vel * 0.1, vel, None, &[]).is_none());
         let past = plan.point + vel.normalize() * 0.10;
         let after = c.deflect_choice(&moved, past, vel * 0.5, Some(&st), &[]);
         assert!(after.map_or(true, |a| a.target != first.target), "la pelota ya pasó: {after:?}");
