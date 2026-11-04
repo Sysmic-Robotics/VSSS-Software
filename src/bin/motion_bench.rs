@@ -36,7 +36,7 @@ use rustengine::motion::{Motion, MotionConfig};
 use rustengine::params::params;
 use rustengine::protos::fira_packet::Environment;
 use rustengine::radio::{FIRASimClient, RadioTarget, TeleportItem};
-use rustengine::skills::zones::{AccionGuardia, AreaRect};
+use rustengine::skills::zones::{AccionGuardia, AreaRect, BocaArco, GOAL_LINE_X, ROBOT_HALF};
 use rustengine::skills::{
     ApproachAlignedSkill, BlockLineSkill, DefendGoalLineSkill, RailKeeperSkill, SkillConfig, SkillId,
     clear_direction,
@@ -88,6 +88,11 @@ enum Goal {
     ArriveFacingBall,
     /// Llega sin mover la pelota más de 0.03 m (GoTo con la pelota en el camino: A4).
     ArriveNoBallPush,
+    /// Línea de gol (tarea 1.1): el robot no entra a la boca del arco propio (`BocaArco`)
+    /// más de `BOCA_TOL` más allá de lo que entraba al empezar; con `salir_s`, desde ese
+    /// instante ya no la toca (el guardia lo sacó y no volvió a entrar). Con la pose real si
+    /// todas las filas la tienen, como el criterio de área.
+    Boca { salir_s: Option<f64> },
     /// Árbitro: en la ventana HALT/STOP la traslación comandada es cero (en HALT también
     /// `omega`) y el robot no se desplaza después de frenar (desde 1.0 s); al salir, cumple el objetivo
     /// de su skill (`arrived`) sin escapes en los primeros 0.5 s.
@@ -130,6 +135,10 @@ const OWN_GOAL: Vec2 = Vec2::new(-0.75, 0.0);
 /// Radio de la pelota y mitad de la boca del arco (m), para el criterio de tiro atajado.
 const BALL_RADIUS: f32 = 0.021;
 const GOAL_HALF_Y: f32 = 0.20;
+/// Cuánto más puede entrar a la boca del arco (m) el robot de un caso `Goal::Boca`: la
+/// latencia y el frenado con aceleración limitada dejan pasar algo después de que el guardia
+/// anula la traslación.
+const BOCA_TOL: f32 = 0.02;
 /// Salto de pose entre dos ticks que solo explica una falla del simulador (m).
 const POSE_JUMP_M: f32 = 0.3;
 /// Reintentos de una repetición que falló por infraestructura.
@@ -277,6 +286,13 @@ const CASES: &[Case] = &[
     Case { ball_vel: SHOT_NEAR_POST, ..c("gk_shot_near_post", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.15, -0.40), 3.0, 0.0, Goal::Save) },
     Case { ball_vel: SHOT_CENTER, ..c("gk_shot_center", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.20, 0.05), 3.0, 0.0, Goal::Save) },
     Case { ball_vel: LINE_ROLL, ..c("gk_line_roll", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.73, 0.45), 4.0, 0.0, Goal::Save) },
+    // Línea de gol (1.1), con el arquero: con el destino dentro del arco frena en la línea, y
+    // puesto por teleport sobre la línea o adentro (como si lo hubieran empujado), el guardia
+    // lo saca a la cancha y no vuelve a entrar.
+    c("boca_destino_adentro", SkillId::GoTo, (-0.85, 0.0), (-0.45, 0.05, 180.0), FAR, 4.0, 0.0, Goal::Boca { salir_s: None }),
+    c("boca_empujado_frente", SkillId::RailKeeper, (-0.75, 0.0), (-0.735, 0.0, 0.0), (0.0, -0.15), 3.0, 0.0, Goal::Boca { salir_s: Some(1.0) }),
+    c("boca_empujado_costado", SkillId::RailKeeper, (-0.75, 0.0), (-0.735, 0.10, 90.0), (0.0, -0.15), 3.0, 0.0, Goal::Boca { salir_s: Some(1.5) }),
+    c("boca_adentro", SkillId::RailKeeper, (-0.75, 0.0), (-0.78, -0.05, 180.0), (0.0, -0.15), 3.0, 0.0, Goal::Boca { salir_s: Some(1.5) }),
     // Árbitro por texto: HALT a velocidad de crucero; HALT y STOP con un jugador de campo
     // dentro del área propia (sin el árbitro, el `ZoneGuard` lo sacaría).
     Case {
@@ -337,6 +353,9 @@ const DRIBBLE_CASES: &[&str] = &[
     "dribble_behind", "dribble_side", "dribble_front", "dribble_diag", "two_side", "two_front",
 ];
 
+/// Guardia de la línea de gol (alias `linea`): el arquero empujado hacia su arco.
+const BOCA_CASES: &[&str] = &["boca_destino_adentro", "boca_empujado_frente", "boca_empujado_costado", "boca_adentro"];
+
 /// Casos del árbitro (alias `referee` en la línea de comandos).
 const REFEREE_CASES: &[&str] = &["halt_game_on", "halt_in_area", "stop_in_area"];
 
@@ -391,6 +410,9 @@ struct Metrics {
     max_pen_real: f32,
     guard_brake_ticks: usize,
     guard_exit_ticks: usize,
+    /// Mayor entrada a la boca del arco propio (`boca_pen`, m), estimada y real.
+    boca_pen: f32,
+    boca_pen_real: f32,
     /// Mayor avance más allá del destino (m), con la pose estimada y con la real.
     overshoot_est: Option<f32>,
     overshoot_real: Option<f32>,
@@ -488,10 +510,18 @@ fn phase_at(case: &Case, tick: u32) -> usize {
     p.len() - 1
 }
 
-/// Robot de prueba: el arquero en los casos de GoalKeep (el `ZoneGuard` solo a él lo deja
-/// entrar al área propia) y el azul 0 en el resto.
+/// Robot de prueba: el arquero en los casos de GoalKeep y RailKeeper y en los de la línea de
+/// gol (el `ZoneGuard` solo a él lo deja entrar al área propia) y el azul 0 en el resto.
 fn robot_id(case: &Case) -> u32 {
-    if matches!(case.skill, SkillId::GoalKeep | SkillId::RailKeeper) { params().coach.keeper_id as u32 } else { 0 }
+    let arquero = matches!(case.skill, SkillId::GoalKeep | SkillId::RailKeeper) || matches!(case.goal, Goal::Boca { .. });
+    if arquero { params().coach.keeper_id as u32 } else { 0 }
+}
+
+/// Cuánto entra (m) el centro del robot en la boca del arco propio del banco (el azul ataca
+/// hacia +x), medido desde donde el guardia la empieza a contar; 0 si no la toca.
+fn boca_pen(p: Vec2) -> f32 {
+    let boca = BocaArco::own(1.0);
+    if boca.touches(p) { p.x * boca.side - (GOAL_LINE_X - ROBOT_HALF) } else { 0.0 }
 }
 
 /// Estado del robot de prueba (azul `rid`) en el `World`, cuya firma es `(id, equipo)`.
@@ -588,6 +618,10 @@ fn metrics(case: &Case, rows: &[Row], bidirectional: bool) -> Metrics {
         {
             m.area_ticks_real += 1;
             m.max_pen_real = m.max_pen_real.max(x.abs() - 0.56);
+        }
+        m.boca_pen = m.boca_pen.max(boca_pen(Vec2::new(r.x, r.y)));
+        if let Some((x, y, _)) = r.real {
+            m.boca_pen_real = m.boca_pen_real.max(boca_pen(Vec2::new(x, y)));
         }
         m.guard_brake_ticks += (r.guard == 1) as usize;
         m.guard_exit_ticks += (r.guard == 2) as usize;
@@ -731,8 +765,24 @@ fn success(case: &Case, rows: &[Row], m: &Metrics, bidirectional: bool) -> Optio
             let pushed = rows.iter().map(|r| (Vec2::new(r.bx, r.by) - b0).length()).fold(0.0f32, f32::max);
             m.arrived.is_some() && pushed < 0.03
         }
+        Goal::Boca { salir_s } => boca_ok(rows, m, salir_s),
         Goal::None => return None,
     })
+}
+
+/// Criterio `Goal::Boca`: con la pose real si todas las filas la tienen (si no, con la
+/// estimada), el robot no entra a la boca más de `BOCA_TOL` por sobre lo que entraba en la
+/// primera fila, y con `salir_s`, desde ese instante no la toca en ninguna fila.
+fn boca_ok(rows: &[Row], m: &Metrics, salir_s: Option<f64>) -> bool {
+    let pose = |r: &Row| if m.area_real { r.real.map(|(x, y, _)| Vec2::new(x, y)) } else { Some(Vec2::new(r.x, r.y)) };
+    let Some(first) = rows.first() else { return false };
+    let pen0 = pose(first).map_or(0.0, boca_pen);
+    let max_pen = if m.area_real { m.boca_pen_real } else { m.boca_pen };
+    let boca = BocaArco::own(1.0);
+    let fuera = salir_s.is_none_or(|s| {
+        rows.iter().filter(|r| r.t - first.t >= s).filter_map(pose).all(|p| !boca.touches(p))
+    });
+    max_pen <= pen0 + BOCA_TOL && fuera
 }
 
 /// Criterio `Goal::Spin`: velocidad angular media medida desde 1.0 s (Δθ normalizado tick
@@ -966,6 +1016,8 @@ async fn run_case(
         // La depuración del tick trae lo que hizo el guardia (no cambia ningún comando).
         exportar_depuracion: true,
         identidad: rustengine::identidad::Identidad::default(),
+        // Los casos de árbitro mandan sus comandos ellos mismos, desde el primer tick.
+        esperar_arbitro: false,
     };
     let decider = Box::new(ScriptDecider { case: *case, robot_id: rid as i32 });
     run_control_loop(cfg, decider, Some(hook), None, Arc::new(AtomicBool::new(false)))
@@ -1044,6 +1096,7 @@ async fn main() {
     let all = names.is_empty() || names.iter().any(|n| n == "all");
     let skills = names.iter().any(|n| n == "skills");
     let referee_alias = names.iter().any(|n| n == "referee");
+    let boca_alias = names.iter().any(|n| n == "linea");
     let suite = names.iter().any(|n| n == "suite");
     let suite_quick = names.iter().any(|n| n == "suite-rapida");
     let keeper_alias = names.iter().any(|n| n == "arquero");
@@ -1056,6 +1109,7 @@ async fn main() {
         .filter(|c| {
             all || names.iter().any(|n| n == c.name)
                 || (skills && SKILL_CASES.contains(&c.name))
+                || (boca_alias && BOCA_CASES.contains(&c.name))
                 || (referee_alias && REFEREE_CASES.contains(&c.name))
                 || (suite && SUITE.contains(&c.name))
                 || (suite_quick && SUITE_QUICK.contains(&c.name))
@@ -1148,6 +1202,7 @@ async fn main() {
                 "area_ticks_real": m.area_real.then_some(m.area_ticks_real),
                 "max_pen_real": m.area_real.then_some(m.max_pen_real),
                 "guard_brake_ticks": m.guard_brake_ticks, "guard_exit_ticks": m.guard_exit_ticks,
+                "boca_pen": m.boca_pen, "boca_pen_real": m.area_real.then_some(m.boca_pen_real),
                 "overshoot_est": m.overshoot_est, "overshoot_real": m.overshoot_real,
                 "ball_disp": m.ball_disp,
                 "ball_prog": prog, "ball_dir_deg": dir.map(f32::round),
@@ -1402,6 +1457,62 @@ mod tests {
         w.update_robot(2, 0, Vec2::new(-0.6, 0.1), 0.0, Vec2::ZERO, 0.0);
         assert_eq!(test_robot(&w, 2).map(|r| r.position), Some(Vec2::new(-0.6, 0.1)));
         assert!(test_robot(&w, 0).is_none());
+    }
+
+    #[test]
+    fn los_casos_de_la_linea_usan_al_arquero_y_su_alias() {
+        for n in BOCA_CASES {
+            let c = case(n);
+            assert!(matches!(c.goal, Goal::Boca { .. }), "{n}");
+            assert_eq!(robot_id(&c), params().coach.keeper_id as u32, "{n}");
+        }
+        assert!(CASES.iter().filter(|c| matches!(c.goal, Goal::Boca { .. })).all(|c| BOCA_CASES.contains(&c.name)));
+    }
+
+    #[test]
+    fn boca_pen_cuenta_desde_donde_el_guardia_toca_la_boca() {
+        assert_eq!(boca_pen(Vec2::new(-0.60, 0.0)), 0.0);
+        assert_eq!(boca_pen(Vec2::new(-0.74, 0.30)), 0.0, "frente a la pared, fuera de la boca");
+        assert!((boca_pen(Vec2::new(-0.73, 0.0)) - 0.02).abs() < 1e-6);
+        assert_eq!(boca_pen(Vec2::new(0.74, 0.0)), 0.0, "el arco rival no cuenta");
+    }
+
+    #[test]
+    fn boca_frena_en_la_linea_y_falla_si_entra() {
+        let c = case("boca_destino_adentro");
+        let frena = vec![row(0.0, -0.45, 0.05, 0.0), row(1.0, -0.65, 0.02, 0.0), row(2.0, -0.72, 0.0, 0.0)];
+        let m = metrics(&c, &frena, false);
+        assert_eq!(success(&c, &frena, &m, false), Some(true), "entra 0.01, dentro de la tolerancia");
+        let entra = vec![row(0.0, -0.45, 0.05, 0.0), row(1.0, -0.70, 0.02, 0.0), row(2.0, -0.78, 0.0, 0.0)];
+        let m = metrics(&c, &entra, false);
+        assert!((m.boca_pen - 0.07).abs() < 1e-6);
+        assert_eq!(success(&c, &entra, &m, false), Some(false));
+    }
+
+    #[test]
+    fn boca_empujado_tiene_que_salir_y_no_volver() {
+        let c = case("boca_empujado_frente");
+        let sale = vec![row(0.0, -0.735, 0.0, 0.0), row(0.5, -0.705, 0.0, 0.0), row(1.0, -0.69, 0.0, 0.0), row(2.0, -0.70, 0.0, 0.0)];
+        let m = metrics(&c, &sale, false);
+        assert_eq!(success(&c, &sale, &m, false), Some(true), "empezó adentro: cuenta lo que entra de más");
+        let vuelve = vec![row(0.0, -0.735, 0.0, 0.0), row(0.5, -0.69, 0.0, 0.0), row(1.5, -0.72, 0.0, 0.0)];
+        let m = metrics(&c, &vuelve, false);
+        assert_eq!(success(&c, &vuelve, &m, false), Some(false), "volvió a tocar la boca después de 1.0 s");
+        let no_sale = vec![row(0.0, -0.735, 0.0, 0.0), row(1.0, -0.735, 0.0, 0.0), row(2.0, -0.735, 0.0, 0.0)];
+        let m = metrics(&c, &no_sale, false);
+        assert_eq!(success(&c, &no_sale, &m, false), Some(false));
+    }
+
+    #[test]
+    fn boca_se_juzga_con_la_pose_real() {
+        let c = case("boca_destino_adentro");
+        // La estimada entra 0.05 (ruido o latencia), la real se queda en la línea.
+        let mut rows = vec![row(0.0, -0.45, 0.05, 0.0), row(1.0, -0.76, 0.0, 0.0)];
+        rows[0].real = Some((-0.45, 0.05, 0.0));
+        rows[1].real = Some((-0.715, 0.0, 0.0));
+        let m = metrics(&c, &rows, false);
+        assert!(m.area_real);
+        assert_eq!(success(&c, &rows, &m, false), Some(true));
     }
 
     /// Filas a 60 Hz: avanza hasta `t_on`, frena 0.2 s sin comando y queda quieto hasta

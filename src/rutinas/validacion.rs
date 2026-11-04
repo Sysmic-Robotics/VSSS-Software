@@ -40,12 +40,14 @@ pub struct ContextoValidacion {
 impl ContextoValidacion {
     /// Con los parámetros vigentes y el lado de `VSSL_SIDE` para el equipo propio.
     pub fn vigente(own_team: i32) -> Self {
+        Self::vigente_con_lado(attack_sign_from_env(own_team))
+    }
+
+    /// Con los parámetros vigentes y el lado dado (la GUI, con el lado vigente del lazo
+    /// después de un cambio de lado).
+    pub fn vigente_con_lado(attack_sign: f32) -> Self {
         let p = params();
-        Self {
-            params: p.rutinas.clone(),
-            arrival_threshold: p.motion.arrival_threshold,
-            attack_sign: attack_sign_from_env(own_team),
-        }
+        Self { params: p.rutinas.clone(), arrival_threshold: p.motion.arrival_threshold, attack_sign }
     }
 
     /// Con los parámetros por defecto y el lado dado (tests).

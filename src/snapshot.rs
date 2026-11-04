@@ -81,6 +81,13 @@ pub struct LoopSnapshot {
     /// Identidad vigente de los robots (qué patrón lleva cada radio), solo con la base
     /// station; `None` en simulación, donde cada robot es su patrón.
     pub identidad: Option<Arc<crate::identidad::Identidad>>,
+    /// Lado vigente del lazo (`ZoneGuard::attack_sign`, +1 = atacamos hacia +x): el de
+    /// `VSSL_SIDE` hasta un cambio de lado. `None` antes de la primera foto: la GUI usa el
+    /// de `VSSL_SIDE`.
+    pub attack_sign: Option<f32>,
+    /// El lazo espera el primer comando del árbitro (`EsperaArbitro`): equipo detenido por
+    /// el camino de HALT hasta que llegue o la GUI lo suelte.
+    pub esperando_arbitro: bool,
 }
 
 impl Default for LoopSnapshot {
@@ -102,6 +109,8 @@ impl Default for LoopSnapshot {
             rutina: None,
             arquero: crate::params::params().coach.keeper_id,
             identidad: None,
+            attack_sign: None,
+            esperando_arbitro: false,
         }
     }
 }

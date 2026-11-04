@@ -38,7 +38,7 @@ use keys::{AccionTecla, EventoTeclado, Jugador, Layer, Tecla};
 use status_line::Salud;
 use tag::MarcasRobot;
 
-use crate::control_loop::{GuiSkillCommand, HeadingPid, ManualCommand};
+use crate::control_loop::{GuiSkillCommand, HeadingPid, ManualCommand, TickMode};
 use crate::radio::TeleportItem;
 use crate::rutinas::OrdenRutina;
 use crate::skills::SkillId;
@@ -228,15 +228,15 @@ pub fn skill_help(skill: Option<SkillId>) -> &'static str {
             "el click no se usa: va al punto de intercepción predicho de la pelota."
         }
         Some(SkillId::BlockLine) => {
-            "el click no se usa: cubre la línea de la pelota al arco propio (lado según VSSL_SIDE)."
+            "el click no se usa: cubre la línea de la pelota al arco propio (el de Arco propio, arriba)."
         }
         Some(SkillId::GoalKeep) => {
-            "el click no se usa: arquero en la línea del arco propio (VSSL_SIDE). Solo el \
+            "el click no se usa: arquero en la línea del arco propio (el de Arco propio). Solo el \
              arquero (ver abajo) puede entrar al área."
         }
         Some(SkillId::RailKeeper) => {
-            "el click no se usa: arquero sobre un riel a 5 cm del arco propio, orientado a lo \
-             largo de él, anticipando el empuje rival (VSSL_SIDE). Solo el arquero (ver abajo) \
+            "el click no se usa: arquero sobre un riel a `keeper_depth` (8 cm) del arco propio, orientado \
+             a lo largo de él, anticipando el empuje rival. Solo el arquero (ver abajo) \
              entra al área."
         }
         Some(SkillId::Mark) => "click = dónde pararse; queda mirando a la pelota.",
@@ -299,7 +299,19 @@ pub fn keeper_warning(
 /// vigente de la foto (`gui-skill-runner`).
 pub fn nota_arco(arco_izquierdo: bool, arquero: i32) -> String {
     let lado = if arco_izquierdo { "izquierdo" } else { "derecho" };
-    format!("Arco propio: {lado} (VSSL_SIDE). Arquero: robot {arquero}.")
+    format!("Arco propio: {lado}. Arquero: robot {arquero}.")
+}
+
+/// Lado vigente (+1 = atacamos hacia +x): el que publica el lazo en la foto o, antes de
+/// la primera foto, el de `VSSL_SIDE` con que arrancó.
+pub fn lado_vigente(snap: &LoopSnapshot, run: &RunInfo) -> f32 {
+    snap.attack_sign.unwrap_or(if run.defend_left { 1.0 } else { -1.0 })
+}
+
+/// El lado se cambia solo con el equipo detenido: parada, HALT, STOP o sin visión (en
+/// juego, un clic de más mandaría a los robots al arco contrario).
+pub fn puede_cambiar_lado(snap: &LoopSnapshot) -> bool {
+    snap.estop || snap.mode != TickMode::Play
 }
 
 /// Agrega una muestra a una serie de telemetría, descartando las más viejas al
@@ -421,6 +433,10 @@ pub enum Message {
     SavePreset,
     LoadPreset,
     ToggleEstop,
+    /// Cambio de lado (entretiempo), solo con el equipo detenido (`puede_cambiar_lado`).
+    CambiarLado,
+    /// Jugar sin esperar el primer comando del árbitro (`EsperaArbitro` del lazo).
+    SoltarEspera,
     TpRobotXChanged(String),
     TpRobotYChanged(String),
     TpRobotThetaChanged(String),
@@ -489,6 +505,12 @@ pub struct GuiSetup {
     /// Órdenes de la pestaña Robots → lazo (identidad y giro de identificación). `None`:
     /// la pestaña muestra la identidad sin poder editarla.
     pub identidad_tx: Option<mpsc::Sender<crate::identidad::OrdenIdentidad>>,
+    /// Cambio de lado → lazo (`GuiChannels::lado_rx`). `None` (p. ej. `scenario`): sin
+    /// botón, el lado de `VSSL_SIDE` queda fijo.
+    pub lado_tx: Option<mpsc::Sender<f32>>,
+    /// Soltar la espera del primer comando del árbitro → lazo
+    /// (`GuiChannels::soltar_espera_rx`). `None`: sin botón.
+    pub soltar_espera_tx: Option<mpsc::Sender<()>>,
     /// Flag de parada de emergencia compartido con el lazo.
     pub estop: Arc<AtomicBool>,
     /// Interruptor del coach (en pausa = `true`), compartido con el conmutador de `main`.
@@ -548,8 +570,12 @@ pub struct DebugGui {
     /// Target de la skill activa (m, marco mundo), fijado con click.
     skill_target: Vec2,
     skill_tx: Option<mpsc::Sender<GuiSkillCommand>>,
-    /// Centro del arco propio (m), desde `VSSL_SIDE`.
-    own_goal: Vec2,
+    /// Cambio de lado → lazo (ver `GuiSetup::lado_tx`).
+    lado_tx: Option<mpsc::Sender<f32>>,
+    /// Soltar la espera del árbitro → lazo (ver `GuiSetup::soltar_espera_tx`).
+    soltar_espera_tx: Option<mpsc::Sender<()>>,
+    /// Lado con que se validó la carpeta de rutinas: al cambiar el de la foto, se recarga.
+    lado_rutinas: f32,
     /// `coach.keeper_id` de los parámetros: el arquero de los puestos `arquero` de las
     /// rutinas (D4 de `arquero`). El arquero vigente del guardia viene en la foto.
     keeper_id: i32,
@@ -598,7 +624,7 @@ pub struct DebugGui {
 
 impl DebugGui {
     fn new(setup: GuiSetup) -> (Self, Task<Message>) {
-        let own_goal = own_goal_center(setup.run.defend_left);
+        let lado_rutinas = if setup.run.defend_left { 1.0 } else { -1.0 };
         let selected_team = setup.run.own_team.max(0) as u32;
         let manual = &crate::params::params().manual;
         let tope_lin = manual.velocidad_m_s(setup.run.is_base_station());
@@ -645,7 +671,9 @@ impl DebugGui {
                 active_skill: None,
                 skill_target: Vec2::ZERO,
                 skill_tx: setup.skill_tx,
-                own_goal,
+                lado_tx: setup.lado_tx,
+                soltar_espera_tx: setup.soltar_espera_tx,
+                lado_rutinas,
                 keeper_id: crate::params::params().coach.keeper_id,
                 spin_omega: SPIN_OMEGA_DEFAULT,
                 spin_omega_str: format!("{SPIN_OMEGA_DEFAULT}"),
@@ -704,6 +732,11 @@ impl DebugGui {
                 self.salud.push(snap.t_ms, snap.vision, snap.radio);
                 self.trazas.registrar(&snap);
                 self.snap = snap;
+                let lado = self.attack_sign();
+                if lado != self.lado_rutinas {
+                    self.lado_rutinas = lado;
+                    self.rutinas.recargar(lado);
+                }
                 self.foto_robots();
                 self.registrar_cuadros();
                 if !self.telemetry_frozen {
@@ -842,6 +875,14 @@ impl DebugGui {
                 // Al enclavarla corta la identificación ya (el lazo borra el giro igual).
                 self.paso_identificacion(Instant::now(), false);
             }
+            Message::CambiarLado => self.cambiar_lado(),
+            Message::SoltarEspera => {
+                if let Some(tx) = &self.soltar_espera_tx
+                    && self.snap.esperando_arbitro
+                {
+                    let _ = tx.try_send(());
+                }
+            }
             Message::TpRobotXChanged(s) => self.tp_robot_x = s,
             Message::TpRobotYChanged(s) => self.tp_robot_y = s,
             Message::TpRobotThetaChanged(s) => self.tp_robot_theta = s,
@@ -971,6 +1012,26 @@ impl DebugGui {
         }
     }
 
+    /// Lado vigente (+1 = atacamos hacia +x): el de la foto del lazo o, antes de la
+    /// primera, el de `VSSL_SIDE`.
+    fn attack_sign(&self) -> f32 {
+        lado_vigente(&self.snap, &self.run)
+    }
+
+    /// Centro del arco propio (m) con el lado vigente.
+    fn own_goal(&self) -> Vec2 {
+        own_goal_center(self.attack_sign() > 0.0)
+    }
+
+    /// Pide al lazo el lado contrario al vigente, si hay canal y el equipo está detenido.
+    fn cambiar_lado(&mut self) {
+        if let Some(tx) = &self.lado_tx
+            && puede_cambiar_lado(&self.snap)
+        {
+            let _ = tx.try_send(-self.attack_sign());
+        }
+    }
+
     /// El coach está en pausa (solo si hay interruptor).
     fn coach_en_pausa(&self) -> bool {
         self.coach_pausa.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
@@ -1044,7 +1105,7 @@ impl DebugGui {
         if modo != jugadores::ModoJuego::Juego {
             return;
         }
-        let arco = jugadores::arco_atacado(team, self.run.own_team, self.own_goal);
+        let arco = jugadores::arco_atacado(team, self.run.own_team, self.own_goal());
         let signo = jugadores::sentido_giro(robot.position, pelota.position, arco);
         let m = &crate::params::params().manual;
         self.jugadores[jugador.indice()].iniciar_giro(
@@ -1090,7 +1151,7 @@ impl DebugGui {
             // Target efectivo: Spin elige el sentido relativo al robot,
             // BlockLine/GoalKeep usan el arco propio y el resto el click.
             let robot_x_m = robot.map(|r| r.position.x).unwrap_or(0.0);
-            let target = effective_skill_target(skill, self.skill_target, robot_x_m, self.own_goal);
+            let target = effective_skill_target(skill, self.skill_target, robot_x_m, self.own_goal());
             let _ = tx.try_send(GuiSkillCommand {
                 team: self.selected_team as i32,
                 id: self.selected_robot as i32,
@@ -1274,7 +1335,7 @@ impl DebugGui {
             selected: Some((self.selected_team as i32, self.selected_robot as i32)),
             skill_target: self
                 .active_skill
-                .and_then(|s| skill_marker(s, self.skill_target, self.own_goal)),
+                .and_then(|s| skill_marker(s, self.skill_target, self.own_goal())),
             identidad: self.snap.identidad.as_deref(),
             capas: &self.capas,
             trazas: &self.trazas,
@@ -1506,6 +1567,8 @@ mod tests {
             teleport_tx: None,
             rutina_tx: None,
             identidad_tx: None,
+            lado_tx: None,
+            soltar_espera_tx: None,
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: Some(pausa.clone()),
             run: run_info::run_info_de_prueba(),
@@ -1977,8 +2040,101 @@ mod tests {
     /// La nota de la sección Skills nombra al arquero vigente, no a `coach.keeper_id`.
     #[test]
     fn the_goal_note_names_the_current_keeper() {
-        assert_eq!(nota_arco(true, 0), "Arco propio: izquierdo (VSSL_SIDE). Arquero: robot 0.");
-        assert_eq!(nota_arco(false, 2), "Arco propio: derecho (VSSL_SIDE). Arquero: robot 2.");
+        assert_eq!(nota_arco(true, 0), "Arco propio: izquierdo. Arquero: robot 0.");
+        assert_eq!(nota_arco(false, 2), "Arco propio: derecho. Arquero: robot 2.");
+    }
+
+    // ── Cambio de lado ──
+
+    /// GUI de prueba con el canal del cambio de lado (arranca defendiendo la izquierda).
+    fn gui_con_lado() -> (DebugGui, mpsc::Receiver<f32>) {
+        let (g, lado_rx, _soltar) = gui_con_lado_y_espera();
+        (g, lado_rx)
+    }
+
+    /// Como `gui_con_lado`, también con el botón que suelta la espera del árbitro.
+    fn gui_con_lado_y_espera() -> (DebugGui, mpsc::Receiver<f32>, mpsc::Receiver<()>) {
+        let (_fotos, snapshot_rx) = crate::snapshot::snapshot_channel();
+        let (lado_tx, lado_rx) = mpsc::channel(8);
+        let (soltar_tx, soltar_rx) = mpsc::channel(8);
+        let setup = GuiSetup {
+            snapshot_rx,
+            manual_tx: None,
+            skill_tx: None,
+            pid_tx: None,
+            teleport_tx: None,
+            rutina_tx: None,
+            identidad_tx: None,
+            lado_tx: Some(lado_tx),
+            soltar_espera_tx: Some(soltar_tx),
+            estop: Arc::new(AtomicBool::new(false)),
+            coach_pausa: None,
+            run: run_info::run_info_de_prueba(),
+        };
+        (DebugGui::new(setup).0, lado_rx, soltar_rx)
+    }
+
+    #[test]
+    fn soltar_la_espera_solo_manda_mientras_el_lazo_espera() {
+        let (mut g, _lado, mut rx) = gui_con_lado_y_espera();
+        g.snap = Arc::new(LoopSnapshot { esperando_arbitro: false, ..LoopSnapshot::default() });
+        let _ = g.update(Message::SoltarEspera);
+        assert!(rx.try_recv().is_err(), "sin espera no hay nada que soltar");
+        g.snap = Arc::new(LoopSnapshot { mode: TickMode::Halt, esperando_arbitro: true, ..LoopSnapshot::default() });
+        let _ = g.update(Message::SoltarEspera);
+        assert_eq!(rx.try_recv(), Ok(()));
+        assert!(puede_cambiar_lado(&g.snap), "esperando, el equipo está detenido");
+    }
+
+    fn foto_lado(modo: TickMode, estop: bool, attack_sign: Option<f32>) -> Arc<LoopSnapshot> {
+        Arc::new(LoopSnapshot { mode: modo, estop, attack_sign, ..LoopSnapshot::default() })
+    }
+
+    #[test]
+    fn el_lado_vigente_es_el_de_la_foto_y_antes_el_de_vssl_side() {
+        let mut run = run_info::run_info_de_prueba();
+        assert_eq!(lado_vigente(&LoopSnapshot::default(), &run), 1.0);
+        run.defend_left = false;
+        assert_eq!(lado_vigente(&LoopSnapshot::default(), &run), -1.0);
+        assert_eq!(lado_vigente(&foto_lado(TickMode::Play, false, Some(1.0)), &run), 1.0, "manda la foto");
+    }
+
+    #[test]
+    fn el_lado_se_cambia_solo_con_el_equipo_detenido() {
+        assert!(!puede_cambiar_lado(&foto_lado(TickMode::Play, false, None)));
+        assert!(puede_cambiar_lado(&foto_lado(TickMode::Play, true, None)), "parada");
+        for modo in [TickMode::Halt, TickMode::Stop, TickMode::SinVision] {
+            assert!(puede_cambiar_lado(&foto_lado(modo, false, None)), "{modo:?}");
+        }
+    }
+
+    #[test]
+    fn cambiar_de_lado_pide_el_contrario_y_el_arco_propio_sigue_a_la_foto() {
+        let (mut g, mut rx) = gui_con_lado();
+        assert_eq!(g.own_goal(), Vec2::new(-0.75, 0.0));
+        // En juego no manda nada.
+        g.snap = foto_lado(TickMode::Play, false, Some(1.0));
+        let _ = g.update(Message::CambiarLado);
+        assert!(rx.try_recv().is_err());
+        // Detenido, pide el lado contrario (absoluto).
+        g.snap = foto_lado(TickMode::Stop, false, Some(1.0));
+        let _ = g.update(Message::CambiarLado);
+        assert_eq!(rx.try_recv(), Ok(-1.0));
+        // El arco propio cambia cuando el lazo lo publica, no antes.
+        assert_eq!(g.own_goal(), Vec2::new(-0.75, 0.0));
+        let _ = g.update(Message::Snapshot(foto_lado(TickMode::Stop, false, Some(-1.0))));
+        assert_eq!(g.own_goal(), Vec2::new(0.75, 0.0));
+        assert_eq!(g.lado_rutinas, -1.0, "las rutinas se validan con el lado nuevo");
+        let objetivo = effective_skill_target(SkillId::RailKeeper, Vec2::ZERO, 0.0, g.own_goal());
+        assert_eq!(objetivo, Vec2::new(0.75, 0.0), "las skills de arquero de la GUI van al arco nuevo");
+        let _ = g.update(Message::CambiarLado);
+        assert_eq!(rx.try_recv(), Ok(1.0));
+    }
+
+    #[test]
+    fn el_boton_dice_el_arco_propio_y_si_se_puede_cambiar() {
+        assert_eq!(status_line::texto_boton_lado(1.0, true), "Arco propio: izquierdo, cambiar de lado");
+        assert_eq!(status_line::texto_boton_lado(-1.0, false), "Arco propio: derecho (detener para cambiar)");
     }
 
     /// Round-trip del preset de tuning (serialize → deserialize preserva valores).

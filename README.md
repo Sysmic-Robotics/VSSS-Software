@@ -41,16 +41,17 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_MULTICAST_IFACE` | (auto) | IPv4 local para forzar la interfaz de multicast (útil si hay varias NICs). |
 | `VSSL_RADIO_TARGET` | `firasim` | `firasim`, `grsim` o `basestation`. Selecciona a quién se le envían los `MotionCommand`. |
 | `VSSL_TEAM_COLOR` | `blue` | `blue` o `yellow`. Equipo que controla el engine (coach, skills) y, en `basestation`, qué comandos van al frame serial. Permite dos engines en la misma máquina, uno por equipo. |
-| `VSSL_SIDE` | azul `left`, amarillo `right` | Arco que defendemos (`left` = atacamos hacia +X). Cambia en el segundo tiempo y según cómo esté puesto el simulador; el coach avisa al arrancar si los robots están en la mitad contraria. |
+| `VSSL_SIDE` | azul `left`, amarillo `right` | Arco que defendemos al arrancar (`left` = atacamos hacia +X). Depende de cómo esté puesto el simulador; el coach avisa al arrancar si los robots están en la mitad contraria. En el entretiempo se cambia sin relanzar con el botón **Arco propio** de la GUI (ver **Cambio de lado**). |
 | `VSSL_COACH` | `heuristic` | `heuristic` (equipo STP de dos caras), `rule_based` (baseline de roles fijos) o `none`. |
 | `VSSL_COACH_PAUSA` | `0` | `1`, `true` u `on`: la GUI parte con el coach en pausa (los robots libres quedan quietos; P o el botón de la barra lo activan). Otro valor que no sea `0`, `false` u `off` no arranca. Solo con la GUI: sin ella, encendida, `main` no arranca (para correr sin coach, `VSSL_COACH=none`). Con `VSSL_COACH=none` no tiene efecto. |
 | `VSSL_BIDIRECTIONAL` | (off) | `1`: heading módulo 180° — el robot usa la cara (frente/espalda) que requiera menos giro y avanza de espaldas cuando conviene. |
 | `VSSL_BORDER_RECOVERY` | (on) | `0`: apaga la recuperación de atasco. Hay atasco si durante 30 ticks se le comanda avanzar (> 0.1 m/s a lo largo del heading) y todas sus poses medidas quedan a menos de 0.03 m de la primera de la ventana (un salto de la pose estimada, como el sobrepaso del estimador al chocar la pelota, cuenta como movimiento); entonces hace una maniobra de escape de 25 ticks. Si la racha de avance arranca desde el reposo (las últimas 30 poses a menos de 0.01 m de la más vieja, aunque gire en el lugar, o el robot recién aparece), los primeros 30 ticks no cuentan: al alinearse y acelerar, la latencia y el torque limitado le impiden recorrer 3 cm en 0.5 s. Un robot trabado desde quieto escapa a los 60 ticks; uno que venía andando, a los 30. |
 | `VSSL_TRACKER` | (on) | `off`: arranca con el EKF apagado (poses crudas de visión; para medir ruido de cámara). |
-| `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota y la depuración por tick). |
+| `VSSL_MATCH_LOG` | (off) | Ruta de un CSV de partido: una fila por robot y tick (skill, target, pose, comando, pelota y la depuración por tick). La última columna, `lado`, es el signo de ataque del tick (`1` = atacamos hacia +X, `-1` hacia −X): cambia con el cambio de lado y separa los dos tiempos. |
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
 | `VSSL_VISION_RECORD` | (off) | Ruta donde grabar los paquetes crudos de visión, para `vision_replay`. |
 | `VSSL_REFEREE_ADDR` | `224.5.23.2:10003` | Dónde escucha el engine los comandos del árbitro (VSSReferee o texto de `tools/referee_cli.py`). |
+| `VSSL_ESPERAR_ARBITRO` | `1` | `rustengine` arranca con el equipo detenido (camino de HALT) hasta el primer comando del árbitro, o hasta el botón **Jugar sin esperar al árbitro** de la GUI. `0`, `false` u `off`: juega desde el arranque (para correr sin árbitro y sin GUI). Otro valor que no sea `1`, `true` u `on` no arranca. Ver **Árbitro y pelota parada**. |
 | `VSSL_REAL_ACTUATOR` | (off) | `<id de visión>:<full\|half>`: capa de actuador real (sysid) en el transporte de FIRASim, la planta de test y `skill_test --transport plant`. El robot simulado anda con la latencia, la dinámica, el tope por rueda y la zona muerta medidos de ese robot con esa batería (`config/real_calibration.json`). Se aplica a todos los robots del engine. |
 | `VSSL_REAL_CALIBRATION` | `config/real_calibration.json` | Otro archivo de calibración del robot real (ensayos). |
 | `VSSL_BASESTATION_DEVICE` | `/dev/ttyUSB0` | Path del puerto serial a la base station. |
@@ -80,8 +81,10 @@ La interfaz se ve como la mesa de la salita: es neutra, y el único color es el 
 - **Barra de estado** (arriba): frases con el modo (simulación o robots reales, frontal o
   bidireccional, ruido de cámara), el coach, el árbitro y la salud del sistema: cuadros/s y
   latencia de visión, pérdidas, frecuencia y jitter del lazo, envíos de radio y la velocidad
-  real de FIRASim. Lo anormal va en color alerta. A la derecha, el interruptor **Coach: activo
-  / en pausa (P)** (no aparece sin coach) y **Detener todo** (o Espacio).
+  real de FIRASim. Lo anormal va en color alerta. A la derecha, **Jugar sin esperar al
+  árbitro** (solo mientras el lazo espera el primer comando del árbitro), el botón **Arco
+  propio** (cambio de lado), el interruptor **Coach: activo / en pausa (P)** (no aparece sin
+  coach) y **Detener todo** (o Espacio).
 - **Nuestros robots** (izquierda): una fila por robot propio con su parche, rol, skill y
   progreso, cara, v y ω **pedidos** (lo que va en el frame, `command_to_vw`) y **medidos**
   (visión), y avisos: tope del frame, skill que no corre, no visto, escape de atasco. Con el
@@ -176,6 +179,17 @@ manual ni skill de la GUI quedan en Hold; el manual, la skill de la GUI y las ru
 funcionando. Con el coach activo, un robot tomado en manual recibe Hold por dentro (su skill
 no corre detrás del manual) y, al soltarlo, el coach lo retoma con la rampa desde cero. Si
 un jugador toma al arquero del coach, Herramientas lo avisa.
+
+**Cambio de lado** (entretiempo, botón **Arco propio: izquierdo/derecho** de la barra): cambia
+el arco que defendemos sin relanzar. El botón solo responde con el equipo detenido (parada,
+HALT o STOP del árbitro, o sin visión); en juego dice "detener para cambiar", porque un clic de
+más mandaría a los robots al arco contrario. En el entretiempo: **Detener todo** (o el HALT del
+árbitro), **Arco propio**, y soltar. El lazo cambia juntos, en el mismo tick, el `ZoneGuard`
+(áreas y línea del arco), las áreas que rodea motion y el coach (`Coach::set_side`, que decide
+de nuevo en ese tick); cada skill retoma sin estado heredado. La orden lleva el lado absoluto:
+repetirla no hace nada. El lado vigente lo publica la foto del lazo; con él la GUI dibuja el
+arco propio de las skills de arquero y valida las rutinas. Sin GUI (y en `scenario`), el lado
+de `VSSL_SIDE` queda fijo.
 
 **Parada de emergencia:** **Detener todo** (o la tecla **Espacio**, en cualquier modo, aunque
 el cursor esté sobre un slider o un campo de texto tenga el foco)
@@ -407,9 +421,16 @@ tácticas (`skills`), navegación (`motion`), geometría del robot real (`robot`
 rueda) y del robot de FIRASim (`sim`). Los tres binarios lo cargan al arrancar y lo anuncian en el
 log (`[main] parámetros: archivo config/team_params.json`).
 
-- `VSSL_PARAMS=<ruta>` usa otro archivo (útil para comparar dos calibraciones en el mismo partido).
-- El JSON puede ser parcial: lo que falta toma el default. Un campo con nombre desconocido es
-  error y el proceso no arranca (evita que un typo en una calibración pase en silencio).
+- `VSSL_PARAMS=<ruta>` es una capa encima de `config/team_params.json`: lo que trae reemplaza al
+  JSON del equipo y lo demás queda como está ahí (log: `archivo <capa> sobre
+  config/team_params.json`). Así un estilo (`config/estilos/*.json`, `tools/jugar.sh`) o un
+  ajuste de la cancha conservan la calibración del robot real, por ejemplo
+  `vision.real_theta_offset_deg`. Sin `config/team_params.json` en el directorio de trabajo, la
+  capa va sobre los defaults de código. Sirve también para comparar dos calibraciones en el
+  mismo partido.
+- Los JSON pueden ser parciales: lo que falta en los dos toma el default. Un campo con nombre
+  desconocido es error y el proceso no arranca (evita que un typo en una calibración pase en
+  silencio).
 - Cambiar un parámetro NO requiere recompilar: editar el JSON y volver a lanzar.
 - `manual`: el control manual de la GUI. `velocidad_real_m_s` (0.30) y `velocidad_sim_m_s`
   (0.50) son la velocidad máxima y de arranque con la base station y en simulación; con 0.30 y
@@ -603,6 +624,16 @@ leyendo el estado del árbitro (`ControlLoopConfig.referee`):
   coach heurístico, en STOP las skills son `Hold` y los robots quedan quietos del todo.
 - Al volver a `GAME_ON`, cada robot retoma sin estado heredado (sin escape interrumpido, rampa
   desde cero, skill reiniciada). La terminal avisa al entrar y al salir de HALT.
+- **Espera del primer comando** (`VSSL_ESPERAR_ARBITRO`, encendida por defecto en `rustengine`):
+  el VSSReferee manda cada comando una sola vez, así que un engine que arranca (o se reinicia)
+  después de un STOP jugaría hasta el comando siguiente. Por eso el equipo arranca detenido, por
+  el mismo camino que HALT (el coach no decide), hasta que llega cualquier comando del árbitro;
+  desde ahí manda el árbitro. Si el engine se reinicia en pleno juego, o se prueba sin árbitro, el
+  botón **Jugar sin esperar al árbitro** de la barra de la GUI suelta la espera; la barra dice
+  "Árbitro: esperando su primer comando" mientras tanto. Como en HALT, durante la espera no
+  corren el manual, las skills de la GUI ni **Identificar** (la pestaña Robots dice cómo
+  soltarla). Sin GUI y sin árbitro, usar `VSSL_ESPERAR_ARBITRO=0`. `motion_bench`, `scenario` y
+  `skill_test` no esperan.
 
 Fuentes, por el mismo puerto (`VSSL_REFEREE_ADDR`): **VSSReferee** (simulador, protobuf
 `VSSRef_Command`) o **texto del operador** para el árbitro humano de la cancha:
@@ -725,7 +756,7 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 | Identidad de los robots (`config/identidad_robots.json`) | sin archivo: radio N ↔ patrón N | Qué patrón lleva cada robot físico y si está activo (ver abajo) |
 
 **Patrones y radios.** Cada robot real tiene dos números:
-- **patrón** (id de visión): el de su parche de colores. ssl-vision numera los patrones por su celda en `VsssPatern.png`, 4 por color de equipo (0 a 3). Con él aparece en el `World` y en la GUI, y es el número que se elige en la GUI y en `skill_test --mode skill --robot`. El coach manda los patrones 0 a 2.
+- **patrón** (id de visión): el de su parche de colores. ssl-vision numera los patrones por su celda en la imagen de patrones: 6 por color de equipo (0 a 5) con la imagen del rojo (`VsssPatern-rojo.png`, 3 × 2 celdas; el 4 y el 5 llevan rojo, para los repuestos), y 4 (0 a 3) con la de antes. Con él aparece en el `World` y en la GUI, y es el número que se elige en la GUI y en `skill_test --mode skill --robot`. El coach manda los patrones 0 a 2.
 - **radio**: la posición del frame que escucha el robot, `MI_ROBOT_ID − 1` del firmware (0 a 4).
 
 **La identidad de los robots** dice, por cada radio, qué patrón lleva el robot (o ninguno) y si está activo. Vive en `config/identidad_robots.json`, que **no se versiona** (es el estado de los robots de la salita, no una configuración del equipo):
@@ -738,9 +769,9 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 ] }
 ```
 
-- **Sin archivo:** la radio N lleva el patrón N (la radio 4, ninguno), todas activas: el mismo frame de siempre. El archivo se crea la primera vez que se guarda desde la GUI.
+- **Sin archivo:** la radio N lleva el patrón N, todas activas: el mismo frame de siempre. Con 6 patrones y 5 radios, el patrón 5 queda sin radio. El archivo se crea la primera vez que se guarda desde la GUI.
 - **Otro archivo:** `VSSL_IDENTIDAD=<ruta>` (por ejemplo, uno por engine). La GUI guarda en esa misma ruta.
-- **Validación al arrancar:** radio en 0 a 4 sin repetir, patrón en 0 a 3. Con un archivo inválido, `main` y `skill_test` no arrancan y dicen qué corregir. Una radio que no aparece queda sin patrón y activa.
+- **Validación al arrancar:** radio en 0 a 4 sin repetir, patrón en 0 a 5. Con un archivo inválido, `main` y `skill_test` no arrancan y dicen qué corregir. Una radio que no aparece queda sin patrón y activa.
 - **Solo con la base station:** en FIRASim y grSim cada robot es su patrón, y el archivo no se lee.
 
 **Cuándo un patrón no recibe comandos:** si su robot está desactivado, si ninguna radio lo tiene o si dos radios lo tienen. Entonces:
@@ -750,8 +781,8 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 
 **Pestaña Robots de la GUI** (solo con la base station):
 - una fila por radio, con el patrón y el interruptor de activo, editables en vivo (rigen desde el tick siguiente y se guardan en el archivo), y una frase con lo que ve la cámara;
-- avisos: dos radios con el mismo patrón, un patrón que el coach no manda (el 3) visto en la cámara, un patrón visto que ningún robot tiene;
-- **Identificar:** con el coach en pausa (P), sin rutina, sin el manual ni una skill de la GUI, gira cada robot activo de a uno (90 °/s, 0.6 s de ida y 0.6 s de vuelta: termina donde empezó), ve qué patrón giró y propone la identidad. "Aplicar" la usa y la guarda; "Descartar" no cambia nada. Si no gira ninguno, giran dos con la misma radio (dos robots con el mismo `MI_ROBOT_ID`) o dos radios hacen girar el mismo patrón, lo dice en frase. Mientras gira, solo se mueve ese robot (el frame pone en cero a los demás); la parada de emergencia y HALT lo cortan en el acto, y sin refresco de la GUI se corta a los 250 ms.
+- avisos: dos radios con el mismo patrón, un patrón que el coach no manda (del 3 al 5) visto en la cámara, un patrón visto que ningún robot tiene;
+- **Identificar:** con el coach en pausa (P), sin rutina, sin el manual ni una skill de la GUI, gira cada robot activo de a uno (90 °/s, 0.6 s de ida y 0.6 s de vuelta: termina donde empezó), ve qué patrón giró y propone la identidad. "Aplicar" la usa y la guarda; "Descartar" no cambia nada. Si no gira ninguno, giran dos con la misma radio (dos robots con el mismo `MI_ROBOT_ID`) o dos radios hacen girar el mismo patrón, lo dice en frase. Mientras gira, solo se mueve ese robot (el frame pone en cero a los demás); la parada de emergencia y HALT lo cortan en el acto (con la espera del primer comando del árbitro no arranca: hay que soltarla antes), y sin refresco de la GUI se corta a los 250 ms.
 
 La terminal imprime la identidad al arrancar y en cada cambio (`[control_loop] identidad: radio 0 (MI_ROBOT_ID 1): patrón 1`), y la sección Radio del Inspector la muestra. `skill_test --mode vw --robot N` **no** pasa por la identidad: ahí N es la posición de radio cruda (bring-up sin visión).
 

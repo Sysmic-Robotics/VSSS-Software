@@ -242,6 +242,13 @@ impl TickDecider for DecisorConRutinas {
         self.proteger(|r| r.usar_sin_comandos(patrones));
     }
 
+    /// Al coach de la base, también con una rutina o en pausa: cuando vuelve a decidir, ya
+    /// juega del lado nuevo. La rutina no mira el lado (sus puntos son absolutos y el
+    /// guardia aplica el lado nuevo).
+    fn set_side(&mut self, attack_sign: f32) {
+        self.base.set_side(attack_sign);
+    }
+
     fn observar(&mut self, ctx: &ContextoTick<'_>) {
         if matches!(ctx.modo, TickMode::Halt | TickMode::SinVision) {
             // El lazo no llamó a `decide`: que la pausa se vea igual en la foto.

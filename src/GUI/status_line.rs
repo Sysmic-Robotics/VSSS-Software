@@ -219,6 +219,9 @@ pub fn frases_estado(
     });
 
     out.push(match snap.referee {
+        _ if snap.esperando_arbitro => {
+            Frase::alerta_si("Árbitro: esperando su primer comando, equipo detenido", true)
+        }
         None => Frase::normal("sin árbitro"),
         Some(r) if r.seq == 0 => Frase::normal("Árbitro: sin comandos, juego en curso"),
         Some(r) => {
@@ -310,7 +313,42 @@ pub fn texto_boton_coach(en_pausa: bool) -> &'static str {
     if en_pausa { "Coach: en pausa (P)" } else { "Coach: activo (P)" }
 }
 
+/// Texto del botón que suelta la espera del primer comando del árbitro.
+pub const TEXTO_SOLTAR_ESPERA: &str = "Jugar sin esperar al árbitro";
+
+/// Texto del botón de cambio de lado: el arco que defendemos ahora y, en juego, que hay
+/// que detener al equipo para cambiarlo.
+pub fn texto_boton_lado(attack_sign: f32, puede: bool) -> String {
+    let arco = if attack_sign > 0.0 { "izquierdo" } else { "derecho" };
+    if puede {
+        format!("Arco propio: {arco}, cambiar de lado")
+    } else {
+        format!("Arco propio: {arco} (detener para cambiar)")
+    }
+}
+
 impl DebugGui {
+    /// Cambio de lado (entretiempo), a la izquierda del interruptor del coach. Solo
+    /// responde con el equipo detenido (`puede_cambiar_lado`).
+    fn boton_lado(&self) -> Element<'_, Message> {
+        let puede = super::puede_cambiar_lado(&self.snap);
+        button(text(texto_boton_lado(self.attack_sign(), puede)).size(theme::TXT))
+            .padding([6, 12])
+            .style(theme::boton_opcion(false))
+            .on_press_maybe(puede.then_some(Message::CambiarLado))
+            .into()
+    }
+
+    /// Mientras el lazo espera el primer comando del árbitro: jugar sin esperarlo (p. ej. el
+    /// engine se reinició en pleno GAME_ON, o se prueba sin árbitro).
+    fn boton_soltar_espera(&self) -> Element<'_, Message> {
+        button(text(TEXTO_SOLTAR_ESPERA).size(theme::TXT))
+            .padding([6, 12])
+            .style(theme::boton_opcion(true))
+            .on_press(Message::SoltarEspera)
+            .into()
+    }
+
     /// Interruptor del coach, inmediatamente a la izquierda de "Detener todo".
     fn boton_coach(&self) -> Element<'_, Message> {
         let en_pausa = self.coach_en_pausa();
@@ -364,6 +402,11 @@ impl DebugGui {
             // El container afloja los límites: a un hijo `Fill` de una fila, iced le
             // pasa `min = max`, y `Wrapping` se los pasaría a cada frase.
             row![container(fila.wrap()).width(Length::Fill)]
+                .push_maybe(
+                    (self.soltar_espera_tx.is_some() && self.snap.esperando_arbitro)
+                        .then(|| self.boton_soltar_espera()),
+                )
+                .push_maybe(self.lado_tx.is_some().then(|| self.boton_lado()))
                 .push_maybe(self.coach_pausa.is_some().then(|| self.boton_coach()))
                 .push(parada)
                 .spacing(theme::SP_LG)
@@ -472,6 +515,20 @@ mod tests {
 
     fn textos(f: &[Frase]) -> Vec<&str> {
         f.iter().map(|x| x.texto.as_str()).collect()
+    }
+
+    #[test]
+    fn esperando_al_arbitro_lo_dice_en_alerta() {
+        let mut snap = snap_sano();
+        snap.referee = Some(RefereeView { foul: Foul::GameOn, seq: 0 });
+        snap.esperando_arbitro = true;
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
+        let espera = f.iter().find(|x| x.texto.starts_with("Árbitro:")).unwrap();
+        assert_eq!(espera.texto, "Árbitro: esperando su primer comando, equipo detenido");
+        assert!(espera.alerta);
+        snap.esperando_arbitro = false;
+        let f = frases_estado(&run_info_de_prueba(), &snap, &tasas_sanas(), None, false);
+        assert!(textos(&f).contains(&"Árbitro: sin comandos, juego en curso"), "soltada a mano");
     }
 
     #[test]

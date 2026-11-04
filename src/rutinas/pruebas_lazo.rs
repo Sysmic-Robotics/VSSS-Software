@@ -359,6 +359,39 @@ fn conmutador_reparte_sin_comandos() {
     assert_eq!(*lista.lock().unwrap(), Some(vec![]));
 }
 
+/// Base que anota los cambios de lado que le llegan.
+struct EspiaLado {
+    lados: Arc<Mutex<Vec<f32>>>,
+}
+
+impl TickDecider for EspiaLado {
+    fn decide(&mut self, _tick: u32, _world: &World) -> Vec<SkillChoice> {
+        Vec::new()
+    }
+
+    fn set_side(&mut self, attack_sign: f32) {
+        self.lados.lock().unwrap().push(attack_sign);
+    }
+}
+
+#[test]
+fn conmutador_pasa_el_cambio_de_lado_al_coach_tambien_con_una_rutina() {
+    let (tx, rx) = mpsc::channel(8);
+    let lados = Arc::new(Mutex::new(Vec::new()));
+    let mut d = DecisorConRutinas::new(Box::new(EspiaLado { lados: lados.clone() }), rx, 0, 3);
+    d.set_side(-1.0);
+    assert_eq!(*lados.lock().unwrap(), vec![-1.0]);
+    // Con una rutina preparada, el coach de la base lo recibe igual: al volver, juega del
+    // lado nuevo.
+    let rutina = prueba::rutina(&prueba::un_puesto(IR_LEJOS));
+    tx.try_send(OrdenRutina::Preparar { rutina, opciones: opciones(100, false) }).unwrap();
+    let mut lazo = Lazo::new(false);
+    lazo.paso(TickMode::Play, false, false, &dos_robots(), &mut d);
+    assert!(d.rutina().is_some(), "rutina preparada");
+    d.set_side(1.0);
+    assert_eq!(*lados.lock().unwrap(), vec![-1.0, 1.0]);
+}
+
 #[test]
 fn rutina_nueva_recibe_la_lista_vigente() {
     // Sin lista, el más cercano (el 0); con el 0 sin comandos, el 1.

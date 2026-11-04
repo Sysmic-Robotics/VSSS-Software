@@ -63,6 +63,11 @@ pub trait TickDecider: Send {
     /// en cada cambio de identidad, solo con la base station.
     fn usar_sin_comandos(&mut self, _patrones: &[i32]) {}
 
+    /// Cambio de lado sin relanzar (entretiempo): `attack_sign` +1 = atacamos hacia +x. El
+    /// lazo la llama solo cuando el lado cambia, junto con el guardia y las áreas de motion
+    /// (`cambiar_lado`). Un decisor que no mira el lado no hace nada.
+    fn set_side(&mut self, _attack_sign: f32) {}
+
     /// Lo que pasó en el tick, al final de cada tick y en todos los modos (también en
     /// HALT y en el corte sin visión, cuando el lazo no llama a `decide`). Lo usa la
     /// rutina para sus abortos y su resumen.
@@ -333,6 +338,87 @@ pub struct ControlLoopConfig {
     /// Identidad de los robots al arrancar (solo la usa la base station; en simulación,
     /// la por defecto). La GUI la cambia en vivo con `GuiChannels::identidad_rx`.
     pub identidad: Identidad,
+    /// Arrancar quieto, por el camino de HALT, hasta el primer comando del árbitro
+    /// (`EsperaArbitro`). El VSSReferee manda cada comando una sola vez: sin esto, un engine
+    /// que arranca (o se reinicia) después de un STOP juega hasta el comando siguiente.
+    /// `main` lo lee de `VSSL_ESPERAR_ARBITRO` (por defecto sí); sin `referee` no hace nada.
+    pub esperar_arbitro: bool,
+}
+
+/// `VSSL_ESPERAR_ARBITRO`: `0`, `false` u `off` → el engine juega desde el arranque sin
+/// esperar al árbitro; `1`, `true`, `on`, vacía o ausente → espera (`EsperaArbitro`).
+pub const ESPERAR_ARBITRO_ENV: &str = "VSSL_ESPERAR_ARBITRO";
+
+/// `VSSL_ESPERAR_ARBITRO`, sin mayúsculas ni espacios. Otro valor es un error con los
+/// valores aceptados (como `VSSL_COACH_PAUSA`): con un error de tipeo no se arranca.
+pub fn esperar_arbitro_de(valor: Option<&str>) -> Result<bool, String> {
+    let v = valor.unwrap_or("").trim().to_ascii_lowercase();
+    match v.as_str() {
+        "" | "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        _ => Err(format!(
+            "{ESPERAR_ARBITRO_ENV}='{}' no vale: usa 1, true u on (arranca quieto hasta el primer \
+             comando del árbitro), o 0, false u off (juega desde el arranque)",
+            valor.unwrap_or("")
+        )),
+    }
+}
+
+/// `esperar_arbitro_de` con el entorno; un valor que no es texto válido es un error.
+pub fn esperar_arbitro_from_env() -> Result<bool, String> {
+    match std::env::var(ESPERAR_ARBITRO_ENV) {
+        Ok(v) => esperar_arbitro_de(Some(&v)),
+        Err(std::env::VarError::NotPresent) => esperar_arbitro_de(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{ESPERAR_ARBITRO_ENV} no es texto válido: usa 1 o 0"))
+        }
+    }
+}
+
+/// Espera del primer comando del árbitro. Mientras está activa, el lazo toma el camino de
+/// HALT (cero a todos los ids propios, sin decisor ni skills): el coach no decide y no
+/// cambia. Termina con el primer comando que llega (cualquiera: después manda el árbitro)
+/// o con el botón de la GUI, y no vuelve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EsperaArbitro {
+    activa: bool,
+}
+
+impl EsperaArbitro {
+    /// Activa solo si se pide y hay árbitro que esperar.
+    pub(crate) fn new(esperar: bool, referee: &Option<SharedReferee>) -> Self {
+        let activa = esperar && referee.is_some();
+        if activa {
+            eprintln!(
+                "[control_loop] equipo detenido hasta el primer comando del árbitro \
+                 (la GUI lo suelta; {ESPERAR_ARBITRO_ENV}=0 no espera)"
+            );
+        }
+        Self { activa }
+    }
+
+    pub(crate) fn activa(&self) -> bool {
+        self.activa
+    }
+
+    /// Al empezar cada tick: termina si ya llegó algún comando del árbitro o si la GUI
+    /// la soltó (`soltar`).
+    pub(crate) fn actualizar(&mut self, referee: &Option<SharedReferee>, soltar: bool) {
+        if !self.activa {
+            return;
+        }
+        let llego = referee
+            .as_ref()
+            .and_then(|r| r.lock().ok().map(|s| s.seq > 0))
+            .unwrap_or(false);
+        if llego {
+            self.activa = false;
+            eprintln!("[control_loop] primer comando del árbitro: termina la espera");
+        } else if soltar {
+            self.activa = false;
+            eprintln!("[control_loop] espera del árbitro soltada desde la GUI: el equipo juega");
+        }
+    }
 }
 
 /// Qué hace el loop con el equipo propio en un tick.
@@ -381,6 +467,9 @@ pub struct TickRecord<'a> {
     pub debug: Option<&'a TickDebug>,
     /// Vista de la rutina activa (después de `observar`), o `None`.
     pub rutina: Option<&'a RutinaVista>,
+    /// Lado vigente del tick (`ZoneGuard::attack_sign`, +1 = atacamos hacia +x); cambia
+    /// con el cambio de lado. Columna `lado` del registro de partido.
+    pub attack_sign: f32,
 }
 
 pub type OnTick = Box<dyn FnMut(&TickRecord<'_>) + Send>;
@@ -398,6 +487,9 @@ pub struct CoachDecider {
     last_choices: Vec<SkillChoice>,
     /// Patrones sin comandos: el coach no los ve, igual que a un robot que no se ve.
     sin_comandos: Vec<i32>,
+    /// Decidir en el próximo `decide` aunque no toque (después de un cambio de lado, para
+    /// no seguir hasta 5 ticks con las elecciones del lado anterior).
+    decidir_ya: bool,
 }
 
 impl CoachDecider {
@@ -408,13 +500,15 @@ impl CoachDecider {
             decision_period,
             last_choices: Vec::new(),
             sin_comandos: Vec::new(),
+            decidir_ya: false,
         }
     }
 }
 
 impl TickDecider for CoachDecider {
     fn decide(&mut self, tick: u32, world: &World) -> Vec<SkillChoice> {
-        if tick.is_multiple_of(self.decision_period) {
+        if self.decidir_ya || tick.is_multiple_of(self.decision_period) {
+            self.decidir_ya = false;
             let mut obs = Observation::from_world(world, self.own_team);
             obs.quitar_propios(&self.sin_comandos);
             self.last_choices = self.coach.decide(&obs);
@@ -424,6 +518,13 @@ impl TickDecider for CoachDecider {
 
     fn usar_sin_comandos(&mut self, patrones: &[i32]) {
         self.sin_comandos = patrones.to_vec();
+    }
+
+    /// `Coach::set_side`, y el coach vuelve a decidir en el próximo `decide` (el lazo
+    /// aplica el cambio antes de decidir: en el mismo tick).
+    fn set_side(&mut self, attack_sign: f32) {
+        self.coach.set_side(attack_sign);
+        self.decidir_ya = true;
     }
 
     fn role(&self, robot_id: i32) -> Option<Role> {
@@ -545,6 +646,41 @@ pub struct GuiChannels {
     pub teleport_rx: Option<mpsc::Receiver<Vec<crate::radio::TeleportItem>>>,
     /// Órdenes de identidad (pestaña Robots) GUI→loop. `None` = sin pestaña.
     pub identidad_rx: Option<mpsc::Receiver<OrdenIdentidad>>,
+    /// Cambio de lado GUI→loop: el `attack_sign` nuevo (+1 = atacamos hacia +x), absoluto
+    /// para que repetirlo no haga nada (`cambiar_lado`). `None` = el lado de `VSSL_SIDE`
+    /// queda fijo.
+    pub lado_rx: Option<mpsc::Receiver<f32>>,
+    /// Soltar la espera del primer comando del árbitro (`EsperaArbitro`) GUI→loop.
+    /// `None` = solo la suelta el árbitro.
+    pub soltar_espera_rx: Option<mpsc::Receiver<()>>,
+}
+
+/// Cambio de lado sin relanzar (entretiempo): el guardia de zonas, las áreas de motion y
+/// el decisor (coach) pasan juntos al lado `attack_sign` (+1 = atacamos hacia +x), y las
+/// skills retoman sin estado heredado. Si el lado ya es ese, no hace nada y devuelve
+/// `false`. El lado vigente es el del guardia (`ZoneGuard::attack_sign`), el que publica
+/// la foto.
+pub(crate) fn cambiar_lado(
+    attack_sign: f32,
+    zone_guard: &mut ZoneGuard,
+    motion: &mut Motion,
+    catalog: &mut SkillCatalog,
+    decider: &mut dyn TickDecider,
+) -> bool {
+    let s = if attack_sign >= 0.0 { 1.0 } else { -1.0 };
+    if s == zone_guard.attack_sign() {
+        return false;
+    }
+    zone_guard.set_side(s);
+    motion.set_side(s);
+    catalog.forget_last_skills();
+    decider.set_side(s);
+    eprintln!(
+        "[control_loop] cambio de lado: defendemos el arco {} y atacamos hacia {}X",
+        if s > 0.0 { "izquierdo" } else { "derecho" },
+        if s > 0.0 { "+" } else { "-" }
+    );
+    true
 }
 
 /// Construye comandos de velocidad cero para todos los robots activos del equipo
@@ -1095,8 +1231,17 @@ pub async fn run_control_loop(
     let tracker_enabled = Arc::new(AtomicBool::new(tracker_on_at_start));
     let vision_pkt_count = Arc::new(AtomicU64::new(0));
 
-    let (snapshot_tx, mut manual_rx, mut skill_rx, estop, mut pid_rx, mut teleport_rx, mut identidad_rx) =
-        match gui {
+    let (
+        snapshot_tx,
+        mut manual_rx,
+        mut skill_rx,
+        estop,
+        mut pid_rx,
+        mut teleport_rx,
+        mut identidad_rx,
+        mut lado_rx,
+        mut soltar_espera_rx,
+    ) = match gui {
             Some(g) => (
                 Some(g.snapshot_tx),
                 g.manual_rx,
@@ -1105,8 +1250,10 @@ pub async fn run_control_loop(
                 g.pid_rx,
                 g.teleport_rx,
                 g.identidad_rx,
+                g.lado_rx,
+                g.soltar_espera_rx,
             ),
-            None => (None, None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None, None, None),
         };
     // Contadores de la visión (atómicos; no cambian ningún comando).
     let vision_stats = Arc::new(VisionStats::default());
@@ -1258,6 +1405,7 @@ pub async fn run_control_loop(
     let blind_stop = Duration::from_secs_f64(crate::params::params().vision.blind_stop_s);
     let mut ciego_prev = true;
     let mut visto_alguna_vez = false;
+    let mut espera = EsperaArbitro::new(config.esperar_arbitro, &config.referee);
     // Depuración por tick: con GUI o con el registro de partido (`exportar_depuracion`).
     let exportar = snapshot_tx.is_some() || config.exportar_depuracion;
     motion.registrar(exportar);
@@ -1341,6 +1489,14 @@ pub async fn run_control_loop(
             };
             identidad.ordenes(ordenes, tick_counter, &mut *radio.lock().await, decider.as_mut());
 
+            // Cambio de lado (entretiempo), antes de decidir: el coach decide en este mismo
+            // tick con el lado nuevo, y el guardia y motion lo aplican desde este envío.
+            if let Some(rx) = lado_rx.as_mut()
+                && let Some(s) = std::iter::from_fn(|| rx.try_recv().ok()).last()
+            {
+                cambiar_lado(s, &mut zone_guard, &mut motion, &mut catalog, decider.as_mut());
+            }
+
             // Tuneo de PID de heading desde la GUI (aplica al catálogo en runtime).
             if let Some(rx) = pid_rx.as_mut() {
                 while let Ok(p) = rx.try_recv() {
@@ -1385,6 +1541,13 @@ pub async fn run_control_loop(
                 .as_ref()
                 .map(|e| e.load(Ordering::Relaxed))
                 .unwrap_or(false);
+            // La espera del primer comando del árbitro toma el mismo camino que la parada.
+            let soltar = match soltar_espera_rx.as_mut() {
+                Some(rx) => std::iter::from_fn(|| rx.try_recv().ok()).count() > 0,
+                None => false,
+            };
+            espera.actualizar(&config.referee, soltar);
+            let detenido = estop_engaged || espera.activa();
             let ref_mode = referee_mode(&config.referee);
             if (ref_mode == TickMode::Halt) != halted_prev {
                 halted_prev = ref_mode == TickMode::Halt;
@@ -1396,7 +1559,7 @@ pub async fn run_control_loop(
             }
             // La parada y HALT vacían el manual, las skills de la GUI y el giro de
             // identificación; el corte sin visión no (el giro no sale igual en ese modo).
-            if tick_mode(estop_engaged, ref_mode, false) == TickMode::Halt {
+            if tick_mode(detenido, ref_mode, false) == TickMode::Halt {
                 manual_state.clear();
                 skill_state.clear();
                 identidad.cortar_giro();
@@ -1420,7 +1583,7 @@ pub async fn run_control_loop(
                     SystemTime::now(),
                     blind_stop,
                 );
-                mode = tick_mode(estop_engaged, ref_mode, ciego);
+                mode = tick_mode(detenido, ref_mode, ciego);
                 let out = tick_commands(
                     mode,
                     &world_guard,
@@ -1532,6 +1695,7 @@ pub async fn run_control_loop(
                     escaping: &escaping,
                     debug: debug.as_deref(),
                     rutina: rutina_vista.as_deref(),
+                    attack_sign: zone_guard.attack_sign(),
                 };
                 hook(&rec);
             }
@@ -1579,6 +1743,8 @@ pub async fn run_control_loop(
                         rutina: rutina_vista.clone(),
                         arquero: zone_guard.keeper(),
                         identidad: identidad.para_foto(),
+                        attack_sign: Some(zone_guard.attack_sign()),
+                        esperando_arbitro: espera.activa(),
                     },
                 );
             }
@@ -1744,6 +1910,59 @@ mod tests {
             shared,
             crate::coach::RefereeCommand { foul, ..crate::coach::RefereeCommand::GAME_ON },
         );
+    }
+
+    // ── Espera del primer comando del árbitro ──
+
+    #[test]
+    fn esperar_arbitro_por_defecto_si_y_un_valor_raro_no_arranca() {
+        for v in [None, Some(""), Some("1"), Some(" TRUE "), Some("on")] {
+            assert_eq!(esperar_arbitro_de(v), Ok(true), "{v:?}");
+        }
+        for v in ["0", "false", "OFF"] {
+            assert_eq!(esperar_arbitro_de(Some(v)), Ok(false), "{v:?}");
+        }
+        let e = esperar_arbitro_de(Some("si")).unwrap_err();
+        assert!(e.contains(ESPERAR_ARBITRO_ENV) && e.contains("0, false u off"), "{e}");
+    }
+
+    #[test]
+    fn la_espera_solo_empieza_si_se_pide_y_hay_arbitro() {
+        let shared = crate::coach::new_shared_referee();
+        assert!(EsperaArbitro::new(true, &Some(shared.clone())).activa());
+        assert!(!EsperaArbitro::new(false, &Some(shared)).activa());
+        assert!(!EsperaArbitro::new(true, &None).activa(), "sin árbitro no hay qué esperar");
+    }
+
+    #[test]
+    fn la_espera_termina_con_el_primer_comando_y_no_vuelve() {
+        let shared = crate::coach::new_shared_referee();
+        let referee = Some(shared.clone());
+        let mut e = EsperaArbitro::new(true, &referee);
+        e.actualizar(&referee, false);
+        assert!(e.activa(), "sin comandos sigue esperando");
+        // Mientras espera, el tick va por HALT aunque el árbitro (sin comandos) diga juego.
+        assert_eq!(referee_mode(&referee), TickMode::Play);
+        assert_eq!(tick_mode(e.activa(), referee_mode(&referee), false), TickMode::Halt);
+        // El primer comando, sea cual sea, la termina; desde ahí manda el árbitro.
+        set_referee(&shared, Foul::Stop);
+        e.actualizar(&referee, false);
+        assert!(!e.activa());
+        assert_eq!(tick_mode(e.activa(), referee_mode(&referee), false), TickMode::Stop);
+        set_referee(&shared, Foul::GameOn);
+        e.actualizar(&referee, false);
+        assert_eq!(tick_mode(e.activa(), referee_mode(&referee), false), TickMode::Play);
+    }
+
+    #[test]
+    fn la_gui_suelta_la_espera_sin_arbitro() {
+        let referee = Some(crate::coach::new_shared_referee());
+        let mut e = EsperaArbitro::new(true, &referee);
+        e.actualizar(&referee, true);
+        assert!(!e.activa());
+        assert_eq!(tick_mode(e.activa(), referee_mode(&referee), false), TickMode::Play, "juega");
+        e.actualizar(&referee, false);
+        assert!(!e.activa(), "no vuelve a esperar");
     }
 
     #[test]
@@ -2285,6 +2504,31 @@ mod tests {
     }
 
     #[test]
+    fn reflexes_never_take_the_keeper_into_its_goal_mouth() {
+        // Arquero (el 0) trabado junto a la boca de su arco, con heading diagonal hacia el
+        // arco y un avance lento que no alcanza a tocarla: tras la gracia y la ventana, la
+        // recuperación escapa. Junto al arco el escape va hacia la cancha, y ningún comando
+        // que sale de los reflejos (guardia → recuperación → guardia) lleva a tocar la boca.
+        let guard = ZoneGuard::new(1.0, 0);
+        let mut recovery = BorderRecovery::new(true);
+        let th = 135f64.to_radians();
+        let p = Vec2::new(-0.66, 0.05);
+        let h = Vec2::new(th.cos() as f32, th.sin() as f32);
+        let boca = guard.boca_propia();
+        let mut world = World::new(3, 3);
+        world.update_robot(0, 0, p, th, Vec2::ZERO, 0.0);
+        let mut escaped = false;
+        for k in 0..90 {
+            let mut cmds = vec![own_cmd(0.15, th)];
+            let esc = apply_reflexes(&mut cmds, &world, &mut recovery, &guard, &HashSet::new(), 0);
+            escaped |= esc[0];
+            let v = (cmds[0].vx * th.cos() + cmds[0].vy * th.sin()) as f32;
+            assert!(!boca.touches(p + h * v * 0.30), "tick {k}: el avance lo lleva a la boca: {:?}", cmds[0]);
+        }
+        assert!(escaped, "la recuperación debía disparar");
+    }
+
+    #[test]
     fn fixed_skill_decider_emits_same_choice_each_tick() {
         let mut decider = FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(0.3, 0.0));
         let world = World::new(3, 3);
@@ -2331,6 +2575,81 @@ mod tests {
         }
         // Debe haber sido llamado en ticks 0, 6, 12 → 3 veces.
         assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    /// Cambio de lado: el coach lo recibe y decide en el próximo `decide` aunque no toque
+    /// (sin seguir con las elecciones del lado anterior); después, su frame-skip de siempre.
+    #[test]
+    fn coach_decider_cambia_de_lado_y_decide_en_seguida() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct Espia {
+            decisiones: Arc<AtomicU32>,
+            lados: Arc<Mutex<Vec<f32>>>,
+        }
+        impl Coach for Espia {
+            fn decide(&mut self, _obs: &Observation) -> Vec<SkillChoice> {
+                self.decisiones.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+            fn set_side(&mut self, attack_sign: f32) {
+                self.lados.lock().unwrap().push(attack_sign);
+            }
+        }
+
+        let decisiones = Arc::new(AtomicU32::new(0));
+        let lados = Arc::new(Mutex::new(Vec::new()));
+        let espia = Espia { decisiones: decisiones.clone(), lados: lados.clone() };
+        let mut d = CoachDecider::new(Box::new(espia), 0, 6);
+        let w = World::new(3, 3);
+        d.decide(0, &w);
+        d.decide(1, &w);
+        assert_eq!(decisiones.load(Ordering::Relaxed), 1);
+        d.set_side(-1.0);
+        assert_eq!(*lados.lock().unwrap(), vec![-1.0]);
+        d.decide(2, &w);
+        assert_eq!(decisiones.load(Ordering::Relaxed), 2, "decide en el tick del cambio");
+        for t in 3..6 {
+            d.decide(t, &w);
+        }
+        assert_eq!(decisiones.load(Ordering::Relaxed), 2, "y vuelve a su frame-skip");
+        d.decide(6, &w);
+        assert_eq!(decisiones.load(Ordering::Relaxed), 3);
+    }
+
+    /// `cambiar_lado` mueve juntos el guardia, las áreas de motion y el decisor; con el
+    /// mismo lado (solo cuenta el signo) no hace nada, así que repetir la orden es inocuo.
+    #[test]
+    fn cambiar_lado_mueve_guardia_motion_y_decisor_juntos() {
+        struct Lados(Vec<f32>);
+        impl TickDecider for Lados {
+            fn decide(&mut self, _tick: u32, _world: &World) -> Vec<SkillChoice> {
+                Vec::new()
+            }
+            fn set_side(&mut self, attack_sign: f32) {
+                self.0.push(attack_sign);
+            }
+        }
+
+        let mut guardia = ZoneGuard::new(1.0, 2);
+        let mut motion = Motion::new().with_areas(1.0, 2);
+        let mut catalogo = SkillCatalog::new(3);
+        let mut d = Lados(Vec::new());
+        assert!(!cambiar_lado(1.0, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert!(d.0.is_empty(), "el mismo lado no llega al decisor");
+
+        assert!(cambiar_lado(-1.0, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert_eq!(guardia.attack_sign(), -1.0);
+        assert_eq!(guardia.keeper(), 2);
+        assert_eq!(motion.attack_dir(), Some(Vec2::new(-1.0, 0.0)));
+        assert_eq!(d.0, vec![-1.0]);
+
+        assert!(!cambiar_lado(-0.5, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert_eq!(d.0, vec![-1.0], "repetir la orden no hace nada");
+
+        assert!(cambiar_lado(1.0, &mut guardia, &mut motion, &mut catalogo, &mut d));
+        assert_eq!((guardia.attack_sign(), motion.attack_dir()), (1.0, Some(Vec2::X)));
+        assert_eq!(d.0, vec![-1.0, 1.0]);
     }
 
     /// 1.7 — Sin comandos manuales, `apply_manual_overrides` no toca nada.
@@ -2632,6 +2951,7 @@ mod tests {
             referee: None,
             exportar_depuracion: false,
             identidad: Identidad::default(),
+            esperar_arbitro: false,
         };
         let _decider: Box<dyn TickDecider> =
             Box::new(FixedSkillDecider::new(0, SkillId::GoTo, Vec2::ZERO));
@@ -2734,20 +3054,37 @@ mod tests {
     /// robots 0 y 1, sin el 2, con la pelota quieta en (0.20, 0.05). Solo el 0 se mueve.
     /// Devuelve la planta del 0 al final y los ticks en que el guardia lo frenó o lo sacó.
     fn correr_en_planta(d: &mut dyn TickDecider, ticks: u32) -> (crate::motion::test_plant::Plant, usize) {
-        let cfg = MotionConfig { bidirectional: true, ..MotionConfig::default() };
+        let c = correr_en_planta_desde(d, ticks, (-0.45, 0.10, 0.0), true);
+        (c.planta, c.guardia)
+    }
+
+    /// Lo que deja una corrida de `correr_en_planta_desde`.
+    struct Corrida {
+        planta: crate::motion::test_plant::Plant,
+        /// Ticks en que el guardia frenó o sacó al 0.
+        guardia: usize,
+        /// x mínima del 0: lo más hondo que llegó hacia el arco propio (a la izquierda).
+        x_min: f32,
+        /// Ticks del 0 en maniobra de escape.
+        escapes: usize,
+    }
+
+    /// `correr_en_planta` con la pose inicial del 0 (x, y, heading en grados) y el modo.
+    fn correr_en_planta_desde(d: &mut dyn TickDecider, ticks: u32, pose: (f32, f32, f64), bidirectional: bool) -> Corrida {
+        let cfg = MotionConfig { bidirectional, ..MotionConfig::default() };
         let mut motion = Motion::with_config(cfg).with_areas(1.0, 2);
         let mut guard = ZoneGuard::new(1.0, 2);
         let mut catalog = SkillCatalog::new(3);
         let mut recovery = BorderRecovery::new(true);
         let (manual, gui) = (HashMap::new(), HashMap::new());
-        let mut planta = crate::motion::test_plant::Plant::new(-0.45, 0.10, 0.0);
-        let mut guardia = 0;
+        let mut planta = crate::motion::test_plant::Plant::new(pose.0, pose.1, pose.2);
+        let (mut guardia, mut x_min, mut escapes) = (0, planta.x, 0);
         for t in 0..ticks {
             let mut w = World::new(3, 3);
             w.update_robot(0, 0, Vec2::new(planta.x, planta.y), planta.th, planta.velocity(), 0.0);
             w.update_robot(1, 0, Vec2::new(0.10, -0.20), 0.0, Vec2::ZERO, 0.0);
             w.update_ball(Vec2::new(0.20, 0.05), Vec2::ZERO);
-            let (cmds, _, _, _, g) = tick_commands(
+            let (cmds, _, _, esc, g) = tick_commands(
                 TickMode::Play,
                 &w,
                 d,
@@ -2763,9 +3100,34 @@ mod tests {
             );
             let k = cmds.iter().position(|c| c.id == 0).expect("comando del 0");
             guardia += usize::from(g[k].is_some_and(|g| g.accion.is_some()));
+            escapes += usize::from(esc[k]);
             planta.step(&cmds[k]);
+            x_min = x_min.min(planta.x);
         }
-        (planta, guardia)
+        Corrida { planta, guardia, x_min, escapes }
+    }
+
+    /// `guardia-linea-de-gol`: el arquero con un destino dentro de su arco no cruza la línea
+    /// de gol (la planta tiene la boca abierta), ni lanzado desde la cancha ni arrancando
+    /// junto al riel mirando al arco, en los dos modos, y la recuperación no lo toma por
+    /// atascado.
+    #[test]
+    fn a_keeper_sent_into_its_goal_never_crosses_the_line() {
+        let boca = ZoneGuard::new(1.0, 2).boca_propia();
+        for bidirectional in [false, true] {
+            for pose in [(-0.50, 0.05, 0.0), (-0.67, 0.0, 180.0)] {
+                let mut d = ConArquero {
+                    fijo: FixedSkillDecider::new(0, SkillId::GoTo, Vec2::new(-0.80, 0.0)),
+                    arquero: Some(0),
+                };
+                let c = correr_en_planta_desde(&mut d, 240, pose, bidirectional);
+                let caso = format!("desde {pose:?}, bidireccional {bidirectional}");
+                assert!(c.x_min > -0.71, "{caso}: el centro llegó a x = {:.3}", c.x_min);
+                assert!(!boca.touches(Vec2::new(c.planta.x, c.planta.y)), "{caso}: terminó tocando la boca");
+                assert!(c.guardia > 0, "{caso}: el guardia tenía que frenarlo");
+                assert_eq!(c.escapes, 0, "{caso}: escape espurio frente a la boca");
+            }
+        }
     }
 
     /// x del riel de RailKeeper con el arco propio a la izquierda, y su tolerancia.
@@ -3174,11 +3536,12 @@ mod tests {
     #[tokio::test]
     async fn lazo_entrega_sin_comandos_al_arrancar_y_con_usar() {
         let mut b = BancoIdentidad::new(true);
-        assert_eq!(b.decisor.listas, vec![Vec::<i32>::new()], "al arrancar, la lista de la identidad");
+        // Por defecto, el patrón 5 no tiene radio (6 patrones, 5 radios).
+        assert_eq!(b.decisor.listas, vec![vec![5]], "al arrancar, la lista de la identidad");
         let mut sin_el_2 = Identidad::default();
         sin_el_2.robots[2].activo = false;
         b.tick(vec![OrdenIdentidad::Usar(sin_el_2)], TickMode::Play, &ceros()).await;
-        assert_eq!(b.decisor.listas.last(), Some(&vec![2]));
+        assert_eq!(b.decisor.listas.last(), Some(&vec![2, 5]));
         // Repetir la misma identidad no la vuelve a entregar.
         let n = b.decisor.listas.len();
         let misma = (*b.identidad.para_foto().unwrap()).clone();
