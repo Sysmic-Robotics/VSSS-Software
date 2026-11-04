@@ -101,6 +101,9 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
  3. Mirar que no oscile ni se quede una rueda atrás, también con la batería a medias.
  ANOTAR en notas.txt: distancias y si el giro sube. Con eso se ajusta el simulador
  (sim.max_wheel_rad_s 35 = 0.7 m/s).
+ SI NO LLEGA A 0.7 m/s: config/team_params.json tiene el planificador en 0.7 (coach.v_ref,
+ motion.max_linear_speed y motion.brake_distance 0.28). Con el tope medido v (m/s), poner
+ v_ref = max_linear_speed = v y brake_distance = 0.44 × (v − 0.06) (0.45 m/s → 0.17).
 
 -------------------------------------------------------------------------------------
  F. COPIAR LOS DATOS ............................................ minuto 28 a 30

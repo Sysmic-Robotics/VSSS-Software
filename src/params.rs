@@ -27,7 +27,13 @@ use std::sync::OnceLock;
 pub struct CoachParams {
     /// Robot que juega de arquero (id 0..2). Cambia solo si queda inactivo.
     pub keeper_id: i32,
-    /// Velocidad lineal de referencia para estimar tiempo de llegada (m/s).
+    /// Velocidad lineal de referencia para estimar tiempo de llegada (m/s). Va el tope real de la
+    /// rueda, igual que `motion.max_linear_speed` (con `brake_distance` para el mismo perfil de
+    /// frenado): con 1.0 y 1.2 sobre un robot que da 0.45, giraba poco a toda velocidad (las dos
+    /// ruedas se escalan juntas) e interceptaba tarde. Cara a cara contra 1.0/1.2: a 0.45 m/s
+    /// +0.29 ± 0.13 y +0.08 ± 0.16, a 0.7 +0.06 ± 0.20 y +0.17 ± 0.18 (4 de 4 a favor, ~1.8
+    /// errores estándar en conjunto; adoptado por corregir el modelo). En el JSON, 0.7 (firmware
+    /// de 700 mm/s); si el robot da otro tope, cambiar los tres juntos.
     pub v_ref: f32,
     /// Velocidad angular de referencia para el costo de giro (rad/s).
     pub omega_ref: f32,
