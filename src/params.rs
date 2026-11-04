@@ -147,6 +147,12 @@ pub struct CoachParams {
     /// tangencial. En FIRASim (motion_bench `desvio`) la cara apaga casi toda la normal: con 0.1
     /// entra al centro del arco y con 1 (espejo) junto al palo. Medir en la cancha.
     pub deflect_face_k: f32,
+    /// SpinKick del atacante solo con la pelota quieta (bajo `intercept_min_ball_speed`) hace al
+    /// menos esto (s). 0 = basta que esté quieta en esa decisión. Con un rival encima la pelota
+    /// se queda y se mueve varias veces por segundo: el atacante elegía el giro a 15 cm de la
+    /// pelota, iba al punto de contacto y a los 0.28 s el rival ya la había movido (73 % de 346
+    /// idas y vueltas approach → giro → approach en 48 partidos).
+    pub spin_min_still_s: f32,
 }
 
 impl Default for CoachParams {
@@ -194,6 +200,7 @@ impl Default for CoachParams {
             aim_post_margin: 0.06,
             deflect_min_speed: 0.0,
             deflect_face_k: 0.15,
+            spin_min_still_s: 0.0,
         }
     }
 }

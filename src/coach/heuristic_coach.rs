@@ -131,6 +131,8 @@ pub struct HeuristicCoach {
     /// Desvío en curso por robot (`deflect_min_speed`).
     deflect_plans: [Option<DeflectPlan>; 3],
     decision_count: u64,
+    /// Decisión desde la que la pelota está quieta (`spin_min_still_s`).
+    ball_still_since: Option<u64>,
     /// Decisión en la que la pelota entró al área propia (para el límite de 10 s).
     ball_in_area_since: Option<u64>,
     /// Estado del árbitro (VSSReferee / operador). `None` = siempre juego abierto.
@@ -203,6 +205,7 @@ impl HeuristicCoach {
             committed: [None; 3],
             deflect_plans: [None; 3],
             decision_count: 0,
+            ball_still_since: None,
             ball_in_area_since: None,
             referee: None,
             current_play: Play::Open,
@@ -640,7 +643,11 @@ impl HeuristicCoach {
         // SpinKick: pelota quieta y disputada (rival encima) o en el fondo/esquina,
         // con el robot cerca; pierde valor si igual se puede empujar.
         let close = clamp01(1.0 - (dist_ball - 0.08) / p.spin_engage_radius.max(1e-3));
-        let slow: f32 = if ball_speed < p.intercept_min_ball_speed { 1.0 } else { 0.0 };
+        let still_s = self
+            .ball_still_since
+            .map_or(0.0, |since| self.decision_count.saturating_sub(since) as f32 / p.decision_hz.max(1e-3));
+        let still_enough = p.spin_min_still_s <= 0.0 || still_s >= p.spin_min_still_s;
+        let slow: f32 = if ball_speed < p.intercept_min_ball_speed && still_enough { 1.0 } else { 0.0 };
         let contested: f32 = if min_opp_dist < p.spin_when_opponent_within { 1.0 } else { 0.0 };
         let wall: f32 = if self.ball_on_end_wall(ball) {
             1.0
@@ -1338,6 +1345,7 @@ impl Coach for HeuristicCoach {
         self.penalty_shot = None;
         self.push_stall = Stall::None;
         self.side_checked = false;
+        self.ball_still_since = None;
         self.last_open_ball = Vec2::ZERO;
     }
 
@@ -1349,6 +1357,11 @@ impl Coach for HeuristicCoach {
         self.decision_count += 1;
         let ball = Self::ball_pos(obs);
         let ball_vel = Self::ball_vel(obs);
+        if ball_vel.length() < self.p.intercept_min_ball_speed {
+            self.ball_still_since.get_or_insert(self.decision_count);
+        } else {
+            self.ball_still_since = None;
+        }
         let own: Vec<RobotView> = obs.own_robots.iter().enumerate().map(|(i, r)| Self::view(i, r)).collect();
         let opp: Vec<RobotView> = obs.opp_robots.iter().enumerate().map(|(i, r)| Self::view(i, r)).collect();
 
@@ -1923,6 +1936,29 @@ mod tests {
         assert_eq!(c.role_of(0), Some(Role::Striker));
         assert_eq!(choice_of(&ch, 0).skill_id, SkillId::SpinKick);
         assert_eq!(choice_of(&ch, 0).target, ATTACK);
+    }
+
+    #[test]
+    fn spin_waits_for_the_ball_to_stay_still() {
+        // Con `spin_min_still_s`, el rival encima no basta: la pelota tiene que llevar ese tiempo
+        // quieta. A 10 Hz, 0.4 s son 4 decisiones; si se mueve, la cuenta vuelve a cero.
+        let ball = Vec2::new(0.1, 0.0);
+        let mut o = obs(ball, Vec2::ZERO, [Vec2::new(0.25, 0.05), Vec2::new(-0.4, -0.3), Vec2::new(-0.63, 0.0)]);
+        o.opp_robots[0] = robot(Vec2::new(0.16, 0.0), 180.0);
+        let mut c = coach();
+        c.p.spin_min_still_s = 0.4;
+        let first = c.decide(&o);
+        assert_ne!(choice_of(&first, 0).skill_id, SkillId::SpinKick);
+        let mut last = first;
+        for _ in 0..5 {
+            last = c.decide(&o);
+        }
+        assert_eq!(choice_of(&last, 0).skill_id, SkillId::SpinKick);
+        let mut moving = o.clone();
+        moving.ball.vx = 0.5 / 1.5;
+        c.decide(&moving);
+        let again = c.decide(&o);
+        assert_ne!(choice_of(&again, 0).skill_id, SkillId::SpinKick, "la cuenta volvió a cero");
     }
 
     #[test]
