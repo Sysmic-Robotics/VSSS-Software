@@ -78,6 +78,16 @@ struct Committed {
     held: u32,
 }
 
+/// Desvío en curso: punto del camino de la pelota donde la toca la cara, centro y rumbo del
+/// robot, y decisión en que se espera el contacto.
+#[derive(Debug, Clone, Copy)]
+struct DeflectPlan {
+    point: Vec2,
+    center: Vec2,
+    heading: f32,
+    contact_at: u64,
+}
+
 /// Pelota trabada junto al striker (pegada al robot sin moverse: contra la pared, con un
 /// rival encima). Empujando, tras `push_stall_s` se la saca con el giro; si el giro
 /// tampoco la suelta en `stall_kick_max_s`, se lo prohíbe `spin_ban_s` para que pruebe
@@ -118,6 +128,8 @@ pub struct HeuristicCoach {
     striker_id: Option<i32>,
     decisions_since_role_switch: u32,
     committed: [Option<Committed>; 3],
+    /// Desvío en curso por robot (`deflect_min_speed`).
+    deflect_plans: [Option<DeflectPlan>; 3],
     decision_count: u64,
     /// Decisión en la que la pelota entró al área propia (para el límite de 10 s).
     ball_in_area_since: Option<u64>,
@@ -189,6 +201,7 @@ impl HeuristicCoach {
             striker_id: None,
             decisions_since_role_switch: p.role_min_hold,
             committed: [None; 3],
+            deflect_plans: [None; 3],
             decision_count: 0,
             ball_in_area_since: None,
             referee: None,
@@ -923,8 +936,20 @@ impl HeuristicCoach {
         opp: &[RobotView],
     ) -> Option<SkillChoice> {
         let min_speed = self.p.deflect_min_speed;
+        if min_speed <= 0.0 {
+            return None;
+        }
+        // El desvío en curso se mantiene hasta el contacto: recalculado en cada decisión se
+        // abandonaba a los 0.18 s (mediana de 187 intentos, 9 llegaron a su punto, ningún toque).
+        let id = r.id as usize;
+        if let Some(plan) = self.deflect_plans[id] {
+            if self.deflect_plan_holds(&plan, ball, ball_vel, striker, opp) {
+                return Some(self.deflect_command(r, plan.center, plan.heading));
+            }
+            self.deflect_plans[id] = None;
+        }
         let speed = ball_vel.length();
-        if min_speed <= 0.0 || speed < min_speed {
+        if speed < min_speed {
             return None;
         }
         // Pelota libre: ni el propio robot, ni nuestro atacante, ni un rival la llevan.
@@ -939,7 +964,7 @@ impl HeuristicCoach {
         let inc = ball_vel / speed;
         let sp = &params().skills;
         let k = sp.intercept_ball_decay_per_s;
-        let mut best: Option<(f32, Vec2, f32)> = None; // (tiempo que necesita, centro, rumbo)
+        let mut best: Option<(f32, Vec2, f32, Vec2, f32)> = None; // (necesita, centro, rumbo, punto, t)
         let mut t = 0.1_f32;
         while t <= sp.intercept_horizon {
             let decay = (-k * t).exp();
@@ -970,17 +995,50 @@ impl HeuristicCoach {
             let (heading, rot) = if off <= quarter / 2.0 { (r.theta - off, off) } else { (r.theta + quarter - off, quarter - off) };
             let need = self.time_to_reach(r, center) + rot / self.p.omega_ref;
             if need + 0.2 <= t - 0.05 && best.map_or(true, |b| need < b.0) {
-                best = Some((need, center, heading));
+                best = Some((need, center, heading, p, t - 0.05));
             }
         }
-        let (_, center, heading) = best?;
+        let (_, center, heading, point, t_contact) = best?;
+        let hz = self.p.decision_hz.max(1e-3);
+        let contact_at = self.decision_count + (t_contact * hz).ceil() as u64;
+        self.deflect_plans[id] = Some(DeflectPlan { point, center, heading, contact_at });
+        Some(self.deflect_command(r, center, heading))
+    }
+
+    /// El desvío en curso sigue: la pelota no pasó el punto, su camino pasa a menos de 8 cm de
+    /// él (la velocidad medida tiene ruido), sigue rodando, ni un rival ni nuestro atacante la
+    /// tomaron y no pasó medio segundo del contacto previsto.
+    fn deflect_plan_holds(
+        &self,
+        plan: &DeflectPlan,
+        ball: Vec2,
+        ball_vel: Vec2,
+        striker: Option<&RobotView>,
+        opp: &[RobotView],
+    ) -> bool {
+        let hz = self.p.decision_hz.max(1e-3);
+        let late = self.decision_count > plan.contact_at + (0.5 * hz).ceil() as u64;
+        let speed = ball_vel.length();
+        let taken = striker.is_some_and(|st| (st.pos - ball).length() < 0.12)
+            || opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.12);
+        if late || speed < 0.08 || taken {
+            return false;
+        }
+        let dir = ball_vel / speed;
+        let rel = plan.point - ball;
+        let along = rel.dot(dir);
+        along > -0.02 && (rel - dir * along).length() <= 0.08
+    }
+
+    /// `GoTo` al centro del desvío y, ya ahí, `FacePoint` al rumbo de la cara.
+    fn deflect_command(&mut self, r: &RobotView, center: Vec2, heading: f32) -> SkillChoice {
         let (wanted, target) = if (center - r.pos).length() > 0.03 {
             (SkillId::GoTo, center)
         } else {
             (SkillId::FacePoint, center + Vec2::from_angle(heading) * 0.30)
         };
         let skill = self.commit(r.id, wanted, |_| false);
-        Some(SkillChoice::new(r.id, skill, target))
+        SkillChoice::new(r.id, skill, target)
     }
 
     fn support_choice(
@@ -2075,9 +2133,39 @@ mod tests {
         });
         assert!(on_path, "rumbo {:?}", heading);
         // Lenta (no llega a 0.3 m/s a la mitad rival) o llevada por el atacante: no desvía.
+        let mut c = coach();
+        c.p.deflect_min_speed = 0.3;
         assert!(c.deflect_choice(&sup, ball, vel * 0.2, Some(&st), &[]).is_none());
         let carrying = RobotView { pos: ball + Vec2::new(-0.05, -0.05), ..st };
         assert!(c.deflect_choice(&sup, ball, vel, Some(&carrying), &[]).is_none());
+    }
+
+    #[test]
+    fn deflection_keeps_its_plan_until_the_ball_arrives() {
+        // Iniciado el desvío, el plan se mantiene aunque la velocidad medida de la pelota gire
+        // unos grados (ruido) y el robot ya se haya movido: mismo centro. Se suelta cuando la
+        // pelota pasó el punto o cuando un rival la toma.
+        let ball = Vec2::new(0.0, -0.45);
+        let vel = Vec2::new(0.79, 0.90);
+        let st = RobotView { id: 0, pos: Vec2::new(-0.20, -0.60), theta: 0.0, active: true };
+        let sup = RobotView { id: 1, pos: Vec2::new(0.48, 0.20), theta: 0.0, active: true };
+        let mut c = coach();
+        c.p.deflect_min_speed = 0.3;
+        let first = c.deflect_choice(&sup, ball, vel, Some(&st), &[]).expect("desvío");
+        let plan = c.deflect_plans[1].expect("plan");
+        let ruido = Vec2::from_angle(3f32.to_radians()).rotate(vel);
+        let moved = RobotView { pos: (sup.pos + first.target) * 0.5, ..sup };
+        let kept = c.deflect_choice(&moved, ball + vel * 0.1, ruido, Some(&st), &[]).expect("sigue");
+        assert!(matches!(kept.skill_id, SkillId::GoTo | SkillId::FacePoint));
+        assert_eq!(c.deflect_plans[1].map(|p| p.center), Some(plan.center), "mismo centro");
+        let past = plan.point + vel.normalize() * 0.10;
+        let after = c.deflect_choice(&moved, past, vel * 0.5, Some(&st), &[]);
+        assert!(after.map_or(true, |a| a.target != first.target), "la pelota ya pasó: {after:?}");
+        let mut c = coach();
+        c.p.deflect_min_speed = 0.3;
+        c.deflect_choice(&sup, ball, vel, Some(&st), &[]).expect("desvío");
+        let rival = RobotView { id: 0, pos: ball + vel * 0.1 + Vec2::new(0.05, 0.0), theta: 0.0, active: true };
+        assert!(!c.deflect_plan_holds(&c.deflect_plans[1].unwrap(), ball + vel * 0.1, vel, Some(&st), &[rival]));
     }
 
     #[test]
