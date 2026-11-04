@@ -33,7 +33,11 @@ pub struct CoachParams {
     pub omega_ref: f32,
     /// El striker cambia solo si el otro llega en menos de este factor del tiempo.
     pub role_switch_gain: f32,
-    /// Decisiones mínimas entre cambios de rol (a 10 Hz: 5 = 0.5 s).
+    /// Decisiones mínimas entre cambios de rol (a 10 Hz: 5 = 0.5 s). (Se probó un coach más
+    /// calmado: role_switch_gain 0.6, role_min_hold 10, skill_min_hold 5 y score_hysteresis
+    /// 0.25. Cambios de atacante de 18.7 a 11.1 por minuto y vueltas atrás en < 1 s de 29 a
+    /// 2 %, pero ni arranca antes ni titubea menos entre empujar y girar; cara a cara −0.25 ±
+    /// 0.17 y −0.02 ± 0.17 en 96 partidos. Queda como estaba.)
     pub role_min_hold: u32,
     /// Decisiones mínimas manteniendo una skill (a 10 Hz: 3 = 0.3 s).
     pub skill_min_hold: u32,
