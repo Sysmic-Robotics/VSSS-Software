@@ -907,12 +907,12 @@ impl HeuristicCoach {
     }
 
     /// Pase y desvío (`pass_deflect_max_dist`): sigue, termina o empieza la jugada.
-    /// Empieza con el atacante pegado detrás de la pelota quieta (respecto del pase), ningún rival
-    /// a menos de 0.15 m de ella, el tiro directo tapado y el apoyo en campo rival a 0.25 m a `pass_deflect_max_dist` de la
+    /// Empieza con el atacante pegado detrás de la pelota quieta (respecto del pase), el tiro
+    /// directo tapado y el apoyo en campo rival a 0.25 m a `pass_deflect_max_dist` de la
     /// pelota, con el pase y su salida al arco libres de rivales y un desvío de 15° a 100°. El
     /// pasador frena cuando la pelota ya va a 0.5 m/s o recorrió 0.2 m (o a 1 s). Termina a los
-    /// 3 s, si un rival toma la pelota, si cambian los roles, o cuando, ya suelta, la pelota se
-    /// frena o deja de ir hacia el receptor.
+    /// 3 s, si cambian los roles, si antes de frenar el pasador pierde la pelota, o cuando, ya
+    /// suelta, la pelota se frena o deja de ir hacia el receptor.
     fn update_pass_play(
         &mut self,
         striker: Option<&RobotView>,
@@ -932,14 +932,18 @@ impl HeuristicCoach {
             let now = self.decision_count;
             let roles_ok =
                 striker.is_some_and(|s| s.id == play.passer) && support.is_some_and(|s| s.id == play.receiver);
-            let taken = opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.12);
+            // Antes de frenar: perdió la pelota (el pasador se alejó de ella) o la pelota va al
+            // revés. Con un rival cerca no se cancela: la pelota está disputada el 68 % del tiempo
+            // que nuestro atacante está sobre ella.
+            let dir = (play.point - play.ball0).normalize_or_zero();
+            let lost = play.released.is_none()
+                && (striker.map_or(true, |s| (s.pos - ball).length() > 0.18) || ball_vel.dot(dir) < -0.1);
             let over = play.released.is_some() && (ball_vel.length() < 0.1 || ball_vel.dot(play.point - ball) <= 0.0);
-            if since(play.started, now) > 3.0 || !roles_ok || taken || over {
+            if since(play.started, now) > 3.0 || !roles_ok || lost || over {
                 self.end_pass_play(&play);
                 return;
             }
             if play.released.is_none() {
-                let dir = (play.point - play.ball0).normalize_or_zero();
                 let fast = ball_vel.dot(dir) >= 0.5;
                 let far = (ball - play.ball0).dot(dir) >= 0.2;
                 if fast || far || since(play.started, now) >= 1.0 {
@@ -956,11 +960,7 @@ impl HeuristicCoach {
         let aim = self.attack_goal;
         let p = sup.pos;
         let d = (p - ball).length();
-        // Sin un rival pegado a la pelota: con uno a menos de 0.15 m la jugada se cancelaba en la
-        // decisión siguiente ("la tomó un rival") y en partido duraba 0.08 s.
-        let contested = opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.15);
         if ball_vel.length() > 0.3
-            || contested
             || (st.pos - ball).length() > 0.12
             || d < 0.25
             || d > max_dist
