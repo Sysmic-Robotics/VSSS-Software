@@ -4,13 +4,19 @@
 //! real, velocidades, distancias de las skills, umbrales del coach) vive aquí, para
 //! que calibrar sea editar un archivo y no recompilar.
 //!
-//! Carga (`TeamParams::load`):
-//! 1. `VSSL_PARAMS=<ruta>` si está definida (error si el archivo no existe o no parsea);
-//! 2. si no, `config/team_params.json` relativo al directorio de trabajo, si existe;
-//! 3. si no, los defaults de código (los mismos valores que trae el JSON del repo).
+//! Carga (`TeamParams::load`), en capas:
+//! 1. la base es `config/team_params.json`, relativo al directorio de trabajo, si existe; si
+//!    no, los defaults de código;
+//! 2. encima va `VSSL_PARAMS=<ruta>` si está definida (error si el archivo no existe o no
+//!    parsea): lo que trae reemplaza a la base y lo demás queda como en la base.
 //!
-//! El JSON puede ser PARCIAL: cualquier campo ausente toma su default. Un campo con
-//! nombre desconocido es error (`deny_unknown_fields`), para que un typo en una
+//! Así una capa parcial (`config/estilos/*.json`, un ajuste de la cancha) conserva la
+//! calibración del JSON del equipo. Antes, la capa se completaba con los defaults de código,
+//! y con `tools/jugar.sh` se perdía `vision.real_theta_offset_deg` (180 en el JSON, 0 en el
+//! código): los robots reales quedaban con la flecha al revés.
+//!
+//! Los JSON pueden ser PARCIALES: cualquier campo ausente en los dos toma su default. Un campo
+//! con nombre desconocido es error (`deny_unknown_fields`), para que un typo en una
 //! calibración no pase en silencio.
 //!
 //! Acceso global: `params()` (se fija una vez al arranque con `load_and_install`;
@@ -682,6 +688,35 @@ pub fn params() -> &'static TeamParams {
     PARAMS.get_or_init(TeamParams::default)
 }
 
+/// El texto de un JSON de parámetros, sin el BOM que dejan los editores de Windows (Bloc de
+/// notas, PowerShell): serde_json no lo acepta y el error resultante es críptico.
+fn leer_texto(path: &Path) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(text.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(text))
+}
+
+fn leer_valor(path: &Path) -> Result<serde_json::Value, String> {
+    serde_json::from_str(&leer_texto(path)?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Pone `capa` encima de `base`: en los objetos, clave por clave y en profundidad; cualquier
+/// otro valor de la capa reemplaza al de la base entero.
+fn mezclar_capa(base: &mut serde_json::Value, capa: serde_json::Value) {
+    match (base, capa) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(c)) => {
+            for (k, v) in c {
+                match b.get_mut(&k) {
+                    Some(bv) => mezclar_capa(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, c) => *b = c,
+    }
+}
+
 impl TeamParams {
     pub const DEFAULT_PATH: &'static str = "config/team_params.json";
     pub const ENV_VAR: &'static str = "VSSL_PARAMS";
@@ -831,41 +866,48 @@ impl TeamParams {
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("{}: {e}", path.as_ref().display()))?;
-        // Editores de Windows (Bloc de notas, PowerShell) suelen guardar con BOM;
-        // serde_json no lo acepta y el error resultante es críptico.
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-        Self::from_json(text).map_err(|e| format!("{}: {e}", path.as_ref().display()))
+        let text = leer_texto(path.as_ref())?;
+        Self::from_json(&text).map_err(|e| format!("{}: {e}", path.as_ref().display()))
+    }
+
+    /// `capa` encima de `base` (ver la cabecera del módulo). Sin ninguno de los dos, los
+    /// defaults de código. Devuelve los parámetros y la fuente para el log.
+    pub fn load_layers(base: Option<&Path>, capa: Option<&Path>) -> Result<(Self, String), String> {
+        match (base, capa) {
+            (None, None) => Ok((Self::default(), "defaults de código (sin JSON)".to_string())),
+            (Some(b), None) => Ok((Self::from_file(b)?, format!("archivo {}", b.display()))),
+            (None, Some(c)) => Ok((Self::from_file(c)?, format!("archivo {}", c.display()))),
+            (Some(b), Some(c)) => {
+                let mut valor = leer_valor(b)?;
+                mezclar_capa(&mut valor, leer_valor(c)?);
+                let fuente = format!("archivo {} sobre {}", c.display(), b.display());
+                let p = Self::from_json(&valor.to_string()).map_err(|e| format!("{fuente}: {e}"))?;
+                Ok((p, fuente))
+            }
+        }
     }
 
     pub fn to_json_pretty(&self) -> String {
         serde_json::to_string_pretty(self).expect("TeamParams serializable")
     }
 
-    /// Ruta a cargar: `VSSL_PARAMS` si está definida; si no, el archivo por defecto
-    /// solo si existe.
-    pub fn resolve_path() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var(Self::ENV_VAR)
-            && !p.trim().is_empty()
-        {
-            return Some(PathBuf::from(p.trim()));
-        }
-        let default = PathBuf::from(Self::DEFAULT_PATH);
-        default.exists().then_some(default)
+    /// La capa de `VSSL_PARAMS`, si está definida y no vacía.
+    pub fn layer_path() -> Option<PathBuf> {
+        std::env::var(Self::ENV_VAR)
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
     }
 
-    /// Carga según `resolve_path`. Devuelve los parámetros y una descripción de la
-    /// fuente para el log. Un archivo indicado pero inválido es error duro (no se
-    /// juega con parámetros a medias sin saberlo).
+    /// Carga la base (`config/team_params.json`, si existe) y encima la capa de
+    /// `VSSL_PARAMS`. Devuelve los parámetros y una descripción de la fuente para el log.
+    /// Un archivo indicado pero inválido es error duro (no se juega con parámetros a
+    /// medias sin saberlo).
     pub fn load() -> Result<(Self, String), String> {
-        match Self::resolve_path() {
-            Some(path) => {
-                let p = Self::from_file(&path)?;
-                Ok((p, format!("archivo {}", path.display())))
-            }
-            None => Ok((Self::default(), "defaults de código (sin JSON)".to_string())),
-        }
+        let base = PathBuf::from(Self::DEFAULT_PATH);
+        let capa = Self::layer_path();
+        Self::load_layers(base.exists().then_some(base.as_path()), capa.as_deref())
     }
 
     /// Carga e instala como parámetros globales del proceso. Si ya había unos
@@ -895,6 +937,52 @@ impl TeamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    #[test]
+    fn las_capas_de_estilo_conservan_la_calibracion_del_json_del_equipo() {
+        // tools/jugar.sh carga un estilo con VSSL_PARAMS: la orientación de la visión real (y
+        // todo lo demás) sale del JSON del equipo, no de los defaults de código.
+        let base = TeamParams::from_file(repo(TeamParams::DEFAULT_PATH)).unwrap();
+        let mut estilos = 0;
+        for entrada in std::fs::read_dir(repo("config/estilos")).unwrap() {
+            let capa = entrada.unwrap().path();
+            let (p, fuente) = TeamParams::load_layers(Some(&repo(TeamParams::DEFAULT_PATH)), Some(&capa)).unwrap();
+            assert!(fuente.contains("sobre"), "{fuente}");
+            assert_eq!(p.vision.real_theta_offset_deg, 180.0, "{}", capa.display());
+            assert_eq!(p.coach.estilo, capa.file_stem().unwrap().to_str().unwrap());
+            assert_eq!(p.motion.max_linear_speed, base.motion.max_linear_speed);
+            estilos += 1;
+        }
+        assert_eq!(estilos, 4);
+    }
+
+    #[test]
+    fn la_capa_reemplaza_solo_lo_que_trae_y_un_typo_no_arranca() {
+        let dir = std::env::temp_dir().join(format!("vssl_capas_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("base.json");
+        let capa = dir.join("capa.json");
+        std::fs::write(&base, r#"{ "vision": { "real_theta_offset_deg": 180 }, "robot": { "max_v_mm_s": 900 } }"#).unwrap();
+        // Con BOM, como la guarda el Bloc de notas.
+        std::fs::write(&capa, "\u{feff}{ \"vision\": { \"real_theta_offset_deg\": 90 }, \"robot\": { \"max_w_deg_s\": 1080 } }").unwrap();
+        let (p, _) = TeamParams::load_layers(Some(&base), Some(&capa)).unwrap();
+        assert_eq!(p.vision.real_theta_offset_deg, 90.0);
+        assert_eq!((p.robot.max_v_mm_s, p.robot.max_w_deg_s), (900, 1080));
+        assert_eq!(p.vision.blind_stop_s, VisionParams::default().blind_stop_s);
+        // Sin base, la capa sola sobre los defaults de código.
+        let (sola, fuente) = TeamParams::load_layers(None, Some(&capa)).unwrap();
+        assert_eq!((sola.robot.max_v_mm_s, sola.robot.max_w_deg_s), (RobotParams::default().max_v_mm_s, 1080));
+        assert!(!fuente.contains("sobre"), "{fuente}");
+        // Una clave desconocida en la capa no arranca, y el error nombra los dos archivos.
+        std::fs::write(&capa, r#"{ "vision": { "real_theta_ofset_deg": 90 } }"#).unwrap();
+        let e = TeamParams::load_layers(Some(&base), Some(&capa)).unwrap_err();
+        assert!(e.contains("real_theta_ofset_deg") && e.contains("capa.json") && e.contains("base.json"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn empty_json_gives_defaults() {

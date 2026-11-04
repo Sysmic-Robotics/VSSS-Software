@@ -421,9 +421,16 @@ tácticas (`skills`), navegación (`motion`), geometría del robot real (`robot`
 rueda) y del robot de FIRASim (`sim`). Los tres binarios lo cargan al arrancar y lo anuncian en el
 log (`[main] parámetros: archivo config/team_params.json`).
 
-- `VSSL_PARAMS=<ruta>` usa otro archivo (útil para comparar dos calibraciones en el mismo partido).
-- El JSON puede ser parcial: lo que falta toma el default. Un campo con nombre desconocido es
-  error y el proceso no arranca (evita que un typo en una calibración pase en silencio).
+- `VSSL_PARAMS=<ruta>` es una capa encima de `config/team_params.json`: lo que trae reemplaza al
+  JSON del equipo y lo demás queda como está ahí (log: `archivo <capa> sobre
+  config/team_params.json`). Así un estilo (`config/estilos/*.json`, `tools/jugar.sh`) o un
+  ajuste de la cancha conservan la calibración del robot real, por ejemplo
+  `vision.real_theta_offset_deg`. Sin `config/team_params.json` en el directorio de trabajo, la
+  capa va sobre los defaults de código. Sirve también para comparar dos calibraciones en el
+  mismo partido.
+- Los JSON pueden ser parciales: lo que falta en los dos toma el default. Un campo con nombre
+  desconocido es error y el proceso no arranca (evita que un typo en una calibración pase en
+  silencio).
 - Cambiar un parámetro NO requiere recompilar: editar el JSON y volver a lanzar.
 - `manual`: el control manual de la GUI. `velocidad_real_m_s` (0.30) y `velocidad_sim_m_s`
   (0.50) son la velocidad máxima y de arranque con la base station y en simulación; con 0.30 y
