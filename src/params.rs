@@ -124,7 +124,12 @@ pub struct CoachParams {
     /// Desvío (escenarios 3 y 6): con la pelota rodando libre y llegando a más de esto (m/s) a
     /// un punto de su camino en la mitad rival que un jugador de campo alcanza antes (el apoyo,
     /// o el atacante en vez de recibirla), ese jugador se para ahí con una cara orientada para
-    /// que rebote al arco. 0 = nunca.
+    /// que rebote al arco. 0 = nunca. En el banco funciona (`desvio`: 8/9 goles con el robot ya
+    /// parado y orientado), pero en partido casi no hay pelotas que un robot alcance a
+    /// esperar: a 0.45 m/s, 2.8 intentos por partido y ningún toque (+0.02 ± 0.16 y
+    /// +0.31 ± 0.19); a 0.7, −0.15 ± 0.22 y −0.12 ± 0.20; con el plan sostenido, desvío de a
+    /// uno y la rampa de aceleración, ~1 intento por partido. Queda apagado: le falta el pase
+    /// dirigido al que desvía (escenario 6).
     pub deflect_min_speed: f32,
     /// Desvío: cuánto devuelve la cara de la velocidad normal de la pelota respecto de la
     /// tangencial. En FIRASim (motion_bench `desvio`) la cara apaga casi toda la normal: con 0.1
