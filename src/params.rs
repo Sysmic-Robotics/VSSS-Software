@@ -151,8 +151,14 @@ pub struct CoachParams {
     /// menos esto (s). 0 = basta que esté quieta en esa decisión. Con un rival encima la pelota
     /// se queda y se mueve varias veces por segundo: el atacante elegía el giro a 15 cm de la
     /// pelota, iba al punto de contacto y a los 0.28 s el rival ya la había movido (73 % de 346
-    /// idas y vueltas approach → giro → approach en 48 partidos).
+    /// idas y vueltas approach → giro → approach en 48 partidos). Con 0.4 a 0.7 m/s, cara a cara
+    /// −0.04 ± 0.28 y +0.46 ± 0.25 (96 partidos): a favor pero sin diferencia detectable.
     pub spin_min_still_s: f32,
+    /// El apoyo que está a menos de esto (m) del camino atacante → pelota se corre al costado
+    /// (con el atacante a más de 0.25 m de la pelota). 0 = nunca. El atacante frenado por un
+    /// compañero lo frenaba el apoyo en el 99.9 % de los casos: cubriendo la línea (68 %) o
+    /// marcando (32 %), quieto en dos tercios (12 % del tiempo lento del atacante).
+    pub support_yield_dist: f32,
 }
 
 impl Default for CoachParams {
@@ -201,6 +207,7 @@ impl Default for CoachParams {
             deflect_min_speed: 0.0,
             deflect_face_k: 0.15,
             spin_min_still_s: 0.0,
+            support_yield_dist: 0.0,
         }
     }
 }

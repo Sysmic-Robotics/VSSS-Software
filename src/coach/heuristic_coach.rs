@@ -133,6 +133,8 @@ pub struct HeuristicCoach {
     decision_count: u64,
     /// Decisión desde la que la pelota está quieta (`spin_min_still_s`).
     ball_still_since: Option<u64>,
+    /// El apoyo estaba cediendo el paso en la decisión anterior (`support_yield_dist`).
+    yielding: [bool; 3],
     /// Decisión en la que la pelota entró al área propia (para el límite de 10 s).
     ball_in_area_since: Option<u64>,
     /// Estado del árbitro (VSSReferee / operador). `None` = siempre juego abierto.
@@ -206,6 +208,7 @@ impl HeuristicCoach {
             deflect_plans: [None; 3],
             decision_count: 0,
             ball_still_since: None,
+            yielding: [false; 3],
             ball_in_area_since: None,
             referee: None,
             current_play: Play::Open,
@@ -1068,6 +1071,56 @@ impl HeuristicCoach {
         SkillChoice::new(r.id, skill, target)
     }
 
+    /// Ceder el paso (`support_yield_dist`): con el apoyo a menos de esa distancia del camino
+    /// atacante → pelota (y el atacante a más de 0.25 m de ella), `Mark` a un punto al costado
+    /// del camino, del lado en que ya está el apoyo (o del otro si ese cae en el área propia).
+    fn yield_to_striker(&mut self, r: &RobotView, ball: Vec2, striker: Option<&RobotView>) -> Option<SkillChoice> {
+        let id = r.id as usize;
+        let choice = self.yield_point(r, ball, striker);
+        match choice {
+            Some(target) => {
+                self.yielding[id] = true;
+                let skill = self.commit(r.id, SkillId::Mark, |_| false);
+                Some(SkillChoice::new(r.id, skill, target))
+            }
+            None => {
+                // Al dejar de ceder, el compromiso no debe arrastrar ese `Mark` al objetivo de
+                // otra rama (por ejemplo, ir a marcar nuestro arco en vez de cubrir la línea).
+                if std::mem::take(&mut self.yielding[id]) {
+                    self.committed[id] = None;
+                }
+                None
+            }
+        }
+    }
+
+    fn yield_point(&self, r: &RobotView, ball: Vec2, striker: Option<&RobotView>) -> Option<Vec2> {
+        let gap = self.p.support_yield_dist;
+        let st = striker?;
+        if gap <= 0.0 {
+            return None;
+        }
+        let path = ball - st.pos;
+        let len = path.length();
+        if len < 0.25 {
+            return None;
+        }
+        let dir = path / len;
+        let rel = r.pos - st.pos;
+        let along = rel.dot(dir);
+        let lateral = rel - dir * along;
+        let side = lateral.length();
+        if along <= -0.08 || along >= len || side >= gap {
+            return None;
+        }
+        let normal = if side > 1e-3 { lateral / side } else { Vec2::new(-dir.y, dir.x) };
+        let foot = st.pos + dir * along;
+        [normal, -normal]
+            .into_iter()
+            .map(|n| self.clamp_field_robot(foot + n * (gap + 0.05)))
+            .find(|p| !self.in_own_area(*p))
+    }
+
     fn support_choice(
         &mut self,
         r: &RobotView,
@@ -1077,6 +1130,9 @@ impl HeuristicCoach {
         opp: &[RobotView],
     ) -> SkillChoice {
         self.end_deflection(r.id);
+        if let Some(choice) = self.yield_to_striker(r, ball, striker) {
+            return choice;
+        }
         // Desvío con la pelota yendo hacia la mitad rival: antes que defender o marcar. Evaluado
         // después, casi no se activaba (0 y 1 intento en partidos de 3 min): el apoyo pasaba la
         // mitad del tiempo cubriendo la línea o marcando cuando pasaban las pelotas rápidas.
@@ -1936,6 +1992,26 @@ mod tests {
         assert_eq!(c.role_of(0), Some(Role::Striker));
         assert_eq!(choice_of(&ch, 0).skill_id, SkillId::SpinKick);
         assert_eq!(choice_of(&ch, 0).target, ATTACK);
+    }
+
+    #[test]
+    fn support_steps_aside_from_the_strikers_path() {
+        // Pelota en nuestra mitad (el apoyo cubriría la línea) y el apoyo parado en el camino del
+        // atacante a la pelota: con la opción se corre al costado, a más de la distancia pedida.
+        let ball = Vec2::new(-0.2, 0.0);
+        let st = RobotView { id: 0, pos: Vec2::new(-0.55, 0.0), theta: 0.0, active: true };
+        let r = RobotView { id: 1, pos: Vec2::new(-0.40, 0.02), theta: 0.0, active: true };
+        let mut c = coach();
+        assert_eq!(c.support_choice(&r, ball, Vec2::ZERO, Some(&st), &[]).skill_id, SkillId::BlockLine);
+        c.p.support_yield_dist = 0.12;
+        let aside = c.support_choice(&r, ball, Vec2::ZERO, Some(&st), &[]);
+        assert_eq!(aside.skill_id, SkillId::Mark);
+        assert!(aside.target.y >= 0.12 && !c.in_own_area(aside.target), "{:?}", aside.target);
+        // Lejos del camino, o con el atacante ya sobre la pelota: no cede.
+        let lejos = RobotView { pos: Vec2::new(-0.40, 0.30), ..r };
+        assert_eq!(c.support_choice(&lejos, ball, Vec2::ZERO, Some(&st), &[]).skill_id, SkillId::BlockLine);
+        let encima = RobotView { pos: ball + Vec2::new(-0.10, 0.0), ..st };
+        assert_eq!(c.support_choice(&r, ball, Vec2::ZERO, Some(&encima), &[]).skill_id, SkillId::BlockLine);
     }
 
     #[test]
