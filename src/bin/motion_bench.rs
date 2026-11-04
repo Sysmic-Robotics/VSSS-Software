@@ -234,6 +234,12 @@ const CASES: &[Case] = &[
     Case { ball_vel: (0.398, 0.448), ..c("desvio_06", SkillId::Hold, (0.0, 0.0), (0.486, 0.157, -76.7), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
     Case { ball_vel: (0.664, 0.747), ..c("desvio_10", SkillId::Hold, (0.0, 0.0), (0.486, 0.157, -76.7), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
     Case { ball_vel: (0.996, 1.121), ..c("desvio_15", SkillId::Hold, (0.0, 0.0), (0.486, 0.157, -76.7), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
+    // Calibración: la cara apaga casi toda la velocidad normal (sale casi a lo largo de la
+    // cara), así que el espejo deja la pelota alta. Cara para k = normal/tangencial 0.25 y 0.1.
+    Case { ball_vel: (0.398, 0.448), ..c("desvio_k025_06", SkillId::Hold, (0.0, 0.0), (0.504, 0.159, -93.9), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
+    Case { ball_vel: (0.664, 0.747), ..c("desvio_k025_10", SkillId::Hold, (0.0, 0.0), (0.504, 0.159, -93.9), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
+    Case { ball_vel: (0.398, 0.448), ..c("desvio_k01_06", SkillId::Hold, (0.0, 0.0), (0.512, 0.158, -101.9), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
+    Case { ball_vel: (0.664, 0.747), ..c("desvio_k01_10", SkillId::Hold, (0.0, 0.0), (0.512, 0.158, -101.9), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
     // Girando junto a la pelota → GoTo a 0.16 m (dentro del radio en que SpinKick daba el
     // giro por vigente) → SpinKick de nuevo: la segunda activación debe acercarse y patear.
     Case {
@@ -322,7 +328,9 @@ const PENALTY_CASES: &[&str] = &["penal_giro_arriba", "penal_giro_abajo", "penal
 const BANK_CASES: &[&str] = &["banda_empuje", "banda_giro", "banda_libre_06", "banda_libre_10", "banda_libre_15"];
 
 /// Desvío de una pelota que viene rodando (alias `desvio`).
-const DEFLECT_CASES: &[&str] = &["desvio_06", "desvio_10", "desvio_15"];
+const DEFLECT_CASES: &[&str] = &[
+    "desvio_06", "desvio_10", "desvio_15", "desvio_k025_06", "desvio_k025_10", "desvio_k01_06", "desvio_k01_10",
+];
 
 /// Banco de conducción (alias `conduccion`): Dribble y la combinación de hoy desde las mismas poses.
 const DRIBBLE_CASES: &[&str] = &[
