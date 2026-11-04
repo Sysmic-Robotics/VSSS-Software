@@ -58,6 +58,7 @@
     "clear_release_ball_speed": 0.5,
     "spin_contact_radius": 0.065,
     "spin_omega": 20.0,
+    "aim_kp": 3.0,
     "spin_pos_tol": 0.05,
     "spin_release_ball_speed": 0.4,
     "spin_max_time_s": 1.0,

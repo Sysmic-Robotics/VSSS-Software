@@ -300,11 +300,15 @@ pub struct SkillParams {
     /// sale a ~38° (`tools/medir_spinkick.py`, con 90 y con 26). Con 26, en motion_bench (tope
     /// real) el error del tiro baja de −48..−68° a −16..+6°, pero en partidos no se detecta
     /// diferencia contra 90: cara a cara +0.25 ± 0.16 y +0.04 ± 0.12 (96 partidos). Queda en 90
-    /// hasta medir el robot real y usarlo donde importa la puntería (tiro de banda).
+    /// hasta medir el robot real y usarlo donde importa la puntería (tiro de banda). A 0.7 m/s,
+    /// 38 (lo medido) contra 90: −0.12 ± 0.20 y +0.04 ± 0.18, sin diferencia.
     pub spin_exit_angle_deg: f32,
     /// Ganancia del giro final con que las skills tácticas (aproximarse, empujar, interceptar,
     /// marcar, despejar, girar) se orientan al llegar (rad/s por rad, topado por
     /// `motion.max_angular_speed`). Con 1.2, faltando 20° gira a ~0.4 rad/s, cada vez más lento.
+    /// En el JSON, 3: en el banco a 0.7 m/s apuntar baja de 3.2 a 1.8 s e interceptar de 2.2 a
+    /// 1.2 s sin bamboleo; en partidos sin diferencia (+0.27 ± 0.21 y −0.10 ± 0.19). Adoptado
+    /// por decisión de Benja; si en el robot real oscila al apuntar, volver a 1.2.
     pub aim_kp: f64,
     /// SpinKick: a esta distancia del punto de contacto deja de navegar a él y cierra
     /// sobre la pelota hasta tenerla al alcance (gira solo tocándola) (m). Mayor que
@@ -404,7 +408,8 @@ pub struct MotionParams {
     pub brake_distance: f32,
     pub uvf_influence_radius: f32,
     pub uvf_k_rep: f32,
-    /// Ganancia del seguimiento de heading hacia la dirección del UVF (rad/s por rad).
+    /// Ganancia del seguimiento de heading hacia la dirección del UVF (rad/s por rad). No subirla:
+    /// a 0.7 m/s, 4.5 con `max_angular_speed` 6 bambolea y pierde (−0.65 ± 0.26 y −0.40 ± 0.21).
     pub heading_gain: f64,
     /// Límite de aceleración del avance comandado, sobre el comando anterior (m/s²).
     pub max_linear_accel: f64,
