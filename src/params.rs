@@ -33,7 +33,13 @@ use std::sync::OnceLock;
 pub struct CoachParams {
     /// Robot que juega de arquero (id 0..2). Cambia solo si queda inactivo.
     pub keeper_id: i32,
-    /// Velocidad lineal de referencia para estimar tiempo de llegada (m/s).
+    /// Velocidad lineal de referencia para estimar tiempo de llegada (m/s). Va el tope real de la
+    /// rueda, igual que `motion.max_linear_speed` (con `brake_distance` para el mismo perfil de
+    /// frenado): con 1.0 y 1.2 sobre un robot que da 0.45, giraba poco a toda velocidad (las dos
+    /// ruedas se escalan juntas) e interceptaba tarde. Cara a cara contra 1.0/1.2: a 0.45 m/s
+    /// +0.29 ± 0.13 y +0.08 ± 0.16, a 0.7 +0.06 ± 0.20 y +0.17 ± 0.18 (4 de 4 a favor, ~1.8
+    /// errores estándar en conjunto; adoptado por corregir el modelo). En el JSON, 0.7 (firmware
+    /// de 700 mm/s); si el robot da otro tope, cambiar los tres juntos.
     pub v_ref: f32,
     /// Velocidad angular de referencia para el costo de giro (rad/s).
     pub omega_ref: f32,
@@ -130,7 +136,12 @@ pub struct CoachParams {
     /// Desvío (escenarios 3 y 6): con la pelota rodando libre y llegando a más de esto (m/s) a
     /// un punto de su camino en la mitad rival que un jugador de campo alcanza antes (el apoyo,
     /// o el atacante en vez de recibirla), ese jugador se para ahí con una cara orientada para
-    /// que rebote al arco. 0 = nunca.
+    /// que rebote al arco. 0 = nunca. En el banco funciona (`desvio`: 8/9 goles con el robot ya
+    /// parado y orientado), pero en partido casi no hay pelotas que un robot alcance a
+    /// esperar: a 0.45 m/s, 2.8 intentos por partido y ningún toque (+0.02 ± 0.16 y
+    /// +0.31 ± 0.19); a 0.7, −0.15 ± 0.22 y −0.12 ± 0.20; con el plan sostenido, desvío de a
+    /// uno y la rampa de aceleración, ~1 intento por partido. Queda apagado: le falta el pase
+    /// dirigido al que desvía (escenario 6).
     pub deflect_min_speed: f32,
     /// Desvío: cuánto devuelve la cara de la velocidad normal de la pelota respecto de la
     /// tangencial. En FIRASim (motion_bench `desvio`) la cara apaga casi toda la normal: con 0.1

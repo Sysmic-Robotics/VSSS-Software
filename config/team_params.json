@@ -1,7 +1,7 @@
 {
   "coach": {
     "keeper_id": 2,
-    "v_ref": 1.0,
+    "v_ref": 0.7,
     "omega_ref": 3.0,
     "role_switch_gain": 0.75,
     "role_min_hold": 5,
@@ -73,11 +73,11 @@
     "dribble_speed": 0.8
   },
   "motion": {
-    "max_linear_speed": 1.2,
+    "max_linear_speed": 0.7,
     "min_linear_speed": 0.06,
     "max_angular_speed": 3.0,
     "arrival_threshold": 0.04,
-    "brake_distance": 0.5,
+    "brake_distance": 0.28,
     "uvf_influence_radius": 0.2,
     "uvf_k_rep": 1.5,
     "heading_gain": 3.0,
@@ -86,7 +86,7 @@
   },
   "robot": {
     "max_v_mm_s": 1500,
-    "max_w_deg_s": 720
+    "max_w_deg_s": 1000
   },
   "sim": {
     "wheel_base_m": 0.085,

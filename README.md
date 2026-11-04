@@ -751,7 +751,7 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 | Parámetro | Valor | Descripción |
 |-----------|-------|-------------|
 | `robot.max_v_mm_s` (`config/team_params.json`) | `1500` | Tope de v, el mismo clamp que aplica la base (`MAX_V_MM_S`) |
-| `robot.max_w_deg_s` (`config/team_params.json`) | `720` | Tope de ω en grados/s, el mismo clamp que aplica la base (`MAX_W_DEG_S`) |
+| `robot.max_w_deg_s` (`config/team_params.json`) | `1000` | Tope de ω en grados/s, el mismo clamp que aplican la base (`MAX_W_DEG_S` / `MAX_ANGULAR_DEG_S`) y el robot (`MAX_ANGULAR_MRAD_S`) en la rama `giro-1000` del firmware; con el firmware de Peluche la base sigue recortando a 720 |
 | `SLOT_COUNT` | `5` | Slots del frame ASCII; el robot físico con `MI_ROBOT_ID = N` (firmware, desde 1) lee `slots[N-1]`. El robot del checkout actual es `MI_ROBOT_ID 2` → slot 1 |
 | Identidad de los robots (`config/identidad_robots.json`) | sin archivo: radio N ↔ patrón N | Qué patrón lleva cada robot físico y si está activo (ver abajo) |
 

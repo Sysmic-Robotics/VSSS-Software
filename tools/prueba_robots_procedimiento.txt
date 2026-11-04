@@ -16,9 +16,9 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
  2. mkdir -p ~/uni
  3. Baterías cargadas; anotar el voltaje de cada una en ~/uni/notas.txt.
  4. Firmware nuevo con el tope de 700 mm/s por rueda (MAX_WHEEL_MM_S = 700) flasheado en
-    los robots, y la base con MAX_W_DEG_S subido (con 700 mm/s sobre la vía de 75 mm el
-    robot gira hasta ~1070 °/s; con 720 °/s el giro de SpinKick queda recortado). Si no
-    alcanza para todos, al menos uno, para el bloque E. Así no se flashea nada en la cancha.
+    los robots, y el tope de giro en 1000 °/s en la base y en el robot (rama giro-1000 del
+    firmware; con 720 °/s el giro de SpinKick queda recortado). Si no alcanza para todos,
+    al menos uno, para el bloque E. Así no se flashea nada en la cancha.
  5. Abrir cuatro terminales en la carpeta del repo, con los comandos de abajo escritos.
 
  SEGURIDAD: la base NO tiene timeout de serial. Siempre alguien listo para LEVANTAR EL
@@ -95,11 +95,15 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
       cargo run --release --bin skill_test -- --transport base-station --mode vw \
         --team blue --robot N --v 500 --w 0 --dur 1.2
     y luego --v 700 y --v 900 (este último debe quedar igual que 700: es el tope).
- 2. Giro en el lugar: --v 0 --w 1000 --dur 1. Anotar si gira más rápido que con --w 720
-    (si no, la base sigue recortando el giro en MAX_W_DEG_S).
+ 2. Solo con la base y el robot flasheados desde la rama giro-1000 del firmware (tope de
+    giro 1000 °/s; el PC ya manda hasta 1000): giro en el lugar --v 0 --w 1000 --dur 1, y
+    comparar con --w 720: debe girar más rápido. Si no, alguno de los dos sigue en 720.
  3. Mirar que no oscile ni se quede una rueda atrás, también con la batería a medias.
  ANOTAR en notas.txt: distancias y si el giro sube. Con eso se ajusta el simulador
- (sim.max_wheel_rad_s 35 = 0.7 m/s) y robot.max_w_deg_s en config/team_params.json.
+ (sim.max_wheel_rad_s 35 = 0.7 m/s).
+ SI NO LLEGA A 0.7 m/s: config/team_params.json tiene el planificador en 0.7 (coach.v_ref,
+ motion.max_linear_speed y motion.brake_distance 0.28). Con el tope medido v (m/s), poner
+ v_ref = max_linear_speed = v y brake_distance = 0.44 × (v − 0.06) (0.45 m/s → 0.17).
 
 -------------------------------------------------------------------------------------
  F. COPIAR LOS DATOS ............................................ minuto 28 a 30
