@@ -302,6 +302,10 @@ pub struct SkillParams {
     /// diferencia contra 90: cara a cara +0.25 ± 0.16 y +0.04 ± 0.12 (96 partidos). Queda en 90
     /// hasta medir el robot real y usarlo donde importa la puntería (tiro de banda).
     pub spin_exit_angle_deg: f32,
+    /// Ganancia del giro final con que las skills tácticas (aproximarse, empujar, interceptar,
+    /// marcar, despejar, girar) se orientan al llegar (rad/s por rad, topado por
+    /// `motion.max_angular_speed`). Con 1.2, faltando 20° gira a ~0.4 rad/s, cada vez más lento.
+    pub aim_kp: f64,
     /// SpinKick: a esta distancia del punto de contacto deja de navegar a él y cierra
     /// sobre la pelota hasta tenerla al alcance (gira solo tocándola) (m). Mayor que
     /// `motion.arrival_threshold`: si no, motion lo detiene antes y queda quieto.
@@ -363,6 +367,7 @@ impl Default for SkillParams {
             spin_contact_radius: 0.065,
             spin_omega: 20.0,
             spin_exit_angle_deg: 90.0,
+            aim_kp: 1.2,
             spin_pos_tol: 0.05,
             spin_release_ball_speed: 0.4,
             spin_max_time_s: 1.0,
