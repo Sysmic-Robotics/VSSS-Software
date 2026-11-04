@@ -23,7 +23,6 @@ use crate::skills::zones::{AreaRect, AREA_CLEARANCE};
 use crate::world::{RobotState, World};
 use glam::Vec2;
 
-const CONTROL_KP: f64 = 1.2;
 const CONTROL_KI: f64 = 0.0;
 const CONTROL_KD: f64 = 0.10;
 
@@ -192,7 +191,7 @@ impl ApproachAlignedSkill {
             angle_tol: p.approach_angle_tol,
             pre_align_radius: p.approach_pre_align_radius,
             bidirectional: MotionConfig::from_env().bidirectional,
-            kp: CONTROL_KP,
+            kp: params().skills.aim_kp,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
         }
@@ -338,7 +337,7 @@ impl ShootPushSkill {
             behind_tol: p.shoot_behind_tol,
             lateral_tol: p.shoot_lateral_tol,
             release_ball_speed: p.shoot_release_ball_speed,
-            kp: CONTROL_KP,
+            kp: params().skills.aim_kp,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
             pushing: false,
@@ -483,7 +482,7 @@ impl InterceptSkill {
             ball_decay_per_s: p.intercept_ball_decay_per_s,
             reaction_delay: p.intercept_reaction_delay,
             reach_radius: p.intercept_reach_radius,
-            kp: CONTROL_KP,
+            kp: params().skills.aim_kp,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
         }
@@ -577,7 +576,7 @@ impl BlockLineSkill {
         Self {
             own_goal,
             distance: p.block_distance,
-            kp: CONTROL_KP,
+            kp: params().skills.aim_kp,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
         }
@@ -723,7 +722,7 @@ impl ClearSkill {
             lose_radius: p.clear_lose_radius,
             push_overshoot: p.shoot_push_overshoot,
             release_ball_speed: p.clear_release_ball_speed,
-            kp: CONTROL_KP,
+            kp: params().skills.aim_kp,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
             eff_dir: None,
@@ -886,7 +885,7 @@ impl SpinKickSkill {
             pos_tol: p.spin_pos_tol,
             release_ball_speed: p.spin_release_ball_speed,
             max_spin_ticks: (p.spin_max_time_s * 60.0).ceil() as u32,
-            kp: CONTROL_KP,
+            kp: params().skills.aim_kp,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
             spin_sign: 0.0,
@@ -1084,7 +1083,7 @@ impl MarkSkill {
     pub fn new(point: Vec2) -> Self {
         Self {
             point,
-            kp: CONTROL_KP,
+            kp: params().skills.aim_kp,
             ki: CONTROL_KI,
             kd: CONTROL_KD,
         }
