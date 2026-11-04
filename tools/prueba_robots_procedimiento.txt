@@ -48,7 +48,8 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
       tools/iniciar.sh real --sin-coach
     Girar el robot a mano y mirar la flecha; cambiar el número y relanzar hasta que calce.
     Anotar el valor. El export queda para todos los bloques siguientes (todos los robots
-    deben llevar la barra del mismo lado).
+    deben llevar la barra del mismo lado). El valor final va en config/team_params.json:
+    el ícono del escritorio no usa VSSL_PARAMS, así que lo de giro.json no le llega.
  5. Guardar la identidad con "Identificar" y cerrar la interfaz.
 
 -------------------------------------------------------------------------------------
@@ -109,6 +110,7 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
  SI NO LLEGA A 0.7 m/s: config/team_params.json tiene el planificador en 0.7 (coach.v_ref,
  motion.max_linear_speed y motion.brake_distance 0.28). Con el tope medido v (m/s), poner
  v_ref = max_linear_speed = v y brake_distance = 0.44 × (v − 0.06) (0.45 m/s → 0.17).
+ Guardarlos en config/team_params.json (el ícono del escritorio no usa VSSL_PARAMS).
 
 -------------------------------------------------------------------------------------
  F. COPIAR LOS DATOS ............................................ minuto 28 a 30
