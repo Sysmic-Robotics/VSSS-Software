@@ -623,8 +623,10 @@ leyendo el estado del árbitro (`ControlLoopConfig.referee`):
   el mismo camino que HALT (el coach no decide), hasta que llega cualquier comando del árbitro;
   desde ahí manda el árbitro. Si el engine se reinicia en pleno juego, o se prueba sin árbitro, el
   botón **Jugar sin esperar al árbitro** de la barra de la GUI suelta la espera; la barra dice
-  "Árbitro: esperando su primer comando" mientras tanto. Sin GUI y sin árbitro, usar
-  `VSSL_ESPERAR_ARBITRO=0`. `motion_bench`, `scenario` y `skill_test` no esperan.
+  "Árbitro: esperando su primer comando" mientras tanto. Como en HALT, durante la espera no
+  corren el manual, las skills de la GUI ni **Identificar** (la pestaña Robots dice cómo
+  soltarla). Sin GUI y sin árbitro, usar `VSSL_ESPERAR_ARBITRO=0`. `motion_bench`, `scenario` y
+  `skill_test` no esperan.
 
 Fuentes, por el mismo puerto (`VSSL_REFEREE_ADDR`): **VSSReferee** (simulador, protobuf
 `VSSRef_Command`) o **texto del operador** para el árbitro humano de la cancha:
@@ -773,7 +775,7 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 **Pestaña Robots de la GUI** (solo con la base station):
 - una fila por radio, con el patrón y el interruptor de activo, editables en vivo (rigen desde el tick siguiente y se guardan en el archivo), y una frase con lo que ve la cámara;
 - avisos: dos radios con el mismo patrón, un patrón que el coach no manda (del 3 al 5) visto en la cámara, un patrón visto que ningún robot tiene;
-- **Identificar:** con el coach en pausa (P), sin rutina, sin el manual ni una skill de la GUI, gira cada robot activo de a uno (90 °/s, 0.6 s de ida y 0.6 s de vuelta: termina donde empezó), ve qué patrón giró y propone la identidad. "Aplicar" la usa y la guarda; "Descartar" no cambia nada. Si no gira ninguno, giran dos con la misma radio (dos robots con el mismo `MI_ROBOT_ID`) o dos radios hacen girar el mismo patrón, lo dice en frase. Mientras gira, solo se mueve ese robot (el frame pone en cero a los demás); la parada de emergencia y HALT lo cortan en el acto, y sin refresco de la GUI se corta a los 250 ms.
+- **Identificar:** con el coach en pausa (P), sin rutina, sin el manual ni una skill de la GUI, gira cada robot activo de a uno (90 °/s, 0.6 s de ida y 0.6 s de vuelta: termina donde empezó), ve qué patrón giró y propone la identidad. "Aplicar" la usa y la guarda; "Descartar" no cambia nada. Si no gira ninguno, giran dos con la misma radio (dos robots con el mismo `MI_ROBOT_ID`) o dos radios hacen girar el mismo patrón, lo dice en frase. Mientras gira, solo se mueve ese robot (el frame pone en cero a los demás); la parada de emergencia y HALT lo cortan en el acto (con la espera del primer comando del árbitro no arranca: hay que soltarla antes), y sin refresco de la GUI se corta a los 250 ms.
 
 La terminal imprime la identidad al arrancar y en cada cambio (`[control_loop] identidad: radio 0 (MI_ROBOT_ID 1): patrón 1`), y la sección Radio del Inspector la muestra. `skill_test --mode vw --robot N` **no** pasa por la identidad: ahí N es la posición de radio cruda (bring-up sin visión).
 

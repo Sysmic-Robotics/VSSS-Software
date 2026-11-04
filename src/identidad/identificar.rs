@@ -60,6 +60,9 @@ pub struct Condiciones {
     pub parada: bool,
     /// HALT del árbitro.
     pub halt: bool,
+    /// El lazo espera el primer comando del árbitro (`VSSL_ESPERAR_ARBITRO`): manda ceros
+    /// como en HALT, pero se suelta desde la barra de estado.
+    pub espera_arbitro: bool,
     /// Corte sin visión.
     pub sin_vision: bool,
     pub coach_activo: bool,
@@ -75,6 +78,9 @@ pub struct Condiciones {
 pub fn puede_identificar(c: &Condiciones, identidad: &Identidad, vistos: &[(i32, f64)]) -> Result<(), String> {
     let razon = if c.parada {
         "Suelta la parada de emergencia para identificar."
+    } else if c.espera_arbitro {
+        "El equipo espera el primer comando del árbitro: suéltalo con «Jugar sin esperar al árbitro» \
+         (barra de estado) o manda un comando del árbitro."
     } else if c.halt {
         "El árbitro tiene al equipo en HALT."
     } else if c.coach_activo {
@@ -101,6 +107,8 @@ fn causa_de_corte(c: &Condiciones) -> Option<&'static str> {
         Some("cancelada")
     } else if c.parada {
         Some("parada de emergencia")
+    } else if c.espera_arbitro {
+        Some("espera del primer comando del árbitro")
     } else if c.halt {
         Some("HALT del árbitro")
     } else if c.sin_vision {
@@ -764,6 +772,8 @@ mod tests {
         assert!(puede_identificar(&Condiciones { manual: true, ..Default::default() }, &id, &v).unwrap_err().contains("control manual"));
         assert!(puede_identificar(&Condiciones { skill_gui: true, ..Default::default() }, &id, &v).unwrap_err().contains("skill de la GUI"));
         assert!(puede_identificar(&Condiciones { halt: true, ..Default::default() }, &id, &v).unwrap_err().contains("HALT"));
+        let espera = puede_identificar(&Condiciones { espera_arbitro: true, halt: true, ..Default::default() }, &id, &v);
+        assert!(espera.unwrap_err().contains("Jugar sin esperar al árbitro"));
     }
 
     #[test]

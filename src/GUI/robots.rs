@@ -192,9 +192,11 @@ impl DebugGui {
     /// Lo que puede cortar (o impedir) la identificación, con el estado de ahora.
     fn condiciones_identificar(&self, cancelar: bool) -> Condiciones {
         let parada = self.estop_activa() || self.snap.estop;
+        let espera_arbitro = self.snap.esperando_arbitro && !parada;
         Condiciones {
             parada,
-            halt: self.snap.mode == TickMode::Halt && !parada,
+            espera_arbitro,
+            halt: self.snap.mode == TickMode::Halt && !parada && !espera_arbitro,
             sin_vision: self.snap.mode == TickMode::SinVision,
             coach_activo: self.coach_activo(),
             rutina: self.snap.rutina.is_some(),
@@ -669,6 +671,20 @@ mod tests {
             p.g.razon_identificar(),
             Err("Pon el coach en pausa (P): con el coach activo, los robots se mueven.".to_string())
         );
+    }
+
+    #[test]
+    fn la_espera_del_arbitro_dice_como_soltarla() {
+        // El lazo espera el primer comando: la foto llega en HALT, sin parada puesta.
+        let mut p = gui("espera");
+        let snap = LoopSnapshot { mode: TickMode::Halt, esperando_arbitro: true, ..foto(Identidad::default(), &[(0, 0.0)]) };
+        let _ = p.g.update(Message::Snapshot(Arc::new(snap)));
+        let razon = p.g.razon_identificar().unwrap_err();
+        assert!(razon.contains(super::super::status_line::TEXTO_SOLTAR_ESPERA), "{razon}");
+        assert!(!razon.contains("HALT"), "{razon}");
+        // Soltada la espera, se puede.
+        let _ = p.g.update(Message::Snapshot(Arc::new(foto(Identidad::default(), &[(0, 0.0)]))));
+        assert_eq!(p.g.razon_identificar(), Ok(()));
     }
 
     #[test]
