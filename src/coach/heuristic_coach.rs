@@ -907,8 +907,8 @@ impl HeuristicCoach {
     }
 
     /// Pase y desvío (`pass_deflect_max_dist`): sigue, termina o empieza la jugada.
-    /// Empieza con el atacante pegado detrás de la pelota quieta (respecto del pase), el tiro
-    /// directo tapado y el apoyo en campo rival a 0.25 m a `pass_deflect_max_dist` de la
+    /// Empieza con el atacante pegado detrás de la pelota quieta (respecto del pase), ningún rival
+    /// a menos de 0.15 m de ella, el tiro directo tapado y el apoyo en campo rival a 0.25 m a `pass_deflect_max_dist` de la
     /// pelota, con el pase y su salida al arco libres de rivales y un desvío de 15° a 100°. El
     /// pasador frena cuando la pelota ya va a 0.5 m/s o recorrió 0.2 m (o a 1 s). Termina a los
     /// 3 s, si un rival toma la pelota, si cambian los roles, o cuando, ya suelta, la pelota se
@@ -956,7 +956,11 @@ impl HeuristicCoach {
         let aim = self.attack_goal;
         let p = sup.pos;
         let d = (p - ball).length();
+        // Sin un rival pegado a la pelota: con uno a menos de 0.15 m la jugada se cancelaba en la
+        // decisión siguiente ("la tomó un rival") y en partido duraba 0.08 s.
+        let contested = opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.15);
         if ball_vel.length() > 0.3
+            || contested
             || (st.pos - ball).length() > 0.12
             || d < 0.25
             || d > max_dist
@@ -990,6 +994,70 @@ impl HeuristicCoach {
             started: self.decision_count,
             released: None,
         });
+    }
+
+    /// Distancia del rival activo más cercano al segmento `a`→`b` (solo los que quedan a lo
+    /// largo del segmento); infinito si no hay ninguno.
+    fn segment_clearance(a: Vec2, b: Vec2, opp: &[RobotView]) -> f32 {
+        let seg = b - a;
+        let len = seg.length();
+        if len < 1e-3 {
+            return f32::INFINITY;
+        }
+        let dir = seg / len;
+        opp.iter()
+            .filter(|o| o.active)
+            .filter_map(|o| {
+                let rel = o.pos - a;
+                let along = rel.dot(dir);
+                (along > 0.0 && along < len).then(|| (rel - dir * along).length())
+            })
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Punto donde el apoyo arma el pase y desvío: alrededor de la pelota, a 0.30-0.50 m (sin
+    /// pasar `pass_deflect_max_dist`) y girado 20-45° desde la dirección en que el atacante
+    /// empuja (así pasa sin rodear la pelota), en campo rival y fuera del área, con el pase y la
+    /// salida al arco libres de rivales, ninguno a menos de 0.20 m y un desvío de 15° a 100°.
+    /// Entre los que quedan, el más lejos de los rivales (y el más corto si empatan). `None` sin
+    /// atacante cerca de la pelota.
+    fn pass_window(&self, ball: Vec2, striker: Option<&RobotView>, opp: &[RobotView]) -> Option<Vec2> {
+        let max_dist = self.p.pass_deflect_max_dist;
+        let st = striker?;
+        let s = self.attack_sign();
+        if max_dist <= 0.0 || (st.pos - ball).length() > 0.25 || ball.x * s < -0.20 {
+            return None;
+        }
+        let aim = self.attack_goal;
+        let push = (ball - st.pos).normalize_or_zero();
+        if push.length_squared() < 0.5 {
+            return None;
+        }
+        let mut best: Option<(f32, f32, Vec2)> = None;
+        for d in [0.30_f32, 0.40, 0.50] {
+            if d > max_dist {
+                continue;
+            }
+            for deg in [-45.0_f32, -30.0, -20.0, 20.0, 30.0, 45.0] {
+                let dir = Vec2::from_angle(deg.to_radians()).rotate(push);
+                let p = ball + dir * d;
+                let inside = p.x.abs() <= FIELD_ROBOT_MAX_ABS_X && p.y.abs() <= FIELD_ROBOT_MAX_ABS_Y;
+                if !inside || p.x * s < 0.0 || p.x * s > GOAL_AREA_X - 0.05 {
+                    continue;
+                }
+                let turn = dir.dot((aim - p).normalize_or_zero());
+                let near = opp.iter().filter(|o| o.active).map(|o| (o.pos - p).length()).fold(f32::INFINITY, f32::min);
+                let clear = Self::segment_clearance(ball, p, opp).min(Self::segment_clearance(p, aim, opp));
+                if !(-0.17..=0.97).contains(&turn) || near < 0.20 || clear < 0.12 {
+                    continue;
+                }
+                let score = clear.min(0.5) + near.min(0.5);
+                if best.map_or(true, |b| score > b.0 + 1e-3 || ((score - b.0).abs() <= 1e-3 && d < b.1)) {
+                    best = Some((score, d, p));
+                }
+            }
+        }
+        best.map(|b| b.2)
     }
 
     /// Fin de la jugada: se sueltan los compromisos de los dos (Hold, Dribble, GoTo y FacePoint
@@ -1297,6 +1365,13 @@ impl HeuristicCoach {
         // arco, mirando a la pelota) en vez de subir a apoyar.
         if let Some(t) = self.threat(ball, opp) {
             let pos = self.mark_point(t.pos);
+            let skill = self.commit(r.id, SkillId::Mark, |_| true);
+            return SkillChoice::new(r.id, skill, pos);
+        }
+        // Ventana de pase y tiro (`pass_deflect_max_dist`): el apoyo se para donde el pase desde
+        // la pelota y su salida al arco quedan libres de rivales, para que el atacante pueda
+        // armar el pase y desvío; con un rival tapando busca otro punto en vez de esperar.
+        if let Some(pos) = self.pass_window(ball, striker, opp) {
             let skill = self.commit(r.id, SkillId::Mark, |_| true);
             return SkillChoice::new(r.id, skill, pos);
         }
@@ -2166,6 +2241,28 @@ mod tests {
         rodando.opp_robots[0] = robot(Vec2::new(0.35, -0.06), 180.0);
         let ch = c.decide(&rodando);
         assert_eq!(choice_of(&ch, 0).skill_id, SkillId::Hold, "frenó para soltarla");
+    }
+
+    #[test]
+    fn support_finds_a_pass_window_around_blockers() {
+        // Atacante detrás de la pelota hacia el arco y un rival tapando el tiro directo. Con la
+        // opción, el apoyo va a un punto con el pase y la salida al arco libres; si otro rival se
+        // para en ese punto, elige otro. Apagado, no busca ventana.
+        let ball = Vec2::new(0.10, -0.10);
+        let st = RobotView { id: 0, pos: Vec2::new(0.0, -0.10), theta: 0.0, active: true };
+        let tapa = RobotView { id: 0, pos: Vec2::new(0.35, -0.06), theta: 3.14, active: true };
+        let mut c = coach();
+        assert!(c.pass_window(ball, Some(&st), &[tapa]).is_none(), "apagado");
+        c.p.pass_deflect_max_dist = 0.6;
+        let p = c.pass_window(ball, Some(&st), &[tapa]).expect("ventana");
+        let goal = c.attack_goal;
+        assert!(!HeuristicCoach::line_blocked(ball, p, &[tapa], 0.09), "pase libre {p:?}");
+        assert!(!HeuristicCoach::line_blocked(p, goal, &[tapa], 0.09), "tiro libre {p:?}");
+        let d = (p - ball).length();
+        assert!((0.29..=0.51).contains(&d) && p.x > 0.0, "{p:?}");
+        let otro = RobotView { id: 1, pos: p, theta: 0.0, active: true };
+        let q = c.pass_window(ball, Some(&st), &[tapa, otro]).expect("otra ventana");
+        assert!((q - p).length() > 0.15, "{p:?} {q:?}");
     }
 
     #[test]
