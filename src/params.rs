@@ -157,7 +157,10 @@ pub struct CoachParams {
     /// El apoyo que está a menos de esto (m) del camino atacante → pelota se corre al costado
     /// (con el atacante a más de 0.25 m de la pelota). 0 = nunca. El atacante frenado por un
     /// compañero lo frenaba el apoyo en el 99.9 % de los casos: cubriendo la línea (68 %) o
-    /// marcando (32 %), quieto en dos tercios (12 % del tiempo lento del atacante).
+    /// marcando (32 %), quieto en dos tercios (12 % del tiempo lento del atacante). Con 0.12 a
+    /// 0.7 m/s los choques solo bajan 7 % (el apoyo, ahora con `Mark` al costado, sigue en el
+    /// camino el 59 %) y cara a cara −0.23 ± 0.24 (48 partidos; el segundo bloque se cortó a los
+    /// 14). Queda apagado.
     pub support_yield_dist: f32,
 }
 
