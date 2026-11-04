@@ -33,7 +33,11 @@ pub struct CoachParams {
     pub omega_ref: f32,
     /// El striker cambia solo si el otro llega en menos de este factor del tiempo.
     pub role_switch_gain: f32,
-    /// Decisiones mínimas entre cambios de rol (a 10 Hz: 5 = 0.5 s).
+    /// Decisiones mínimas entre cambios de rol (a 10 Hz: 5 = 0.5 s). (Se probó un coach más
+    /// calmado: role_switch_gain 0.6, role_min_hold 10, skill_min_hold 5 y score_hysteresis
+    /// 0.25. Cambios de atacante de 18.7 a 11.1 por minuto y vueltas atrás en < 1 s de 29 a
+    /// 2 %, pero ni arranca antes ni titubea menos entre empujar y girar; cara a cara −0.25 ±
+    /// 0.17 y −0.02 ± 0.17 en 96 partidos. Queda como estaba.)
     pub role_min_hold: u32,
     /// Decisiones mínimas manteniendo una skill (a 10 Hz: 3 = 0.3 s).
     pub skill_min_hold: u32,
@@ -117,6 +121,15 @@ pub struct CoachParams {
     /// penales contra el arquero de rule_based (sigue la y de la pelota): 0.09 convierte 51 %
     /// contra 82 % de 0.06 (240 penales); 0.04, 84 % contra 79 % (sin diferencia).
     pub aim_post_margin: f32,
+    /// Desvío (escenarios 3 y 6): con la pelota rodando libre y llegando a más de esto (m/s) a
+    /// un punto de su camino en la mitad rival que un jugador de campo alcanza antes (el apoyo,
+    /// o el atacante en vez de recibirla), ese jugador se para ahí con una cara orientada para
+    /// que rebote al arco. 0 = nunca.
+    pub deflect_min_speed: f32,
+    /// Desvío: cuánto devuelve la cara de la velocidad normal de la pelota respecto de la
+    /// tangencial. En FIRASim (motion_bench `desvio`) la cara apaga casi toda la normal: con 0.1
+    /// entra al centro del arco y con 1 (espejo) junto al palo. Medir en la cancha.
+    pub deflect_face_k: f32,
 }
 
 impl Default for CoachParams {
@@ -162,6 +175,8 @@ impl Default for CoachParams {
             estilo: "equilibrado".to_string(),
             playbook_episodio_s: 15.0,
             aim_post_margin: 0.06,
+            deflect_min_speed: 0.0,
+            deflect_face_k: 0.15,
         }
     }
 }
@@ -261,6 +276,15 @@ pub struct SkillParams {
     pub spin_contact_radius: f32,
     /// SpinKick: velocidad angular del giro (rad/s).
     pub spin_omega: f64,
+    /// SpinKick: ángulo, en el sentido del giro, entre la recta centro del robot → pelota y
+    /// la dirección en que sale la pelota (grados). 90 = sale tangente (modelo de robot
+    /// redondo). El robot es cuadrado: la pelota sale por la normal de la cara que la golpea,
+    /// cos φ = (medio lado + radio de la pelota) / spin_contact_radius ≈ 26°, aunque en FIRASim
+    /// sale a ~38° (`tools/medir_spinkick.py`, con 90 y con 26). Con 26, en motion_bench (tope
+    /// real) el error del tiro baja de −48..−68° a −16..+6°, pero en partidos no se detecta
+    /// diferencia contra 90: cara a cara +0.25 ± 0.16 y +0.04 ± 0.12 (96 partidos). Queda en 90
+    /// hasta medir el robot real y usarlo donde importa la puntería (tiro de banda).
+    pub spin_exit_angle_deg: f32,
     /// SpinKick: a esta distancia del punto de contacto deja de navegar a él y cierra
     /// sobre la pelota hasta tenerla al alcance (gira solo tocándola) (m). Mayor que
     /// `motion.arrival_threshold`: si no, motion lo detiene antes y queda quieto.
@@ -321,6 +345,7 @@ impl Default for SkillParams {
             clear_release_ball_speed: 0.5,
             spin_contact_radius: 0.065,
             spin_omega: 20.0,
+            spin_exit_angle_deg: 90.0,
             spin_pos_tol: 0.05,
             spin_release_ball_speed: 0.4,
             spin_max_time_s: 1.0,

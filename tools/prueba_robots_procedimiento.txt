@@ -1,0 +1,107 @@
+PRUEBA DE LOS ROBOTS REALES EN 30 MINUTOS: QUÉ MEDIR PARA QUE EL SIMULADOR JUEGUE COMO LA CANCHA
+=================================================================================================
+
+Hay 30 minutos de cancha. Todo lo que se puede hacer antes (compilar, cargar baterías, flashear,
+abrir terminales) se hace ANTES de entrar. En la cancha solo se corren comandos ya escritos.
+Cada bloque tiene su tiempo: si se pasa, se corta y se sigue con el siguiente.
+Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a Benja.
+
+-------------------------------------------------------------------------------------
+ ANTES DE IR (en casa o en el camino, no gasta tiempo de cancha)
+-------------------------------------------------------------------------------------
+ 1. Traer la rama de Benja al main del notebook y compilar:
+      git fetch origin
+      git merge origin/feature/estrategia-competitiva
+      cargo build --release
+ 2. mkdir -p ~/uni
+ 3. Baterías cargadas; anotar el voltaje de cada una en ~/uni/notas.txt.
+ 4. Firmware nuevo con el tope de 700 mm/s por rueda (MAX_WHEEL_MM_S = 700) flasheado en
+    los robots, y la base con MAX_W_DEG_S subido (con 700 mm/s sobre la vía de 75 mm el
+    robot gira hasta ~1070 °/s; con 720 °/s el giro de SpinKick queda recortado). Si no
+    alcanza para todos, al menos uno, para el bloque E. Así no se flashea nada en la cancha.
+ 5. Abrir cuatro terminales en la carpeta del repo, con los comandos de abajo escritos.
+
+ SEGURIDAD: la base NO tiene timeout de serial. Siempre alguien listo para LEVANTAR EL
+ ROBOT o DESENCHUFAR LA BASE. Cortar solo con Ctrl+C. No tocar la configuración del
+ SSL-Vision de la sala. Un solo programa con la base a la vez.
+ Si el engine no ve robots: export VSSL_VISION_PORT=10006
+ Si la base no es /dev/ttyUSB0: export VSSL_BASESTATION_DEVICE=/dev/ttyUSBn
+
+-------------------------------------------------------------------------------------
+ A. VISIÓN E IDENTIDAD (6.1 y 6.2) .............................. minuto 0 a 5
+-------------------------------------------------------------------------------------
+ 1. tools/iniciar.sh real --sin-coach
+ 2. Los robots bajo la cámara, uno a la vez. En la pestaña Robots, anotar el patrón de cada
+    uno: los rojos deben salir como 4 y 5; los titulares, en 0, 1 y 2.
+ 3. Girar cada robot a mano: la flecha de la GUI debe apuntar a su frente.
+ 4. 6.1 (barra de equipo ADELANTE o ATRÁS): SSL-Vision reconoce el parche girado igual (el
+    patrón no depende de la orientación); lo que cambia es la flecha. Hoy el engine suma
+    vision.real_theta_offset_deg = 180, que corresponde a la barra al COSTADO. Con la barra
+    adelante o atrás el valor correcto es 90 o 270. Con el parche nuevo puesto:
+      echo '{"vision": {"real_theta_offset_deg": 90}}' > ~/uni/giro.json
+      export VSSL_PARAMS=~/uni/giro.json
+      tools/iniciar.sh real --sin-coach
+    Girar el robot: si la flecha apunta a su frente, listo; si apunta atrás, cambiar 90 por
+    270 en giro.json y relanzar. Anotar el valor. El export queda para todos los bloques
+    siguientes (todos los robots deben llevar la barra del mismo lado).
+ 5. Guardar la identidad con "Identificar" y cerrar la interfaz.
+
+-------------------------------------------------------------------------------------
+ B. PARTIDO CON REGISTRO Y ÁRBITRO (1.4 corto, 6.3 a 6.7) ....... minuto 5 a 13
+-------------------------------------------------------------------------------------
+ Un solo partido corto da velocidades reales en juego, frenado de la pelota en esa
+ cancha, ruido de la cámara y la reacción al árbitro.
+ 1. Terminal 1: tools/salita_equipo.sh blue /dev/ttyUSB0 uni1
+    Terminal 2: python3 tools/referee_cli.py
+ 2. Activar el coach (P). Dejar jugar 4 minutos contra lo que haya (otro equipo propio
+    por la otra base, o robots quietos de obstáculo).
+ 3. Durante el partido, en la terminal 2, uno por vez y cada uno seguido de "go" (GAME_ON):
+      s        (STOP: quedan quietos)
+      k b      (saque nuestro: 6.6 y 6.7, posiciones del saque)
+      p b      (penal a favor: 6.3)
+      p y      (penal en contra: 6.4)
+      b 1      (free ball)
+    Mirar: en STOP quedan quietos, se ubican sin entrar al área, con "go" retoman.
+ 4. Ctrl+C en las dos terminales. Anotar en notas.txt lo que hizo mal cada comando.
+ QUEDA en logs/salita/<fecha>/uni1_blue.csv (+ uni1_vision.bin).
+
+-------------------------------------------------------------------------------------
+ C. SYSID CORTO DE UN ROBOT (1.5, 2.6) .......................... minuto 13 a 19
+-------------------------------------------------------------------------------------
+ Solo los dos perfiles que dan velocidad, aceleración y giro (los otros cuatro, otro día).
+ Cancha sin pelota ni otros robots. Robot encendido QUIETO. Firmware NORMAL.
+ 1. tools/sysid_sesion.sh <posición de radio> <id de visión> full --repetir v_steps
+ 2. tools/sysid_sesion.sh <posición de radio> <id de visión> full --repetir w_steps
+ QUEDA en ~/sysid/<id>/full/.
+
+-------------------------------------------------------------------------------------
+ D. SPINKICK REAL .............................................. minuto 19 a 25
+-------------------------------------------------------------------------------------
+ En FIRASim la pelota sale ~38° desde la recta centro del robot → pelota. Hay que saber
+ cuánto es en el robot real (base de los tiros con giro).
+ 1. Pelota en (0, 0); robot a unos 10 cm a su izquierda, en (-0.10, 0.065), mirando a +y.
+ 2. N = patrón del robot:
+      cargo run --release --bin skill_test -- --transport base-station --mode skill \
+        --skill spinkick --team blue --robot N --target 0.75,0 --dur 5 --log ~/uni/spin_r1.csv
+ 3. Repetir 5 veces (spin_r1 a spin_r5), recolocando pelota y robot. Grabar con el celular.
+ 4. python3 tools/medir_spinkick.py ~/uni/spin_r*.csv   → última línea: el ángulo real.
+
+-------------------------------------------------------------------------------------
+ E. FIRMWARE DE 700 MM/S (robot con el firmware nuevo) .......... minuto 25 a 28
+-------------------------------------------------------------------------------------
+ El firmware ahora permite 700 mm/s por rueda (antes 450). Verificar que el robot los
+ sigue de verdad. N = posición de radio del robot.
+ 1. Rectas de 1.2 s desde un extremo, anotando la x inicial y final de la GUI:
+      cargo run --release --bin skill_test -- --transport base-station --mode vw \
+        --team blue --robot N --v 500 --w 0 --dur 1.2
+    y luego --v 700 y --v 900 (este último debe quedar igual que 700: es el tope).
+ 2. Giro en el lugar: --v 0 --w 1000 --dur 1. Anotar si gira más rápido que con --w 720
+    (si no, la base sigue recortando el giro en MAX_W_DEG_S).
+ 3. Mirar que no oscile ni se quede una rueda atrás, también con la batería a medias.
+ ANOTAR en notas.txt: distancias y si el giro sube. Con eso se ajusta el simulador
+ (sim.max_wheel_rad_s 35 = 0.7 m/s) y robot.max_w_deg_s en config/team_params.json.
+
+-------------------------------------------------------------------------------------
+ F. COPIAR LOS DATOS ............................................ minuto 28 a 30
+-------------------------------------------------------------------------------------
+ ~/uni/ (notas.txt y CSV), ~/sysid/ y logs/salita/<fecha>/ a un pendrive o por scp a Benja.
