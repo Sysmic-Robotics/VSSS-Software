@@ -92,7 +92,8 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
  El firmware ahora permite 700 mm/s por rueda (antes 450). Verificar que el robot los
  sigue de verdad. N = posición de radio del robot.
  1. Rectas de 1.2 s desde un extremo, anotando la x inicial y final de la GUI:
-      cargo run --release --bin skill_test -- --transport base-station --mode vw \n        --team blue --robot N --v 500 --w 0 --dur 1.2
+      cargo run --release --bin skill_test -- --transport base-station --mode vw \
+        --team blue --robot N --v 500 --w 0 --dur 1.2
     y luego --v 700 y --v 900 (este último debe quedar igual que 700: es el tope).
  2. Giro en el lugar: --v 0 --w 1000 --dur 1. Anotar si gira más rápido que con --w 720
     (si no, la base sigue recortando el giro en MAX_W_DEG_S).
