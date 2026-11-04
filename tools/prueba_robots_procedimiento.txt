@@ -95,8 +95,12 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
       cargo run --release --bin skill_test -- --transport base-station --mode vw \
         --team blue --robot N --v 500 --w 0 --dur 1.2
     y luego --v 700 y --v 900 (este último debe quedar igual que 700: es el tope).
- 2. Giro en el lugar: --v 0 --w 1000 --dur 1. Anotar si gira más rápido que con --w 720
-    (si no, la base sigue recortando el giro en MAX_W_DEG_S).
+ 2. Solo si la base se flasheó con MAX_W_DEG_S = 1000 (rama propia del firmware): el PC
+    también recorta ω (robot.max_w_deg_s = 720), así que subirlo en el mismo archivo del
+    bloque A y volver a exportarlo:
+      echo '{"vision": {"real_theta_offset_deg": 90}, "robot": {"max_w_deg_s": 1000}}' > ~/uni/giro.json
+    (con el giro que haya quedado en el bloque A). Giro en el lugar: --v 0 --w 1000 --dur 1,
+    y comparar con --w 720: debe girar más rápido.
  3. Mirar que no oscile ni se quede una rueda atrás, también con la batería a medias.
  ANOTAR en notas.txt: distancias y si el giro sube. Con eso se ajusta el simulador
  (sim.max_wheel_rad_s 35 = 0.7 m/s) y robot.max_w_deg_s en config/team_params.json.
