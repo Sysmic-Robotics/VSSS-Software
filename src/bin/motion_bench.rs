@@ -227,6 +227,13 @@ const CASES: &[Case] = &[
     Case { ball_vel: (0.147, 0.582), ..c("banda_libre_06", SkillId::Hold, (0.0, 0.0), (-0.5, -0.5, 0.0), (0.40, 0.30), 4.0, 0.0, Goal::Score) },
     Case { ball_vel: (0.245, 0.970), ..c("banda_libre_10", SkillId::Hold, (0.0, 0.0), (-0.5, -0.5, 0.0), (0.40, 0.30), 4.0, 0.0, Goal::Score) },
     Case { ball_vel: (0.368, 1.454), ..c("banda_libre_15", SkillId::Hold, (0.0, 0.0), (-0.5, -0.5, 0.0), (0.40, 0.30), 4.0, 0.0, Goal::Score) },
+    // Desvío (escenarios 3 y 6 de Benja): la pelota viene rodando (un pase) hacia (0.50, 0.10) y
+    // un robot quieto la espera con la cara orientada como espejo entre la llegada y el arco:
+    // normal = (salida − llegada) normalizado, −76.7°; el robot, 5.9 cm detrás del contacto.
+    // La pelota tiene que entrar. A 0.6, 1.0 y 1.5 m/s.
+    Case { ball_vel: (0.398, 0.448), ..c("desvio_06", SkillId::Hold, (0.0, 0.0), (0.486, 0.157, -76.7), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
+    Case { ball_vel: (0.664, 0.747), ..c("desvio_10", SkillId::Hold, (0.0, 0.0), (0.486, 0.157, -76.7), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
+    Case { ball_vel: (0.996, 1.121), ..c("desvio_15", SkillId::Hold, (0.0, 0.0), (0.486, 0.157, -76.7), (0.301, -0.124), 4.0, 0.0, Goal::Score) },
     // Girando junto a la pelota → GoTo a 0.16 m (dentro del radio en que SpinKick daba el
     // giro por vigente) → SpinKick de nuevo: la segunda activación debe acercarse y patear.
     Case {
@@ -313,6 +320,9 @@ const PENALTY_CASES: &[&str] = &["penal_giro_arriba", "penal_giro_abajo", "penal
 
 /// Tiro de banda (alias `banda`): empujando y de giro hacia el punto de rebote.
 const BANK_CASES: &[&str] = &["banda_empuje", "banda_giro", "banda_libre_06", "banda_libre_10", "banda_libre_15"];
+
+/// Desvío de una pelota que viene rodando (alias `desvio`).
+const DEFLECT_CASES: &[&str] = &["desvio_06", "desvio_10", "desvio_15"];
 
 /// Banco de conducción (alias `conduccion`): Dribble y la combinación de hoy desde las mismas poses.
 const DRIBBLE_CASES: &[&str] = &[
@@ -1032,6 +1042,7 @@ async fn main() {
     let dribble_alias = names.iter().any(|n| n == "conduccion");
     let penalty_alias = names.iter().any(|n| n == "penal");
     let bank_alias = names.iter().any(|n| n == "banda");
+    let deflect_alias = names.iter().any(|n| n == "desvio");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
@@ -1044,6 +1055,7 @@ async fn main() {
                 || (dribble_alias && DRIBBLE_CASES.contains(&c.name))
                 || (penalty_alias && PENALTY_CASES.contains(&c.name))
                 || (bank_alias && BANK_CASES.contains(&c.name))
+                || (deflect_alias && DEFLECT_CASES.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {
