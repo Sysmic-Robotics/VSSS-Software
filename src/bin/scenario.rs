@@ -185,6 +185,7 @@ fn run_bench(
         identidad_tx: None, // la identidad se edita desde main con GUI
         lado_tx: None,      // una skill fija: el lado de VSSL_SIDE queda
         soltar_espera_tx: None, // sin árbitro: no hay espera
+        arbitro: None,
         estop,
         coach_pausa: None, // una skill fija: no hay coach que pausar
         run: GUI::RunInfo::from_env(

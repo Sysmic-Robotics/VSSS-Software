@@ -9,6 +9,7 @@
 //! canal de "último valor": nunca frena el lazo) y manda comandos explícitos (manual,
 //! skill, PID, teleport, parada) por los mismos canales de siempre.
 
+pub mod arbitro;
 mod capas;
 mod charts;
 mod field;
@@ -357,7 +358,7 @@ pub enum Tab {
     /// Decisión del coach (fase 2).
     PorQue,
     Inspector,
-    /// Comandos del árbitro (fase 4).
+    /// Árbitro de práctica (`arbitro`), solo con `VSSL_ARBITRO_GUI=1`.
     Arbitro,
     /// Rutinas: lista, opciones, botones por fase y estado (capability `gui-rutinas`).
     Rutinas,
@@ -369,11 +370,13 @@ pub enum Tab {
 }
 
 impl Tab {
-    /// Las implementadas en esta fase, en orden. Robots, solo con la base station.
-    pub fn visibles(base_station: bool) -> Vec<Tab> {
-        [Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Robots, Tab::Parametros, Tab::Herramientas]
+    /// Las implementadas en esta fase, en orden. Robots, solo con la base station; Árbitro,
+    /// solo encendida (`VSSL_ARBITRO_GUI=1`).
+    pub fn visibles(base_station: bool, arbitro: bool) -> Vec<Tab> {
+        [Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Robots, Tab::Arbitro, Tab::Parametros, Tab::Herramientas]
             .into_iter()
             .filter(|t| *t != Tab::Robots || base_station)
+            .filter(|t| *t != Tab::Arbitro || arbitro)
             .collect()
     }
 
@@ -437,6 +440,8 @@ pub enum Message {
     CambiarLado,
     /// Jugar sin esperar el primer comando del árbitro (`EsperaArbitro` del lazo).
     SoltarEspera,
+    /// Botón de la pestaña Árbitro: el comando de texto (`arbitro::FILAS`).
+    Arbitro(&'static str),
     TpRobotXChanged(String),
     TpRobotYChanged(String),
     TpRobotThetaChanged(String),
@@ -511,6 +516,9 @@ pub struct GuiSetup {
     /// Soltar la espera del primer comando del árbitro → lazo
     /// (`GuiChannels::soltar_espera_rx`). `None`: sin botón.
     pub soltar_espera_tx: Option<mpsc::Sender<()>>,
+    /// Estado del árbitro de este engine, solo con la pestaña Árbitro encendida
+    /// (`VSSL_ARBITRO_GUI=1`). `None`: sin pestaña.
+    pub arbitro: Option<crate::coach::SharedReferee>,
     /// Flag de parada de emergencia compartido con el lazo.
     pub estop: Arc<AtomicBool>,
     /// Interruptor del coach (en pausa = `true`), compartido con el conmutador de `main`.
@@ -574,6 +582,9 @@ pub struct DebugGui {
     lado_tx: Option<mpsc::Sender<f32>>,
     /// Soltar la espera del árbitro → lazo (ver `GuiSetup::soltar_espera_tx`).
     soltar_espera_tx: Option<mpsc::Sender<()>>,
+    /// Árbitro de práctica (ver `GuiSetup::arbitro`) y el último comando que mandó.
+    arbitro: Option<crate::coach::SharedReferee>,
+    arbitro_ultimo: Option<&'static str>,
     /// Lado con que se validó la carpeta de rutinas: al cambiar el de la foto, se recarga.
     lado_rutinas: f32,
     /// `coach.keeper_id` de los parámetros: el arquero de los puestos `arquero` de las
@@ -673,6 +684,8 @@ impl DebugGui {
                 skill_tx: setup.skill_tx,
                 lado_tx: setup.lado_tx,
                 soltar_espera_tx: setup.soltar_espera_tx,
+                arbitro: setup.arbitro,
+                arbitro_ultimo: None,
                 lado_rutinas,
                 keeper_id: crate::params::params().coach.keeper_id,
                 spin_omega: SPIN_OMEGA_DEFAULT,
@@ -883,6 +896,7 @@ impl DebugGui {
                     let _ = tx.try_send(());
                 }
             }
+            Message::Arbitro(comando) => self.mandar_arbitro(comando),
             Message::TpRobotXChanged(s) => self.tp_robot_x = s,
             Message::TpRobotYChanged(s) => self.tp_robot_y = s,
             Message::TpRobotThetaChanged(s) => self.tp_robot_theta = s,
@@ -1360,7 +1374,7 @@ impl DebugGui {
         // Cinco pestañas en 300 px: espaciado y margen chicos, texto de 12 px. Con la base
         // station son seis y no entran: la barra sigue en una segunda línea (`wrap`).
         let mut barra = row![].spacing(BARRA_PESTANAS_SP).align_y(Alignment::End);
-        for t in Tab::visibles(self.run.is_base_station()) {
+        for t in Tab::visibles(self.run.is_base_station(), self.arbitro.is_some()) {
             let activa = t == self.tab;
             let boton = button(
                 text(t.titulo())
@@ -1385,7 +1399,7 @@ impl DebugGui {
             Tab::Robots => self.pestana_robots(),
             Tab::Parametros => self.pestana_parametros(),
             Tab::PorQue => self.pestana_por_que(),
-            Tab::Arbitro => text("Llega en una fase posterior.").into(),
+            Tab::Arbitro => self.pestana_arbitro(),
         };
         container(
             column![
@@ -1511,14 +1525,14 @@ mod tests {
 
     #[test]
     fn cinco_pestanas_en_sim_en_una_linea() {
-        let tabs = Tab::visibles(false);
+        let tabs = Tab::visibles(false, false);
         assert_eq!(tabs, vec![Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Parametros, Tab::Herramientas]);
         assert_eq!(lineas_de_barra(&tabs), 1);
     }
 
     #[test]
     fn seis_pestanas_en_a_lo_mas_dos_lineas() {
-        let tabs = Tab::visibles(true);
+        let tabs = Tab::visibles(true, false);
         assert_eq!(tabs[2], Tab::Rutinas, "Rutinas va después de Inspector");
         assert_eq!(tabs[3], Tab::Robots, "Robots, después de Rutinas");
         assert_eq!(lineas_de_barra(&tabs), 2);
@@ -1526,8 +1540,8 @@ mod tests {
 
     #[test]
     fn robots_solo_con_base_station() {
-        assert!(Tab::visibles(true).contains(&Tab::Robots));
-        assert!(!Tab::visibles(false).contains(&Tab::Robots));
+        assert!(Tab::visibles(true, false).contains(&Tab::Robots));
+        assert!(!Tab::visibles(false, false).contains(&Tab::Robots));
     }
 
     #[tokio::test]
@@ -1569,6 +1583,7 @@ mod tests {
             identidad_tx: None,
             lado_tx: None,
             soltar_espera_tx: None,
+            arbitro: None,
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: Some(pausa.clone()),
             run: run_info::run_info_de_prueba(),
@@ -2067,11 +2082,78 @@ mod tests {
             identidad_tx: None,
             lado_tx: Some(lado_tx),
             soltar_espera_tx: Some(soltar_tx),
+            arbitro: None,
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: None,
             run: run_info::run_info_de_prueba(),
         };
         (DebugGui::new(setup).0, lado_rx, soltar_rx)
+    }
+
+    fn gui_con_arbitro(arbitro: Option<crate::coach::SharedReferee>) -> DebugGui {
+        let (_fotos, snapshot_rx) = crate::snapshot::snapshot_channel();
+        let setup = GuiSetup {
+            snapshot_rx,
+            manual_tx: None,
+            skill_tx: None,
+            pid_tx: None,
+            teleport_tx: None,
+            rutina_tx: None,
+            identidad_tx: None,
+            lado_tx: None,
+            soltar_espera_tx: None,
+            arbitro,
+            estop: Arc::new(AtomicBool::new(false)),
+            coach_pausa: None,
+            run: run_info::run_info_de_prueba(),
+        };
+        DebugGui::new(setup).0
+    }
+
+    #[test]
+    fn la_pestana_arbitro_solo_aparece_encendida() {
+        assert!(!Tab::visibles(false, false).contains(&Tab::Arbitro));
+        assert!(!Tab::visibles(true, false).contains(&Tab::Arbitro));
+        assert_eq!(
+            Tab::visibles(true, true),
+            vec![Tab::PorQue, Tab::Inspector, Tab::Rutinas, Tab::Robots, Tab::Arbitro, Tab::Parametros, Tab::Herramientas]
+        );
+        assert_eq!(Tab::visibles(false, true)[3], Tab::Arbitro, "sin base station, después de Rutinas");
+    }
+
+    #[test]
+    fn los_botones_del_arbitro_dejan_el_comando_en_este_engine() {
+        let shared = crate::coach::new_shared_referee();
+        let mut g = gui_con_arbitro(Some(shared.clone()));
+        // El lazo espera el primer comando del árbitro: el primer botón la termina, igual que
+        // un comando que llega por la red.
+        let mut espera = crate::control_loop::EsperaArbitro::new(true, &Some(shared.clone()));
+        assert!(espera.activa());
+        let mut seq = 0;
+        for (_, botones) in arbitro::FILAS {
+            for (_, comando) in botones.iter() {
+                let _ = g.update(Message::Arbitro(comando));
+                seq += 1;
+                let estado = shared.lock().unwrap();
+                assert_eq!(estado.seq, seq, "{comando}");
+                assert_eq!(Some(estado.command), crate::coach::referee::parse_text_command(comando), "{comando}");
+                drop(estado);
+                assert_eq!(g.arbitro_ultimo, Some(*comando));
+                espera.actualizar(&Some(shared.clone()), false);
+                assert!(!espera.activa(), "{comando}");
+            }
+        }
+        g.tab = Tab::Arbitro;
+        let _ = g.view();
+    }
+
+    #[test]
+    fn sin_la_pestana_los_botones_no_hacen_nada() {
+        let mut g = gui_con_arbitro(None);
+        let _ = g.update(Message::Arbitro("PENALTY BLUE"));
+        assert_eq!(g.arbitro_ultimo, None);
+        g.tab = Tab::Arbitro;
+        let _ = g.view();
     }
 
     #[test]

@@ -471,6 +471,7 @@ mod tests {
             identidad_tx: Some(tx),
             lado_tx: None,
             soltar_espera_tx: None,
+            arbitro: None,
             estop: Arc::new(AtomicBool::new(false)),
             coach_pausa: Some(pausa.clone()),
             run,
@@ -715,7 +716,7 @@ mod tests {
 
     #[test]
     fn la_pestana_solo_con_base_station() {
-        assert!(Tab::visibles(true).contains(&Tab::Robots));
-        assert!(!Tab::visibles(false).contains(&Tab::Robots));
+        assert!(Tab::visibles(true, false).contains(&Tab::Robots));
+        assert!(!Tab::visibles(false, false).contains(&Tab::Robots));
     }
 }

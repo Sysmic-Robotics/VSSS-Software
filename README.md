@@ -51,6 +51,7 @@ No se necesita `protoc` — los bindings protobuf se generan en compilación ví
 | `VSSL_VISION_NOISE` | (off) | `1`: proxy de ruido de cámara en el simulador (σ, latencia, pérdida de frames de `vision.proxy_*`). Regla: nada se acepta en sim limpio. |
 | `VSSL_VISION_RECORD` | (off) | Ruta donde grabar los paquetes crudos de visión, para `vision_replay`. |
 | `VSSL_REFEREE_ADDR` | `224.5.23.2:10003` | Dónde escucha el engine los comandos del árbitro (VSSReferee o texto de `tools/referee_cli.py`). |
+| `VSSL_ARBITRO_GUI` | `0` | `1`, `true` u `on`: pestaña **Árbitro** de la GUI, con botones para practicar pelotas paradas. Los comandos quedan en este engine (no salen a la red). Otro valor que no sea `0`, `false`, `off` o vacío no arranca. Ver **Árbitro y pelota parada**. |
 | `VSSL_ESPERAR_ARBITRO` | `1` | `rustengine` arranca con el equipo detenido (camino de HALT) hasta el primer comando del árbitro, o hasta el botón **Jugar sin esperar al árbitro** de la GUI. `0`, `false` u `off`: juega desde el arranque (para correr sin árbitro y sin GUI). Otro valor que no sea `1`, `true` u `on` no arranca. Ver **Árbitro y pelota parada**. |
 | `VSSL_REAL_ACTUATOR` | (off) | `<id de visión>:<full\|half>`: capa de actuador real (sysid) en el transporte de FIRASim, la planta de test y `skill_test --transport plant`. El robot simulado anda con la latencia, la dinámica, el tope por rueda y la zona muerta medidos de ese robot con esa batería (`config/real_calibration.json`). Se aplica a todos los robots del engine. |
 | `VSSL_REAL_CALIBRATION` | `config/real_calibration.json` | Otro archivo de calibración del robot real (ensayos). |
@@ -114,8 +115,9 @@ La interfaz se ve como la mesa de la salita: es neutra, y el único color es el 
   la adaptación al rival), **Herramientas** (control manual de dos jugadores, skill para el
   robot elegido y teleport), **Inspector** (robot elegido, salud en detalle, visión, radio y mapeo visión →
   radio, error de la skill), **Rutinas** (lista, opciones, Preparar → Iniciar → Pausar/Abortar
-  → Cerrar, estado y resumen; ver "Rutinas") y **Parámetros** (vista, escalas y rampa del
-  manual, Spin ω, PID de heading, presets; en el modo manual, sin sliders).
+  → Cerrar, estado y resumen; ver "Rutinas"), **Parámetros** (vista, escalas y rampa del
+  manual, Spin ω, PID de heading, presets; en el modo manual, sin sliders) y, solo con
+  `VSSL_ARBITRO_GUI=1`, **Árbitro** (botones de práctica; ver "Árbitro y pelota parada").
 - **Gráficos** (abajo): velocidad y giro del robot elegido, pedido (azul) y medido (negro),
   cada uno escalado a su tope (una consigna saturada toca el borde). Se pueden congelar y
   elegir la ventana (5, 15 o 30 s).
@@ -642,6 +644,14 @@ Fuentes, por el mismo puerto (`VSSL_REFEREE_ADDR`): **VSSReferee** (simulador, p
 python tools/referee_cli.py            # interactivo: k b (kickoff azul), b 1 (free ball Q1), go, s, h
 python tools/referee_cli.py penalty yellow
 ```
+
+Para practicar con un solo engine, la pestaña **Árbitro** de la GUI (`VSSL_ARBITRO_GUI=1`,
+apagada por defecto) tiene los mismos comandos en botones: STOP, GAME ON y HALT; saque, penal,
+tiro libre y tiro de arco para cada color; free ball en Q1 a Q4 (cuadrantes de la cancha, no de
+nuestro lado). Cada botón pasa por el mismo parser que el texto de `referee_cli` y deja el
+comando en el estado del árbitro de ese engine, sin abrir ningún socket: no le llega al árbitro
+oficial, al rival ni a otro engine del mismo notebook. Termina la espera del primer comando
+como cualquier comando del árbitro. Con dos engines a la vez se sigue usando `referee_cli.py`.
 
 ## Métricas de partido (`tools/match_metrics.py`)
 
