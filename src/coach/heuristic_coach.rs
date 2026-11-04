@@ -964,7 +964,7 @@ impl HeuristicCoach {
             || (st.pos - ball).length() > 0.12
             || d < 0.25
             || d > max_dist
-            || p.x * s < 0.0
+            || p.x * s < -0.10
             || p.x * s > GOAL_AREA_X - 0.05
             || !Self::shot_blocked(ball, aim, opp)
             || Self::line_blocked(ball, p, opp, 0.09)
@@ -1017,15 +1017,19 @@ impl HeuristicCoach {
 
     /// Punto donde el apoyo arma el pase y desvío: alrededor de la pelota, a 0.30-0.50 m (sin
     /// pasar `pass_deflect_max_dist`) y girado 20-45° desde la dirección en que el atacante
-    /// empuja (así pasa sin rodear la pelota), en campo rival y fuera del área, con el pase y la
+    /// llega a la pelota (así pasa sin rodearla), desde 0.10 m antes de la mitad hasta el área
+    /// rival, con el pase y la
     /// salida al arco libres de rivales, ninguno a menos de 0.20 m y un desvío de 15° a 100°.
     /// Entre los que quedan, el más lejos de los rivales (y el más corto si empatan). `None` sin
-    /// atacante cerca de la pelota.
+    /// atacante o con la pelota en nuestro tercio.
     fn pass_window(&self, ball: Vec2, striker: Option<&RobotView>, opp: &[RobotView]) -> Option<Vec2> {
         let max_dist = self.p.pass_deflect_max_dist;
         let st = striker?;
         let s = self.attack_sign();
-        if max_dist <= 0.0 || (st.pos - ball).length() > 0.25 || ball.x * s < -0.20 {
+        // Se anticipa: desde que el atacante va a la pelota (no recién cuando la tiene), con la
+        // dirección en que llega, para que el pase salga en el primer toque. Esperando a que el
+        // atacante estuviera a 0.25 m, el apoyo no estaba en su punto el 53 % de las veces.
+        if max_dist <= 0.0 || ball.x * s < -0.20 {
             return None;
         }
         let aim = self.attack_goal;
@@ -1042,7 +1046,7 @@ impl HeuristicCoach {
                 let dir = Vec2::from_angle(deg.to_radians()).rotate(push);
                 let p = ball + dir * d;
                 let inside = p.x.abs() <= FIELD_ROBOT_MAX_ABS_X && p.y.abs() <= FIELD_ROBOT_MAX_ABS_Y;
-                if !inside || p.x * s < 0.0 || p.x * s > GOAL_AREA_X - 0.05 {
+                if !inside || p.x * s < -0.10 || p.x * s > GOAL_AREA_X - 0.05 {
                     continue;
                 }
                 let turn = dir.dot((aim - p).normalize_or_zero());
