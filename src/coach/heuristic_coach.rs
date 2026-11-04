@@ -1346,6 +1346,12 @@ impl HeuristicCoach {
                 return choice;
             }
         }
+        // Repliegue (`support_cover_dist`): con la pelota del rival, delante de ella en la recta
+        // pelota → arco propio, en cualquier mitad, para cortar la conducción o el pase.
+        if let Some(pos) = self.cover_point(ball, striker, opp) {
+            let skill = self.commit(r.id, SkillId::Mark, |_| true);
+            return SkillChoice::new(r.id, skill, pos);
+        }
         // Defiende (cubre la línea) con la pelota en nuestra mitad, salvo que el striker la
         // tenga sin rival encima: entonces se ofrece como receptor también desde ahí. Sin
         // esto, alrededor de la mitad de cancha el apoyo oscilaba entre receptor y
@@ -1364,6 +1370,12 @@ impl HeuristicCoach {
         if defending {
             let skill = self.commit(r.id, SkillId::BlockLine, |_| true);
             return SkillChoice::new(r.id, skill, self.own_goal);
+        }
+        // Marca al presionador (`support_screen_dist`): con la pelota nuestra, tapar al rival que
+        // viene a quitársela al atacante.
+        if let Some(pos) = self.screen_point(ball, striker, opp) {
+            let skill = self.commit(r.id, SkillId::Mark, |_| true);
+            return SkillChoice::new(r.id, skill, pos);
         }
         // Atacando con un rival suelto en nuestra mitad: marcarlo (entre él y el
         // arco, mirando a la pelota) en vez de subir a apoyar.
@@ -1441,6 +1453,60 @@ impl HeuristicCoach {
         // `standoff_from_ball` de la pelota: el 100 % de sus toques es en movimiento.)
         let skill = self.commit(r.id, SkillId::Mark, |_| true);
         SkillChoice::new(r.id, skill, pos)
+    }
+
+    /// Punto de repliegue (`support_cover_dist`): con un rival activo a menos de 0.15 m de la
+    /// pelota y más cerca de ella que nuestro atacante, el punto a esa distancia delante de la
+    /// pelota en la recta pelota → arco propio. `None` sin opción, sin el rival con la pelota, o
+    /// si el punto cae a menos de `block_distance` + 0.10 m del arco o en el área (ahí cubrir la
+    /// línea, como siempre).
+    fn cover_point(&self, ball: Vec2, striker: Option<&RobotView>, opp: &[RobotView]) -> Option<Vec2> {
+        let dist = self.p.support_cover_dist;
+        if dist <= 0.0 {
+            return None;
+        }
+        let d_rival = opp
+            .iter()
+            .filter(|o| o.active)
+            .map(|o| (o.pos - ball).length())
+            .fold(f32::INFINITY, f32::min);
+        let d_striker = striker.map_or(f32::INFINITY, |st| (st.pos - ball).length());
+        if d_rival > 0.15 || d_rival >= d_striker {
+            return None;
+        }
+        let to_goal = self.own_goal - ball;
+        let len = to_goal.length();
+        if len - dist < params().skills.block_distance + 0.10 {
+            return None;
+        }
+        let pos = self.clamp_field_robot(ball + to_goal / len * dist);
+        (!self.in_own_area(pos)).then_some(pos)
+    }
+
+    /// Punto para tapar al presionador (`support_screen_dist`): con nuestro atacante a menos de
+    /// 0.12 m de la pelota y más cerca que todos los rivales, el rival más cercano a la pelota,
+    /// si está a 0.15 m a esa distancia de ella, se tapa desde 0.13 m delante de él, en la recta
+    /// hacia la pelota. `None` sin opción o sin presionador, con la pelota a más de 0.25 m dentro
+    /// de nuestra mitad, o si el punto queda a menos de 0.12 m del atacante, a menos de 0.10 m de
+    /// la pelota o en el área propia.
+    fn screen_point(&self, ball: Vec2, striker: Option<&RobotView>, opp: &[RobotView]) -> Option<Vec2> {
+        let max = self.p.support_screen_dist;
+        let st = striker?;
+        let d_striker = (st.pos - ball).length();
+        if max <= 0.0 || d_striker > 0.12 || ball.x * self.attack_sign() < -0.25 {
+            return None;
+        }
+        let (d, rival) = opp
+            .iter()
+            .filter(|o| o.active)
+            .map(|o| ((o.pos - ball).length(), o.pos))
+            .min_by(|a, b| a.0.total_cmp(&b.0))?;
+        if d <= d_striker || !(0.15..=max).contains(&d) {
+            return None;
+        }
+        let pos = self.clamp_field_robot(rival + (ball - rival) / d * 0.13);
+        let ok = (pos - st.pos).length() >= 0.12 && (pos - ball).length() >= 0.10 && !self.in_own_area(pos);
+        ok.then_some(pos)
     }
 
     /// Punto de receptor legal: dentro de la cancha, a `standoff_from_ball` de la pelota,
@@ -2267,6 +2333,58 @@ mod tests {
         let otro = RobotView { id: 1, pos: p, theta: 0.0, active: true };
         let q = c.pass_window(ball, Some(&st), &[tapa, otro]).expect("otra ventana");
         assert!((q - p).length() > 0.15, "{p:?} {q:?}");
+    }
+
+    #[test]
+    fn support_covers_in_front_of_the_ball_when_the_rival_has_it() {
+        // Rival con la pelota en su mitad y nuestro atacante detrás: apagado, el apoyo sigue de
+        // receptor adelante; con la opción va delante de la pelota, en la recta al arco propio.
+        let ball = Vec2::new(0.30, 0.10);
+        let rival = RobotView { id: 0, pos: Vec2::new(0.38, 0.10), theta: 3.14, active: true };
+        let st = RobotView { id: 0, pos: Vec2::new(0.50, 0.20), theta: 3.14, active: true };
+        let r = RobotView { id: 1, pos: Vec2::new(0.55, -0.20), theta: 0.0, active: true };
+        let mut c = coach();
+        let antes = c.support_choice(&r, ball, Vec2::ZERO, Some(&st), &[rival]);
+        assert!(antes.target.x > ball.x, "{:?}", antes.target);
+        c.p.support_cover_dist = 0.35;
+        let cub = c.support_choice(&r, ball, Vec2::ZERO, Some(&st), &[rival]);
+        assert_eq!(cub.skill_id, SkillId::Mark);
+        let to_goal = (c.own_goal - ball).normalize();
+        let rel = cub.target - ball;
+        assert!((rel.length() - 0.35).abs() < 1e-3 && rel.normalize().dot(to_goal) > 0.999, "{:?}", cub.target);
+        // Nuestro atacante más cerca de la pelota que el rival: no se repliega.
+        let encima = RobotView { pos: ball + Vec2::new(-0.05, 0.0), ..st };
+        assert!(c.cover_point(ball, Some(&encima), &[rival]).is_none());
+        // Pelota cerca de nuestro arco: cubre la línea como siempre (coach nuevo, sin el
+        // compromiso con `Mark` de la decisión anterior).
+        let cerca = Vec2::new(-0.40, 0.0);
+        let rival_cerca = RobotView { pos: cerca + Vec2::new(0.08, 0.0), ..rival };
+        let mut c = coach();
+        c.p.support_cover_dist = 0.35;
+        assert_eq!(c.support_choice(&r, cerca, Vec2::ZERO, Some(&st), &[rival_cerca]).skill_id, SkillId::BlockLine);
+    }
+
+    #[test]
+    fn support_screens_the_rival_coming_to_press() {
+        // Nuestro atacante con la pelota y un rival viniendo a presionar desde 0.35 m: con la
+        // opción el apoyo se para entre ese rival y la pelota. Con el rival ya encima de la
+        // pelota, o apagado, no.
+        let ball = Vec2::new(0.10, 0.0);
+        let st = RobotView { id: 0, pos: Vec2::new(0.02, 0.0), theta: 0.0, active: true };
+        let rival = RobotView { id: 0, pos: Vec2::new(0.35, 0.25), theta: 3.6, active: true };
+        let r = RobotView { id: 1, pos: Vec2::new(0.20, -0.30), theta: 0.0, active: true };
+        let mut c = coach();
+        assert!(c.screen_point(ball, Some(&st), &[rival]).is_none(), "apagado");
+        c.p.support_screen_dist = 0.45;
+        let ch = c.support_choice(&r, ball, Vec2::ZERO, Some(&st), &[rival]);
+        assert_eq!(ch.skill_id, SkillId::Mark);
+        let to_ball = (ball - rival.pos).normalize();
+        let rel = ch.target - rival.pos;
+        assert!((rel.length() - 0.13).abs() < 1e-3 && rel.normalize().dot(to_ball) > 0.999, "{:?}", ch.target);
+        let encima = RobotView { pos: ball + Vec2::new(0.07, 0.03), ..rival };
+        assert!(c.screen_point(ball, Some(&st), &[encima]).is_none(), "rival encima");
+        let lejos = RobotView { pos: Vec2::new(0.60, 0.30), ..rival };
+        assert!(c.screen_point(ball, Some(&st), &[lejos]).is_none(), "rival lejos");
     }
 
     #[test]

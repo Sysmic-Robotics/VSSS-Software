@@ -169,6 +169,19 @@ pub struct CoachParams {
     /// y frenando, la pelota llega 4/4 a ±6 cm a 0.45-0.60 m/s; sin frenar el robot la llevaba
     /// pegada (los pases por empuje llegaban al receptor el 9-20 % de las veces).
     pub pass_deflect_max_dist: f32,
+    /// Repliegue del apoyo: con la pelota del rival (un rival a menos de 0.15 m y más cerca que
+    /// nuestro atacante), el apoyo se pone a esta distancia (m) delante de ella, en la recta
+    /// pelota → arco propio, para cortar la conducción; cerca del arco sigue cubriendo la línea.
+    /// 0 = nunca. Sin esto, con el rival dueño de la pelota en su mitad (14 % del juego) el apoyo
+    /// seguía de receptor adelante (98 %) y estaba entre la pelota y el arco el 21 %; 2 s antes
+    /// de los goles en contra, el 15 % (41 goles, 48 partidos; el 54 % venía de la mitad rival).
+    pub support_cover_dist: f32,
+    /// Marca al presionador: con nuestro atacante dueño de la pelota, el rival más cercano a
+    /// ella que viene a presionarlo (a 0.15 m a esta distancia, en m, de la pelota) se tapa: el
+    /// apoyo se para entre él y la pelota. 0 = nunca. Sin esto el atacante tenía un rival a
+    /// menos de 0.30 m el 87 % del tiempo que tenía la pelota y la perdía 45 veces por partido
+    /// (57 % en la mitad rival), con el apoyo esperando de receptor.
+    pub support_screen_dist: f32,
 }
 
 impl Default for CoachParams {
@@ -219,6 +232,8 @@ impl Default for CoachParams {
             spin_min_still_s: 0.0,
             support_yield_dist: 0.0,
             pass_deflect_max_dist: 0.0,
+            support_cover_dist: 0.0,
+            support_screen_dist: 0.0,
         }
     }
 }
