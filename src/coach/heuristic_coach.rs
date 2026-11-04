@@ -163,6 +163,10 @@ pub struct HeuristicCoach {
     penalty_shot: Option<(Vec2, u64, f32)>,
     /// Penales propios pateados (alterna el palo cuando el arquero está centrado).
     penalties_taken: u32,
+    /// Penal propio con un solo robot nuestro en la cancha (tanda de penales: "apenas um
+    /// jogador de cada equipe"): ese robot patea en vez de quedar de arquero. Se recalcula en
+    /// cada `assign_roles`.
+    pateador_unico: Option<i32>,
     /// Últimos scores del striker (skill, score) — para logs/GUI y tests.
     last_scores: [(SkillId, f32); 5],
     /// Contadores de adaptación al rival (éxito de tiro por carril, disputas).
@@ -232,6 +236,7 @@ impl HeuristicCoach {
             current_play: Play::Open,
             penalty_shot: None,
             penalties_taken: 0,
+            pateador_unico: None,
             last_scores: [
                 (SkillId::ShootPush, 0.0),
                 (SkillId::Clear, 0.0),
@@ -313,7 +318,9 @@ impl HeuristicCoach {
 
     /// Rol vigente de cada robot (para GUI/logs). `None` si inactivo.
     pub fn role_of(&self, robot_id: i32) -> Option<Role> {
-        if robot_id == self.keeper_id {
+        if self.pateador_unico == Some(robot_id) {
+            Some(Role::Striker)
+        } else if robot_id == self.keeper_id {
             Some(Role::Keeper)
         } else if Some(robot_id) == self.striker_id {
             Some(Role::Striker)
@@ -1610,6 +1617,21 @@ impl HeuristicCoach {
     fn assign_roles(&mut self, own: &[RobotView], ball: Vec2, ball_vel: Vec2) {
         self.decisions_since_role_switch = self.decisions_since_role_switch.saturating_add(1);
 
+        // Penal propio (formación o tiro) con un solo robot activo: patea él. Sin esto quedaba
+        // de arquero (el fijo, o el más cercano al arco propio) y volvía a nuestro arco: en la
+        // tanda de penales, con un robot por equipo, nunca pateábamos.
+        let mut activos = own.iter().filter(|r| r.active);
+        let unico = match (activos.next(), activos.next()) {
+            (Some(r), None) => Some(r.id),
+            _ => None,
+        };
+        let penal_propio = self.current_play == Play::PenaltyOurs || self.active_penalty_shot().is_some();
+        self.pateador_unico = unico.filter(|_| penal_propio);
+        if let Some(id) = self.pateador_unico {
+            self.striker_id = Some(id);
+            return;
+        }
+
         // Arquero: fijo; si está inactivo, el activo más cercano al arco propio.
         let keeper_active = own.iter().any(|r| r.active && r.id == self.keeper_id);
         if !keeper_active {
@@ -2857,6 +2879,66 @@ mod tests {
             last = choice_of(&c.decide(&o), 0).target;
         }
         assert_eq!(last, ATTACK);
+    }
+
+    /// Tanda de penales: un solo robot nuestro en la cancha.
+    fn solo(id: usize, pos: Vec2) -> Observation {
+        let mut o = obs(Vec2::new(0.375, 0.0), Vec2::ZERO, [Vec2::new(-0.3, 0.3), Vec2::new(-0.3, -0.3), Vec2::new(-0.68, 0.0)]);
+        for (i, r) in o.own_robots.iter_mut().enumerate() {
+            if i == id {
+                *r = robot(pos, 0.0);
+            } else {
+                r.active = 0.0;
+            }
+        }
+        o.opp_robots[2] = robot(Vec2::new(0.70, 0.0), 90.0);
+        o
+    }
+
+    #[test]
+    fn en_la_tanda_el_unico_robot_patea_nuestro_penal() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        // Con el arquero designado (2) y con otro robot (0): antes, los dos se iban a nuestro arco.
+        for id in [2usize, 0] {
+            let shared = new_shared_referee();
+            let mut c = coach(); // azul, ataca +x, arquero 2
+            c.set_referee(shared.clone());
+            let o = solo(id, Vec2::new(0.05, 0.0));
+            apply_command(&shared, RefereeCommand { foul: Foul::PenaltyKick, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
+            let formacion = choice_of(&c.decide(&o), id as i32);
+            assert_eq!(c.role_of(id as i32), Some(Role::Striker), "robot {id}");
+            assert_eq!(formacion.skill_id, SkillId::Mark, "robot {id}: va detrás de la pelota");
+            assert!(formacion.target.x > 0.2 && formacion.target.x < 0.375, "robot {id}: {:?}", formacion.target);
+            // Silbato: patea al palo, no vuelve al arco propio.
+            apply_command(&shared, RefereeCommand::GAME_ON);
+            let tiro = choice_of(&c.decide(&o), id as i32);
+            assert_eq!(c.role_of(id as i32), Some(Role::Striker), "robot {id}");
+            assert_eq!(tiro.target.x, ATTACK.x, "robot {id}: {tiro:?}");
+            assert!(tiro.target.y.abs() > 0.0, "robot {id}: a un palo, {tiro:?}");
+        }
+    }
+
+    #[test]
+    fn en_la_tanda_el_unico_robot_ataja_el_penal_rival_y_con_tres_nada_cambia() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        // Penal en contra con un solo robot: sigue de arquero.
+        let shared = new_shared_referee();
+        let mut c = coach();
+        c.set_referee(shared.clone());
+        let mut o = solo(0, Vec2::new(-0.40, 0.0));
+        o.ball.x = -0.375 / FIELD_HALF_X;
+        apply_command(&shared, RefereeCommand { foul: Foul::PenaltyKick, team: RefTeam::Yellow, ..RefereeCommand::GAME_ON });
+        let _ = c.decide(&o);
+        assert_eq!(c.role_of(0), Some(Role::Keeper));
+        // Penal propio con los tres: el arquero sigue de arquero y patea un jugador de campo.
+        let shared = new_shared_referee();
+        let mut c = coach();
+        c.set_referee(shared.clone());
+        let o = obs(Vec2::new(0.375, 0.0), Vec2::ZERO, [Vec2::new(0.235, 0.0), Vec2::new(-0.1, 0.35), Vec2::new(-0.68, 0.0)]);
+        apply_command(&shared, RefereeCommand { foul: Foul::PenaltyKick, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
+        let _ = c.decide(&o);
+        assert_eq!(c.role_of(2), Some(Role::Keeper));
+        assert_eq!(c.role_of(0), Some(Role::Striker));
     }
 
     #[test]
