@@ -15,8 +15,10 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
       cargo build --release
  2. mkdir -p ~/uni
  3. Baterías cargadas; anotar el voltaje de cada una en ~/uni/notas.txt.
- 4. (Opcional, para el bloque E) Un robot de REPUESTO flasheado con un firmware de prueba
-    con MAX_WHEEL_MM_S = 1000. Así no se flashea nada en la cancha.
+ 4. Firmware nuevo con el tope de 700 mm/s por rueda (MAX_WHEEL_MM_S = 700) flasheado en
+    los robots, y la base con MAX_W_DEG_S subido (con 700 mm/s sobre la vía de 75 mm el
+    robot gira hasta ~1070 °/s; con 720 °/s el giro de SpinKick queda recortado). Si no
+    alcanza para todos, al menos uno, para el bloque E. Así no se flashea nada en la cancha.
  5. Abrir cuatro terminales en la carpeta del repo, con los comandos de abajo escritos.
 
  SEGURIDAD: la base NO tiene timeout de serial. Siempre alguien listo para LEVANTAR EL
@@ -85,14 +87,18 @@ Todo lo medido queda en ~/uni/, ~/sysid/ y logs/salita/<fecha>/ y se le pasa a B
  4. python3 tools/medir_spinkick.py ~/uni/spin_r*.csv   → última línea: el ángulo real.
 
 -------------------------------------------------------------------------------------
- E. TOPE DEL MOTOR (solo con el robot de repuesto ya flasheado) .. minuto 25 a 28
+ E. FIRMWARE DE 700 MM/S (robot con el firmware nuevo) .......... minuto 25 a 28
 -------------------------------------------------------------------------------------
- Hoy el firmware topa cada rueda en 450 mm/s. Si el motor da más, es lo que más acelera.
- 1. Con el robot de prueba (posición de radio P), rectas de 1.2 s desde un extremo:
-      cargo run --release --bin skill_test -- --transport base-station --mode vw \
-        --team blue --robot P --v 600 --w 0 --dur 1.2
-    y luego --v 800 y --v 1000. Anotar la x inicial y final que muestra la GUI.
- 2. Cuando la distancia deja de crecer, ese es el techo. Mirar que no oscile.
+ El firmware ahora permite 700 mm/s por rueda (antes 450). Verificar que el robot los
+ sigue de verdad. N = posición de radio del robot.
+ 1. Rectas de 1.2 s desde un extremo, anotando la x inicial y final de la GUI:
+      cargo run --release --bin skill_test -- --transport base-station --mode vw \n        --team blue --robot N --v 500 --w 0 --dur 1.2
+    y luego --v 700 y --v 900 (este último debe quedar igual que 700: es el tope).
+ 2. Giro en el lugar: --v 0 --w 1000 --dur 1. Anotar si gira más rápido que con --w 720
+    (si no, la base sigue recortando el giro en MAX_W_DEG_S).
+ 3. Mirar que no oscile ni se quede una rueda atrás, también con la batería a medias.
+ ANOTAR en notas.txt: distancias y si el giro sube. Con eso se ajusta el simulador
+ (sim.max_wheel_rad_s 35 = 0.7 m/s) y robot.max_w_deg_s en config/team_params.json.
 
 -------------------------------------------------------------------------------------
  F. COPIAR LOS DATOS ............................................ minuto 28 a 30
