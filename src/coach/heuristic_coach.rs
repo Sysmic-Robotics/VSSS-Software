@@ -50,6 +50,9 @@ pub const GOAL_HALF_Y: f32 = 0.20;
 const PENALTY_SHOT_S: f32 = 3.0;
 const FIELD_ROBOT_MAX_ABS_X: f32 = 0.55;
 const FIELD_ROBOT_MAX_ABS_Y: f32 = 0.55;
+/// Desvío: centro del robot a la pelota cuando ella toca el medio de una cara (medio lado del
+/// robot de 7.5 cm más el radio de la pelota).
+const DEFLECT_FACE_TO_BALL: f32 = 0.059;
 
 // Umbrales de decisión: `CoachParams` en `src/params.rs` / `config/team_params.json`
 // (histéresis de rol, compromiso por skill, velocidades de referencia, bandas).
@@ -857,10 +860,118 @@ impl HeuristicCoach {
         pos
     }
 
+    /// Normal de la cara (ángulo, rad) que manda hacia `out` una pelota que llega por `inc`
+    /// (unitarios), con la cara devolviendo `k` de la velocidad normal respecto de la
+    /// tangencial: la salida `inc − (1 + k)(inc·n) n` va por `out`. `None` si ninguna cara de
+    /// frente a la pelota lo logra.
+    fn deflect_normal(inc: Vec2, out: Vec2, k: f32) -> Option<f32> {
+        let (al, be) = (inc.y.atan2(inc.x), out.y.atan2(out.x));
+        let a = 1.0 + k;
+        let f = |ph: f32| (al - be).sin() - a * (ph - al).cos() * (ph - be).sin();
+        // Caras de frente a la pelota que llega: cos(ph − al) < 0.
+        let (lo, hi) = (al + FRAC_PI_2 + 1e-3, al + 3.0 * FRAC_PI_2 - 1e-3);
+        const N: usize = 180;
+        (0..N).find_map(|i| {
+            let mut x0 = lo + (hi - lo) * i as f32 / N as f32;
+            let mut x1 = lo + (hi - lo) * (i + 1) as f32 / N as f32;
+            if f(x0) * f(x1) > 0.0 {
+                return None;
+            }
+            for _ in 0..30 {
+                let xm = 0.5 * (x0 + x1);
+                if f(x0) * f(xm) <= 0.0 {
+                    x1 = xm;
+                } else {
+                    x0 = xm;
+                }
+            }
+            let ph = 0.5 * (x0 + x1);
+            let n = Vec2::from_angle(ph);
+            let v = inc - n * (a * inc.dot(n));
+            (v.dot(out) > 0.0).then_some(ph)
+        })
+    }
+
+    /// Desvío (`deflect_min_speed`): con la pelota rodando libre, el punto de su camino en la
+    /// mitad rival que el apoyo alcanza antes que ella y con menos recorrido (el más temprano
+    /// lo haría perseguir puntos cada vez más atrás sin asentarse), adonde llega a más de
+    /// `deflect_min_speed` y que la desvía entre 15° y 100° hacia el centro del arco sin un
+    /// rival en la salida. El apoyo va con `GoTo` al centro del robot y, ahí, gira con
+    /// `FacePoint` hasta tener una cara con la normal de `deflect_normal` (el robot es cuadrado:
+    /// sirve cualquiera de sus cuatro caras, la que menos gira).
+    fn deflect_choice(
+        &mut self,
+        r: &RobotView,
+        ball: Vec2,
+        ball_vel: Vec2,
+        striker: Option<&RobotView>,
+        opp: &[RobotView],
+    ) -> Option<SkillChoice> {
+        let min_speed = self.p.deflect_min_speed;
+        let speed = ball_vel.length();
+        if min_speed <= 0.0 || speed < min_speed {
+            return None;
+        }
+        // Pelota libre: ni nuestro atacante ni un rival la llevan.
+        let carried = striker.is_some_and(|st| (st.pos - ball).length() < 0.15)
+            || opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.12);
+        if carried {
+            return None;
+        }
+        let s = self.attack_sign();
+        let aim = self.attack_goal;
+        let inc = ball_vel / speed;
+        let sp = &params().skills;
+        let k = sp.intercept_ball_decay_per_s;
+        let mut best: Option<(f32, Vec2, f32)> = None; // (tiempo que necesita, centro, rumbo)
+        let mut t = 0.1_f32;
+        while t <= sp.intercept_horizon {
+            let decay = (-k * t).exp();
+            if speed * decay < min_speed {
+                break;
+            }
+            let travel = if k > 1e-6 { (1.0 - decay) / k } else { t };
+            let p = ball + ball_vel * travel;
+            t += 0.05;
+            if p.x * s < 0.10 || p.x * s > GOAL_AREA_X - 0.05 || p.y.abs() > FIELD_ROBOT_MAX_ABS_Y {
+                continue;
+            }
+            let out = (aim - p).normalize_or_zero();
+            let turn = inc.dot(out);
+            if !(-0.17..=0.97).contains(&turn) || Self::line_blocked(p, aim, opp, 0.09) {
+                continue;
+            }
+            let Some(ph) = Self::deflect_normal(inc, out, self.p.deflect_face_k) else {
+                continue;
+            };
+            let center = p - Vec2::from_angle(ph) * DEFLECT_FACE_TO_BALL;
+            if center.x.abs() > FIELD_ROBOT_MAX_ABS_X || center.y.abs() > FIELD_ROBOT_MAX_ABS_Y {
+                continue;
+            }
+            // La cara que menos gira: rumbo ≡ ph módulo 90°.
+            let quarter = std::f32::consts::FRAC_PI_2;
+            let off = (r.theta - ph).rem_euclid(quarter);
+            let (heading, rot) = if off <= quarter / 2.0 { (r.theta - off, off) } else { (r.theta + quarter - off, quarter - off) };
+            let need = self.time_to_reach(r, center) + rot / self.p.omega_ref;
+            if need + 0.2 <= t - 0.05 && best.map_or(true, |b| need < b.0) {
+                best = Some((need, center, heading));
+            }
+        }
+        let (_, center, heading) = best?;
+        let (wanted, target) = if (center - r.pos).length() > 0.03 {
+            (SkillId::GoTo, center)
+        } else {
+            (SkillId::FacePoint, center + Vec2::from_angle(heading) * 0.30)
+        };
+        let skill = self.commit(r.id, wanted, |_| false);
+        Some(SkillChoice::new(r.id, skill, target))
+    }
+
     fn support_choice(
         &mut self,
         r: &RobotView,
         ball: Vec2,
+        ball_vel: Vec2,
         striker: Option<&RobotView>,
         opp: &[RobotView],
     ) -> SkillChoice {
@@ -889,6 +1000,9 @@ impl HeuristicCoach {
             let pos = self.mark_point(t.pos);
             let skill = self.commit(r.id, SkillId::Mark, |_| true);
             return SkillChoice::new(r.id, skill, pos);
+        }
+        if let Some(choice) = self.deflect_choice(r, ball, ball_vel, striker, opp) {
+            return choice;
         }
         // Estilo ofensivo: con la pelota disputada en la mitad rival (nuestro striker encima y
         // un rival sobre ella), el apoyo también va, desde el lado contrario al striker:
@@ -1280,7 +1394,7 @@ impl Coach for HeuristicCoach {
                     SkillChoice::new(r.id, skill, self.press_point(ball))
                 }
                 Some(Role::Striker) => self.striker_choice(r, ball, ball_vel, &opp),
-                _ => self.support_choice(r, ball, striker.as_ref(), &opp),
+                _ => self.support_choice(r, ball, ball_vel, striker.as_ref(), &opp),
             };
             choices.push(choice);
         }
@@ -1895,6 +2009,53 @@ mod tests {
             last = decidida_de(&mut c, &obs(ball, Vec2::ZERO, parked), 0);
         }
         assert_eq!(last, SkillId::SpinKick, "{:?}", c.last_striker_scores());
+    }
+
+    #[test]
+    fn deflect_normal_is_the_mirror_bisector_and_bends_with_a_soft_face() {
+        let inc = Vec2::new(0.664, 0.747).normalize();
+        let out = Vec2::new(0.928, -0.371).normalize();
+        // Espejo (k = 1): la normal es la bisectriz salida − llegada.
+        let mirror = HeuristicCoach::deflect_normal(inc, out, 1.0).unwrap();
+        assert!(Vec2::from_angle(mirror).dot((out - inc).normalize()) > 0.9999, "{mirror}");
+        // Cara que apaga la normal (k = 0.1): la salida inc − 1.1 (inc·n) n va por `out`.
+        let n = Vec2::from_angle(HeuristicCoach::deflect_normal(inc, out, 0.1).unwrap());
+        let v = inc - n * (1.1 * inc.dot(n));
+        assert!(inc.dot(n) < 0.0 && v.normalize().dot(out) > 0.9999);
+    }
+
+    #[test]
+    fn support_deflects_a_rolling_ball_toward_the_goal() {
+        // Pase rodando a 1.2 m/s desde (0, −0.45) hacia arriba a la derecha; el apoyo en
+        // (0.48, 0.20) llega antes a un punto del camino: va (GoTo) al centro del robot que deja
+        // una cara en ese punto y, ya ahí, gira (FacePoint) a un rumbo con esa cara.
+        let ball = Vec2::new(0.0, -0.45);
+        let vel = Vec2::new(0.79, 0.90);
+        let st = RobotView { id: 0, pos: Vec2::new(-0.20, -0.60), theta: 0.0, active: true };
+        let sup = RobotView { id: 1, pos: Vec2::new(0.48, 0.20), theta: 0.0, active: true };
+        let mut c = coach();
+        assert!(c.deflect_choice(&sup, ball, vel, Some(&st), &[]).is_none(), "apagado por defecto");
+        c.p.deflect_min_speed = 0.3;
+        let go = c.deflect_choice(&sup, ball, vel, Some(&st), &[]).expect("desvío");
+        assert_eq!(go.skill_id, SkillId::GoTo);
+        let dir = vel.normalize();
+        let off_line = |p: Vec2| (p - ball - dir * (p - ball).dot(dir)).length();
+        assert!(off_line(go.target) <= DEFLECT_FACE_TO_BALL + 1e-3 && go.target.x > 0.3, "{:?}", go.target);
+        // Ya en el centro: gira; con ese rumbo, una de sus cuatro caras queda sobre el camino.
+        let at = RobotView { pos: go.target, ..sup };
+        let face = c.deflect_choice(&at, ball, vel, Some(&st), &[]).expect("sigue el desvío");
+        assert_eq!(face.skill_id, SkillId::FacePoint);
+        let d = face.target - go.target;
+        let heading = d.y.atan2(d.x);
+        let on_path = (0..4).any(|m| {
+            let n = Vec2::from_angle(heading + m as f32 * FRAC_PI_2);
+            off_line(go.target + n * DEFLECT_FACE_TO_BALL) < 2e-3
+        });
+        assert!(on_path, "rumbo {:?}", heading);
+        // Lenta (no llega a 0.3 m/s a la mitad rival) o llevada por el atacante: no desvía.
+        assert!(c.deflect_choice(&sup, ball, vel * 0.2, Some(&st), &[]).is_none());
+        let carrying = RobotView { pos: ball + Vec2::new(-0.05, -0.05), ..st };
+        assert!(c.deflect_choice(&sup, ball, vel, Some(&carrying), &[]).is_none());
     }
 
     #[test]

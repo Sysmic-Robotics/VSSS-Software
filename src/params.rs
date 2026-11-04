@@ -121,6 +121,14 @@ pub struct CoachParams {
     /// penales contra el arquero de rule_based (sigue la y de la pelota): 0.09 convierte 51 %
     /// contra 82 % de 0.06 (240 penales); 0.04, 84 % contra 79 % (sin diferencia).
     pub aim_post_margin: f32,
+    /// Desvío (escenarios 3 y 6): con la pelota rodando libre hacia la mitad rival y llegando a
+    /// más de esto (m/s) a un punto de su camino que el apoyo alcanza antes, el apoyo se para ahí
+    /// con una cara orientada para que rebote al arco. 0 = nunca.
+    pub deflect_min_speed: f32,
+    /// Desvío: cuánto devuelve la cara de la velocidad normal de la pelota respecto de la
+    /// tangencial. En FIRASim (motion_bench `desvio`) la cara apaga casi toda la normal: con 0.1
+    /// entra al centro del arco y con 1 (espejo) junto al palo. Medir en la cancha.
+    pub deflect_face_k: f32,
 }
 
 impl Default for CoachParams {
@@ -166,6 +174,8 @@ impl Default for CoachParams {
             estilo: "equilibrado".to_string(),
             playbook_episodio_s: 15.0,
             aim_post_margin: 0.06,
+            deflect_min_speed: 0.0,
+            deflect_face_k: 0.15,
         }
     }
 }
