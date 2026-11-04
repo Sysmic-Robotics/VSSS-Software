@@ -162,6 +162,13 @@ pub struct CoachParams {
     /// camino el 59 %) y cara a cara −0.23 ± 0.24 (48 partidos; el segundo bloque se cortó a los
     /// 14). Queda apagado.
     pub support_yield_dist: f32,
+    /// Pase y desvío (escenario 6): con el tiro directo tapado y el apoyo en campo rival con
+    /// línea libre al arco, a lo más a esta distancia (m) de la pelota, el atacante la conduce
+    /// hacia el apoyo y frena para que siga rodando sola, y el apoyo la espera con una cara
+    /// orientada para desviarla al arco. 0 = nunca. En el banco (`pase`), conduciendo 0.7-0.9 s
+    /// y frenando, la pelota llega 4/4 a ±6 cm a 0.45-0.60 m/s; sin frenar el robot la llevaba
+    /// pegada (los pases por empuje llegaban al receptor el 9-20 % de las veces).
+    pub pass_deflect_max_dist: f32,
 }
 
 impl Default for CoachParams {
@@ -211,6 +218,7 @@ impl Default for CoachParams {
             deflect_face_k: 0.15,
             spin_min_still_s: 0.0,
             support_yield_dist: 0.0,
+            pass_deflect_max_dist: 0.0,
         }
     }
 }

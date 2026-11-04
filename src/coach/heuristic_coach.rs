@@ -78,6 +78,21 @@ struct Committed {
     held: u32,
 }
 
+/// Pase y desvío en curso (`pass_deflect_max_dist`): quién pasa y quién desvía, dónde toca la
+/// cara del receptor (`point`), su centro y rumbo, dónde estaba la pelota al empezar y la
+/// decisión en que empezó y en que el pasador frenó.
+#[derive(Debug, Clone, Copy)]
+struct PassPlay {
+    passer: i32,
+    receiver: i32,
+    point: Vec2,
+    center: Vec2,
+    heading: f32,
+    ball0: Vec2,
+    started: u64,
+    released: Option<u64>,
+}
+
 /// Desvío en curso: punto del camino de la pelota donde la toca la cara, centro y rumbo del
 /// robot, y decisión en que se espera el contacto.
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +150,8 @@ pub struct HeuristicCoach {
     ball_still_since: Option<u64>,
     /// El apoyo estaba cediendo el paso en la decisión anterior (`support_yield_dist`).
     yielding: [bool; 3],
+    /// Pase y desvío en curso.
+    pass_play: Option<PassPlay>,
     /// Decisión en la que la pelota entró al área propia (para el límite de 10 s).
     ball_in_area_since: Option<u64>,
     /// Estado del árbitro (VSSReferee / operador). `None` = siempre juego abierto.
@@ -209,6 +226,7 @@ impl HeuristicCoach {
             decision_count: 0,
             ball_still_since: None,
             yielding: [false; 3],
+            pass_play: None,
             ball_in_area_since: None,
             referee: None,
             current_play: Play::Open,
@@ -888,6 +906,121 @@ impl HeuristicCoach {
         pos
     }
 
+    /// Pase y desvío (`pass_deflect_max_dist`): sigue, termina o empieza la jugada.
+    /// Empieza con el atacante pegado detrás de la pelota quieta (respecto del pase), el tiro
+    /// directo tapado y el apoyo en campo rival a 0.25 m a `pass_deflect_max_dist` de la
+    /// pelota, con el pase y su salida al arco libres de rivales y un desvío de 15° a 100°. El
+    /// pasador frena cuando la pelota ya va a 0.5 m/s o recorrió 0.2 m (o a 1 s). Termina a los
+    /// 3 s, si un rival toma la pelota, si cambian los roles, o cuando, ya suelta, la pelota se
+    /// frena o deja de ir hacia el receptor.
+    fn update_pass_play(
+        &mut self,
+        striker: Option<&RobotView>,
+        support: Option<&RobotView>,
+        ball: Vec2,
+        ball_vel: Vec2,
+        opp: &[RobotView],
+    ) {
+        let max_dist = self.p.pass_deflect_max_dist;
+        if max_dist <= 0.0 {
+            self.pass_play = None;
+            return;
+        }
+        let hz = self.p.decision_hz.max(1e-3);
+        let since = |d: u64, now: u64| now.saturating_sub(d) as f32 / hz;
+        if let Some(mut play) = self.pass_play {
+            let now = self.decision_count;
+            let roles_ok =
+                striker.is_some_and(|s| s.id == play.passer) && support.is_some_and(|s| s.id == play.receiver);
+            let taken = opp.iter().any(|o| o.active && (o.pos - ball).length() < 0.12);
+            let over = play.released.is_some() && (ball_vel.length() < 0.1 || ball_vel.dot(play.point - ball) <= 0.0);
+            if since(play.started, now) > 3.0 || !roles_ok || taken || over {
+                self.end_pass_play(&play);
+                return;
+            }
+            if play.released.is_none() {
+                let dir = (play.point - play.ball0).normalize_or_zero();
+                let fast = ball_vel.dot(dir) >= 0.5;
+                let far = (ball - play.ball0).dot(dir) >= 0.2;
+                if fast || far || since(play.started, now) >= 1.0 {
+                    play.released = Some(now);
+                }
+            }
+            self.pass_play = Some(play);
+            return;
+        }
+        let (Some(st), Some(sup)) = (striker, support) else {
+            return;
+        };
+        let s = self.attack_sign();
+        let aim = self.attack_goal;
+        let p = sup.pos;
+        let d = (p - ball).length();
+        if ball_vel.length() > 0.3
+            || (st.pos - ball).length() > 0.12
+            || d < 0.25
+            || d > max_dist
+            || p.x * s < 0.0
+            || p.x * s > GOAL_AREA_X - 0.05
+            || !Self::shot_blocked(ball, aim, opp)
+            || Self::line_blocked(ball, p, opp, 0.09)
+            || Self::line_blocked(p, aim, opp, 0.09)
+        {
+            return;
+        }
+        let inc = (p - ball) / d;
+        let out = (aim - p).normalize_or_zero();
+        let behind = (ball - st.pos).normalize_or_zero().dot(inc) >= std::f32::consts::FRAC_1_SQRT_2;
+        if !behind || !(-0.17..=0.97).contains(&inc.dot(out)) {
+            return;
+        }
+        let Some(ph) = Self::deflect_normal(inc, out, self.p.deflect_face_k) else {
+            return;
+        };
+        let quarter = FRAC_PI_2;
+        let off = (sup.theta - ph).rem_euclid(quarter);
+        let heading = if off <= quarter / 2.0 { sup.theta - off } else { sup.theta + quarter - off };
+        self.pass_play = Some(PassPlay {
+            passer: st.id,
+            receiver: sup.id,
+            point: p,
+            center: p - Vec2::from_angle(ph) * DEFLECT_FACE_TO_BALL,
+            heading,
+            ball0: ball,
+            started: self.decision_count,
+            released: None,
+        });
+    }
+
+    /// Fin de la jugada: se sueltan los compromisos de los dos (Hold, Dribble, GoTo y FacePoint
+    /// del pase no deben seguir con el objetivo de otra rama).
+    fn end_pass_play(&mut self, play: &PassPlay) {
+        for id in [play.passer, play.receiver] {
+            if let Some(slot) = self.committed.get_mut(id as usize) {
+                *slot = None;
+            }
+        }
+        self.pass_play = None;
+    }
+
+    /// La orden de la jugada para `r`: el pasador conduce hacia el receptor y después frena
+    /// (`Hold`); el receptor va a su centro y orienta la cara (`deflect_command`).
+    fn pass_play_choice(&mut self, r: &RobotView) -> Option<SkillChoice> {
+        let play = self.pass_play?;
+        if r.id == play.passer {
+            let (wanted, target) = match play.released {
+                None => (SkillId::Dribble, play.point),
+                Some(_) => (SkillId::Hold, r.pos),
+            };
+            let skill = self.commit(r.id, wanted, |_| false);
+            Some(SkillChoice::new(r.id, skill, target))
+        } else if r.id == play.receiver {
+            Some(self.deflect_command(r, play.center, play.heading))
+        } else {
+            None
+        }
+    }
+
     /// Normal de la cara (ángulo, rad) que manda hacia `out` una pelota que llega por `inc`
     /// (unitarios), con la cara devolviendo `k` de la velocidad normal respecto de la
     /// tangencial: la salida `inc − (1 + k)(inc·n) n` va por `out`. `None` si ninguna cara de
@@ -1540,8 +1673,18 @@ impl Coach for HeuristicCoach {
         let ball_in_own_area = self.in_own_area(ball) && keeper_active;
         let ball_on_area_edge = self.ball_is_keepers(ball) && keeper_active;
 
+        let support = own
+            .iter()
+            .find(|r| r.active && Some(r.id) != self.striker_id && r.id != self.keeper_id)
+            .copied();
+        self.update_pass_play(striker.as_ref(), support.as_ref(), ball, ball_vel, &opp);
+
         let mut choices = Vec::with_capacity(3);
         for r in own.iter().filter(|r| r.active) {
+            if let Some(choice) = self.pass_play_choice(r) {
+                choices.push(choice);
+                continue;
+            }
             let choice = match self.role_of(r.id) {
                 Some(Role::Keeper) => keeper_choice.expect("arquero activo"),
                 Some(Role::Striker) if ball_in_own_area => {
@@ -1992,6 +2135,37 @@ mod tests {
         assert_eq!(c.role_of(0), Some(Role::Striker));
         assert_eq!(choice_of(&ch, 0).skill_id, SkillId::SpinKick);
         assert_eq!(choice_of(&ch, 0).target, ATTACK);
+    }
+
+    #[test]
+    fn pass_and_deflect_play() {
+        // Tiro directo tapado por un rival; el apoyo en campo rival con línea libre al arco y el
+        // atacante pegado detrás de la pelota respecto del pase: el atacante conduce hacia el
+        // apoyo (Dribble a su punto) y el apoyo va a su centro de desvío; cuando la pelota ya va
+        // rápida hacia él, el atacante frena (Hold). Apagado, nada de eso.
+        let ball = Vec2::new(0.10, -0.10);
+        let p = Vec2::new(0.40, 0.20);
+        let inc = (p - ball).normalize();
+        let own = [ball - inc * 0.10, p, Vec2::new(-0.68, 0.0)];
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.35, -0.06), 180.0);
+        let mut off = coach();
+        let ch = off.decide(&o);
+        assert_ne!(choice_of(&ch, 1).skill_id, SkillId::GoTo, "apagado: {:?}", choice_of(&ch, 1));
+        let mut c = coach();
+        c.p.pass_deflect_max_dist = 0.6;
+        let ch = c.decide(&o);
+        assert_eq!(c.role_of(0), Some(Role::Striker));
+        let pase = choice_of(&ch, 0);
+        assert_eq!(pase.skill_id, SkillId::Dribble);
+        assert!((pase.target - p).length() < 1e-4, "{pase:?}");
+        let rec = choice_of(&ch, 1);
+        assert!(matches!(rec.skill_id, SkillId::GoTo | SkillId::FacePoint), "{rec:?}");
+        assert!((rec.target - p).length() <= DEFLECT_FACE_TO_BALL + 0.31, "{rec:?}");
+        let mut rodando = obs(ball + inc * 0.08, inc * 0.6, own);
+        rodando.opp_robots[0] = robot(Vec2::new(0.35, -0.06), 180.0);
+        let ch = c.decide(&rodando);
+        assert_eq!(choice_of(&ch, 0).skill_id, SkillId::Hold, "frenó para soltarla");
     }
 
     #[test]
