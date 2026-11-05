@@ -37,7 +37,7 @@
     "gk_rail": true,
     "support_cover_dist": 0.35,
     "pass_deflect_max_dist": 0.6,
-    "kickoff_rush_s": 5.0,
+    "kickoff_rush_s": 2.5,
     "kickoff_guard_s": 0.0
   },
   "skills": {
@@ -73,6 +73,8 @@
     "keeper_rail_tol": 0.06,
     "keeper_contact_dist": 0.12,
     "keeper_sweep": 0.1,
+    "keeper_rival_min_ball_speed": 0.1,
+    "keeper_rival_max_shift": 0.05,
     "dribble_de": 0.1,
     "dribble_kr": 0.05,
     "dribble_speed": 0.8

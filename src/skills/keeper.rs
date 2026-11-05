@@ -90,6 +90,10 @@ pub struct RailKeeperSkill {
     pub lag_s: f32,
     /// Banda dentro de la que se queda quieto (m); 0 = siempre corrige.
     pub hold_band: f32,
+    /// Con la pelota más lenta que esto no anticipa al rival (m/s); 0 = siempre anticipa.
+    pub rival_min_ball_speed: f32,
+    /// Tope de lo que se corre desde la bisectriz al anticipar al rival (m); 0 = sin tope.
+    pub rival_max_shift: f32,
     /// Quieto dentro de la banda (`hold_band`).
     holding: bool,
     v_prev: f64,
@@ -114,6 +118,8 @@ impl RailKeeperSkill {
             still_rival_dist: p.keeper_still_rival_dist,
             lag_s: p.keeper_lag_s,
             hold_band: p.keeper_hold_band,
+            rival_min_ball_speed: p.keeper_rival_min_ball_speed,
+            rival_max_shift: p.keeper_rival_max_shift,
             holding: false,
             v_prev: 0.0,
             last_target: None,
@@ -216,14 +222,23 @@ impl RailKeeperSkill {
             .copied()
             .filter(|r| (*r - ball).length() <= reach)
             .min_by(|a, b| (*a - ball).length().total_cmp(&(*b - ball).length()));
-        if let Some(r) = rival {
+        // Con la pelota quieta (`rival_min_ball_speed`) no se anticipa: la puntería del rival
+        // antes del toque no dice por dónde va a salir (penal, golpe de lado o de giro).
+        let anticipate = ball_vel.length() >= self.rival_min_ball_speed;
+        if let Some(r) = rival.filter(|_| anticipate) {
             let dir = ball - r;
             let toward_goal = -dir.x * self.inward();
             if toward_goal > 1e-3 {
                 let t = (self.rail_x() - ball.x) / dir.x;
                 if t > 0.0 {
-                    let y = ball.y + dir.y * t;
-                    return (y.clamp(-GOAL_HALF_Y, GOAL_HALF_Y), KeeperMode::Rival);
+                    let mut y = (ball.y + dir.y * t).clamp(-GOAL_HALF_Y, GOAL_HALF_Y);
+                    // Tope (`rival_max_shift`): nunca tan lejos de la bisectriz que no alcance a
+                    // volver si la pelota sale para el otro lado.
+                    if self.rival_max_shift > 0.0 {
+                        let base = self.bisector_y(ball_ahead).clamp(-GOAL_HALF_Y, GOAL_HALF_Y);
+                        y = y.clamp(base - self.rival_max_shift, base + self.rival_max_shift);
+                    }
+                    return (y, KeeperMode::Rival);
                 }
             }
         }
@@ -533,6 +548,28 @@ mod tests {
         let g3 = run(3.0);
         assert!(g3[60..].iter().all(|y| y.abs() < 0.01) && peak_to_peak(&g3[120..]) < 0.005, "{:?}", &g3[60..70]);
         assert!(peak_to_peak(&run(8.0)[120..]) > 0.05);
+    }
+
+    #[test]
+    fn keeper_does_not_follow_the_kickers_aim_with_the_ball_still() {
+        // Pateador encima de la pelota quieta en la cruz, apuntando en diagonal a un palo: sin
+        // las opciones el arquero se corre a ese palo; con `rival_min_ball_speed` se queda al
+        // centro, y con `rival_max_shift` (y la pelota en movimiento) se corre a lo más eso.
+        let cruz = Vec2::new(-0.375, 0.0);
+        let pateador = cruz + Vec2::new(0.08, -0.04);
+        let mut k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+        let (y0, m0) = k.target_y(cruz, Vec2::ZERO, &[pateador]);
+        assert_eq!(m0, KeeperMode::Rival);
+        assert!(y0 > 0.10, "sin opciones sigue la puntería: {y0}");
+        k.rival_min_ball_speed = 0.10;
+        let (y1, m1) = k.target_y(cruz, Vec2::ZERO, &[pateador]);
+        assert_eq!((y1, m1), (0.0, KeeperMode::Angle));
+        k.rival_max_shift = 0.05;
+        let lenta = Vec2::new(-0.12, 0.06);
+        let (y2, m2) = k.target_y(cruz, lenta, &[pateador]);
+        let base = k.bisector_y(cruz + lenta * k.lead_s);
+        assert_eq!(m2, KeeperMode::Rival);
+        assert!((y2 - base).abs() <= 0.05 + 1e-5 && y2 > base, "{y2} {base}");
     }
 
     #[test]

@@ -116,6 +116,8 @@ struct KickoffRush {
     side: f32,
     since: u64,
     target: Vec2,
+    /// Amagando hacia el palo contrario (`kickoff_feint_s`).
+    feint: bool,
 }
 
 /// Desvío en curso: punto del camino de la pelota donde la toca la cara, centro y rumbo del
@@ -346,7 +348,7 @@ impl HeuristicCoach {
                     side
                 }
             };
-            self.kickoff_rush_target(Vec2::ZERO, side, opp)
+            self.kickoff_first_target(Vec2::ZERO, side, opp)
         } else {
             self.aim_point(opp)
         };
@@ -996,6 +998,16 @@ impl HeuristicCoach {
         }
     }
 
+    /// Primer objetivo de la arrancada: con amague (`kickoff_feint_s`), rozando el palo contrario
+    /// al lado `side`; sin amague, el de `kickoff_rush_target`.
+    fn kickoff_first_target(&self, ball: Vec2, side: f32, opp: &[RobotView]) -> Vec2 {
+        if self.p.kickoff_feint_s > 0.0 {
+            Vec2::new(self.attack_goal.x, -side * KICKOFF_EDGE_Y)
+        } else {
+            self.kickoff_rush_target(ball, side, opp)
+        }
+    }
+
     /// Objetivo de la arrancada desde la pelota en `ball`: el primero con la recta libre de
     /// rivales (a más de 0.09 m) entre el palo del lado `side`, el centro y el otro palo (por
     /// dentro, `aim_post_margin`). Si ninguno lo está (un rival parado delante de la pelota) y la
@@ -1037,7 +1049,21 @@ impl HeuristicCoach {
         // pasó el carril. (Esperando a llegar al punto del carril, el atacante frenaba ahí, la
         // pelota se le adelantaba y la arrancada se cortaba a los 1.2 s.)
         let (s, goal_x, post_y) = (self.attack_sign(), self.attack_goal.x, GOAL_HALF_Y - self.p.aim_post_margin);
-        if let Some(rush) = self.kickoff_rush {
+        // Fin del amague: corta hacia el lado elegido (rozando el palo si la recta pasa, si no al
+        // palo de ese lado).
+        let hz = self.p.decision_hz.max(1e-3);
+        if let Some(rush) = self.kickoff_rush.filter(|r| r.feint) {
+            if self.decision_count.saturating_sub(rush.since) as f32 / hz >= self.p.kickoff_feint_s {
+                let edge = Vec2::new(goal_x, rush.side * KICKOFF_EDGE_Y);
+                let target = if Self::line_blocked(ball, edge, opp, KICKOFF_EDGE_MARGIN) {
+                    Vec2::new(goal_x, rush.side * post_y)
+                } else {
+                    edge
+                };
+                self.kickoff_rush = Some(KickoffRush { target, feint: false, ..rush });
+            }
+        }
+        if let Some(rush) = self.kickoff_rush.filter(|r| !r.feint) {
             let post = Vec2::new(goal_x, rush.side * post_y);
             let on_lane = rush.target.x * s < goal_x * s - 1e-3;
             if on_lane && (!Self::line_blocked(ball, post, opp, 0.09) || ball.x * s >= KICKOFF_LANE.x - 0.05) {
@@ -1052,10 +1078,8 @@ impl HeuristicCoach {
                 .map(|o| (o.pos - ball).length())
                 .fold(f32::INFINITY, f32::min);
             let in_area = ball.x * self.attack_sign() > GOAL_AREA_X - 0.05;
-            if elapsed(since, now) > self.p.kickoff_rush_s
-                || d_striker > 0.30
-                || (d_rival < 0.10 && d_rival < d_striker)
-                || in_area
+            let contested = d_rival < 0.10 && d_rival < d_striker && !self.p.kickoff_rush_push;
+            if elapsed(since, now) > self.p.kickoff_rush_s || d_striker > 0.30 || contested || in_area
             {
                 self.kickoff_rush = None;
             }
@@ -1955,7 +1979,8 @@ impl Coach for HeuristicCoach {
             self.kickoff_rush = if silbato && self.current_play == Play::KickoffOurs && self.p.kickoff_rush_s > 0.0 {
                 let side = self.kickoff_side.unwrap_or_else(|| self.kickoff_rush_side(ball, &opp));
                 self.kickoffs_taken += 1;
-                Some(KickoffRush { side, since: self.decision_count, target: self.kickoff_rush_target(ball, side, &opp) })
+                let feint = self.p.kickoff_feint_s > 0.0;
+                Some(KickoffRush { side, since: self.decision_count, target: self.kickoff_first_target(ball, side, &opp), feint })
             } else {
                 None
             };
@@ -2673,6 +2698,35 @@ mod tests {
         c.p.kickoff_rush_s = 5.0;
         let t = c.kickoff_rush_target(Vec2::ZERO, 1.0, &opp);
         assert_eq!(t, Vec2::new(ATTACK.x, KICKOFF_EDGE_Y));
+    }
+
+    #[test]
+    fn kickoff_rush_feints_then_cuts_and_can_push_through() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = coach();
+        c.p.kickoff_rush_s = 2.5;
+        c.p.kickoff_feint_s = 0.5;
+        c.p.kickoff_rush_push = true;
+        c.set_referee(shared.clone());
+        let own = [Vec2::new(-0.12, 0.0), Vec2::new(-0.35, 0.30), Vec2::new(-0.68, 0.0)];
+        let o = escena_saque(Vec2::ZERO, own, Vec2::new(0.26, 0.0));
+        apply_command(&shared, RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
+        let _ = c.decide(&o);
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        let amague = choice_of(&c.decide(&o), 0).target;
+        let side = -amague.y.signum();
+        assert_eq!(amague, Vec2::new(ATTACK.x, -side * KICKOFF_EDGE_Y), "primero al palo contrario");
+        // A los 0.5 s (5 decisiones) corta al lado elegido; un rival encima no la corta.
+        let mut o2 = escena_saque(Vec2::new(0.10, 0.0), [Vec2::new(0.02, 0.0), own[1], own[2]], Vec2::new(0.16, 0.02));
+        o2.opp_robots[0] = robot(Vec2::new(0.16, 0.02), 180.0);
+        let mut corte = Vec2::ZERO;
+        for _ in 0..6 {
+            corte = choice_of(&c.decide(&o2), 0).target;
+        }
+        assert!(c.kickoff_rush.is_some(), "con rival encima sigue empujando");
+        assert_eq!(corte.x, ATTACK.x);
+        assert!(corte.y * side > 0.0, "cortó al lado elegido: {corte:?}");
     }
 
     #[test]
