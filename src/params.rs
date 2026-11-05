@@ -207,6 +207,13 @@ pub struct CoachParams {
     /// `kickoff_rush_s`, 4 goles en contra con la muralla y 1 saliendo a la pelota al silbato
     /// (la arrancada pasa rozando el palo junto al que espera); queda apagada.
     pub kickoff_guard_s: f32,
+    /// Arrancada que empuja a través: un rival encima de la pelota no la corta (sigue conduciendo
+    /// al arco empujando la pelota contra él); solo el tiempo, perder la pelota o llegar al área.
+    pub kickoff_rush_push: bool,
+    /// Arrancada con amague (zigzag): durante estos segundos va hacia el palo contrario y recién
+    /// después corta hacia el palo elegido, para descolocar al defensor y al arquero. 0 = sin
+    /// amague.
+    pub kickoff_feint_s: f32,
 }
 
 impl Default for CoachParams {
@@ -261,6 +268,8 @@ impl Default for CoachParams {
             support_screen_dist: 0.0,
             kickoff_rush_s: 0.0,
             kickoff_guard_s: 0.0,
+            kickoff_rush_push: false,
+            kickoff_feint_s: 0.0,
         }
     }
 }
@@ -420,6 +429,15 @@ pub struct SkillParams {
     /// no se mueve (el cuerpo, de ±4 cm, ya lo tapa), y si se movía, se detiene a la mitad de
     /// la banda. 0 = siempre corrige.
     pub keeper_hold_band: f32,
+    /// RailKeeper: con la pelota más lenta que esto (m/s), no anticipa la puntería del rival
+    /// encima de ella (modo Rival): se queda en la bisectriz hasta que la pelota se mueve. 0 =
+    /// anticipa siempre. En la madera (5-nov), en un penal el arquero siguió la puntería del
+    /// pateador, se corrió 5.6 cm al lado contrario al tiro y, con 240 ms de retraso, le faltaron
+    /// 11 cm; un golpe de lado o de giro tampoco sale por la recta rival → pelota.
+    pub keeper_rival_min_ball_speed: f32,
+    /// RailKeeper: cuánto puede correrse (m) desde la bisectriz por anticipar al rival (modo
+    /// Rival); el resto lo decide la pelota cuando se mueve (modo Shot). 0 = sin tope.
+    pub keeper_rival_max_shift: f32,
     /// Dribble: radio de las espirales del campo "ir al arco" (m).
     pub dribble_de: f32,
     /// Dribble: suavizado de la espiral fuera de su círculo (m).
@@ -467,6 +485,8 @@ impl Default for SkillParams {
             keeper_still_rival_dist: 0.0,
             keeper_lag_s: 0.0,
             keeper_hold_band: 0.0,
+            keeper_rival_min_ball_speed: 0.0,
+            keeper_rival_max_shift: 0.0,
             dribble_de: 0.10,
             dribble_kr: 0.05,
             dribble_speed: 0.8,
