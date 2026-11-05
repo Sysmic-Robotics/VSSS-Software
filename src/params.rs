@@ -167,7 +167,10 @@ pub struct CoachParams {
     /// hacia el apoyo y frena para que siga rodando sola, y el apoyo la espera con una cara
     /// orientada para desviarla al arco. 0 = nunca. En el banco (`pase`), conduciendo 0.7-0.9 s
     /// y frenando, la pelota llega 4/4 a ±6 cm a 0.45-0.60 m/s; sin frenar el robot la llevaba
-    /// pegada (los pases por empuje llegaban al receptor el 9-20 % de las veces).
+    /// pegada (los pases por empuje llegaban al receptor el 9-20 % de las veces). Con 0.6: +0.15 ±
+    /// 0.23 y +0.27 ± 0.18, pero de 126 jugadas en 96 partidos solo 3 llegaron al receptor (la
+    /// ganancia, si es real, viene de la ventana donde espera el apoyo). Encendido en
+    /// config/team_params.json desde el 4-nov, junto con `support_cover_dist`.
     pub pass_deflect_max_dist: f32,
     /// Repliegue del apoyo: con la pelota del rival (un rival a menos de 0.15 m y más cerca que
     /// nuestro atacante), el apoyo se pone a esta distancia (m) delante de ella, en la recta
@@ -175,12 +178,16 @@ pub struct CoachParams {
     /// 0 = nunca. Sin esto, con el rival dueño de la pelota en su mitad (14 % del juego) el apoyo
     /// seguía de receptor adelante (98 %) y estaba entre la pelota y el arco el 21 %; 2 s antes
     /// de los goles en contra, el 15 % (41 goles, 48 partidos; el 54 % venía de la mitad rival).
+    /// Con 0.35: entre pelota y arco el 57 %; cara a cara +0.42 ± 0.23 y −0.02 ± 0.21; junto con
+    /// `pass_deflect_max_dist` 0.6 sobre el arquero de ganancia 3, +0.31 ± 0.15 y +0.00 ± 0.13.
+    /// Encendido en config/team_params.json desde el 4-nov (0.35).
     pub support_cover_dist: f32,
     /// Marca al presionador: con nuestro atacante dueño de la pelota, el rival más cercano a
     /// ella que viene a presionarlo (a 0.15 m a esta distancia, en m, de la pelota) se tapa: el
     /// apoyo se para entre él y la pelota. 0 = nunca. Sin esto el atacante tenía un rival a
     /// menos de 0.30 m el 87 % del tiempo que tenía la pelota y la perdía 45 veces por partido
-    /// (57 % en la mitad rival), con el apoyo esperando de receptor.
+    /// (57 % en la mitad rival), con el apoyo esperando de receptor. Con 0.45: +0.08 ± 0.24 y
+    /// +0.06 ± 0.24, sin efecto; queda apagado.
     pub support_screen_dist: f32,
 }
 
@@ -360,7 +367,11 @@ pub struct SkillParams {
     pub spin_max_time_s: f32,
     /// RailKeeper: distancia del riel (centro del robot) a la línea de gol (m).
     pub keeper_depth: f32,
-    /// RailKeeper: velocidad lateral pedida por metro de error en y (1/s).
+    /// RailKeeper: velocidad lateral pedida por metro de error en y (1/s). Con 8, y la latencia
+    /// del simulador (~0.2 s), el arquero oscilaba solo 9-13 cm pico a pico con la pelota lejos y
+    /// quieta; con 3 queda quieto (0.3 cm en el banco `arquero_osc`), llega casi igual de rápido y
+    /// cara a cara ganó +0.58 ± 0.22 y +0.83 ± 0.18 goles por partido (96 partidos, la mitad de
+    /// goles en contra): config/team_params.json usa 3 desde el 4-nov.
     pub keeper_gain: f64,
     /// RailKeeper: horizonte para tratar como tiro una pelota que viene al arco (s).
     pub keeper_horizon_s: f32,
@@ -379,7 +390,8 @@ pub struct SkillParams {
     /// +0.08 ± 0.17): queda apagado, como palanca para un rival que se alinea temprano.
     pub keeper_still_rival_dist: f32,
     /// RailKeeper: latencia (s) con que frena mirando dónde va a estar (`y + vy·lag`) y no
-    /// dónde está. 0 = dónde está. Con la latencia del simulador (~0.2 s entre comando y
+    /// dónde está. 0 = dónde está. Con ganancia 3 no hace falta: con la visión al doble de
+    /// latencia (180 ms), 0.15 contra 0 dio +0.06 ± 0.18 y −0.42 ± 0.17; queda en 0. Con la latencia del simulador (~0.2 s entre comando y
     /// movimiento visto) el arquero oscilaba solo, con la pelota quieta y lejos: 13 cm pico a
     /// pico (mediana de 343 ventanas de 1.5 s en 24 partidos), cambiando de sentido 1.25
     /// veces por segundo; en la planta de tests, 12 cm con 12 ticks de latencia y 0 con 5.

@@ -34,7 +34,9 @@
     "gk_engage_opp_dist": 0.2,
     "gk_engage_max_ball_speed": 0.4,
     "gk_block_incoming_speed": 0.1,
-    "gk_rail": true
+    "gk_rail": true,
+    "support_cover_dist": 0.35,
+    "pass_deflect_max_dist": 0.6
   },
   "skills": {
     "approach_staging_offset": 0.14,
@@ -63,7 +65,7 @@
     "spin_release_ball_speed": 0.4,
     "spin_max_time_s": 1.0,
     "keeper_depth": 0.08,
-    "keeper_gain": 8.0,
+    "keeper_gain": 3.0,
     "keeper_horizon_s": 1.5,
     "keeper_lead_s": 0.1,
     "keeper_rail_tol": 0.06,
