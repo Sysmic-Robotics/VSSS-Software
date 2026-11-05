@@ -38,7 +38,7 @@
     "support_cover_dist": 0.35,
     "pass_deflect_max_dist": 0.6,
     "kickoff_rush_s": 5.0,
-    "kickoff_guard_s": 5.0
+    "kickoff_guard_s": 0.0
   },
   "skills": {
     "approach_staging_offset": 0.14,

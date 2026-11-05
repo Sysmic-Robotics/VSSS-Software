@@ -196,13 +196,16 @@ pub struct CoachParams {
     /// el atacante queda a más de 0.30 m de la pelota, si un rival está encima de ella o con la
     /// pelota en el área rival. 0 = nunca. En los partidos del simulador, de 189 saques ninguno
     /// terminaba en gol en 8 s; en la cancha (4-nov), la mayoría de los goles rivales entraban
-    /// en los primeros 5 s del saque.
+    /// en los primeros 5 s del saque. Con 5 s, en 60 saques: 0 goles contra una defensa que sale a
+    /// la pelota al silbato y 4 contra una que espera (`kickoff_guard_s`), sin goles en contra.
     pub kickoff_rush_s: f32,
     /// Muralla en el saque rival: durante estos segundos desde el silbato y mientras la pelota
     /// no se mueva del centro (4 cm), el atacante espera en la recta pelota → arco propio,
     /// justo fuera del círculo central, en vez de salir a buscarla, y el apoyo se forma detrás
     /// en la misma recta (a 0.45 m): la arrancada en línea recta o el tiro rápido del medio les
-    /// pega en el cuerpo. 0 = nunca.
+    /// pega en el cuerpo. 0 = nunca. Contra una arrancada rival empeora: en 60 saques rivales con
+    /// `kickoff_rush_s`, 4 goles en contra con la muralla y 1 saliendo a la pelota al silbato
+    /// (la arrancada pasa rozando el palo junto al que espera); queda apagada.
     pub kickoff_guard_s: f32,
 }
 

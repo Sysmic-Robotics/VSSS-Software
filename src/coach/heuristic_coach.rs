@@ -58,6 +58,10 @@ const KICKOFF_WALL_RELEASE: f32 = 0.04;
 /// Carril de la arrancada del saque cuando un rival tapa todas las rectas al arco: el punto
 /// (x hacia el arco rival, |y|) al que conduce primero para pasarle al costado (m).
 const KICKOFF_LANE: Vec2 = Vec2::new(0.45, 0.25);
+/// Arrancada rozando el palo: |y| en la línea de gol (el borde interior del palo) y holgura con
+/// que la recta pasa a los rivales (medio robot + radio de la pelota), m.
+const KICKOFF_EDGE_Y: f32 = 0.175;
+const KICKOFF_EDGE_MARGIN: f32 = 0.0585;
 const FIELD_ROBOT_MAX_ABS_X: f32 = 0.55;
 const FIELD_ROBOT_MAX_ABS_Y: f32 = 0.55;
 /// Desvío: centro del robot a la pelota cuando ella toca el medio de una cara (medio lado del
@@ -1003,6 +1007,15 @@ impl HeuristicCoach {
         let post_y = GOAL_HALF_Y - self.p.aim_post_margin;
         let goal = [Vec2::new(gx, side * post_y), Vec2::new(gx, 0.0), Vec2::new(gx, -side * post_y)];
         if let Some(target) = goal.into_iter().find(|&g| !Self::line_blocked(ball, g, opp, 0.09)) {
+            return target;
+        }
+        // Rozando el palo: del centro, la recta a y = 0.175 en la línea de gol (la pelota entra sin
+        // tocar el palo) pasa a 5.9 cm de un rival parado justo fuera del círculo (0.26 m), y a la
+        // pelota le alcanza con 5.85 (medio robot y su radio): al límite. Empujada fuerte la pelota
+        // sigue derecho: por el carril llegaba al fondo 22 cm fuera del arco (y = 0.42 en 5 de 5
+        // saques); por esta recta, si se escapa, va hacia adentro.
+        let edge = [Vec2::new(gx, side * KICKOFF_EDGE_Y), Vec2::new(gx, -side * KICKOFF_EDGE_Y)];
+        if let Some(target) = edge.into_iter().find(|&g| !Self::line_blocked(ball, g, opp, KICKOFF_EDGE_MARGIN)) {
             return target;
         }
         if ball.x * s < KICKOFF_LANE.x - 0.05 {
@@ -2612,9 +2625,9 @@ mod tests {
         c.p.kickoff_rush_s = 5.0;
         c.set_referee(shared.clone());
         let own = [Vec2::new(-0.12, 0.0), Vec2::new(-0.35, 0.30), Vec2::new(-0.68, 0.0)];
-        // Con un rival justo delante (0.26 m) todas las rectas al arco quedan tapadas: primero el
-        // carril del costado, sin dudar entre opciones.
-        let o = escena_saque(Vec2::ZERO, own, Vec2::new(0.26, 0.0));
+        // Con un rival justo delante (0.24 m, tocando el círculo) todas las rectas al arco quedan
+        // tapadas, también rozando el palo: primero el carril del costado, sin dudar entre opciones.
+        let o = escena_saque(Vec2::ZERO, own, Vec2::new(0.24, 0.0));
         apply_command(&shared, RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
         let formado = choice_of(&c.decide(&o), 0);
         assert_eq!(formado.skill_id, SkillId::Mark, "formación");
@@ -2648,6 +2661,18 @@ mod tests {
         apply_command(&shared, RefereeCommand::GAME_ON);
         let _ = d.decide(&o);
         assert!(d.kickoff_rush.is_none());
+    }
+
+    #[test]
+    fn kickoff_rush_grazes_the_post_past_a_rival_at_the_circle() {
+        // Rival parado justo fuera del círculo (0.26 m) y arquero centrado: la recta al borde
+        // interior del palo le pasa a 5.9 cm, y la arrancada va por ahí y no por el carril.
+        let mut c = coach();
+        let o = escena_saque(Vec2::ZERO, [Vec2::new(-0.12, 0.0), Vec2::new(-0.35, 0.30), Vec2::new(-0.68, 0.0)], Vec2::new(0.26, 0.0));
+        let opp: Vec<RobotView> = o.opp_robots.iter().enumerate().map(|(i, r)| HeuristicCoach::view(i, r)).collect();
+        c.p.kickoff_rush_s = 5.0;
+        let t = c.kickoff_rush_target(Vec2::ZERO, 1.0, &opp);
+        assert_eq!(t, Vec2::new(ATTACK.x, KICKOFF_EDGE_Y));
     }
 
     #[test]
