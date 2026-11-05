@@ -36,7 +36,9 @@
     "gk_block_incoming_speed": 0.1,
     "gk_rail": true,
     "support_cover_dist": 0.35,
-    "pass_deflect_max_dist": 0.6
+    "pass_deflect_max_dist": 0.6,
+    "kickoff_rush_s": 5.0,
+    "kickoff_guard_s": 5.0
   },
   "skills": {
     "approach_staging_offset": 0.14,
