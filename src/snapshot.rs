@@ -81,6 +81,10 @@ pub struct LoopSnapshot {
     /// Identidad vigente de los robots (qué patrón lleva cada radio), solo con la base
     /// station; `None` en simulación, donde cada robot es su patrón.
     pub identidad: Option<Arc<crate::identidad::Identidad>>,
+    /// Aviso de la vigilancia de identidad (`identidad::vigilancia`): patrones que no
+    /// responden a sus comandos y sí a los de otro, con la identidad que lo arregla. Solo con
+    /// la base station.
+    pub alerta_identidad: Option<Arc<crate::identidad::vigilancia::AlertaIdentidad>>,
     /// Lado vigente del lazo (`ZoneGuard::attack_sign`, +1 = atacamos hacia +x): el de
     /// `VSSL_SIDE` hasta un cambio de lado. `None` antes de la primera foto: la GUI usa el
     /// de `VSSL_SIDE`.
@@ -109,6 +113,7 @@ impl Default for LoopSnapshot {
             rutina: None,
             arquero: crate::params::params().coach.keeper_id,
             identidad: None,
+            alerta_identidad: None,
             attack_sign: None,
             esperando_arbitro: false,
         }

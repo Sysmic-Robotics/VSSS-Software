@@ -33,6 +33,8 @@ pub enum MensajeRobots {
     Cancelar,
     Aplicar,
     Descartar,
+    /// Aplicar la identidad que propone la vigilancia durante el juego.
+    AplicarVigilancia,
 }
 
 /// La identificación en curso, con la identidad de la que partió.
@@ -311,6 +313,14 @@ impl DebugGui {
                 }
             }
             MensajeRobots::Descartar => self.robots.resultado = None,
+            MensajeRobots::AplicarVigilancia => {
+                if self.robots.identificando() {
+                    return;
+                }
+                if let Some(p) = self.snap.alerta_identidad.as_deref().and_then(|a| a.propuesta.clone()) {
+                    self.aplicar_identidad(p);
+                }
+            }
         }
     }
 
@@ -355,6 +365,21 @@ impl DebugGui {
             col = col.push(horizontal_rule(1).style(theme::filete));
             for a in avisos {
                 col = col.push(text(a).size(theme::TXT_CHICO).style(theme::alerta));
+            }
+        }
+        // Vigilancia durante el juego: un patrón que no responde a sus comandos y sí a los de
+        // otro. Puede ser la identidad o la visión que confundió dos etiquetas: no se aplica
+        // sola.
+        if let Some(alerta) = self.snap.alerta_identidad.as_deref() {
+            col = col.push(horizontal_rule(1).style(theme::filete)).push(subtitulo("Identidad cruzada"));
+            for f in alerta.frases() {
+                col = col.push(text(f).size(theme::TXT).style(theme::alerta));
+            }
+            if alerta.propuesta.is_some() {
+                col = col.push(boton_chico(
+                    "Aplicar la propuesta",
+                    (editable && r.tx.is_some()).then(|| m(MensajeRobots::AplicarVigilancia)),
+                ));
             }
         }
         col = col

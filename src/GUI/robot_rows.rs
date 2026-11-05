@@ -169,7 +169,14 @@ pub fn datos_fila(
         cara,
         pedido,
         medido,
-        avisos: avisos_robot(vista, robot, skill_warning),
+        avisos: {
+            let mut avisos = avisos_robot(vista, robot, skill_warning);
+            // La vigilancia de identidad: primero, porque explica todo lo demás.
+            if let Some(a) = snap.alerta_identidad.as_deref().and_then(|a| a.aviso_de(id)) {
+                avisos.insert(0, a);
+            }
+            avisos
+        },
     }
 }
 
@@ -376,6 +383,22 @@ mod tests {
         assert_eq!(d.pedido.as_deref(), Some("\u{2212}0.62 m/s, 1.40 rad/s"));
         assert_eq!(d.medido.as_deref(), Some("0.58 m/s, 1.20 rad/s"));
         assert!(d.avisos.is_empty(), "{:?}", d.avisos);
+    }
+
+    #[test]
+    fn la_identidad_cruzada_va_primera_en_los_avisos() {
+        use crate::identidad::vigilancia::{AlertaIdentidad, Cruce};
+        let snap = LoopSnapshot {
+            own: vec![vista(0, CommandSource::Coach)],
+            robots: vec![robot(0, 0, 0.0)],
+            alerta_identidad: Some(std::sync::Arc::new(AlertaIdentidad {
+                cruces: vec![Cruce { mandado: 0, se_mueve: 2, correlacion: 0.7, propia: 0.0 }],
+                propuesta: None,
+            })),
+            ..LoopSnapshot::default()
+        };
+        let d = datos_fila(0, &run_info_de_prueba(), &snap, None, false);
+        assert_eq!(d.avisos.first().map(String::as_str), Some("sus comandos los recibe el robot 2: identidad cruzada"));
     }
 
     #[test]

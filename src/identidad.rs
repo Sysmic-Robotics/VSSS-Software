@@ -18,6 +18,7 @@
 //! versiona; la GUI la edita en vivo (pestaña Robots) y la guarda en cada cambio.
 
 pub mod identificar;
+pub mod vigilancia;
 
 use crate::radio::base_station::SLOT_COUNT;
 use serde::{Deserialize, Serialize};

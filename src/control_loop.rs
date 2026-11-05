@@ -177,16 +177,59 @@ impl PerfilEnLazo {
 ///
 /// En simulación no hay identidad: ni foto, ni patrones sin comandos (cada robot es su
 /// patrón); el giro lo ignora el transporte.
+///
+/// Con la base station también vigila la identidad durante el juego
+/// (`identidad::vigilancia`): si un patrón no responde a sus comandos y sí a los de otro, lo
+/// dice en la terminal y en la foto, con la identidad que lo arregla. No la cambia sola: la
+/// causa puede ser la visión que confundió dos etiquetas.
 #[derive(Debug)]
 pub(crate) struct IdentidadEnLazo {
     vigente: Arc<Identidad>,
     giro: Option<(GiroIdentificacion, u32)>,
     base_station: bool,
+    vigilancia: crate::identidad::vigilancia::VigilanciaIdentidad,
+    alerta: Option<Arc<crate::identidad::vigilancia::AlertaIdentidad>>,
 }
 
 impl IdentidadEnLazo {
     pub(crate) fn new(identidad: Identidad, base_station: bool) -> Self {
-        Self { vigente: Arc::new(identidad), giro: None, base_station }
+        Self {
+            vigente: Arc::new(identidad),
+            giro: None,
+            base_station,
+            vigilancia: Default::default(),
+            alerta: None,
+        }
+    }
+
+    /// Después del envío del tick: el giro mandado a cada patrón propio y el rumbo de los que
+    /// ve la cámara (`vistos`: patrón, rumbo). Solo con la base station y sin giro de
+    /// identificación (ese giro no pasa por los comandos).
+    pub(crate) fn vigilar(&mut self, t: f64, enviados: &[MotionCommand], own_team: i32, vistos: &[(i32, f64)]) {
+        if !self.base_station || self.giro.is_some() {
+            return;
+        }
+        let mandados: Vec<(i32, f64)> =
+            enviados.iter().filter(|c| c.team == own_team).map(|c| (c.id, c.omega)).collect();
+        self.vigilancia.registrar(t, &mandados, vistos);
+        match self.vigilancia.evaluar(t, &self.vigente) {
+            Some(Some(a)) => {
+                for f in a.frases() {
+                    eprintln!("[control_loop] identidad: ⚠ {f}");
+                }
+                self.alerta = Some(Arc::new(a));
+            }
+            Some(None) => {
+                eprintln!("[control_loop] identidad: cada robot vuelve a responder a sus comandos");
+                self.alerta = None;
+            }
+            None => {}
+        }
+    }
+
+    /// La alerta de identidad vigente, para la foto.
+    pub(crate) fn alerta_para_foto(&self) -> Option<Arc<crate::identidad::vigilancia::AlertaIdentidad>> {
+        self.alerta.clone()
     }
 
     /// Al arrancar: la identidad al transporte antes del primer envío y, con la base
@@ -238,6 +281,11 @@ impl IdentidadEnLazo {
             OrdenIdentidad::Usar(i) => {
                 let cambia = *self.vigente != i;
                 self.vigente = Arc::new(i);
+                if cambia {
+                    // Con otra identidad, lo observado con la anterior ya no dice nada.
+                    self.vigilancia.reiniciar();
+                    self.alerta = None;
+                }
                 cambia
             }
             OrdenIdentidad::Giro { radio, w_deg_s } => {
@@ -1571,8 +1619,18 @@ pub async fn run_control_loop(
             let mode: TickMode;
             // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
             let mut gui_world = None;
+            // Rumbo de los robots propios que ve la cámara, para la vigilancia de identidad.
+            let mut vistos_identidad: Vec<(i32, f64)> = Vec::new();
             let (commands, targets, applied_choices, escaping, debug, (escapando, frenados)) = {
                 let world_guard = world.read().await;
+                if base_station {
+                    let propios = if config.own_team == 0 {
+                        world_guard.get_blue_team_active()
+                    } else {
+                        world_guard.get_yellow_team_active()
+                    };
+                    vistos_identidad = propios.iter().map(|r| (r.id, r.orientation)).collect();
+                }
                 if !field_scale_warned {
                     field_scale_warned = warn_if_outside_vsss_field(&world_guard);
                 }
@@ -1743,6 +1801,7 @@ pub async fn run_control_loop(
                         rutina: rutina_vista.clone(),
                         arquero: zone_guard.keeper(),
                         identidad: identidad.para_foto(),
+                        alerta_identidad: identidad.alerta_para_foto(),
                         attack_sign: Some(zone_guard.attack_sign()),
                         esperando_arbitro: espera.activa(),
                     },
@@ -1752,9 +1811,11 @@ pub async fn run_control_loop(
             // El hook y la foto registran lo que decidió el tick; el envío, los ceros si no
             // hubo comandos.
             let mut radio_guard = radio.lock().await;
-            for cmd in ceros.as_deref().unwrap_or(&commands) {
+            let enviados = ceros.as_deref().unwrap_or(&commands);
+            for cmd in enviados {
                 radio_guard.add_motion_command(cmd.clone());
             }
+            identidad.vigilar(started.elapsed().as_secs_f64(), enviados, config.own_team, &vistos_identidad);
             // El giro de identificación (exclusivo: el transporte pone en cero las demás
             // posiciones) vale este envío; no sale en la parada, HALT ni el corte sin visión.
             identidad.al_enviar(mode, &mut radio_guard);
@@ -3428,6 +3489,35 @@ mod tests {
 
     fn avance(id: i32, vx: f64) -> MotionCommand {
         MotionCommand { id, team: 0, vx, vy: 0.0, omega: 0.0, orientation: 0.0 }
+    }
+
+    #[test]
+    fn la_identidad_cruzada_se_avisa_en_la_foto_y_se_borra_con_otra_identidad() {
+        use crate::identidad::vigilancia::giro_de_prueba;
+        // Radio k ↔ patrón k, pero los comandos del 0 mueven al robot del 1 y al revés.
+        let mut i = IdentidadEnLazo::new(Identidad::default(), true);
+        let mut sim = IdentidadEnLazo::new(Identidad::default(), false);
+        let (mut th0, mut th1) = (0.0_f64, 0.0_f64);
+        for k in 0..1200 {
+            let t = k as f64 / 60.0;
+            th1 += giro_de_prueba(0, t - 0.25) / 60.0;
+            th0 += giro_de_prueba(1, t - 0.25) / 60.0;
+            let cmds: Vec<MotionCommand> = (0..2)
+                .map(|id| MotionCommand { id, team: 0, vx: 0.0, vy: 0.0, omega: giro_de_prueba(id, t), orientation: 0.0 })
+                .collect();
+            let vistos = [(0, th0), (1, th1)];
+            i.vigilar(t, &cmds, 0, &vistos);
+            sim.vigilar(t, &cmds, 0, &vistos);
+        }
+        let a = i.alerta_para_foto().expect("con la base station debería avisar");
+        assert_eq!(a.cruces.len(), 2, "{a:?}");
+        let p = a.propuesta.clone().expect("propuesta");
+        assert_eq!([p.robots[0].patron, p.robots[1].patron], [Some(1), Some(0)]);
+        // En simulación no hay identidad que vigilar.
+        assert!(sim.alerta_para_foto().is_none());
+        // Con la identidad nueva, la alerta se borra hasta volver a juntar evidencia.
+        assert!(i.recibir(OrdenIdentidad::Usar(p), 1200));
+        assert!(i.alerta_para_foto().is_none());
     }
 
     fn ceros() -> Vec<MotionCommand> {
