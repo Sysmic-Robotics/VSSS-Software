@@ -213,6 +213,9 @@ pub struct HeuristicCoach {
     push_stall: Stall,
     /// Depuración de las decisiones (GUI y CSV de partido; no decide nada).
     depuracion: depuracion::Registro,
+    /// Registro de cartas (`coach::cartas`, etapa 1 del selector de jugadas): solo el coach de
+    /// producción lo abre, junto al registro de partido; no decide nada.
+    cartas: Option<crate::coach::cartas::RegistroCartas>,
     /// Con `estilo = adaptativo`: elige el estilo de juego abierto durante el partido.
     playbook: Option<Playbook>,
     /// Pelota en la última decisión de juego abierto (el playbook reconoce un gol por el saque
@@ -237,12 +240,14 @@ impl HeuristicCoach {
     /// Coach de producción: parámetros del JSON vigente y modo de dos caras según
     /// `MotionConfig::from_env()` (decide igual que como se ejecuta).
     pub fn new(attack_goal: Vec2, own_goal: Vec2) -> Self {
-        Self::from_params(
+        let mut c = Self::from_params(
             attack_goal,
             own_goal,
             params().coach.clone(),
             MotionConfig::from_env().bidirectional,
-        )
+        );
+        c.cartas = crate::coach::cartas::RegistroCartas::desde_entorno();
+        c
     }
 
     /// Defaults de código con arquero y modo explícitos (tests, herramientas).
@@ -289,6 +294,7 @@ impl HeuristicCoach {
             side_checked: false,
             push_stall: Stall::None,
             depuracion: depuracion::Registro::default(),
+            cartas: None,
             playbook: (p.estilo == "adaptativo").then(|| {
                 let largo = (p.playbook_episodio_s * p.decision_hz).round() as u32;
                 Playbook::new(largo, 0x9E37_79B9_7F4A_7C15 ^ u64::from(attack_goal.x.to_bits()))
@@ -1112,6 +1118,120 @@ impl HeuristicCoach {
         let dir = (self.own_goal - ball).normalize_or_zero();
         let skill = self.commit(r.id, SkillId::Mark, |_| false);
         Some(SkillChoice::new(r.id, skill, ball + dir * dist))
+    }
+
+    /// Fracción de la boca del arco rival (9 puntos entre ±0.18 m) que se ve desde `from` sin un
+    /// rival a menos de 6 cm de la recta (medio robot y el radio de la pelota): 1 = arco abierto.
+    fn open_goal_fraction(&self, from: Vec2, opp: &[RobotView]) -> f32 {
+        const N: usize = 9;
+        let libres = (0..N)
+            .filter(|&i| {
+                let y = -0.18 + 0.36 * i as f32 / (N - 1) as f32;
+                !Self::line_blocked(from, Vec2::new(self.attack_goal.x, y), opp, 0.06)
+            })
+            .count();
+        libres as f32 / N as f32
+    }
+
+    /// Una línea del registro de cartas (`coach::cartas`) con las cartas del atacante en esta
+    /// decisión y lo que eligió el coach. Posiciones en el marco "atacamos hacia +x".
+    #[allow(clippy::too_many_arguments)]
+    fn cartas_json(
+        &self,
+        own: &[RobotView],
+        opp: &[RobotView],
+        ball: Vec2,
+        ball_vel: Vec2,
+        striker: Option<&RobotView>,
+        support: Option<&RobotView>,
+        choices: &[SkillChoice],
+    ) -> serde_json::Value {
+        use crate::coach::cartas::r3;
+        use serde_json::json;
+        let s = self.attack_sign();
+        let p = |v: Vec2| [r3(v.x * s), r3(v.y)];
+        let near = |robots: &[RobotView]| {
+            robots
+                .iter()
+                .filter(|r| r.active)
+                .map(|r| (r.pos - ball).length())
+                .fold(f32::INFINITY, f32::min)
+        };
+        let campo: Vec<RobotView> = own.iter().filter(|r| r.active && r.id != self.keeper_id).copied().collect();
+        let (d_nuestro, d_rival) = (near(&campo), near(opp));
+        let posesion = if d_nuestro < 0.12 && d_nuestro <= d_rival {
+            "nuestra"
+        } else if d_rival < 0.12 {
+            "rival"
+        } else {
+            "libre"
+        };
+        let t_rival = opp
+            .iter()
+            .filter(|o| o.active)
+            .map(|o| self.time_to_intercept(o, ball, ball_vel))
+            .fold(f32::INFINITY, f32::min);
+        // Tiro directo: al centro, o al palo lejano si el arquero rival está corrido (como
+        // `aim_point`, sin los contadores de adaptación ni tocar la depuración).
+        let keeper = opp
+            .iter()
+            .filter(|o| o.active && (o.pos - self.attack_goal).length() <= self.p.opp_keeper_radius)
+            .min_by(|a, b| (a.pos - self.attack_goal).length().total_cmp(&(b.pos - self.attack_goal).length()));
+        let post_y = GOAL_HALF_Y - self.p.aim_post_margin;
+        let aim = match keeper {
+            Some(k) if k.pos.y.abs() > 0.03 => Vec2::new(self.attack_goal.x, -k.pos.y.signum() * post_y),
+            _ => Vec2::new(self.attack_goal.x, 0.0),
+        };
+        let atacante = striker.map(|st| {
+            let alin = (ball - st.pos).normalize_or_zero().dot((aim - ball).normalize_or_zero());
+            json!({
+                "id": st.id,
+                "pos": p(st.pos),
+                "d": r3((st.pos - ball).length()),
+                "alineado": r3(alin),
+                "t_llegar": r3(self.time_to_intercept(st, ball, ball_vel)),
+            })
+        });
+        let pase = support.map(|sup| {
+            json!({
+                "id": sup.id,
+                "pos": p(sup.pos),
+                "d": r3((sup.pos - ball).length()),
+                "linea_libre": r3(Self::segment_clearance(ball, sup.pos, opp).min(1.0)),
+                "abierto": r3(self.open_goal_fraction(sup.pos, opp)),
+                "ventana": self.pass_window(ball, striker, opp).map(p),
+            })
+        });
+        let eleccion = |id: Option<i32>| {
+            id.and_then(|id| choices.iter().find(|c| c.robot_id == id))
+                .map(|c| json!({"skill": format!("{:?}", c.skill_id), "objetivo": p(c.target)}))
+        };
+        json!({
+            "t": self.decision_count,
+            "play": format!("{:?}", self.current_play),
+            "pelota": p(ball),
+            "vel": p(ball_vel),
+            "posesion": posesion,
+            "d_nuestro": r3(d_nuestro.min(9.0)),
+            "d_rival": r3(d_rival.min(9.0)),
+            "t_rival": r3(t_rival.min(9.0)),
+            "atacante": atacante,
+            "directo": {
+                "objetivo_y": r3(aim.y),
+                "abierto": r3(self.open_goal_fraction(ball, opp)),
+                "libre": r3(Self::segment_clearance(ball, aim, opp).min(1.0)),
+                "dist": r3((aim - ball).length()),
+                "arquero_y": keeper.map(|k| r3(k.pos.y)),
+            },
+            "giro": {
+                "al_alcance": striker.is_some_and(|st| (st.pos - ball).length() <= self.p.spin_engage_radius),
+                "rival_encima": d_rival <= self.p.spin_when_opponent_within + 0.05,
+            },
+            "pase": pase,
+            "puntajes": self.last_scores.iter().map(|(k, v)| json!([format!("{k:?}"), r3(*v)])).collect::<Vec<_>>(),
+            "eleccion": {"atacante": eleccion(self.striker_id), "apoyo": eleccion(support.map(|r| r.id))},
+            "jugadas": {"pase_y_desvio": self.pass_play.is_some(), "arrancada": self.kickoff_rush.is_some()},
+        })
     }
 
     /// Pase y desvío (`pass_deflect_max_dist`): sigue, termina o empieza la jugada.
@@ -1950,6 +2070,19 @@ impl Coach for HeuristicCoach {
         // Árbitro: al cambiar de play se olvidan los compromisos de skill para que
         // el silbato (GAME_ON) tenga efecto inmediato.
         let play = self.read_play(obs.own_team);
+        if play != self.current_play && self.cartas.is_some() {
+            let s = self.attack_sign();
+            let linea = serde_json::json!({
+                "t": self.decision_count,
+                "evento": "jugada",
+                "play": format!("{play:?}"),
+                "antes": format!("{:?}", self.current_play),
+                "ultima_pelota": [crate::coach::cartas::r3(self.last_open_ball.x * s), crate::coach::cartas::r3(self.last_open_ball.y)],
+            });
+            if let Some(reg) = self.cartas.as_mut() {
+                reg.escribir(&linea);
+            }
+        }
         if play != self.current_play {
             self.committed = [None; 3];
             self.push_stall = Stall::None;
@@ -2133,6 +2266,12 @@ impl Coach for HeuristicCoach {
         // Robots inactivos: olvidar su compromiso para que arranquen limpios.
         for r in own.iter().filter(|r| !r.active) {
             self.committed[r.id as usize] = None;
+        }
+        if self.cartas.is_some() {
+            let linea = self.cartas_json(&own, &opp, ball, ball_vel, striker.as_ref(), support.as_ref(), &choices);
+            if let Some(reg) = self.cartas.as_mut() {
+                reg.escribir(&linea);
+            }
         }
         choices
     }
@@ -2771,6 +2910,36 @@ mod tests {
         let ch = c.decide(&o2);
         assert!(c.kickoff_guard.is_none());
         assert_ne!(choice_of(&ch, 0).target, Vec2::new(-0.14 - KICKOFF_WALL_DIST, 0.0));
+    }
+
+    #[test]
+    fn cards_describe_the_strikers_options() {
+        // Atacante detrás de la pelota hacia el arco rival: sin rivales el arco está abierto;
+        // con un rival delante tapando el centro, solo en parte. La línea dice qué eligió.
+        let ball = Vec2::new(0.30, 0.0);
+        let own = [Vec2::new(0.22, 0.0), Vec2::new(0.25, 0.30), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(ball, Vec2::ZERO, own);
+        let mut c = coach();
+        let views = |o: &Observation| -> (Vec<RobotView>, Vec<RobotView>) {
+            (
+                o.own_robots.iter().enumerate().map(|(i, r)| HeuristicCoach::view(i, r)).collect(),
+                o.opp_robots.iter().enumerate().map(|(i, r)| HeuristicCoach::view(i, r)).collect(),
+            )
+        };
+        let ch = c.decide(&o);
+        let (ov, rv) = views(&o);
+        let j = c.cartas_json(&ov, &rv, ball, Vec2::ZERO, Some(&ov[0]), Some(&ov[1]), &ch);
+        assert_eq!(j["directo"]["abierto"], 1.0, "{j}");
+        assert_eq!(j["posesion"], "nuestra");
+        assert!(j["eleccion"]["atacante"]["skill"].is_string(), "{j}");
+        assert_eq!(j["pelota"][0], 0.3);
+        o.opp_robots[0] = robot(Vec2::new(0.50, 0.0), 180.0);
+        let ch = c.decide(&o);
+        let (ov, rv) = views(&o);
+        let j = c.cartas_json(&ov, &rv, ball, Vec2::ZERO, Some(&ov[0]), Some(&ov[1]), &ch);
+        let abierto = j["directo"]["abierto"].as_f64().unwrap();
+        assert!(abierto > 0.0 && abierto < 1.0, "{j}");
+        assert!(j["pase"]["linea_libre"].as_f64().unwrap() > 0.0);
     }
 
     #[test]

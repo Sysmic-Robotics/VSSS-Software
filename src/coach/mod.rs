@@ -1,4 +1,5 @@
 pub mod adaptation;
+pub mod cartas;
 mod coach_trait;
 pub mod debug;
 pub mod heuristic_coach;
