@@ -1,0 +1,4 @@
+{
+  "motion": { "max_linear_speed": 0.45, "brake_distance": 0.40, "heading_gain": 2.0 },
+  "coach": { "v_ref": 0.45 }
+}
