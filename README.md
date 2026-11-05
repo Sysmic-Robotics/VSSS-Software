@@ -430,6 +430,19 @@ log (`[main] parámetros: archivo config/team_params.json`).
   `vision.real_theta_offset_deg`. Sin `config/team_params.json` en el directorio de trabajo, la
   capa va sobre los defaults de código. Sirve también para comparar dos calibraciones en el
   mismo partido.
+- `config/robots_reales.json` es la capa para los robots reales: tope de 0.45 m/s
+  (`motion.max_linear_speed` y `coach.v_ref`, contra 0.7 en `team_params.json`), frenado desde
+  0.40 m (`brake_distance`, contra 0.28) y `heading_gain` 2.0 (contra 3.0). Entre el comando y el
+  movimiento del robot real pasan ~250-350 ms (en FIRASim se calibra con ~90 ms), y con los
+  valores del simulador se pasa del punto y el arquero oscila. Medido el 5-nov-2026 sobre el
+  mantel de prueba, con el registro de partido y `keeper_gain` 3: al ir a un punto se pasaba
+  12.5 cm (mediana; máximo 43.9) y con la capa, 1.5 cm (máximo 7.2), y el arquero quedó quieto
+  (oscilación de 16.7 cm de pico a pico a 0.2 cm). En la cancha de madera
+  (5-nov-2026, 11:20) el robot avanzaba ~1.5 veces
+  lo pedido y el arquero oscilaba ±20 cm con la pelota quieta en el punto penal: la capa baja
+  `skills.keeper_gain` de 3 a 2, y queda quieto (ventanas de 2 s con más de 5 cm: del 19 % al 4 %).
+  El ícono del escritorio la carga en "Robots reales" si `VSSL_PARAMS` no
+  viene puesta; a mano, `VSSL_PARAMS=config/robots_reales.json`. No se usa en el simulador.
 - Los JSON pueden ser parciales: lo que falta en los dos toma el default. Un campo con nombre
   desconocido es error y el proceso no arranca (evita que un typo en una calibración pase en
   silencio).
