@@ -21,6 +21,12 @@
 //! acaba el tiempo o la pelota vuelve más allá del punto (despejada). En la salida, `blue`
 //! y `yellow` son los penales convertidos por cada uno (`penalties`: los que pateó cada uno).
 //! Un empate en eliminatoria se define con 3 penales por equipo y luego muerte súbita.
+//!
+//! Con `--kickoffs N` tampoco juega un partido: repite N saques alternando el que saca (empieza
+//! `--kickoff`), con la formación de saque de siempre, y juega `KICKOFF_S` s de cada uno o hasta
+//! el primer gol. En la salida: los goles de cada equipo con su saque y en contra con el saque
+//! del otro (los primeros segundos de cada ronda, donde en la cancha entran la mayoría de los
+//! goles).
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
@@ -57,6 +63,11 @@ const AREA_KEEP_OUT: f64 = 0.10;
 /// darlo por despejado (m).
 const PENALTY_S: f64 = 6.0;
 const PENALTY_CLEARED: f64 = 0.15;
+/// Tiempo de juego de cada saque del modo `--kickoffs` (s), y pausa entre KICKOFF y GAME_ON
+/// (ms): con la de partido (1.2 s) el pateador recién formándose seguía girando al silbato; en la
+/// cancha el operador da varios segundos.
+const KICKOFF_S: f64 = 8.0;
+const KICKOFF_READY_MS: f64 = 3000.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Team {
@@ -103,6 +114,8 @@ struct Options {
     speed: f64,
     /// Modo penales: cantidad de penales a tirar (0 = partido normal).
     penalties: u32,
+    /// Modo saques: cantidad de saques a jugar (0 = partido normal).
+    kickoffs: u32,
 }
 
 fn parse_args() -> Options {
@@ -115,6 +128,7 @@ fn parse_args() -> Options {
         cmd_port: 20011,
         speed: 1.0,
         penalties: 0,
+        kickoffs: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -142,6 +156,7 @@ fn parse_args() -> Options {
             "--cmd-port" => o.cmd_port = value(&mut args).parse().expect("--cmd-port: entero"),
             "--speed" => o.speed = value(&mut args).parse::<f64>().expect("--speed: número").max(1.0),
             "--penalties" => o.penalties = value(&mut args).parse().expect("--penalties: entero"),
+            "--kickoffs" => o.kickoffs = value(&mut args).parse().expect("--kickoffs: entero"),
             other => {
                 eprintln!("[director] opción desconocida: {other}");
                 std::process::exit(2);
@@ -292,6 +307,9 @@ struct Match {
     ball_trail: VecDeque<(f64, f64)>,
     /// Divisor de las pausas de pared en las paradas (`--speed`).
     pause_scale: f64,
+    /// Pausa entre el comando de la play y GAME_ON (ms de pared a velocidad 1): 1.2 s en partido,
+    /// `KICKOFF_READY_MS` en el modo saques.
+    ready_ms: f64,
 }
 
 impl Match {
@@ -355,7 +373,7 @@ async fn set_piece(m: &mut Match, command: &str, items: &[TeleportItem], whistle
     }
     tokio::time::sleep(pause(1000.0)).await;
     whistle.send(command);
-    tokio::time::sleep(pause(1200.0)).await;
+    tokio::time::sleep(pause(m.ready_ms)).await;
     let mut buf = [0u8; 65536];
     drain(vision, &mut buf);
     m.ball_trail.clear();
@@ -464,6 +482,7 @@ async fn main() {
         free_balls: 0,
         ball_trail: VecDeque::new(),
         pause_scale: opt.speed,
+        ready_ms: 1200.0,
     };
     eprintln!(
         "[director] azul ataca hacia {:+}X · {} min · corte a {} goles · árbitro {}",
@@ -492,6 +511,59 @@ async fn main() {
             let line = format!(
                 "{{\"blue\":{},\"yellow\":{},\"seconds\":{:.1},\"ended\":\"penalties\",\"free_balls\":0,\"goals\":[],\"penalties\":[{},{}]}}",
                 m.score[0], m.score[1], m.seconds(), taken[0], taken[1]
+            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        return;
+    }
+
+    if opt.kickoffs > 0 {
+        // Por equipo que saca: saques, goles del que saca y goles del otro.
+        let mut stats = [[0u32; 3]; 2];
+        let mut kicker = opt.kickoff;
+        m.ready_ms = KICKOFF_READY_MS;
+        for i in 0..opt.kickoffs {
+            kickoff(&mut m, kicker, &whistle, &mut sim, &vision).await;
+            let (t0, end) = (m.seconds(), m.frames + (KICKOFF_S * FRAMES_PER_S) as u64);
+            let mut result = None;
+            while m.frames < end {
+                let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), vision.recv(&mut buf)).await else {
+                    eprintln!("[director] FIRASim dejó de emitir visión");
+                    break;
+                };
+                let Some(f) = parse_frame(&buf[..n]) else { continue };
+                m.frames += 1;
+                if let Some(scorer) = f.ball.and_then(|b| m.goal_scored(b)) {
+                    result = Some((scorer, m.seconds() - t0));
+                    break;
+                }
+            }
+            let k = kicker.fira_id() as usize;
+            stats[k][0] += 1;
+            match result {
+                Some((scorer, dt)) => {
+                    stats[k][if scorer == kicker { 1 } else { 2 }] += 1;
+                    m.score[scorer.fira_id() as usize] += 1;
+                    m.goals.push((m.seconds(), scorer));
+                    eprintln!("[director] saque {} de {}: gol de {} a los {dt:.1} s", i + 1, kicker.spanish(), scorer.spanish());
+                }
+                None => eprintln!("[director] saque {} de {}: sin gol en {KICKOFF_S} s", i + 1, kicker.spanish()),
+            }
+            kicker = kicker.other();
+        }
+        whistle.send("HALT");
+        println!(
+            "SAQUES azul: {}/{} goles con su saque, {} en contra · amarillo: {}/{} goles con su saque, {} en contra",
+            stats[0][1], stats[0][0], stats[0][2], stats[1][1], stats[1][0], stats[1][2]
+        );
+        if let Some(path) = opt.out {
+            let line = format!(
+                "{{\"blue\":{},\"yellow\":{},\"seconds\":{:.1},\"ended\":\"kickoffs\",\"free_balls\":0,\"goals\":[],\"kickoffs\":[[{},{},{}],[{},{},{}]]}}",
+                m.score[0], m.score[1], m.seconds(),
+                stats[0][0], stats[0][1], stats[0][2], stats[1][0], stats[1][1], stats[1][2]
             );
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
@@ -609,6 +681,7 @@ mod tests {
             free_balls: 0,
             ball_trail: VecDeque::new(),
             pause_scale: 1.0,
+            ready_ms: 1200.0,
         }
     }
 

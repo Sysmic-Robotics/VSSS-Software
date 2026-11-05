@@ -189,6 +189,21 @@ pub struct CoachParams {
     /// (57 % en la mitad rival), con el apoyo esperando de receptor. Con 0.45: +0.08 ± 0.24 y
     /// +0.06 ± 0.24, sin efecto; queda apagado.
     pub support_screen_dist: f32,
+    /// Arrancada en el saque propio: durante estos segundos desde el silbato, el atacante conduce
+    /// la pelota al arco rival a toda velocidad, sin cambiar de opción: al palo lejos del arquero
+    /// (o el centro, o el otro palo, el primero con la recta libre de rivales); con un rival
+    /// tapando todas las rectas, primero en diagonal por el carril de ese lado. Termina antes si
+    /// el atacante queda a más de 0.30 m de la pelota, si un rival está encima de ella o con la
+    /// pelota en el área rival. 0 = nunca. En los partidos del simulador, de 189 saques ninguno
+    /// terminaba en gol en 8 s; en la cancha (4-nov), la mayoría de los goles rivales entraban
+    /// en los primeros 5 s del saque.
+    pub kickoff_rush_s: f32,
+    /// Muralla en el saque rival: durante estos segundos desde el silbato y mientras la pelota
+    /// no se mueva del centro (4 cm), el atacante espera en la recta pelota → arco propio,
+    /// justo fuera del círculo central, en vez de salir a buscarla, y el apoyo se forma detrás
+    /// en la misma recta (a 0.45 m): la arrancada en línea recta o el tiro rápido del medio les
+    /// pega en el cuerpo. 0 = nunca.
+    pub kickoff_guard_s: f32,
 }
 
 impl Default for CoachParams {
@@ -241,6 +256,8 @@ impl Default for CoachParams {
             pass_deflect_max_dist: 0.0,
             support_cover_dist: 0.0,
             support_screen_dist: 0.0,
+            kickoff_rush_s: 0.0,
+            kickoff_guard_s: 0.0,
         }
     }
 }

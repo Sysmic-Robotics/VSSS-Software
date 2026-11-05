@@ -48,6 +48,16 @@ pub const GOAL_HALF_Y: f32 = 0.20;
 /// Límite |x| para robots de campo (no entrar al área propia: solo 1 permitido).
 /// Segundos desde el silbato de un penal propio en que el atacante patea al palo elegido.
 const PENALTY_SHOT_S: f32 = 3.0;
+/// Saque rival con muralla: distancia a la pelota del atacante (justo fuera del círculo central,
+/// como en la formación) y del apoyo, sobre la recta pelota → arco propio (m).
+const KICKOFF_WALL_DIST: f32 = crate::coach::plays::CENTER_CIRCLE_R + 0.06;
+const KICKOFF_SECOND_DIST: f32 = 0.45;
+/// La muralla termina apenas la pelota se mueve esto del centro (m). Con 0.12, el atacante esperaba
+/// quieto mientras una arrancada en diagonal lo rodeaba (gol a los 1.3 s en el partido visible).
+const KICKOFF_WALL_RELEASE: f32 = 0.04;
+/// Carril de la arrancada del saque cuando un rival tapa todas las rectas al arco: el punto
+/// (x hacia el arco rival, |y|) al que conduce primero para pasarle al costado (m).
+const KICKOFF_LANE: Vec2 = Vec2::new(0.45, 0.25);
 const FIELD_ROBOT_MAX_ABS_X: f32 = 0.55;
 const FIELD_ROBOT_MAX_ABS_Y: f32 = 0.55;
 /// Desvío: centro del robot a la pelota cuando ella toca el medio de una cara (medio lado del
@@ -91,6 +101,17 @@ struct PassPlay {
     ball0: Vec2,
     started: u64,
     released: Option<u64>,
+}
+
+/// Arrancada del saque propio (`kickoff_rush_s`): lado del carril (+1/−1 en y), decisión del
+/// silbato y objetivo. El objetivo se fija al silbato y cambia una sola vez, del carril al palo de
+/// ese lado cuando la pelota lo pasa: recalculado en cada decisión saltaba de un palo al otro y el
+/// atacante empujaba la pelota de costado hasta la banda (0 goles en 30 saques).
+#[derive(Debug, Clone, Copy)]
+struct KickoffRush {
+    side: f32,
+    since: u64,
+    target: Vec2,
 }
 
 /// Desvío en curso: punto del camino de la pelota donde la toca la cara, centro y rumbo del
@@ -152,6 +173,16 @@ pub struct HeuristicCoach {
     yielding: [bool; 3],
     /// Pase y desvío en curso.
     pass_play: Option<PassPlay>,
+    /// Arrancada del saque propio en curso (`kickoff_rush_s`).
+    kickoff_rush: Option<KickoffRush>,
+    /// Saques propios con arrancada: alterna el lado con el arquero rival centrado.
+    kickoffs_taken: u32,
+    /// Lado de la arrancada elegido al empezar el saque propio: fijo hasta el silbato. Elegido en
+    /// cada decisión cambiaba con los rivales acomodándose y el pateador se corría de un lado al
+    /// otro detrás de la pelota; al silbato todavía estaba girando.
+    kickoff_side: Option<f32>,
+    /// Muralla del saque rival en curso (`kickoff_guard_s`): decisión del silbato.
+    kickoff_guard: Option<u64>,
     /// Decisión en la que la pelota entró al área propia (para el límite de 10 s).
     ball_in_area_since: Option<u64>,
     /// Estado del árbitro (VSSReferee / operador). `None` = siempre juego abierto.
@@ -231,6 +262,10 @@ impl HeuristicCoach {
             ball_still_since: None,
             yielding: [false; 3],
             pass_play: None,
+            kickoff_rush: None,
+            kickoffs_taken: 0,
+            kickoff_side: None,
+            kickoff_guard: None,
             ball_in_area_since: None,
             referee: None,
             current_play: Play::Open,
@@ -296,11 +331,29 @@ impl HeuristicCoach {
     /// que la play le dé un punto explícito (goal kick propio: lo saca él).
     fn set_piece_choices(&mut self, play: Play, own: &[RobotView], opp: &[RobotView]) -> Vec<SkillChoice> {
         let s = self.attack_sign();
-        let aim = self.aim_point(opp);
+        // Con la arrancada, el pateador se forma ya alineado con ella: formado hacia el centro del
+        // arco, al silbato tenía que rodear la pelota y el primer segundo iba a 0.1-0.2 m/s.
+        let aim = if play == Play::KickoffOurs && self.p.kickoff_rush_s > 0.0 {
+            let side = match self.kickoff_side {
+                Some(side) => side,
+                None => {
+                    let side = self.kickoff_rush_side(Vec2::ZERO, opp);
+                    self.kickoff_side = Some(side);
+                    side
+                }
+            };
+            self.kickoff_rush_target(Vec2::ZERO, side, opp)
+        } else {
+            self.aim_point(opp)
+        };
         let staging = params().skills.approach_staging_offset;
-        let Some(f) = formation(play, s, aim, staging) else {
+        let Some(mut f) = formation(play, s, aim, staging) else {
             return Vec::new();
         };
+        // Muralla del saque rival: el apoyo ya formado detrás del atacante, en la recta al arco.
+        if play == Play::KickoffTheirs && self.p.kickoff_guard_s > 0.0 {
+            f.support = Vec2::new(-s * KICKOFF_SECOND_DIST, 0.0);
+        }
         // El pateador es el jugador de campo que llega antes a su punto.
         self.assign_roles(own, f.striker, Vec2::ZERO);
         own.iter()
@@ -911,6 +964,117 @@ impl HeuristicCoach {
             pos.x = self.attack_sign() * -(GOAL_AREA_X - 0.08);
         }
         pos
+    }
+
+    /// Lado (+1/−1 en y) de la arrancada del saque: el del palo lejos del arquero rival; con el
+    /// arquero centrado (o sin arquero visible), el del carril más despejado, y si empatan,
+    /// alternando de un saque al siguiente (`kickoffs_taken`).
+    fn kickoff_rush_side(&self, ball: Vec2, opp: &[RobotView]) -> f32 {
+        let keeper_y = opp
+            .iter()
+            .filter(|o| o.active && (o.pos - self.attack_goal).length() <= self.p.opp_keeper_radius)
+            .min_by(|a, b| (a.pos - self.attack_goal).length().total_cmp(&(b.pos - self.attack_goal).length()))
+            .map(|k| k.pos.y);
+        if let Some(y) = keeper_y.filter(|y| y.abs() > 0.01) {
+            return -y.signum();
+        }
+        let s = self.attack_sign();
+        let lane = |side: f32| {
+            Self::segment_clearance(ball, Vec2::new(s * KICKOFF_LANE.x, side * KICKOFF_LANE.y), opp).min(1.0)
+        };
+        let (up, down) = (lane(1.0), lane(-1.0));
+        if (up - down).abs() > 0.02 {
+            if up > down { 1.0 } else { -1.0 }
+        } else if self.kickoffs_taken % 2 == 0 {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+
+    /// Objetivo de la arrancada desde la pelota en `ball`: el primero con la recta libre de
+    /// rivales (a más de 0.09 m) entre el palo del lado `side`, el centro y el otro palo (por
+    /// dentro, `aim_post_margin`). Si ninguno lo está (un rival parado delante de la pelota) y la
+    /// pelota no pasó todavía el carril, el punto del carril de ese lado, para pasarle al costado;
+    /// si no, el palo de ese lado.
+    fn kickoff_rush_target(&self, ball: Vec2, side: f32, opp: &[RobotView]) -> Vec2 {
+        let s = self.attack_sign();
+        let gx = self.attack_goal.x;
+        let post_y = GOAL_HALF_Y - self.p.aim_post_margin;
+        let goal = [Vec2::new(gx, side * post_y), Vec2::new(gx, 0.0), Vec2::new(gx, -side * post_y)];
+        if let Some(target) = goal.into_iter().find(|&g| !Self::line_blocked(ball, g, opp, 0.09)) {
+            return target;
+        }
+        if ball.x * s < KICKOFF_LANE.x - 0.05 {
+            return Vec2::new(s * KICKOFF_LANE.x, side * KICKOFF_LANE.y);
+        }
+        goal[0]
+    }
+
+    /// Saques: termina la arrancada (`kickoff_rush_s`) al acabarse su tiempo, si el atacante
+    /// queda a más de 0.30 m de la pelota (empujada rápido se le adelanta), si un rival está encima de ella (a menos de 0.10 m y
+    /// más cerca que el atacante) o con la pelota en el área rival; y la muralla
+    /// (`kickoff_guard_s`) al acabarse su tiempo o apenas la pelota se mueve del centro
+    /// (`KICKOFF_WALL_RELEASE`).
+    fn update_kickoff(&mut self, striker: Option<&RobotView>, ball: Vec2, opp: &[RobotView]) {
+        let hz = self.p.decision_hz.max(1e-3);
+        let elapsed = |since: u64, now: u64| now.saturating_sub(since) as f32 / hz;
+        let now = self.decision_count;
+        // Del carril al palo de ese lado, una vez: apenas la recta al palo queda libre o la pelota
+        // pasó el carril. (Esperando a llegar al punto del carril, el atacante frenaba ahí, la
+        // pelota se le adelantaba y la arrancada se cortaba a los 1.2 s.)
+        let (s, goal_x, post_y) = (self.attack_sign(), self.attack_goal.x, GOAL_HALF_Y - self.p.aim_post_margin);
+        if let Some(rush) = self.kickoff_rush {
+            let post = Vec2::new(goal_x, rush.side * post_y);
+            let on_lane = rush.target.x * s < goal_x * s - 1e-3;
+            if on_lane && (!Self::line_blocked(ball, post, opp, 0.09) || ball.x * s >= KICKOFF_LANE.x - 0.05) {
+                self.kickoff_rush = Some(KickoffRush { target: post, ..rush });
+            }
+        }
+        if let Some(KickoffRush { since, .. }) = self.kickoff_rush {
+            let d_striker = striker.map_or(f32::INFINITY, |st| (st.pos - ball).length());
+            let d_rival = opp
+                .iter()
+                .filter(|o| o.active)
+                .map(|o| (o.pos - ball).length())
+                .fold(f32::INFINITY, f32::min);
+            let in_area = ball.x * self.attack_sign() > GOAL_AREA_X - 0.05;
+            if elapsed(since, now) > self.p.kickoff_rush_s
+                || d_striker > 0.30
+                || (d_rival < 0.10 && d_rival < d_striker)
+                || in_area
+            {
+                self.kickoff_rush = None;
+            }
+        }
+        if let Some(since) = self.kickoff_guard {
+            if elapsed(since, now) > self.p.kickoff_guard_s || ball.length() > KICKOFF_WALL_RELEASE {
+                self.kickoff_guard = None;
+            }
+        }
+    }
+
+    /// La orden de un saque en curso para `r`: en la arrancada, el atacante conduce al objetivo
+    /// de la arrancada; en la muralla, el atacante espera en la recta pelota → arco propio justo
+    /// fuera del círculo y el apoyo detrás, mirando la pelota.
+    fn kickoff_choice(&mut self, r: &RobotView, ball: Vec2) -> Option<SkillChoice> {
+        let role = self.role_of(r.id)?;
+        if let Some(rush) = self.kickoff_rush {
+            if role != Role::Striker {
+                return None;
+            }
+            let skill = self.commit(r.id, SkillId::Dribble, |_| false);
+            return Some(SkillChoice::new(r.id, skill, rush.target));
+        }
+        self.kickoff_guard?;
+        let dist = match role {
+            Role::Striker => KICKOFF_WALL_DIST,
+            Role::Support => KICKOFF_SECOND_DIST,
+            Role::Keeper => return None,
+        };
+        let dir = (self.own_goal - ball).normalize_or_zero();
+        let skill = self.commit(r.id, SkillId::Mark, |_| false);
+        Some(SkillChoice::new(r.id, skill, ball + dir * dist))
     }
 
     /// Pase y desvío (`pass_deflect_max_dist`): sigue, termina o empieza la jugada.
@@ -1699,6 +1863,8 @@ impl Coach for HeuristicCoach {
         self.committed = [None; 3];
         self.striker_id = None;
         self.penalty_shot = None;
+        self.kickoff_rush = None;
+        self.kickoff_guard = None;
         self.push_stall = Stall::None;
         self.side_checked = false;
         self.ball_still_since = None;
@@ -1770,6 +1936,19 @@ impl Coach for HeuristicCoach {
             // 0.16 goles, 21 goles en contra tras free balls. Ir de frente gana la carrera.)
             self.penalty_shot = (self.current_play == Play::PenaltyOurs && play == Play::Open)
                 .then(|| (self.penalty_corner(&opp), self.decision_count, PENALTY_SHOT_S));
+            // Saques (`kickoff_rush_s`, `kickoff_guard_s`): al silbato, la arrancada propia o la
+            // muralla ante la rival.
+            let silbato = play == Play::Open;
+            self.kickoff_rush = if silbato && self.current_play == Play::KickoffOurs && self.p.kickoff_rush_s > 0.0 {
+                let side = self.kickoff_side.unwrap_or_else(|| self.kickoff_rush_side(ball, &opp));
+                self.kickoffs_taken += 1;
+                Some(KickoffRush { side, since: self.decision_count, target: self.kickoff_rush_target(ball, side, &opp) })
+            } else {
+                None
+            };
+            self.kickoff_guard = (silbato && self.current_play == Play::KickoffTheirs && self.p.kickoff_guard_s > 0.0)
+                .then_some(self.decision_count);
+            self.kickoff_side = None;
             // Saque tras un gol: saca el equipo que lo recibió.
             let x = self.last_open_ball.x * self.attack_sign();
             let gol = match play {
@@ -1844,10 +2023,17 @@ impl Coach for HeuristicCoach {
             .iter()
             .find(|r| r.active && Some(r.id) != self.striker_id && r.id != self.keeper_id)
             .copied();
-        self.update_pass_play(striker.as_ref(), support.as_ref(), ball, ball_vel, &opp);
+        self.update_kickoff(striker.as_ref(), ball, &opp);
+        if self.kickoff_rush.is_none() {
+            self.update_pass_play(striker.as_ref(), support.as_ref(), ball, ball_vel, &opp);
+        }
 
         let mut choices = Vec::with_capacity(3);
         for r in own.iter().filter(|r| r.active) {
+            if let Some(choice) = self.kickoff_choice(r, ball) {
+                choices.push(choice);
+                continue;
+            }
             if let Some(choice) = self.pass_play_choice(r) {
                 choices.push(choice);
                 continue;
@@ -2407,6 +2593,105 @@ mod tests {
         assert!(c.screen_point(ball, Some(&st), &[encima]).is_none(), "rival encima");
         let lejos = RobotView { pos: Vec2::new(0.60, 0.30), ..rival };
         assert!(c.screen_point(ball, Some(&st), &[lejos]).is_none(), "rival lejos");
+    }
+
+    /// Saque: pelota al centro, nuestros robots formados y los rivales con arquero centrado y uno
+    /// parado delante de la pelota (como nuestra formación del saque rival).
+    fn escena_saque(ball: Vec2, own: [Vec2; 3], rival_frente: Vec2) -> Observation {
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[2] = robot(Vec2::new(0.70, 0.0), 90.0);
+        o.opp_robots[0] = robot(rival_frente, 180.0);
+        o
+    }
+
+    #[test]
+    fn kickoff_rush_goes_straight_and_hands_over_when_contested() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = coach(); // azul, ataca +x
+        c.p.kickoff_rush_s = 5.0;
+        c.set_referee(shared.clone());
+        let own = [Vec2::new(-0.12, 0.0), Vec2::new(-0.35, 0.30), Vec2::new(-0.68, 0.0)];
+        // Con un rival justo delante (0.26 m) todas las rectas al arco quedan tapadas: primero el
+        // carril del costado, sin dudar entre opciones.
+        let o = escena_saque(Vec2::ZERO, own, Vec2::new(0.26, 0.0));
+        apply_command(&shared, RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
+        let formado = choice_of(&c.decide(&o), 0);
+        assert_eq!(formado.skill_id, SkillId::Mark, "formación");
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        let ch = choice_of(&c.decide(&o), 0);
+        assert_eq!(ch.skill_id, SkillId::Dribble);
+        assert!((ch.target.x - KICKOFF_LANE.x).abs() < 1e-6 && (ch.target.y.abs() - KICKOFF_LANE.y).abs() < 1e-6, "{:?}", ch.target);
+        let side = ch.target.y.signum();
+        // Formado detrás de la pelota en la dirección de la arrancada.
+        assert!(formado.target.normalize().dot(ch.target.normalize()) < -0.99, "{:?} {:?}", formado.target, ch.target);
+        // Sigue por el carril mientras un rival tape la recta al palo de ese lado (aunque otra
+        // recta quede libre); con la recta libre o pasado el carril, al palo de ese lado.
+        let o_medio = escena_saque(Vec2::new(0.15, side * 0.08), [Vec2::new(0.06, side * 0.03), own[1], own[2]], Vec2::new(0.30, side * 0.10));
+        assert_eq!(choice_of(&c.decide(&o_medio), 0).target, ch.target);
+        let mut o2 = escena_saque(Vec2::new(0.42, side * 0.23), [Vec2::new(0.34, side * 0.20), own[1], own[2]], Vec2::new(0.26, 0.0));
+        o2.opp_robots[0] = robot(Vec2::new(0.26, -side * 0.02), 180.0);
+        let ch = choice_of(&c.decide(&o2), 0);
+        assert_eq!(ch.skill_id, SkillId::Dribble);
+        assert_eq!(ch.target, Vec2::new(ATTACK.x, side * (GOAL_HALF_Y - c.p.aim_post_margin)));
+        // Un rival encima de la pelota: termina la arrancada y sigue la estrategia normal.
+        let mut o3 = o2.clone();
+        o3.opp_robots[0] = robot(Vec2::new(0.47, side * 0.23), 180.0);
+        let _ = c.decide(&o3);
+        assert!(c.kickoff_rush.is_none());
+        // Apagada (por defecto): al silbato no hay arrancada.
+        let shared = new_shared_referee();
+        let mut d = coach();
+        d.set_referee(shared.clone());
+        apply_command(&shared, RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
+        let _ = d.decide(&o);
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        let _ = d.decide(&o);
+        assert!(d.kickoff_rush.is_none());
+    }
+
+    #[test]
+    fn kickoff_rush_with_a_clear_line_goes_to_the_post_away_from_the_keeper() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = coach();
+        c.p.kickoff_rush_s = 5.0;
+        c.set_referee(shared.clone());
+        let own = [Vec2::new(-0.12, 0.0), Vec2::new(-0.35, 0.30), Vec2::new(-0.68, 0.0)];
+        // Arquero rival corrido hacia +y y el otro rival lejos del centro: al palo de −y.
+        let mut o = escena_saque(Vec2::ZERO, own, Vec2::new(0.30, 0.40));
+        o.opp_robots[2] = robot(Vec2::new(0.70, 0.08), 90.0);
+        apply_command(&shared, RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Blue, ..RefereeCommand::GAME_ON });
+        let _ = c.decide(&o);
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        let ch = choice_of(&c.decide(&o), 0);
+        assert_eq!((ch.skill_id, ch.target), (SkillId::Dribble, Vec2::new(ATTACK.x, -(GOAL_HALF_Y - c.p.aim_post_margin))));
+    }
+
+    #[test]
+    fn kickoff_wall_waits_on_the_line_until_the_ball_leaves_the_center() {
+        use crate::coach::referee::{Foul, RefTeam, RefereeCommand, apply_command, new_shared_referee};
+        let shared = new_shared_referee();
+        let mut c = coach();
+        c.p.kickoff_guard_s = 5.0;
+        c.set_referee(shared.clone());
+        let own = [Vec2::new(-0.26, 0.0), Vec2::new(-0.40, 0.30), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(Vec2::ZERO, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.12, 0.0), 180.0);
+        apply_command(&shared, RefereeCommand { foul: Foul::Kickoff, team: RefTeam::Yellow, ..RefereeCommand::GAME_ON });
+        let f = c.decide(&o);
+        assert_eq!(choice_of(&f, 1).target, Vec2::new(-KICKOFF_SECOND_DIST, 0.0), "apoyo formado detrás");
+        apply_command(&shared, RefereeCommand::GAME_ON);
+        let ch = c.decide(&o);
+        let (st, sup) = (choice_of(&ch, 0), choice_of(&ch, 1));
+        assert_eq!((st.skill_id, sup.skill_id), (SkillId::Mark, SkillId::Mark));
+        assert!((st.target - Vec2::new(-KICKOFF_WALL_DIST, 0.0)).length() < 1e-5, "{:?}", st.target);
+        assert!((sup.target - Vec2::new(-KICKOFF_SECOND_DIST, 0.0)).length() < 1e-5, "{:?}", sup.target);
+        // La pelota salió del centro hacia nosotros: se juega normal (el atacante va a la pelota).
+        let o2 = obs(Vec2::new(-0.14, 0.0), Vec2::new(-0.6, 0.0), own);
+        let ch = c.decide(&o2);
+        assert!(c.kickoff_guard.is_none());
+        assert_ne!(choice_of(&ch, 0).target, Vec2::new(-0.14 - KICKOFF_WALL_DIST, 0.0));
     }
 
     #[test]
