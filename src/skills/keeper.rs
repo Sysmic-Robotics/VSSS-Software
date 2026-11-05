@@ -518,6 +518,24 @@ mod tests {
     }
 
     #[test]
+    fn keeper_waits_still_at_the_center_for_a_penalty() {
+        // Penal en contra: pelota quieta en la cruz (−0.375, 0) y el arquero 3 cm corrido tras
+        // ubicarse. Su punto es el centro; con ganancia 3 llega y queda quieto ahí (un tiro de
+        // frente le pega en el cuerpo), con 8 y la latencia del simulador oscila.
+        let cruz = Vec2::new(-0.375, 0.0);
+        let run = |gain: f64| {
+            let mut k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+            k.gain = gain;
+            let (y, mode) = k.target_y(cruz, Vec2::ZERO, &[cruz + Vec2::new(0.14, 0.0)]);
+            assert_eq!((y, mode), (0.0, KeeperMode::Angle));
+            rail_trace(&mut k, 12, 0.03, cruz, 240)
+        };
+        let g3 = run(3.0);
+        assert!(g3[60..].iter().all(|y| y.abs() < 0.01) && peak_to_peak(&g3[120..]) < 0.005, "{:?}", &g3[60..70]);
+        assert!(peak_to_peak(&run(8.0)[120..]) > 0.05);
+    }
+
+    #[test]
     fn keeper_stays_still_inside_the_hold_band() {
         // Con la banda de 3 cm, un punto a 1.2 cm no lo mueve; sin banda, corrige. Lejos del
         // punto se mueve igual y se detiene a menos de la mitad de la banda.
