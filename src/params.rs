@@ -378,6 +378,16 @@ pub struct SkillParams {
     /// cambió nada (con 0.30: nuestro pateador convierte 0.8 % en vez de 3.3 %, juego abierto
     /// +0.08 ± 0.17): queda apagado, como palanca para un rival que se alinea temprano.
     pub keeper_still_rival_dist: f32,
+    /// RailKeeper: latencia (s) con que frena mirando dónde va a estar (`y + vy·lag`) y no
+    /// dónde está. 0 = dónde está. Con la latencia del simulador (~0.2 s entre comando y
+    /// movimiento visto) el arquero oscilaba solo, con la pelota quieta y lejos: 13 cm pico a
+    /// pico (mediana de 343 ventanas de 1.5 s en 24 partidos), cambiando de sentido 1.25
+    /// veces por segundo; en la planta de tests, 12 cm con 12 ticks de latencia y 0 con 5.
+    pub keeper_lag_s: f32,
+    /// RailKeeper: banda (m) dentro de la que se queda quieto: con el punto a menos de esto
+    /// no se mueve (el cuerpo, de ±4 cm, ya lo tapa), y si se movía, se detiene a la mitad de
+    /// la banda. 0 = siempre corrige.
+    pub keeper_hold_band: f32,
     /// Dribble: radio de las espirales del campo "ir al arco" (m).
     pub dribble_de: f32,
     /// Dribble: suavizado de la espiral fuera de su círculo (m).
@@ -423,6 +433,8 @@ impl Default for SkillParams {
             keeper_contact_dist: 0.12,
             keeper_sweep: 0.10,
             keeper_still_rival_dist: 0.0,
+            keeper_lag_s: 0.0,
+            keeper_hold_band: 0.0,
             dribble_de: 0.10,
             dribble_kr: 0.05,
             dribble_speed: 0.8,

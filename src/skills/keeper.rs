@@ -86,6 +86,12 @@ pub struct RailKeeperSkill {
     pub sweep: f32,
     /// Con la pelota quieta, un rival detrás hasta esta distancia ya anticipa (m); 0 = apagado.
     pub still_rival_dist: f32,
+    /// Latencia con que frena mirando dónde va a estar (s); 0 = dónde está.
+    pub lag_s: f32,
+    /// Banda dentro de la que se queda quieto (m); 0 = siempre corrige.
+    pub hold_band: f32,
+    /// Quieto dentro de la banda (`hold_band`).
+    holding: bool,
     v_prev: f64,
     last_target: Option<Vec2>,
     last_mode: KeeperMode,
@@ -106,6 +112,9 @@ impl RailKeeperSkill {
             contact_dist: p.keeper_contact_dist,
             sweep: p.keeper_sweep,
             still_rival_dist: p.keeper_still_rival_dist,
+            lag_s: p.keeper_lag_s,
+            hold_band: p.keeper_hold_band,
+            holding: false,
             v_prev: 0.0,
             last_target: None,
             last_mode: KeeperMode::Angle,
@@ -281,10 +290,23 @@ impl Skill for RailKeeperSkill {
         self.navigating = false;
 
         let cfg = &motion.config;
+        // Quieto dentro de la banda: el cuerpo ya tapa el punto. Se mueve recién cuando el punto
+        // sale de la banda y se vuelve a quedar quieto al llegar a la mitad de ella, ya frenado.
+        let err = y_t - robot.position.y;
+        if self.hold_band > 0.0 {
+            if self.holding && err.abs() > self.hold_band {
+                self.holding = false;
+            } else if !self.holding && err.abs() < 0.5 * self.hold_band && robot.velocity.y.abs() < 0.05 {
+                self.holding = true;
+            }
+        }
+        // Frena mirando dónde va a estar: la velocidad de ahora sigue `lag_s` (latencia de la
+        // visión y del comando) y, sin descontarla, frenaba tarde y se pasaba.
+        let dy = if self.holding { 0.0 } else { y_t - (robot.position.y + robot.velocity.y * self.lag_s) };
         // (Se probó, ante un tiro, pedir la velocidad para llegar al cruce a tiempo sin reservar
         // frenado: el arquero terminaba más desfasado, 0.12 m contra 0.09, y cara a cara quedó
         // −0.21 ± 0.28 goles; se descartó.)
-        let u = self.lateral_speed(y_t - robot.position.y, cfg.max_linear_accel, cfg.max_linear_speed);
+        let u = self.lateral_speed(dy, cfg.max_linear_accel, cfg.max_linear_speed);
         // Dirección deseada: a lo largo del riel, inclinada hacia él si se desvió. Quieto,
         // solo mantiene la orientación a lo largo del riel.
         let theta_d = if u.abs() > 0.02 {
@@ -328,6 +350,7 @@ impl Skill for RailKeeperSkill {
         self.v_prev = 0.0;
         self.last_target = None;
         self.navigating = false;
+        self.holding = false;
     }
 }
 
@@ -442,6 +465,75 @@ mod tests {
         // Ya fuera del ancho del área sigue cerrando el palo.
         let (y, mode) = keeper().target_y(Vec2::new(-0.68, 0.45), Vec2::ZERO, &[]);
         assert_eq!((y, mode), (GOAL_HALF_Y, KeeperMode::NearPost));
+    }
+
+    /// Corre el arquero `ticks` ticks en la planta de tests (`lat` ticks de latencia entre el
+    /// comando y las ruedas), con la pelota quieta en `ball` y partiendo de `y0` en el riel.
+    /// Devuelve la y de cada tick.
+    fn rail_trace(k: &mut RailKeeperSkill, lat: usize, y0: f32, ball: Vec2, ticks: usize) -> Vec<f32> {
+        use crate::motion::test_plant::Plant;
+        let motion = Motion::new();
+        let mut plant = Plant::new(k.rail_x(), y0, 90.0);
+        plant.latency = lat;
+        let mut ys = Vec::with_capacity(ticks);
+        for _ in 0..ticks {
+            let mut world = World::new(3, 3);
+            world.update_robot(2, 0, Vec2::new(plant.x, plant.y), plant.th, plant.velocity(), 0.0);
+            world.update_ball(ball, Vec2::ZERO);
+            let r = world.get_robot_state(2, 0).expect("arquero").clone();
+            let c = k.tick(&r, &world, &motion);
+            ys.push(plant.y);
+            plant.step(&c);
+        }
+        ys
+    }
+
+    fn peak_to_peak(ys: &[f32]) -> f32 {
+        ys.iter().copied().fold(f32::MIN, f32::max) - ys.iter().copied().fold(f32::MAX, f32::min)
+    }
+
+    #[test]
+    fn keeper_holds_still_with_the_ball_far_despite_latency() {
+        // Pelota quieta en el centro de la cancha y el arquero a 15 cm de su punto. Con ~0.2 s
+        // entre el comando y el movimiento (12 ticks, como en el simulador), la ganancia 8 frena
+        // tarde y oscila 12 cm pico a pico; con 3 llega casi igual de rápido y queda quieto,
+        // también con 0.3 s.
+        let run = |gain: f64, lag: f32, lat: usize| {
+            let mut k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+            k.gain = gain;
+            k.lag_s = lag;
+            rail_trace(&mut k, lat, 0.15, Vec2::new(0.30, 0.0), 600)
+        };
+        assert!(peak_to_peak(&run(8.0, 0.0, 12)[300..]) > 0.08, "la causa: ganancia alta con latencia");
+        for lat in [5, 12, 18] {
+            let ys = run(3.0, 0.0, lat);
+            assert!(peak_to_peak(&ys[300..]) < 0.01, "lat {lat}");
+            let llega = ys.iter().position(|y| y.abs() < 0.02).expect("llega");
+            assert!((llega as f32 / 60.0) < 0.9, "lat {lat}: {llega} ticks");
+        }
+        // Con 0.4 s (un robot que se pasa al frenar) oscila de nuevo, salvo frenando mirando
+        // dónde va a estar (`lag_s`).
+        assert!(peak_to_peak(&run(3.0, 0.0, 24)[300..]) > 0.02);
+        assert!(peak_to_peak(&run(3.0, 0.15, 24)[300..]) < 0.01);
+    }
+
+    #[test]
+    fn keeper_stays_still_inside_the_hold_band() {
+        // Con la banda de 3 cm, un punto a 1.2 cm no lo mueve; sin banda, corrige. Lejos del
+        // punto se mueve igual y se detiene a menos de la mitad de la banda.
+        let make = |band: f32| {
+            let mut k = RailKeeperSkill::new(Vec2::new(-0.75, 0.0));
+            k.gain = 3.0;
+            k.hold_band = band;
+            k
+        };
+        let ball = Vec2::new(0.30, 0.0);
+        let quieto = rail_trace(&mut make(0.03), 12, 0.012, ball, 120);
+        assert!(peak_to_peak(&quieto) < 1e-3, "{:?}", &quieto[..5]);
+        let corrige = rail_trace(&mut make(0.0), 12, 0.012, ball, 240);
+        assert!(corrige[239].abs() < 0.007, "{}", corrige[239]);
+        let lejos = rail_trace(&mut make(0.03), 12, 0.12, ball, 300);
+        assert!(lejos[299].abs() < 0.015 && peak_to_peak(&lejos[200..]) < 1e-3, "{}", lejos[299]);
     }
 
     #[test]
