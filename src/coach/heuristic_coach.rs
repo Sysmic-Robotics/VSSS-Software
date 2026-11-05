@@ -749,11 +749,17 @@ impl HeuristicCoach {
         } else {
             0.0
         };
-        let spin = close
-            * slow
-            * contested.max(wall)
-            * if shoot > 0.0 { 0.3 } else { 1.0 }
-            * self.adaptation.spin_factor();
+        // Con el arco abierto, conducir rinde más que girar (`spin_max_open_goal`), salvo de
+        // costado con un rival encima.
+        let open_goal = p.spin_max_open_goal > 0.0 && {
+            let aligned = (ball - r.pos).normalize_or_zero().dot((target - ball).normalize_or_zero()) >= 0.7;
+            (aligned || contested == 0.0) && self.open_goal_fraction(ball, opp) >= p.spin_max_open_goal
+        };
+        let spin = if open_goal {
+            0.0
+        } else {
+            close * slow * contested.max(wall) * if shoot > 0.0 { 0.3 } else { 1.0 } * self.adaptation.spin_factor()
+        };
 
         // Intercept: pelota rápida y viniendo hacia el robot.
         let vmin = p.intercept_min_ball_speed.max(1e-3);
@@ -2940,6 +2946,25 @@ mod tests {
         let abierto = j["directo"]["abierto"].as_f64().unwrap();
         assert!(abierto > 0.0 && abierto < 1.0, "{j}");
         assert!(j["pase"]["linea_libre"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn with_an_open_goal_an_aligned_striker_drives_instead_of_spinning() {
+        // Atacante alineado detrás de la pelota quieta, un rival encima al costado y el arco
+        // abierto: hoy el giro puntúa; con `spin_max_open_goal` no.
+        let ball = Vec2::new(0.30, 0.0);
+        let st = RobotView { id: 0, pos: Vec2::new(0.22, 0.0), theta: 0.0, active: true };
+        let rival = RobotView { id: 0, pos: Vec2::new(0.30, 0.09), theta: 3.14, active: true };
+        let mut c = coach();
+        let target = c.attack_goal;
+        let spin = |c: &HeuristicCoach| c.striker_scores(&st, ball, Vec2::ZERO, &[rival], target)[2];
+        assert_eq!(spin(&c).0, SkillId::SpinKick);
+        assert!(spin(&c).1 > 0.0, "{:?}", spin(&c));
+        c.p.spin_max_open_goal = 0.75;
+        assert_eq!(spin(&c).1, 0.0);
+        // Con un rival delante tapando el arco, el giro vuelve a contar.
+        let tapa = RobotView { id: 1, pos: Vec2::new(0.50, 0.0), theta: 3.14, active: true };
+        assert!(c.striker_scores(&st, ball, Vec2::ZERO, &[rival, tapa], target)[2].1 > 0.0);
     }
 
     #[test]

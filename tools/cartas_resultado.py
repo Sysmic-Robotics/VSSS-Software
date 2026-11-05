@@ -75,7 +75,12 @@ def main():
         gs = goles(lineas)
         gf += sum(1 for _, s in gs if s > 0)
         gc += sum(1 for _, s in gs if s < 0)
-        dec = [l for l in lineas if l.get("evento") is None and l.get("play") == "Open"]
+        # Sin pelota a la vista el engine guarda una posición de relleno fuera de la cancha.
+        def valida(l):
+            p = l.get("pelota") or [None, None]
+            return p[0] is not None and p[1] is not None and abs(p[0]) <= 0.85 and abs(p[1]) <= 0.70
+
+        dec = [l for l in lineas if l.get("evento") is None and l.get("play") == "Open" and valida(l)]
         for i, l in enumerate(dec):
             t = l["t"]
             fut = [m for m in dec[i + 1:i + 1 + h] if m["t"] - t <= h]

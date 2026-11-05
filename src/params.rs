@@ -214,6 +214,13 @@ pub struct CoachParams {
     /// después corta hacia el palo elegido, para descolocar al defensor y al arquero. 0 = sin
     /// amague.
     pub kickoff_feint_s: f32,
+    /// Selector de jugadas, primera regla con datos: no girar (SpinKick) si desde la pelota se ve
+    /// abierta al menos esta fracción de la boca del arco rival y el atacante está alineado con el
+    /// tiro o no hay rival encima: ahí conduce. 0 = gira como siempre. En 108 registros de partido
+    /// (81 goles), con el arco abierto conducir terminó en gol en 3 s el 14.1 % (alineado, sin
+    /// rival) contra 0.6 % girando, 2.6 % contra 1.0 % alineado con rival encima, 4.7 % contra
+    /// 1.4 % de costado sin rival; de costado con rival encima, empate (3.2 y 3.5 %).
+    pub spin_max_open_goal: f32,
 }
 
 impl Default for CoachParams {
@@ -270,6 +277,7 @@ impl Default for CoachParams {
             kickoff_guard_s: 0.0,
             kickoff_rush_push: false,
             kickoff_feint_s: 0.0,
+            spin_max_open_goal: 0.0,
         }
     }
 }
