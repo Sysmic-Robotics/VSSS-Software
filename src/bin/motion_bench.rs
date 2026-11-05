@@ -288,6 +288,11 @@ const CASES: &[Case] = &[
     Case { ball_vel: SHOT_NEAR_POST, ..c("rk_shot_near_post", SkillId::RailKeeper, (-0.75, 0.0), (-0.70, 0.0, 90.0), (-0.15, -0.40), 3.0, 0.0, Goal::Save) },
     Case { ball_vel: SHOT_CENTER, ..c("rk_shot_center", SkillId::RailKeeper, (-0.75, 0.0), (-0.70, 0.0, 90.0), (-0.20, 0.05), 3.0, 0.0, Goal::Save) },
     Case { ball_vel: LINE_ROLL, ..c("rk_line_roll", SkillId::RailKeeper, (-0.75, 0.0), (-0.70, 0.0, 90.0), (-0.73, 0.45), 4.0, 0.0, Goal::Save) },
+    // Oscilación del arquero (alias `arquero_osc`): con la pelota quieta y lejos, parte a 12 cm
+    // de su punto y debe quedar quieto. En FIRASim, con ganancia 8 oscila 9-11 cm pico a pico
+    // en los últimos 3 s; con 3, 0.3 cm. (Penales desde la cruz a 1 m/s con el arquero corrido
+    // no sirven de caso: llegan en 0.3 s y ninguna ganancia los alcanza.)
+    c("rk_quieto", SkillId::RailKeeper, (-0.75, 0.0), (-0.67, 0.12, 90.0), (0.30, 0.0), 6.0, 0.0, Goal::RailSpot),
     Case { ball_vel: SHOT_FAR_POST, ..c("gk_shot_far_post", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.25, 0.25), 3.0, 0.0, Goal::Save) },
     Case { ball_vel: SHOT_NEAR_POST, ..c("gk_shot_near_post", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.15, -0.40), 3.0, 0.0, Goal::Save) },
     Case { ball_vel: SHOT_CENTER, ..c("gk_shot_center", SkillId::GoalKeep, (-0.75, 0.0), (-0.63, 0.0, 0.0), (-0.20, 0.05), 3.0, 0.0, Goal::Save) },
@@ -341,6 +346,12 @@ const SUITE_QUICK: &[&str] = &[
 const KEEPER_CASES: &[&str] = &[
     "goalkeep_keeper", "railkeeper_keeper", "rk_shot_far_post", "rk_shot_near_post", "rk_shot_center",
     "rk_line_roll", "gk_shot_far_post", "gk_shot_near_post", "gk_shot_center", "gk_line_roll",
+];
+
+/// Oscilación del arquero (alias `arquero_osc`): quieto con la pelota lejos, y los tiros.
+const KEEPER_OSC_CASES: &[&str] = &[
+    "rk_quieto", "rk_shot_far_post", "rk_shot_near_post", "rk_shot_center",
+    "rk_line_roll",
 ];
 
 /// Penales sin arquero (alias `penal`): de giro y empujando, a cada palo.
@@ -1114,6 +1125,7 @@ async fn main() {
     let bank_alias = names.iter().any(|n| n == "banda");
     let deflect_alias = names.iter().any(|n| n == "desvio");
     let pass_alias = names.iter().any(|n| n == "pase");
+    let keeper_osc_alias = names.iter().any(|n| n == "arquero_osc");
     let selected: Vec<&Case> = CASES
         .iter()
         .filter(|c| {
@@ -1129,6 +1141,7 @@ async fn main() {
                 || (bank_alias && BANK_CASES.contains(&c.name))
                 || (deflect_alias && DEFLECT_CASES.contains(&c.name))
                 || (pass_alias && PASS_CASES.contains(&c.name))
+                || (keeper_osc_alias && KEEPER_OSC_CASES.contains(&c.name))
         })
         .collect();
     if selected.is_empty() {
