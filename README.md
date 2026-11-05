@@ -437,8 +437,11 @@ log (`[main] parámetros: archivo config/team_params.json`).
   valores del simulador se pasa del punto y el arquero oscila. Medido el 5-nov-2026 sobre el
   mantel de prueba, con el registro de partido y `keeper_gain` 3: al ir a un punto se pasaba
   12.5 cm (mediana; máximo 43.9) y con la capa, 1.5 cm (máximo 7.2), y el arquero quedó quieto
-  (oscilación de 16.7 cm de pico a pico a 0.2 cm). En la cancha de madera el roce cambia, así que
-  hay que volver a medir. El ícono del escritorio la carga en "Robots reales" si `VSSL_PARAMS` no
+  (oscilación de 16.7 cm de pico a pico a 0.2 cm). En la cancha de madera
+  (5-nov-2026, 11:20) el robot avanzaba ~1.5 veces
+  lo pedido y el arquero oscilaba ±20 cm con la pelota quieta en el punto penal: la capa baja
+  `skills.keeper_gain` de 3 a 2, y queda quieto (ventanas de 2 s con más de 5 cm: del 19 % al 4 %).
+  El ícono del escritorio la carga en "Robots reales" si `VSSL_PARAMS` no
   viene puesta; a mano, `VSSL_PARAMS=config/robots_reales.json`. No se usa en el simulador.
 - Los JSON pueden ser parciales: lo que falta en los dos toma el default. Un campo con nombre
   desconocido es error y el proceso no arranca (evita que un typo en una calibración pase en
