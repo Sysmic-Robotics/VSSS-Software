@@ -772,6 +772,9 @@ Estas skills siguen disponibles como primitives reactivas. Hoy se usan sobre tod
 |-----------|-------|-------------|
 | `robot.max_v_mm_s` (`config/team_params.json`) | `1500` | Tope de v, el mismo clamp que aplica la base (`MAX_V_MM_S`) |
 | `robot.max_w_deg_s` (`config/team_params.json`) | `1000` | Tope de ω en grados/s, el mismo clamp que aplican la base (`MAX_W_DEG_S` / `MAX_ANGULAR_DEG_S`) y el robot (`MAX_ANGULAR_MRAD_S`) en la rama `giro-1000` del firmware; con el firmware de Peluche la base sigue recortando a 720 |
+| `robot.prediccion_ms` | `0` (apagada) | Predicción de la pose propia para el retraso del robot real (`src/motion/prediccion.rs`): el coach, las skills y motion ven la pose del EKF más lo que el robot recorre con los comandos enviados en ese lapso; la GUI y el registro, lo medido. El 5-nov-2026 el retraso del comando a la pose fue de 220-250 ms en la cancha de madera |
+| `robot.prediccion_ganancia` | `1` | Cuánto avanza el robot por cada m/s pedido, en la predicción (el giro va tal cual): en la madera, ~1.5 |
+| `robot.prediccion_v_max_m_s` | `0.45` | Tope del avance en la predicción, ya con la ganancia |
 | `SLOT_COUNT` | `5` | Slots del frame ASCII; el robot físico con `MI_ROBOT_ID = N` (firmware, desde 1) lee `slots[N-1]`. El robot del checkout actual es `MI_ROBOT_ID 2` → slot 1 |
 | Identidad de los robots (`config/identidad_robots.json`) | sin archivo: radio N ↔ patrón N | Qué patrón lleva cada robot físico y si está activo (ver abajo) |
 

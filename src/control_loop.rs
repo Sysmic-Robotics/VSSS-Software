@@ -1395,6 +1395,9 @@ pub async fn run_control_loop(
     let keeper_id = crate::params::params().coach.keeper_id;
     let mut motion = Motion::with_config(motion_cfg).with_areas(attack_sign, keeper_id);
     let mut zone_guard = ZoneGuard::new(attack_sign, keeper_id);
+    // Predicción de la pose propia (`robot.prediccion_ms`, apagada por defecto): compensa el
+    // retraso entre el comando y el movimiento del robot real.
+    let mut prediccion = crate::motion::prediccion::PrediccionPose::new();
     // Perfil de velocidad de una rutina (topes de motion y giro de Spin); sin rutina no
     // escribe nada.
     let mut perfil = PerfilEnLazo::default();
@@ -1571,8 +1574,22 @@ pub async fn run_control_loop(
             let mode: TickMode;
             // Solo con GUI: robots, pelota y `SkillStatus` del `World` de este tick.
             let mut gui_world = None;
+            // Hora del tick (s) para la predicción de pose: con el reloj por frames, la del
+            // simulador.
+            let t_tick = if frame_clock {
+                tick_counter as f64 * crate::vision_tools::FRAME_PERIOD_S
+            } else {
+                started.elapsed().as_secs_f64()
+            };
             let (commands, targets, applied_choices, escaping, debug, (escapando, frenados)) = {
                 let world_guard = world.read().await;
+                // El decisor, las skills y motion ven dónde va a estar cada robot propio
+                // cuando le lleguen los comandos (`robot.prediccion_ms`); la GUI, el registro
+                // y los ceros, lo medido.
+                let horizonte_s = crate::params::params().robot.prediccion_ms / 1000.0;
+                let mundo_predicho = (horizonte_s > 0.0)
+                    .then(|| prediccion.predecir(&world_guard, config.own_team, t_tick, horizonte_s));
+                let mundo_control: &World = mundo_predicho.as_ref().unwrap_or(&world_guard);
                 if !field_scale_warned {
                     field_scale_warned = warn_if_outside_vsss_field(&world_guard);
                 }
@@ -1586,7 +1603,7 @@ pub async fn run_control_loop(
                 mode = tick_mode(detenido, ref_mode, ciego);
                 let out = tick_commands(
                     mode,
-                    &world_guard,
+                    mundo_control,
                     decider.as_mut(),
                     tick_counter,
                     &mut catalog,
@@ -1752,8 +1769,22 @@ pub async fn run_control_loop(
             // El hook y la foto registran lo que decidió el tick; el envío, los ceros si no
             // hubo comandos.
             let mut radio_guard = radio.lock().await;
-            for cmd in ceros.as_deref().unwrap_or(&commands) {
+            let enviados = ceros.as_deref().unwrap_or(&commands);
+            for cmd in enviados {
                 radio_guard.add_motion_command(cmd.clone());
+            }
+            // Lo que se manda, para la predicción de pose de los próximos ticks.
+            {
+                let robot = &crate::params::params().robot;
+                prediccion.registrar(
+                    t_tick,
+                    enviados,
+                    config.own_team,
+                    robot.prediccion_ms / 1000.0,
+                    robot.prediccion_ganancia,
+                    robot.prediccion_v_max_m_s,
+                    f64::from(robot.max_w_deg_s).to_radians(),
+                );
             }
             // El giro de identificación (exclusivo: el transporte pone en cero las demás
             // posiciones) vale este envío; no sale en la parada, HALT ni el corte sin visión.

@@ -530,6 +530,19 @@ pub struct RobotParams {
     pub max_v_mm_s: i32,
     /// Tope de velocidad angular (grados/s). Mismo clamp que la base (`MAX_W_DEG_S`).
     pub max_w_deg_s: i32,
+    /// Predicción de la pose propia (ms) para compensar el retraso entre el comando y el
+    /// movimiento del robot real (`motion/prediccion.rs`): el 5-nov-2026 se midieron 250-350 ms
+    /// en el mantel y 220-250 ms en la cancha de madera (del comando a la pose del EKF).
+    /// 0 = apagada (por defecto). El lazo le pasa al coach, las skills y motion la pose del
+    /// EKF más lo que el robot recorre con los comandos de este lapso.
+    pub prediccion_ms: f64,
+    /// Cuánto avanza de verdad el robot por cada m/s pedido, en esa predicción (el giro va
+    /// tal cual). 1 = lo pedido; en la cancha de madera del 5-nov-2026 el robot avanzaba ~1.5
+    /// veces lo pedido.
+    pub prediccion_ganancia: f64,
+    /// Tope del avance (m/s) en esa predicción, ya con la ganancia: en el mantel el robot no
+    /// pasaba de ~0.45 m/s; en la madera llegó a 0.6.
+    pub prediccion_v_max_m_s: f64,
 }
 
 impl Default for RobotParams {
@@ -537,6 +550,9 @@ impl Default for RobotParams {
         Self {
             max_v_mm_s: 1500,
             max_w_deg_s: 720,
+            prediccion_ms: 0.0,
+            prediccion_ganancia: 1.0,
+            prediccion_v_max_m_s: 0.45,
         }
     }
 }
@@ -847,6 +863,24 @@ impl TeamParams {
         p.validate_tolerances()?;
         p.validate_rutinas()?;
         p.manual.validate()?;
+        if !(p.robot.prediccion_ms >= 0.0 && p.robot.prediccion_ms <= 600.0) {
+            return Err(format!(
+                "robot.prediccion_ms ({}) debe estar entre 0 (apagada) y 600 ms",
+                p.robot.prediccion_ms
+            ));
+        }
+        if !(p.robot.prediccion_ganancia >= 0.2 && p.robot.prediccion_ganancia <= 3.0) {
+            return Err(format!(
+                "robot.prediccion_ganancia ({}) debe estar entre 0.2 y 3",
+                p.robot.prediccion_ganancia
+            ));
+        }
+        if !(p.robot.prediccion_v_max_m_s > 0.0 && p.robot.prediccion_v_max_m_s <= 3.0) {
+            return Err(format!(
+                "robot.prediccion_v_max_m_s ({}) debe ser mayor que cero y a lo sumo 3 m/s",
+                p.robot.prediccion_v_max_m_s
+            ));
+        }
         if p.vision.blind_stop_s <= 0.0 {
             return Err(format!(
                 "vision.blind_stop_s ({}) debe ser mayor que cero: es el tiempo sin ver robots \

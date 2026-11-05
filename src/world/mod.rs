@@ -12,6 +12,9 @@ use std::collections::HashMap;
 pub const INACTIVO_TRAS_S: f64 = 2.0;
 
 /// Modelo del mundo que almacena el estado de todos los robots y el balón
+///
+/// `Clone`: el lazo arma una copia con las poses propias predichas (`motion::prediccion`).
+#[derive(Clone)]
 pub struct World {
     blue_robots: HashMap<i32, RobotState>,
     yellow_robots: HashMap<i32, RobotState>,
@@ -35,6 +38,17 @@ impl World {
     /// Devuelve los tamaños configurados para cada equipo.
     pub fn team_sizes(&self) -> (usize, usize) {
         (self.blue_team_size, self.yellow_team_size)
+    }
+
+    /// Los robots de un equipo, para cambiarlos en una copia del mundo (la predicción de
+    /// pose del lazo). `team` fuera de 0/1: ninguno.
+    pub fn robots_mut(&mut self, team: i32) -> impl Iterator<Item = &mut RobotState> {
+        let robots = match team {
+            0 => Some(&mut self.blue_robots),
+            1 => Some(&mut self.yellow_robots),
+            _ => None,
+        };
+        robots.into_iter().flat_map(|m| m.values_mut())
     }
 
     /// Obtiene el estado de un robot específico
