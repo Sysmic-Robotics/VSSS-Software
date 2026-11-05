@@ -51,6 +51,16 @@ impl World {
         robots.into_iter().flat_map(|m| m.values_mut())
     }
 
+    /// (activo, posición) de los robots de un equipo, sin copiarlos (la predicción de pose).
+    pub fn robots_posiciones(&self, team: i32) -> impl Iterator<Item = (bool, glam::Vec2)> + '_ {
+        let robots = match team {
+            0 => Some(&self.blue_robots),
+            1 => Some(&self.yellow_robots),
+            _ => None,
+        };
+        robots.into_iter().flat_map(|m| m.values().map(|r| (r.active, r.position)))
+    }
+
     /// Obtiene el estado de un robot específico
     pub fn get_robot_state(&self, id: i32, team: i32) -> Option<&RobotState> {
         match team {

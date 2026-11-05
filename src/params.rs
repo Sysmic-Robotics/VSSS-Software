@@ -543,6 +543,10 @@ pub struct RobotParams {
     /// Tope del avance (m/s) en esa predicción, ya con la ganancia: en el mantel el robot no
     /// pasaba de ~0.45 m/s; en la madera llegó a 0.6.
     pub prediccion_v_max_m_s: f64,
+    /// Cerca de la pelota no se adelanta (m): un robot propio a menos de esto de la pelota se
+    /// adelanta menos, y nada a la mitad; la pelota, lo que permita el propio más cerca. Así el
+    /// que empuja la pelota no se ve adentro de ella. 0 = adelantar siempre.
+    pub prediccion_radio_pelota_m: f64,
 }
 
 impl Default for RobotParams {
@@ -553,6 +557,7 @@ impl Default for RobotParams {
             prediccion_ms: 0.0,
             prediccion_ganancia: 1.0,
             prediccion_v_max_m_s: 0.45,
+            prediccion_radio_pelota_m: 0.30,
         }
     }
 }
@@ -873,6 +878,12 @@ impl TeamParams {
             return Err(format!(
                 "robot.prediccion_ganancia ({}) debe estar entre 0.2 y 3",
                 p.robot.prediccion_ganancia
+            ));
+        }
+        if !(p.robot.prediccion_radio_pelota_m >= 0.0 && p.robot.prediccion_radio_pelota_m <= 1.0) {
+            return Err(format!(
+                "robot.prediccion_radio_pelota_m ({}) debe estar entre 0 y 1 m",
+                p.robot.prediccion_radio_pelota_m
             ));
         }
         if !(p.robot.prediccion_v_max_m_s > 0.0 && p.robot.prediccion_v_max_m_s <= 3.0) {

@@ -1588,7 +1588,16 @@ pub async fn run_control_loop(
                 // y los ceros, lo medido.
                 let horizonte_s = crate::params::params().robot.prediccion_ms / 1000.0;
                 let mundo_predicho = (horizonte_s > 0.0)
-                    .then(|| prediccion.predecir(&world_guard, config.own_team, t_tick, horizonte_s));
+                    .then(|| {
+                        prediccion.predecir(
+                            &world_guard,
+                            config.own_team,
+                            t_tick,
+                            horizonte_s,
+                            f64::from(crate::params::params().skills.intercept_ball_decay_per_s),
+                            crate::params::params().robot.prediccion_radio_pelota_m,
+                        )
+                    });
                 let mundo_control: &World = mundo_predicho.as_ref().unwrap_or(&world_guard);
                 if !field_scale_warned {
                     field_scale_warned = warn_if_outside_vsss_field(&world_guard);
