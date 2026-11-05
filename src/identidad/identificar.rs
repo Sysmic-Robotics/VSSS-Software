@@ -78,12 +78,11 @@ pub struct Condiciones {
 pub fn puede_identificar(c: &Condiciones, identidad: &Identidad, vistos: &[(i32, f64)]) -> Result<(), String> {
     let razon = if c.parada {
         "Suelta la parada de emergencia para identificar."
-    } else if c.espera_arbitro {
-        "El equipo espera el primer comando del árbitro: suéltalo con «Jugar sin esperar al árbitro» \
-         (barra de estado) o manda un comando del árbitro."
     } else if c.halt {
         "El árbitro tiene al equipo en HALT."
-    } else if c.coach_activo {
+    } else if c.coach_activo && !c.espera_arbitro {
+        // Durante la espera del primer comando del árbitro el equipo está quieto aunque el
+        // coach esté activo: se puede identificar (la GUI lo hace sola al arrancar).
         "Pon el coach en pausa (P): con el coach activo, los robots se mueven."
     } else if c.rutina {
         "Hay una rutina en curso: ciérrala para identificar."
@@ -107,13 +106,12 @@ fn causa_de_corte(c: &Condiciones) -> Option<&'static str> {
         Some("cancelada")
     } else if c.parada {
         Some("parada de emergencia")
-    } else if c.espera_arbitro {
-        Some("espera del primer comando del árbitro")
     } else if c.halt {
         Some("HALT del árbitro")
     } else if c.sin_vision {
         Some("corte sin visión")
-    } else if c.coach_activo {
+    } else if c.coach_activo && !c.espera_arbitro {
+        // Con la espera terminada (llegó el árbitro) y el coach activo, los robots juegan.
         Some("se activó el coach")
     } else if c.rutina {
         Some("empezó una rutina")
@@ -198,6 +196,33 @@ impl Resultado {
             RobotFisico { patron, activo: actual_r.activo }
         });
         Identidad { robots }
+    }
+
+    /// La propuesta para la identificación automática del arranque: la de siempre, salvo que
+    /// una radio que no giró nada conserva su patrón si la cámara no lo ve (el robot todavía no
+    /// está en la cancha) y nadie más lo tomó; así no queda sin comandos al ponerlo.
+    pub fn propuesta_auto(&self, actual: &Identidad, vistos: &[i32]) -> Identidad {
+        let mut p = self.propuesta(actual);
+        for (r, res) in self.por_radio.iter().enumerate() {
+            let Some(mio) = actual.robots[r].patron else { continue };
+            let tomado = p.robots.iter().enumerate().any(|(o, x)| o != r && x.patron == Some(mio));
+            if matches!(res, ResultadoRadio::Ninguno) && !vistos.contains(&i32::from(mio)) && !tomado {
+                p.robots[r].patron = Some(mio);
+            }
+        }
+        p
+    }
+
+    /// Sin dudas: cada radio identificada dio un solo patrón o ninguno, ningún patrón se
+    /// repitió y al menos una dio su patrón. Así la identificación automática del arranque
+    /// aplica la propuesta sola; si no, la deja para que la vea una persona.
+    pub fn sin_dudas(&self) -> bool {
+        self.repetidos.is_empty()
+            && self.por_radio.iter().any(|r| matches!(r, ResultadoRadio::Uno { .. }))
+            && self
+                .por_radio
+                .iter()
+                .all(|r| matches!(r, ResultadoRadio::Uno { .. } | ResultadoRadio::Ninguno | ResultadoRadio::Omitida))
     }
 
     /// Una frase por radio y una por cada patrón repetido.
@@ -772,8 +797,42 @@ mod tests {
         assert!(puede_identificar(&Condiciones { manual: true, ..Default::default() }, &id, &v).unwrap_err().contains("control manual"));
         assert!(puede_identificar(&Condiciones { skill_gui: true, ..Default::default() }, &id, &v).unwrap_err().contains("skill de la GUI"));
         assert!(puede_identificar(&Condiciones { halt: true, ..Default::default() }, &id, &v).unwrap_err().contains("HALT"));
-        let espera = puede_identificar(&Condiciones { espera_arbitro: true, halt: true, ..Default::default() }, &id, &v);
-        assert!(espera.unwrap_err().contains("Jugar sin esperar al árbitro"));
+        // Durante la espera del árbitro el equipo está quieto: se puede, aunque el coach esté
+        // activo; con HALT del árbitro, no.
+        let espera = Condiciones { espera_arbitro: true, coach_activo: true, ..Default::default() };
+        assert_eq!(puede_identificar(&espera, &id, &v), Ok(()));
+        assert_eq!(causa_de_corte(&espera), None);
+        assert_eq!(causa_de_corte(&Condiciones { coach_activo: true, ..Default::default() }), Some("se activó el coach"));
+        let espera_halt = Condiciones { espera_arbitro: true, halt: true, ..Default::default() };
+        assert!(puede_identificar(&espera_halt, &id, &v).unwrap_err().contains("HALT"));
+    }
+
+    #[test]
+    fn la_propuesta_automatica_no_le_quita_el_patron_al_robot_que_falta() {
+        // Radio 0 ↔ patrón 0, radio 1 ↔ 1, radio 2 ↔ 2; el robot de la radio 2 no está en la
+        // cancha (la cámara no ve el 2) y las etiquetas de 0 y 1 se cambiaron.
+        let actual = Identidad::default();
+        let r = Resultado::nuevo(vec![
+            ResultadoRadio::Uno { patron: 1, grados: 50.0 },
+            ResultadoRadio::Uno { patron: 0, grados: 50.0 },
+            ResultadoRadio::Ninguno,
+        ]);
+        let p = r.propuesta_auto(&actual, &[0, 1]);
+        assert_eq!([p.robots[0].patron, p.robots[1].patron, p.robots[2].patron], [Some(1), Some(0), Some(2)]);
+        // La propuesta de siempre lo dejaba sin patrón.
+        assert_eq!(r.propuesta(&actual).robots[2].patron, None);
+        // Si la cámara sí ve el 2, que no giró: queda sin patrón (de verdad no es esa radio).
+        assert_eq!(r.propuesta_auto(&actual, &[0, 1, 2]).robots[2].patron, None);
+    }
+
+    #[test]
+    fn sin_dudas_solo_con_patrones_unicos() {
+        let uno = |p| ResultadoRadio::Uno { patron: p, grados: 50.0 };
+        assert!(Resultado::nuevo(vec![uno(1), uno(0), uno(2), ResultadoRadio::Ninguno, ResultadoRadio::Omitida]).sin_dudas());
+        assert!(!Resultado::nuevo(vec![uno(1), uno(1), uno(2)]).sin_dudas());
+        assert!(!Resultado::nuevo(vec![uno(1), ResultadoRadio::Dudoso(vec![(0, 15.0)])]).sin_dudas());
+        assert!(!Resultado::nuevo(vec![uno(1), ResultadoRadio::Varios(vec![(0, 50.0), (2, 47.0)])]).sin_dudas());
+        assert!(!Resultado::nuevo(vec![ResultadoRadio::Ninguno, ResultadoRadio::Ninguno]).sin_dudas());
     }
 
     #[test]

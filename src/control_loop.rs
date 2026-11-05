@@ -269,8 +269,10 @@ impl IdentidadEnLazo {
     }
 
     /// Antes del envío: el giro del tick, si sale, va a la radio (vale ese envío).
-    pub(crate) fn al_enviar(&self, modo: TickMode, radio: &mut crate::radio::Radio) {
-        if let Some(g) = self.giro_del_tick(modo) {
+    /// `solo_espera`: el HALT del tick es solo la espera del primer comando del árbitro (sin
+    /// parada, sin HALT del árbitro y con visión): el giro de identificación sí sale.
+    pub(crate) fn al_enviar(&self, modo: TickMode, solo_espera: bool, radio: &mut crate::radio::Radio) {
+        if let Some(g) = self.giro_del_tick(modo, solo_espera) {
             radio.giro_identificacion(g);
         }
     }
@@ -313,8 +315,9 @@ impl IdentidadEnLazo {
 
     /// El giro que sale en el envío de este tick, o `None` en HALT (parada incluida) y en el
     /// corte sin visión.
-    pub(crate) fn giro_del_tick(&self, modo: TickMode) -> Option<GiroIdentificacion> {
+    pub(crate) fn giro_del_tick(&self, modo: TickMode, solo_espera: bool) -> Option<GiroIdentificacion> {
         match modo {
+            TickMode::Halt if solo_espera => self.giro.map(|(g, _)| g),
             TickMode::Halt | TickMode::SinVision => None,
             TickMode::Play | TickMode::Stop => self.giro.map(|(g, _)| g),
         }
@@ -1610,7 +1613,11 @@ pub async fn run_control_loop(
             if tick_mode(detenido, ref_mode, false) == TickMode::Halt {
                 manual_state.clear();
                 skill_state.clear();
-                identidad.cortar_giro();
+                // La espera del primer comando del árbitro no corta el giro de identificación:
+                // el equipo está quieto y la GUI identifica sola al arrancar.
+                if estop_engaged || ref_mode == TickMode::Halt {
+                    identidad.cortar_giro();
+                }
             }
 
             let skill_warning: Option<String>;
@@ -1818,7 +1825,8 @@ pub async fn run_control_loop(
             identidad.vigilar(started.elapsed().as_secs_f64(), enviados, config.own_team, &vistos_identidad);
             // El giro de identificación (exclusivo: el transporte pone en cero las demás
             // posiciones) vale este envío; no sale en la parada, HALT ni el corte sin visión.
-            identidad.al_enviar(mode, &mut radio_guard);
+            let solo_espera = espera.activa() && !estop_engaged && ref_mode != TickMode::Halt && !ciego;
+            identidad.al_enviar(mode, solo_espera, &mut radio_guard);
             let send_result = radio_guard.send_commands().await;
             drop(radio_guard);
             let ok = send_result.is_ok();
@@ -3480,7 +3488,7 @@ mod tests {
             for c in cmds {
                 radio.add_motion_command(c.clone());
             }
-            self.identidad.al_enviar(modo, radio);
+            self.identidad.al_enviar(modo, false, radio);
             radio.send_commands().await.unwrap();
             self.tick += 1;
             self.frames.lock().unwrap().last().cloned().unwrap()
@@ -3489,6 +3497,18 @@ mod tests {
 
     fn avance(id: i32, vx: f64) -> MotionCommand {
         MotionCommand { id, team: 0, vx, vy: 0.0, omega: 0.0, orientation: 0.0 }
+    }
+
+    #[test]
+    fn el_giro_de_identificacion_sale_durante_la_espera_del_arbitro() {
+        let mut i = IdentidadEnLazo::new(Identidad::default(), true);
+        i.recibir(OrdenIdentidad::Giro { radio: 1, w_deg_s: 90 }, 0);
+        let g = Some(GiroIdentificacion { radio: 1, w_deg_s: 90 });
+        // HALT que es solo la espera del árbitro: sale; HALT de verdad (parada o árbitro), no.
+        assert_eq!(i.giro_del_tick(TickMode::Halt, true), g);
+        assert_eq!(i.giro_del_tick(TickMode::Halt, false), None);
+        assert_eq!(i.giro_del_tick(TickMode::SinVision, true), None);
+        assert_eq!(i.giro_del_tick(TickMode::Play, false), g);
     }
 
     #[test]
