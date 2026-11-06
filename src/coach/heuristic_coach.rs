@@ -80,6 +80,20 @@ const GIFT_LINE_REACH: f32 = 0.45;
 /// Gol regalado en curso: se suelta a los 1.5 s.
 const GIFT_MAX_S: f32 = 1.5;
 
+/// Amague en juego abierto (`open_feint_s`): después del amague, cuánto dura el corte (s) y
+/// cuánto espera para volver a amagar (s).
+const OPEN_CUT_S: f32 = 1.0;
+const OPEN_FEINT_COOLDOWN_S: f32 = 2.0;
+/// Contención (`contain_dist`): hasta dónde (x en el marco de ataque) cuenta como nuestra mitad.
+const CONTAIN_ZONE_X: f32 = 0.10;
+
+/// Amague en juego abierto en curso: lado del corte (+1/−1 en y) y desde cuándo.
+#[derive(Debug, Clone, Copy)]
+struct OpenFeint {
+    cut: f32,
+    since: u64,
+}
+
 /// Remate regalado en curso (`gift_goal_open`).
 #[derive(Debug, Clone, Copy)]
 struct GiftShot {
@@ -203,6 +217,9 @@ pub struct HeuristicCoach {
     kickoff_rush: Option<KickoffRush>,
     /// Gol regalado en curso (`gift_goal_open`).
     gift: Option<GiftShot>,
+    /// Amague en juego abierto en curso (`open_feint_s`) y decisión desde la que puede volver a amagar.
+    open_feint: Option<OpenFeint>,
+    open_feint_ready: u64,
     /// Saques propios con arrancada: alterna el lado con el arquero rival centrado.
     kickoffs_taken: u32,
     /// Lado de la arrancada elegido al empezar el saque propio: fijo hasta el silbato. Elegido en
@@ -297,6 +314,8 @@ impl HeuristicCoach {
             pass_play: None,
             kickoff_rush: None,
             gift: None,
+            open_feint: None,
+            open_feint_ready: 0,
             kickoffs_taken: 0,
             kickoff_side: None,
             kickoff_guard: None,
@@ -968,7 +987,77 @@ impl HeuristicCoach {
         } else {
             skill
         };
+        let target = if executed == SkillId::Dribble {
+            self.open_feint_target(r, ball, opp).unwrap_or(target)
+        } else {
+            self.open_feint = None;
+            target
+        };
         SkillChoice::new(r.id, executed, target)
+    }
+
+    /// Amague en juego abierto (`open_feint_s`): objetivo de la conducción mientras dura (primero el
+    /// palo del lado del defensor, después el otro), o `None`.
+    fn open_feint_target(&mut self, r: &RobotView, ball: Vec2, opp: &[RobotView]) -> Option<Vec2> {
+        if self.p.open_feint_s <= 0.0 || self.current_play != Play::Open || self.kickoff_rush.is_some() {
+            self.open_feint = None;
+            return None;
+        }
+        let hz = self.p.decision_hz.max(1e-3);
+        let post_y = GOAL_HALF_Y - self.p.aim_post_margin;
+        let post = |side: f32| Vec2::new(self.attack_goal.x, side * post_y);
+        if let Some(f) = self.open_feint {
+            let t = self.decision_count.saturating_sub(f.since) as f32 / hz;
+            if (r.pos - ball).length() > 0.15 || t > self.p.open_feint_s + OPEN_CUT_S {
+                self.open_feint = None;
+                self.open_feint_ready = self.decision_count + (OPEN_FEINT_COOLDOWN_S * hz) as u64;
+                return None;
+            }
+            return Some(if t < self.p.open_feint_s { post(-f.cut) } else { post(f.cut) });
+        }
+        let s = self.attack_sign();
+        if self.decision_count < self.open_feint_ready
+            || (r.pos - ball).length() > 0.10
+            || ball.x * s < 0.0
+            || ball.x * s > 0.50
+            || Self::alignment(r.pos, ball, self.attack_goal) < 0.5
+        {
+            return None;
+        }
+        let dir = (self.attack_goal - ball).normalize_or_zero();
+        let defender = opp.iter().filter(|o| o.active).find(|o| {
+            let rel = o.pos - ball;
+            let along = rel.dot(dir);
+            (0.12..=0.45).contains(&along) && (rel - dir * along).length() < 0.12
+        })?;
+        let cut = if defender.pos.y >= ball.y { -1.0 } else { 1.0 };
+        self.open_feint = Some(OpenFeint { cut, since: self.decision_count });
+        Some(post(-cut))
+    }
+
+    /// Contención (`contain_dist`): en nuestra mitad, con un rival pegado a la pelota y `r` sin
+    /// estar entre ella y nuestro arco (cerca), el punto de la recta pelota → arco propio a
+    /// `contain_dist` de la pelota; si no, `None` (disputa la pelota como siempre).
+    fn contain_point(&self, r: &RobotView, ball: Vec2, opp: &[RobotView]) -> Option<Vec2> {
+        let d = self.p.contain_dist;
+        if d <= 0.0 || self.current_play != Play::Open || ball.x * self.attack_sign() > CONTAIN_ZONE_X {
+            return None;
+        }
+        let d_rival = opp.iter().filter(|o| o.active).map(|o| (o.pos - ball).length()).fold(f32::INFINITY, f32::min);
+        let d_own = (r.pos - ball).length();
+        if d_rival > self.p.spin_when_opponent_within || d_own + 0.03 < d_rival {
+            return None;
+        }
+        let to_own = (self.own_goal - ball).normalize_or_zero();
+        let goal_side = (r.pos - ball).normalize_or_zero().dot(to_own) >= 0.8;
+        if goal_side && d_own <= d + 0.05 {
+            return None;
+        }
+        let mut pos = self.clamp_field_robot(ball + to_own * d);
+        if self.in_own_area(pos) {
+            pos.x = self.attack_sign() * -(GOAL_AREA_X - 0.08);
+        }
+        Some(pos)
     }
 
     /// Rival que amenaza en nuestra mitad sin ser el que está sobre la pelota
@@ -2344,6 +2433,11 @@ impl Coach for HeuristicCoach {
                     let skill = self.commit(r.id, SkillId::BlockLine, |_| false);
                     SkillChoice::new(r.id, skill, self.own_goal)
                 }
+                Some(Role::Striker) if self.contain_point(r, ball, &opp).is_some() => {
+                    let pos = self.contain_point(r, ball, &opp).expect("contención");
+                    let skill = self.commit(r.id, SkillId::Mark, |_| true);
+                    SkillChoice::new(r.id, skill, pos)
+                }
                 Some(Role::Striker) if self.holds_press_line(r, ball, &opp) => {
                     let skill = self.commit(r.id, SkillId::Mark, |_| true);
                     SkillChoice::new(r.id, skill, self.press_point(ball))
@@ -3098,6 +3192,55 @@ mod tests {
         c.decide(&o);
         assert_eq!(c.striker_id, Some(0));
         assert!(c.gift.is_none(), "{:?}", c.gift);
+    }
+
+    #[test]
+    fn the_striker_contains_a_rival_dribbler_from_the_goal_side() {
+        // Rival pegado a la pelota en nuestra mitad, nuestro atacante de costado: con contención
+        // va a la recta pelota → arco propio, a 0.15 m de la pelota, en vez de ir a la pelota.
+        let ball = Vec2::new(-0.25, 0.10);
+        let own = [Vec2::new(-0.20, 0.30), Vec2::new(0.30, -0.30), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(-0.17, 0.10), 180.0);
+        let mut c = coach();
+        c.p.contain_dist = 0.15;
+        let ch = c.decide(&o);
+        assert_eq!(c.striker_id, Some(0));
+        let st = choice_of(&ch, 0);
+        assert_eq!(st.skill_id, SkillId::Mark, "{st:?}");
+        let esperado = ball + (OWN - ball).normalize() * 0.15;
+        assert!((st.target - esperado).length() < 1e-3, "{st:?}");
+        // Ya entre la pelota y el arco, cerca: la disputa.
+        let mut o2 = o.clone();
+        o2.own_robots[0] = robot(esperado, 0.0);
+        let mut c = coach();
+        c.p.contain_dist = 0.15;
+        assert_ne!(choice_of(&c.decide(&o2), 0).target, esperado);
+        // Apagado: no va al punto de contención.
+        let mut c = coach();
+        assert_ne!(choice_of(&c.decide(&o), 0).skill_id, SkillId::Mark);
+    }
+
+    #[test]
+    fn with_a_defender_in_line_the_striker_feints_then_cuts() {
+        // Atacante detrás de la pelota en campo rival y un defensor 0.30 m adelante, un poco hacia
+        // +y: amaga hacia el palo de +y y a los `open_feint_s` corta al de −y.
+        let ball = Vec2::new(0.15, 0.0);
+        let own = [Vec2::new(0.07, 0.0), Vec2::new(-0.20, 0.40), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.45, 0.03), 180.0);
+        let mut c = coach();
+        c.p.open_feint_s = 0.5;
+        let views: Vec<RobotView> = o.own_robots.iter().enumerate().map(|(i, r)| HeuristicCoach::view(i, r)).collect();
+        let opp: Vec<RobotView> = o.opp_robots.iter().enumerate().map(|(i, r)| HeuristicCoach::view(i, r)).collect();
+        let first = c.open_feint_target(&views[0], ball, &opp).expect("amaga");
+        assert!(first.y > 0.0 && first.x > 0.7, "{first:?}");
+        c.decision_count += 6;
+        let cut = c.open_feint_target(&views[0], ball, &opp).expect("corta");
+        assert!(cut.y < 0.0, "{cut:?}");
+        // Apagado: nada.
+        let mut c = coach();
+        assert!(c.open_feint_target(&views[0], ball, &opp).is_none());
     }
 
     #[test]

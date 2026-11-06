@@ -231,6 +231,17 @@ pub struct CoachParams {
     pub gift_goal_open: f32,
     /// Distancia máxima (m) del robot a la pelota para el remate regalado.
     pub gift_goal_reach: f32,
+    /// Amague en juego abierto: con la pelota en campo rival y un defensor tapando la recta al arco
+    /// a 0.12-0.45 m, el atacante conduce durante estos segundos hacia el palo del lado del
+    /// defensor y después corta al otro (hasta 1 s; no vuelve a amagar en 2 s). 0 = nunca. El
+    /// rival que nos ganó el 5-nov conducía en arcos y zigzag (rectitud 0.3-0.7, hasta 8 cambios de
+    /// dirección en 3 s) y pasaba a nuestro atacante.
+    pub open_feint_s: f32,
+    /// Contención: en nuestra mitad, con un rival pegado a la pelota y nuestro atacante sin estar
+    /// entre ella y el arco, el atacante va primero a la recta pelota → arco propio, a esta distancia
+    /// de la pelota, y recién ahí la disputa. 0 = va directo a la pelota. En 5 de 7 goles en
+    /// contra del 5-nov el rival rodeó a uno de los nuestros que iba a la pelota.
+    pub contain_dist: f32,
 }
 
 impl Default for CoachParams {
@@ -290,6 +301,8 @@ impl Default for CoachParams {
             spin_max_open_goal: 0.0,
             gift_goal_open: 0.0,
             gift_goal_reach: 0.18,
+            open_feint_s: 0.0,
+            contain_dist: 0.0,
         }
     }
 }
