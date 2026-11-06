@@ -458,6 +458,16 @@ pub struct SkillParams {
     /// RailKeeper: cuánto puede correrse (m) desde la bisectriz por anticipar al rival (modo
     /// Rival); el resto lo decide la pelota cuando se mueve (modo Shot). 0 = sin tope.
     pub keeper_rival_max_shift: f32,
+    /// RailKeeper: con la pelota en el rincón del área (entre el riel y la línea, fuera de la boca)
+    /// y un rival encima, cierra el palo en vez de salir a barrerla por fuera. Barriéndola se iba
+    /// fuera del arco (y = 0.33 en el gol de los ~911 s del 5-nov, 16:28) y el rival la sacaba en
+    /// arco hacia el centro. Sin rival cerca barre como siempre (penal por pelota trabada).
+    pub keeper_corner_post: bool,
+    /// Guardia de la boca del arco propio para el arquero: en vez de anular la traslación (o
+    /// hacerlo girar en el lugar si ya toca la línea), recorta solo lo que avanza hacia la línea.
+    /// Con el riel a 6 cm, el guardia completo lo frenaba al correr de costado con el heading
+    /// inclinado unos grados (6.4 % del tiempo, y en dos goles del 5-nov justo en el tiro).
+    pub keeper_boca_suave: bool,
     /// Dribble: radio de las espirales del campo "ir al arco" (m).
     pub dribble_de: f32,
     /// Dribble: suavizado de la espiral fuera de su círculo (m).
@@ -507,6 +517,8 @@ impl Default for SkillParams {
             keeper_hold_band: 0.0,
             keeper_rival_min_ball_speed: 0.0,
             keeper_rival_max_shift: 0.0,
+            keeper_corner_post: false,
+            keeper_boca_suave: false,
             dribble_de: 0.10,
             dribble_kr: 0.05,
             dribble_speed: 0.8,

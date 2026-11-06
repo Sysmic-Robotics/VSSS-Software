@@ -173,6 +173,30 @@ impl BocaArco {
     pub fn restrict(&self, p: Vec2, theta: f64, cmd: &mut MotionCommand) -> GuardiaDebug {
         restringir(|q| self.touches(q), Vec2::new(-self.side, 0.0), p, theta, cmd)
     }
+
+    /// Restricción suave para el arquero (`keeper_boca_suave`): no anula la traslación ni lo hace
+    /// girar en el lugar; recorta solo el avance hacia la línea para que en `LOOK_AHEAD_S` no la
+    /// toque (si ya la toca, no avanza más hacia ella). Corriendo a lo largo del riel con el
+    /// heading inclinado, el guardia completo lo dejaba quieto justo en el tiro.
+    pub fn restrict_keeper(&self, p: Vec2, theta: f64, cmd: &mut MotionCommand) -> GuardiaDebug {
+        let h = Vec2::new(theta.cos() as f32, theta.sin() as f32);
+        let v = cmd.vx as f32 * h.x + cmd.vy as f32 * h.y;
+        let proyeccion = p + h * v * LOOK_AHEAD_S;
+        let frente = |q: Vec2| q.y.abs() <= GOAL_HALF_Y + ROBOT_HALF;
+        let hacia = h.x * self.side * v;
+        if hacia <= 0.0 || !(frente(p) || frente(proyeccion)) {
+            return GuardiaDebug { proyeccion, accion: None };
+        }
+        let margen = (GOAL_LINE_X - ROBOT_HALF) - p.x * self.side;
+        let permitido = margen.max(0.0) / LOOK_AHEAD_S;
+        if hacia <= permitido {
+            return GuardiaDebug { proyeccion, accion: None };
+        }
+        let k = (permitido / hacia) as f64;
+        cmd.vx *= k;
+        cmd.vy *= k;
+        GuardiaDebug { proyeccion, accion: Some(AccionGuardia::Frena) }
+    }
 }
 
 impl AreaRect {
@@ -227,6 +251,8 @@ pub struct ZoneGuard {
     opp_area: AreaRect,
     boca_propia: BocaArco,
     keeper_id: i32,
+    /// Guardia de la boca suave para el arquero (`skills.keeper_boca_suave`).
+    keeper_suave: bool,
 }
 
 impl ZoneGuard {
@@ -236,6 +262,7 @@ impl ZoneGuard {
             opp_area: AreaRect::opp(attack_sign),
             boca_propia: BocaArco::own(attack_sign),
             keeper_id,
+            keeper_suave: crate::params::params().skills.keeper_boca_suave,
         }
     }
 
@@ -328,7 +355,11 @@ impl ZoneGuard {
                 let g = self.opp_area.restrict(p, theta, cmd);
                 *guardia = Some(combinar(*guardia, g));
             }
-            let g = self.boca_propia.restrict(p, theta, cmd);
+            let g = if cmd.id == self.keeper_id && self.keeper_suave {
+                self.boca_propia.restrict_keeper(p, theta, cmd)
+            } else {
+                self.boca_propia.restrict(p, theta, cmd)
+            };
             *guardia = Some(combinar(*guardia, g));
         }
         out
@@ -776,6 +807,37 @@ mod tests {
             (guard.own_area(), guard.opp_area(), guard.boca_propia()),
             (nuevo.own_area(), nuevo.opp_area(), nuevo.boca_propia())
         );
+    }
+
+    #[test]
+    fn the_soft_guard_lets_the_keeper_run_along_its_rail() {
+        // Arquero en el riel a 6 cm (centro en x = −0.69, arco en −x), corriendo de costado a
+        // 0.45 m/s con el heading inclinado 12° hacia la línea: el guardia completo lo deja
+        // quieto; el suave solo recorta el avance hacia la línea y sigue corriendo.
+        let boca = BocaArco::own(1.0);
+        let p = Vec2::new(-0.69, 0.05);
+        let theta = (90.0f64 + 12.0).to_radians();
+        let mando = || cmd(2, 0.45 * theta.cos(), 0.45 * theta.sin());
+        let mut c = mando();
+        assert_eq!(boca.restrict(p, theta, &mut c).accion, Some(AccionGuardia::Frena));
+        assert_eq!((c.vx, c.vy), (0.0, 0.0));
+        let mut c = mando();
+        boca.restrict_keeper(p, theta, &mut c);
+        let v = (c.vx * c.vx + c.vy * c.vy).sqrt();
+        assert!(v > 0.25, "sigue corriendo: {v}");
+        // El avance hacia la línea en 0.30 s no la toca.
+        assert!(p.x as f64 + c.vx * LOOK_AHEAD_S as f64 > -(GOAL_LINE_X - ROBOT_HALF) as f64 - 1e-6);
+        // Ya tocando la línea, de costado: el completo lo hace girar en el lugar; el suave lo
+        // deja seguir si no va más hacia la línea.
+        let p = Vec2::new(-0.715, 0.05);
+        let theta = 80f64.to_radians();
+        let mut c = cmd(2, 0.4 * theta.cos(), 0.4 * theta.sin());
+        boca.restrict_keeper(p, theta, &mut c);
+        assert!(c.vy > 0.3, "{c:?}");
+        // Derecho hacia la línea: no avanza.
+        let mut c = cmd(2, -0.3, 0.0);
+        boca.restrict_keeper(Vec2::new(-0.715, 0.0), std::f64::consts::PI, &mut c);
+        assert!(c.vx.abs() < 1e-9, "{c:?}");
     }
 
     #[test]

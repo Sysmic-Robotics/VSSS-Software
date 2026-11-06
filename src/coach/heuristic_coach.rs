@@ -1201,14 +1201,19 @@ impl HeuristicCoach {
             return None;
         }
         let aim = self.gift_aim(ball, opp)?;
-        let (reach, min_align) = if on_line { (GIFT_LINE_REACH, 0.0) } else { (self.p.gift_goal_reach, 0.3) };
-        // El remate es para el que no es el atacante: el atacante ya conduce al arco con su propia
-        // lógica (en 96 partidos la regla lo tomó 420 veces, 3 % de goles, sin mejorar nada); la
-        // pelota sobre la línea, para cualquiera (el atacante iba al palo lejano, paralelo a ella).
+        let (reach, min_align) = if on_line { (GIFT_LINE_REACH, 0.0) } else { (self.p.gift_goal_reach, 0.5) };
+        // El remate es para el que no es el atacante, y solo si la tiene al menos tan cerca como él:
+        // el atacante ya conduce al arco con su propia lógica (en 96 partidos la regla lo tomó 420
+        // veces, 3 % de goles, sin mejorar nada), y con el apoyo más lejos que el atacante fueron 95
+        // remates y 1 gol. La pelota sobre la línea, para cualquiera (34-36 % de goles en 3 s).
+        let d_striker = own
+            .iter()
+            .find(|r| r.active && Some(r.id) == self.striker_id)
+            .map_or(f32::INFINITY, |r| (r.pos - ball).length());
         let (id, _) = own
             .iter()
             .filter(|r| r.active && r.id != self.keeper_id)
-            .filter(|r| on_line || Some(r.id) != self.striker_id)
+            .filter(|r| on_line || (Some(r.id) != self.striker_id && (r.pos - ball).length() <= d_striker + 0.02))
             .filter_map(|r| {
                 let d = (r.pos - ball).length();
                 let al = Self::alignment(r.pos, ball, aim);

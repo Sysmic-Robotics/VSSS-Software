@@ -46,11 +46,14 @@ REPO = Path(__file__).resolve().parent.parent
 RANGES_PATH = REPO / "config" / "style_ranges.json"
 INTEGER_PARAMS = {"role_min_hold", "skill_min_hold"}
 
-ENGINE = Path("/root/vsss-target/release/rustengine")
-DIRECTOR = Path("/root/vsss-target/release/match_director")
+# `VSSL_BIN_DIR` y `VSSL_WORK_DIR` permiten correr dos series a la vez, cada una con su
+# ejecutable y su carpeta de trabajo (y sus puertos); sin ellas, las de siempre.
+BIN_DIR = Path(os.environ.get("VSSL_BIN_DIR", "/root/vsss-target/release"))
+ENGINE = BIN_DIR / "rustengine"
+DIRECTOR = BIN_DIR / "match_director"
 FIRASIM = Path("/root/FIRASim/bin/FIRASim")
 # Los CSV y logs por tick van a ext4: sobre /mnt/d el lazo salta frames.
-WORK = Path("/root/annealing_work")
+WORK = Path(os.environ.get("VSSL_WORK_DIR", "/root/annealing_work"))
 
 # Lado en que FIRASim coloca al azul al arrancar (el director lee los lados de las posiciones).
 BLUE_SIDE, YELLOW_SIDE = "right", "left"

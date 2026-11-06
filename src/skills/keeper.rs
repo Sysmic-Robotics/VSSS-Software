@@ -94,6 +94,8 @@ pub struct RailKeeperSkill {
     pub rival_min_ball_speed: f32,
     /// Tope de lo que se corre desde la bisectriz al anticipar al rival (m); 0 = sin tope.
     pub rival_max_shift: f32,
+    /// En el rincón del área con un rival encima, cerrar el palo (`keeper_corner_post`).
+    pub corner_post: bool,
     /// Quieto dentro de la banda (`hold_band`).
     holding: bool,
     v_prev: f64,
@@ -120,6 +122,7 @@ impl RailKeeperSkill {
             hold_band: p.keeper_hold_band,
             rival_min_ball_speed: p.keeper_rival_min_ball_speed,
             rival_max_shift: p.keeper_rival_max_shift,
+            corner_post: p.keeper_corner_post,
             holding: false,
             v_prev: 0.0,
             last_target: None,
@@ -177,6 +180,13 @@ impl RailKeeperSkill {
 
         // Pelota entre el riel y la línea de gol: ya está "detrás" del arquero.
         if d_ball < self.depth + BALL_RADIUS {
+            // En el rincón (fuera de la boca) con un rival encima (`corner_post`): cerrar el palo.
+            // Barriéndola se iba fuera del arco y el rival la sacaba en arco hacia el centro; con el
+            // rival ahí, la pelota no queda trabada (no hay penal por eso).
+            let rival_on_ball = rivals.iter().any(|r| (*r - ball).length() <= self.contact_dist + 0.05);
+            if self.corner_post && ball_ahead.y.abs() > GOAL_HALF_Y && rival_on_ball {
+                return (ball_ahead.y.signum() * GOAL_HALF_Y, KeeperMode::NearPost);
+            }
             if ball_ahead.y.abs() <= AREA_HALF_Y + BALL_RADIUS {
                 // Dentro del ancho del área: barrerla a lo largo de la línea hacia afuera, desde
                 // el lado del centro. Frente a la boca la saca por el palo; en el rincón del área
@@ -391,6 +401,27 @@ mod tests {
         assert!((y - 0.103).abs() < 0.003, "{y}");
         // Pelota centrada: en el centro.
         assert!(k.target_y(Vec2::new(-0.2, 0.0), Vec2::ZERO, &[]).0.abs() < 1e-5);
+    }
+
+    #[test]
+    fn with_a_rival_on_a_corner_ball_the_keeper_closes_the_post_instead_of_leaving_the_goal() {
+        // Partido del 5-nov, 16:28, ~911 s: pelota en el rincón del área (entre el riel y la
+        // línea, y = 0.28, fuera de la boca) con el rival encima. Barriéndola, el arquero se iba
+        // a y = 0.33 (fuera del arco); con `corner_post`, al palo (0.20).
+        let ball = Vec2::new(-0.72, 0.28);
+        let rival = Vec2::new(-0.66, 0.31);
+        let mut k = keeper();
+        let (y, mode) = k.target_y(ball, Vec2::ZERO, &[rival]);
+        assert_eq!(mode, KeeperMode::SweepLine);
+        assert!(y > GOAL_HALF_Y, "la de siempre sale del arco: {y}");
+        k.corner_post = true;
+        let (y, mode) = k.target_y(ball, Vec2::ZERO, &[rival]);
+        assert_eq!(mode, KeeperMode::NearPost);
+        assert!((y - GOAL_HALF_Y).abs() < 1e-6, "{y}");
+        // Sin rival cerca la barre como siempre (penal por pelota trabada).
+        assert_eq!(k.target_y(ball, Vec2::ZERO, &[Vec2::new(-0.2, 0.0)]).1, KeeperMode::SweepLine);
+        // En la boca no cambia nada.
+        assert_eq!(k.target_y(Vec2::new(-0.72, 0.10), Vec2::ZERO, &[rival]).1, KeeperMode::SweepLine);
     }
 
     #[test]
