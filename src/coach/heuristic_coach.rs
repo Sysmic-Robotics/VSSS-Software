@@ -1517,13 +1517,21 @@ impl HeuristicCoach {
         let aim = self.attack_goal;
         let p = sup.pos;
         let d = (p - ball).length();
+        // El tiro está tapado solo si lo tapa un defensor de campo: el arquero rival, parado en el
+        // centro de su línea, siempre está en la recta al centro del arco y con él contando el
+        // atacante pasaba con el camino libre desde mitad de cancha (cancha, 6-nov).
+        let defensores: Vec<RobotView> = opp
+            .iter()
+            .filter(|o| (o.pos - self.attack_goal).length() > self.p.opp_keeper_radius)
+            .copied()
+            .collect();
         if ball_vel.length() > 0.3
             || (st.pos - ball).length() > 0.12
             || d < 0.25
             || d > max_dist
             || p.x * s < -0.10
             || p.x * s > GOAL_AREA_X - 0.05
-            || !Self::shot_blocked(ball, aim, opp)
+            || !Self::shot_blocked(ball, aim, &defensores)
             || Self::line_blocked(ball, p, opp, 0.09)
             || Self::line_blocked(p, aim, opp, 0.09)
         {
@@ -3256,6 +3264,32 @@ mod tests {
         c.decisions_since_role_switch = 0;
         c.decide(&o);
         assert_eq!(c.gift.map(|g| g.id), Some(1), "{:?}", c.gift);
+    }
+
+    #[test]
+    fn with_only_the_keeper_ahead_the_striker_drives_to_goal_instead_of_passing() {
+        // Cancha, 6-nov: pelota en mitad de cancha con nuestro atacante detrás, el camino libre y
+        // solo el arquero rival en el centro de su línea; el apoyo en campo rival con línea libre.
+        // Antes el arquero contaba como "tiro tapado" y armaba el pase; ahora conduce al arco.
+        let ball = Vec2::new(0.05, 0.0);
+        let own = [Vec2::new(-0.03, 0.0), Vec2::new(0.30, 0.32), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.70, 0.0), 90.0);
+        let mut c = coach();
+        c.p.pass_deflect_max_dist = 0.6;
+        c.striker_id = Some(0);
+        c.decisions_since_role_switch = 0;
+        c.decide(&o);
+        assert!(c.pass_play.is_none(), "no pasa: {:?}", c.pass_play.map(|p| p.receiver));
+        // Con un defensor de campo en la recta, sí puede armar el pase.
+        o.opp_robots[1] = robot(Vec2::new(0.30, 0.0), 180.0);
+        let mut c = coach();
+        c.p.pass_deflect_max_dist = 0.6;
+        c.striker_id = Some(0);
+        c.decisions_since_role_switch = 0;
+        c.decide(&o);
+        let views: Vec<RobotView> = o.opp_robots.iter().enumerate().map(|(i, r)| HeuristicCoach::view(i, r)).collect();
+        assert!(HeuristicCoach::shot_blocked(ball, c.attack_goal, &views[1..2]), "el defensor tapa");
     }
 
     #[test]
