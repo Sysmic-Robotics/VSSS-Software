@@ -7,7 +7,7 @@
 //! en la cruz del cuadrante (un robot por equipo a 0.20 m del lado propio). Termina por
 //! tiempo de juego o por goles y deja el resultado en la salida (y en `--out`, JSON).
 //!
-//!   match_director [--minutes 3] [--goals 3] [--kickoff blue|yellow] [--out partidos.jsonl]
+//!   match_director [--minutes 3] [--goals 3] [--kickoff blue|yellow] [--out partidos.jsonl] [--sin-free-ball]
 //!                  [--vision-port 10002] [--cmd-port 20011] [--speed 8]
 //!
 //! El tiempo de juego se cuenta en frames de visión (60 por segundo simulado), así vale
@@ -116,6 +116,9 @@ struct Options {
     penalties: u32,
     /// Modo saques: cantidad de saques a jugar (0 = partido normal).
     kickoffs: u32,
+    /// Sin free ball por pelota trabada (`--sin-free-ball`): solo reinicia tras un gol. Para el
+    /// partido visible, donde una persona mueve la pelota trabada en la ventana de FIRASim.
+    sin_free_ball: bool,
 }
 
 fn parse_args() -> Options {
@@ -129,6 +132,7 @@ fn parse_args() -> Options {
         speed: 1.0,
         penalties: 0,
         kickoffs: 0,
+        sin_free_ball: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -157,6 +161,7 @@ fn parse_args() -> Options {
             "--speed" => o.speed = value(&mut args).parse::<f64>().expect("--speed: número").max(1.0),
             "--penalties" => o.penalties = value(&mut args).parse().expect("--penalties: entero"),
             "--kickoffs" => o.kickoffs = value(&mut args).parse().expect("--kickoffs: entero"),
+            "--sin-free-ball" => o.sin_free_ball = true,
             other => {
                 eprintln!("[director] opción desconocida: {other}");
                 std::process::exit(2);
@@ -606,7 +611,7 @@ async fn main() {
                 break "goals";
             }
             kickoff(&mut m, scorer.other(), &whistle, &mut sim, &vision).await;
-        } else if m.ball_stuck(ball) {
+        } else if m.ball_stuck(ball) && !opt.sin_free_ball {
             free_ball(&mut m, ball, &f.robots, &whistle, &mut sim, &vision).await;
         }
     };

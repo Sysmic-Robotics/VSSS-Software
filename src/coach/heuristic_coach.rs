@@ -76,7 +76,14 @@ const GIFT_AIM_DEPTH: f32 = 0.08;
 const GIFT_LINE_BAND: f32 = 0.06;
 /// Gol regalado, pelota sobre la línea: rapidez máxima (m/s) y alcance del robot (m).
 const GIFT_LINE_MAX_SPEED: f32 = 0.35;
-const GIFT_LINE_REACH: f32 = 0.45;
+const GIFT_LINE_REACH: f32 = 0.90;
+/// Gol regalado: no va el más cercano sino el que tiene el camino más fácil (Benja, 6-nov). Costo =
+/// distancia / `GIFT_SPEED` (s), más `GIFT_STUCK_PENALTY` s si está trabado (un rival a menos de
+/// `GIFT_STUCK_DIST` de él) y `GIFT_PATH_PENALTY` s si un rival se cruza en su camino a la pelota.
+const GIFT_SPEED: f32 = 0.5;
+const GIFT_STUCK_DIST: f32 = 0.10;
+const GIFT_STUCK_PENALTY: f32 = 1.0;
+const GIFT_PATH_PENALTY: f32 = 0.5;
 /// Gol regalado en curso: se suelta a los 1.5 s.
 const GIFT_MAX_S: f32 = 1.5;
 
@@ -1244,6 +1251,26 @@ impl HeuristicCoach {
         (ball - robot).normalize_or_zero().dot((aim - ball).normalize_or_zero())
     }
 
+    /// Costo (s) del gol regalado para un robot en `pos`: el camino más fácil, no el más cercano.
+    fn gift_cost(&self, pos: Vec2, ball: Vec2, aim: Vec2, opp: &[RobotView]) -> f32 {
+        let d = (pos - ball).length();
+        let trabado = opp.iter().any(|o| o.active && (o.pos - pos).length() < GIFT_STUCK_DIST);
+        // Un rival en el camino a la pelota (sin contar el que está junto a ella, al final).
+        let camino = ball - pos;
+        let len = camino.length();
+        let cruzado = len > 0.15 && {
+            let dir = camino / len;
+            opp.iter().filter(|o| o.active).any(|o| {
+                let rel = o.pos - pos;
+                let along = rel.dot(dir);
+                along > 0.05 && along < len - 0.08 && (rel - dir * along).length() < 0.08
+            })
+        };
+        d / GIFT_SPEED - 0.1 * Self::alignment(pos, ball, aim)
+            + if trabado { GIFT_STUCK_PENALTY } else { 0.0 }
+            + if cruzado { GIFT_PATH_PENALTY } else { 0.0 }
+    }
+
     /// Punto de remate del gol regalado: de los 9 puntos de la boca (±0.18 m), el libre de rivales
     /// (a 6 cm de la recta) más cercano en y a la pelota, adentro del arco (`GIFT_AIM_DEPTH`).
     fn gift_aim(&self, ball: Vec2, opp: &[RobotView]) -> Option<Vec2> {
@@ -1275,8 +1302,14 @@ impl HeuristicCoach {
         if let Some(g) = self.gift {
             let held_s = self.decision_count.saturating_sub(g.since) as f32 / self.p.decision_hz.max(1e-3);
             let reach = if on_line { GIFT_LINE_REACH } else { self.p.gift_goal_reach } + 0.07;
+            let trabado = |p: Vec2| opp.iter().any(|o| o.active && (o.pos - p).length() < GIFT_STUCK_DIST);
+            // Trabado con un rival y otro propio libre que también podría: se vuelve a elegir.
+            let otro_libre = own.iter().any(|r| {
+                r.active && r.id != g.id && r.id != self.keeper_id && !trabado(r.pos) && (r.pos - ball).length() <= reach
+            });
             let sigue = own.iter().find(|r| r.active && r.id == g.id).is_some_and(|r| {
-                (r.pos - ball).length() <= reach
+                !(trabado(r.pos) && otro_libre)
+                    && (r.pos - ball).length() <= reach
                     && Self::alignment(r.pos, ball, g.aim) >= -0.2
                     && !Self::line_blocked(ball, g.aim, opp, 0.06)
                     && (on_line || open >= 0.5 * self.p.gift_goal_open)
@@ -1290,7 +1323,9 @@ impl HeuristicCoach {
             return None;
         }
         let aim = self.gift_aim(ball, opp)?;
-        let (reach, min_align) = if on_line { (GIFT_LINE_REACH, 0.0) } else { (self.p.gift_goal_reach, 0.5) };
+        // Sobre la línea basta con llegar desde el lado de la cancha, aunque sea de costado: cualquier
+        // toque la mete (con 0 quedaba afuera el que estaba al lado de la pelota).
+        let (reach, min_align) = if on_line { (GIFT_LINE_REACH, -0.3) } else { (self.p.gift_goal_reach, 0.5) };
         // El remate es para el que no es el atacante, y solo si la tiene al menos tan cerca como él:
         // el atacante ya conduce al arco con su propia lógica (en 96 partidos la regla lo tomó 420
         // veces, 3 % de goles, sin mejorar nada), y con el apoyo más lejos que el atacante fueron 95
@@ -1306,7 +1341,7 @@ impl HeuristicCoach {
             .filter_map(|r| {
                 let d = (r.pos - ball).length();
                 let al = Self::alignment(r.pos, ball, aim);
-                (d <= reach && al >= min_align).then_some((r.id, d - 0.05 * al))
+                (d <= reach && al >= min_align).then_some((r.id, self.gift_cost(r.pos, ball, aim, opp)))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))?;
         let g = GiftShot { id, aim, since: self.decision_count };
@@ -3179,6 +3214,48 @@ mod tests {
         let mut c = coach();
         let ch = c.decide(&o);
         assert!(choice_of(&ch, 1).target.y < -0.05, "{:?}", choice_of(&ch, 1));
+    }
+
+    #[test]
+    fn with_the_striker_stuck_on_the_keeper_the_free_support_pushes_the_line_ball_in() {
+        // Foto de Benja (6-nov): pelota quieta sobre la línea frente al arco, nuestro atacante
+        // trabado contra el arquero rival junto a ella y el apoyo libre a 0.3 m. Antes la regla
+        // elegía al más cercano (el trabado) y el apoyo seguía en su rol; ahora va el apoyo.
+        let ball = Vec2::new(0.745, 0.02);
+        let own = [Vec2::new(0.71, -0.16), Vec2::new(0.45, 0.10), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.72, -0.07), 90.0);
+        let mut c = coach_regalo();
+        c.striker_id = Some(0);
+        c.decisions_since_role_switch = 0;
+        let ch = c.decide(&o);
+        assert_eq!(c.gift.map(|g| g.id), Some(1), "va el libre: {:?}", c.gift);
+        let sup = choice_of(&ch, 1);
+        assert_eq!(sup.skill_id, SkillId::Dribble, "{sup:?}");
+        assert!(sup.target.x > 0.75, "adentro del arco: {sup:?}");
+        // Sin el rival encima del atacante, va el del camino más corto (el atacante).
+        o.opp_robots[0] = robot(Vec2::new(0.30, -0.40), 90.0);
+        let mut c = coach_regalo();
+        c.striker_id = Some(0);
+        c.decisions_since_role_switch = 0;
+        let ch = c.decide(&o);
+        assert_eq!(c.gift.map(|g| g.id), Some(0), "{:?}", c.gift);
+        assert!(choice_of(&ch, 0).target.x > 0.75);
+    }
+
+    #[test]
+    fn a_farther_robot_with_a_clear_path_beats_a_closer_one_with_a_rival_in_the_way() {
+        // Pelota sobre la línea: el atacante a 0.30 m con un rival cruzado en el camino y el apoyo a
+        // 0.55 m con el camino libre: va el apoyo.
+        let ball = Vec2::new(0.74, 0.0);
+        let own = [Vec2::new(0.44, 0.0), Vec2::new(0.30, 0.30), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(ball, Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.58, 0.01), 90.0);
+        let mut c = coach_regalo();
+        c.striker_id = Some(0);
+        c.decisions_since_role_switch = 0;
+        c.decide(&o);
+        assert_eq!(c.gift.map(|g| g.id), Some(1), "{:?}", c.gift);
     }
 
     #[test]
