@@ -162,6 +162,8 @@ impl Skill for DribbleSkill {
             // Al volver al campo, la rampa sigue desde la velocidad que traía.
             let th = robot.orientation;
             self.v_prev = cmd.vx * th.cos() + cmd.vy * th.sin();
+            // Con la memoria de cara de motion (`face_switch_s`) la cara sigue la del rodeo; sin
+            // ella, al volver al campo se elige de nuevo.
             self.face = 0.0;
             return cmd;
         }
@@ -169,6 +171,8 @@ impl Skill for DribbleSkill {
         let raw = Motion::normalize_angle(theta_d - robot.orientation);
         let dir = if !cfg.bidirectional {
             1.0
+        } else if cfg.face_switch_s > 0.0 {
+            motion.pick_face(robot, raw, Motion::v_along(robot))
         } else {
             let fresh = if raw.abs() > FRAC_PI_2 as f64 { -1.0 } else { 1.0 };
             let current = if self.face == 0.0 { fresh } else { self.face };

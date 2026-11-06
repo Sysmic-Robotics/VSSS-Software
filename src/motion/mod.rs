@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Paso de control de motion (s, ~60 Hz): la rampa limita el avance a `max_linear_accel · CONTROL_DT` por tick.
 pub const CONTROL_DT: f64 = 0.016;
+/// Elección de cara: por encima de este avance (m/s) la cara vigente es la del movimiento.
+const FACE_MOVING_SPEED: f64 = 0.05;
 
 /// Parámetros tunables del sistema de movimiento.
 /// `MotionConfig::default()` toma los defaults de `params::MotionParams`;
@@ -54,6 +56,8 @@ pub struct MotionConfig {
     /// `face_to` apunta a la cara más cercana. Activar con `VSSL_BIDIRECTIONAL=1`
     /// (ver `MotionConfig::from_env`).
     pub bidirectional: bool,
+    /// Elección de cara por tiempo (`MotionParams::face_switch_s`, ver `Motion::pick_face`).
+    pub face_switch_s: f64,
 }
 
 impl Default for MotionConfig {
@@ -76,6 +80,7 @@ impl MotionConfig {
             heading_gain: p.heading_gain,
             max_linear_accel: p.max_linear_accel,
             bidirectional: p.bidirectional,
+            face_switch_s: p.face_switch_s,
         }
     }
 
@@ -110,6 +115,8 @@ pub struct Motion {
     areas: Option<AreaRules>,
     /// Lado de rodeo elegido por robot (histéresis de `avoid::aim_point`).
     side_by_robot: Mutex<HashMap<(i32, i32), avoid::Memo>>,
+    /// Cara vigente por robot (+1 frente, −1 espalda), compartida por las skills (`pick_face`).
+    face_by_robot: Mutex<HashMap<(i32, i32), f64>>,
     /// Depuración (GUI y CSV de partido): con `registrar`, `navigate` anota lo que
     /// calculó por robot; el lazo lo toma una vez por tick. No cambia ningún comando.
     registrar: AtomicBool,
@@ -150,6 +157,7 @@ impl Motion {
             v_prev_by_robot: Mutex::new(HashMap::new()),
             areas: None,
             side_by_robot: Mutex::new(HashMap::new()),
+            face_by_robot: Mutex::new(HashMap::new()),
             registrar: AtomicBool::new(false),
             registro: Mutex::new(HashMap::new()),
         }
@@ -254,6 +262,47 @@ impl Motion {
         } else {
             error
         }
+    }
+
+    /// Cara con la que avanzar (+1 frente, −1 espalda) hacia una dirección que está a `raw` rad
+    /// del frente, con `v_along` (m/s) el avance actual a lo largo del frente.
+    ///
+    /// Con `face_switch_s` 0, la más cercana (corte en 90°, sin memoria). Si no, sigue con la
+    /// cara vigente (la de su avance si se mueve; si no, la última elegida) salvo que la otra
+    /// llegue antes: girar hasta la dirección cuesta |error|/ω_max, y cambiar de cara obliga además
+    /// a frenar lo que lleva (|v|/a). Cambia si (π − |e|)/ω + |v|/a + margen < |e|/ω, o sea con
+    /// |e| > π/2 + ω/2·(|v|/a + margen). La memoria es una por robot y la comparten todas las
+    /// skills: al pasar de rodear la pelota a conducirla no vuelve a elegir desde cero.
+    pub fn pick_face(&self, robot: &RobotState, raw: f64, v_along: f64) -> f64 {
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        if !self.config.bidirectional {
+            return 1.0;
+        }
+        let fresh = if raw.abs() > half_pi { -1.0 } else { 1.0 };
+        let key = (robot.team, robot.id);
+        let mut faces = self.face_by_robot.lock().expect("face lock poisoned");
+        if self.config.face_switch_s <= 0.0 {
+            faces.insert(key, fresh);
+            return fresh;
+        }
+        let current = if v_along.abs() > FACE_MOVING_SPEED {
+            v_along.signum()
+        } else {
+            faces.get(&key).copied().unwrap_or(fresh)
+        };
+        let err_current = if current > 0.0 { raw.abs() } else { std::f64::consts::PI - raw.abs() };
+        let w = self.config.max_angular_speed.max(1e-3);
+        let brake = v_along.abs() / self.config.max_linear_accel.max(1e-3);
+        let extra = (0.5 * w * (brake + self.config.face_switch_s)).min(half_pi - 0.05);
+        let chosen = if err_current > half_pi + extra { -current } else { current };
+        faces.insert(key, chosen);
+        chosen
+    }
+
+    /// Avance actual del robot a lo largo de su frente (m/s), de la velocidad medida.
+    pub fn v_along(robot: &RobotState) -> f64 {
+        let th = robot.orientation;
+        robot.velocity.x as f64 * th.cos() + robot.velocity.y as f64 * th.sin()
     }
 
     /// Dirección del Univector Field (rad) desde el robot hacia `target`, con los otros
@@ -386,8 +435,10 @@ impl Motion {
         let (aim, rodeo) = self.aim_point(robot_state, move_target, world, avoid_ball);
         let theta_d = self.uvf_toward(robot_state, aim, move_target, world) as f64;
         let raw = Self::normalize_angle(theta_d - robot_state.orientation);
-        let (err, dir) = if self.config.bidirectional && raw.abs() > std::f64::consts::FRAC_PI_2
-        {
+        let (err, dir) = if self.config.bidirectional && self.config.face_switch_s > 0.0 {
+            let d = self.pick_face(robot_state, raw, Self::v_along(robot_state));
+            (if d > 0.0 { raw } else { Self::normalize_angle(raw + std::f64::consts::PI) }, d)
+        } else if self.config.bidirectional && raw.abs() > std::f64::consts::FRAC_PI_2 {
             (Self::fold_bidirectional(raw), -1.0)
         } else {
             (raw, 1.0)
@@ -671,6 +722,62 @@ mod tests {
             (normalized_neg_pi - (-pi)).abs() < 1e-10 || (normalized_neg_pi - pi).abs() < 1e-10
         );
         assert!((Motion::normalize_angle(2.0 * pi) - 0.0).abs() < 1e-10);
+    }
+
+    fn bidir_por_tiempo() -> Motion {
+        let mut cfg = MotionConfig::default();
+        cfg.bidirectional = true;
+        cfg.face_switch_s = 0.10;
+        Motion::with_config(cfg)
+    }
+
+    #[test]
+    fn a_moving_robot_keeps_its_face_when_the_target_swings_past_90_degrees() {
+        // Avanzando de frente a 0.3 m/s y con el destino a 110° del frente: la cara más cercana
+        // es la espalda (corte en 90°: frena y retrocede), pero llegar de frente girando 110° es
+        // más rápido que frenar, invertir y girar 70°. Con la elección por tiempo sigue de frente.
+        let w = world_far_ball();
+        let mut r = robot(0.0, 0.0, 0.0);
+        r.velocity = Vec2::new(0.3, 0.0);
+        let a = 110f32.to_radians();
+        let target = Vec2::new(0.5 * a.cos(), 0.5 * a.sin());
+        let cmd = bidir_por_tiempo().move_and_face(&r, target, target, &w, 1.0, 0.0, 0.0);
+        assert!(v_body(&cmd) >= 0.0, "sigue de frente: {cmd:?}");
+        assert!(cmd.omega > 0.0, "gira hacia el destino: {cmd:?}");
+        let cmd = bidir().move_and_face(&r, target, target, &w, 1.0, 0.0, 0.0);
+        assert!(v_body(&cmd) < 0.0, "la de siempre: de espaldas: {cmd:?}");
+    }
+
+    #[test]
+    fn a_stopped_robot_still_reverses_when_the_target_is_behind() {
+        let w = world_far_ball();
+        let r = robot(0.0, 0.0, 0.0);
+        let a = 170f32.to_radians();
+        let target = Vec2::new(0.5 * a.cos(), 0.5 * a.sin());
+        let cmd = bidir_por_tiempo().move_and_face(&r, target, target, &w, 1.0, 0.0, 0.0);
+        assert!(v_body(&cmd) < 0.0, "de espaldas: {cmd:?}");
+    }
+
+    #[test]
+    fn the_face_does_not_flip_back_and_forth_around_90_degrees() {
+        // Quieto, con el destino oscilando entre 85° y 95° del frente (como cuando la pelota
+        // queda de costado): la de siempre cambia de cara en cada tick; con memoria, ninguna vez.
+        let m = bidir_por_tiempo();
+        let r = robot(0.0, 0.0, 0.0);
+        let mut caras = Vec::new();
+        for k in 0..10 {
+            let raw = if k % 2 == 0 { 85f64 } else { 95f64 }.to_radians();
+            caras.push(m.pick_face(&r, raw, 0.0));
+        }
+        assert!(caras.windows(2).all(|p| p[0] == p[1]), "{caras:?}");
+        let old = bidir();
+        let flips = (0..10)
+            .map(|k| old.pick_face(&r, if k % 2 == 0 { 85f64 } else { 95f64 }.to_radians(), 0.0))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|p| p[0] != p[1])
+            .count();
+        assert_eq!(flips, 9);
     }
 
     #[test]

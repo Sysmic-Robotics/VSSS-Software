@@ -221,6 +221,16 @@ pub struct CoachParams {
     /// rival) contra 0.6 % girando, 2.6 % contra 1.0 % alineado con rival encima, 4.7 % contra
     /// 1.4 % de costado sin rival; de costado con rival encima, empate (3.2 y 3.5 %).
     pub spin_max_open_goal: f32,
+    /// Gol regalado: en los últimos 30 cm frente al arco rival, si desde la pelota se ve abierta al
+    /// menos esta fracción de la boca, el jugador de campo (atacante o apoyo) que la tiene a
+    /// `gift_goal_reach` y detrás remata al punto abierto más cercano, sin esperar a cambiar de
+    /// rol; con la pelota lenta sobre la línea, el más cercano a 0.45 m la empuja adentro aunque el
+    /// arco no esté abierto. 0 = apagado. En los partidos del 5-nov el apoyo hacía `mark` con la
+    /// pelota a 6-13 cm y el arco abierto, y la pelota quedó 1.5 s sobre la línea con el atacante
+    /// conduciendo al palo lejano (paralelo a la línea).
+    pub gift_goal_open: f32,
+    /// Distancia máxima (m) del robot a la pelota para el remate regalado.
+    pub gift_goal_reach: f32,
 }
 
 impl Default for CoachParams {
@@ -278,6 +288,8 @@ impl Default for CoachParams {
             kickoff_rush_push: false,
             kickoff_feint_s: 0.0,
             spin_max_open_goal: 0.0,
+            gift_goal_open: 0.0,
+            gift_goal_reach: 0.18,
         }
     }
 }
@@ -527,6 +539,13 @@ pub struct MotionParams {
     pub max_linear_accel: f64,
     /// Robot de dos caras (heading módulo 180°). `VSSL_BIDIRECTIONAL` lo sobreescribe.
     pub bidirectional: bool,
+    /// Elección de cara por tiempo (robots de dos caras). 0 = la de siempre: en cada tick, la cara
+    /// más cercana a la dirección pedida, con corte exacto en 90°. Mayor que 0: una memoria de
+    /// cara por robot, compartida por todas las skills, que cambia de cara solo si la otra llega
+    /// antes contando el giro y el frenado de la velocidad que lleva, más este margen (s). En los
+    /// partidos del 5-nov hubo 64 cambios de cara por minuto de juego, el 40 % de ida y vuelta en
+    /// menos de 0.5 s, y las llegadas a la pelota con duda tardaron ~2 s de más.
+    pub face_switch_s: f64,
 }
 
 impl Default for MotionParams {
@@ -542,6 +561,7 @@ impl Default for MotionParams {
             heading_gain: 3.0,
             max_linear_accel: 1.0,
             bidirectional: false,
+            face_switch_s: 0.0,
         }
     }
 }

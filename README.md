@@ -708,6 +708,8 @@ ticks en que un robot recibe comando de avance pero no se mueve (atascado).
 
 `move_and_face` sigue el heading como un uniciclo: `ω = heading_gain · e` hacia la dirección del UVF y avance `v = v_perfil · max(cos e, 0)` a lo largo del heading (en bidireccional el error se pliega a ±90° y el avance va de espaldas). El `face_target` se usa recién al llegar. El comando sale paralelo al heading, así que el diferencial lo ejecuta sin pérdida.
 
+`face_switch_s` (0 = apagado) cambia cómo se elige la cara en bidireccional: en vez de la más cercana en cada tick (corte exacto en 90°), una memoria de cara por robot, compartida por todas las skills (también la conducción al rodear la pelota), que cambia de cara solo si la otra llega antes. Girar hasta la dirección cuesta `|e| / max_angular_speed`, y cambiar de cara obliga además a frenar lo que lleva (`|v| / max_linear_accel`), así que cambia con `|e| > 90° + max_angular_speed / 2 · (|v| / max_linear_accel + face_switch_s)`. En los partidos del 5-nov-2026 hubo 73-80 inversiones del avance por minuto en los jugadores de campo, el 34 % de ida y vuelta en menos de 0.5 s, y la mitad de las llegadas a la pelota giró más de 180°. Con más retraso entre el comando y el robot conviene un margen mayor.
+
 `v_perfil` baja en línea recta dentro de `brake_distance`, pero nunca por encima de `sqrt(2 · max_linear_accel · (d − arrival_threshold))`: la velocidad desde la que la rampa alcanza a frenar hasta el umbral de llegada. Sin ese tope, en un viaje largo el robot llegaba caliente (0.72 m/s a 0.16 m del destino) y se pasaba 4–5 cm en FIRASim.
 
 | Parámetro | Valor | Descripción |
