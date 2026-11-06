@@ -84,6 +84,10 @@ const GIFT_SPEED: f32 = 0.5;
 const GIFT_STUCK_DIST: f32 = 0.10;
 const GIFT_STUCK_PENALTY: f32 = 1.0;
 const GIFT_PATH_PENALTY: f32 = 0.5;
+/// Gol regalado: con el atacante a menos de esto de la pelota y sin rival encima (no trabado), no
+/// interviene: la tiene él (madera, 6-nov: conduciendo a lo largo de la línea a 2-8 cm quedaba
+/// afuera por la alineación y se elegía al apoyo, a 29-45 cm, que no llegaba).
+const GIFT_OWNER_DIST: f32 = 0.10;
 /// Gol regalado en curso: se suelta a los 1.5 s.
 const GIFT_MAX_S: f32 = 1.5;
 
@@ -107,6 +111,9 @@ struct GiftShot {
     id: i32,
     aim: Vec2,
     since: u64,
+    /// Alcance con que se asignó (m): se mantiene mientras dure el remate (si la pelota salía de la
+    /// franja de la línea bajaba de 0.97 a 0.25 m y el apoyo lo soltaba a mitad de camino).
+    reach: f32,
 }
 
 // Umbrales de decisión: `CoachParams` en `src/params.rs` / `config/team_params.json`
@@ -1299,9 +1306,18 @@ impl HeuristicCoach {
             && ball.y.abs() <= GOAL_HALF_Y
             && ball_vel.length() <= GIFT_LINE_MAX_SPEED;
         let open = self.open_goal_fraction(ball, opp);
+        // El atacante la tiene y está libre: su lógica, sin gol regalado.
+        let trabado_ = |p: Vec2| opp.iter().any(|o| o.active && (o.pos - p).length() < GIFT_STUCK_DIST);
+        let atacante_con_pelota = own.iter().find(|r| r.active && Some(r.id) == self.striker_id).is_some_and(|r| {
+            (r.pos - ball).length() <= GIFT_OWNER_DIST && !trabado_(r.pos)
+        });
+        if atacante_con_pelota {
+            self.gift = None;
+            return None;
+        }
         if let Some(g) = self.gift {
             let held_s = self.decision_count.saturating_sub(g.since) as f32 / self.p.decision_hz.max(1e-3);
-            let reach = if on_line { GIFT_LINE_REACH } else { self.p.gift_goal_reach } + 0.07;
+            let reach = g.reach + 0.07;
             let trabado = |p: Vec2| opp.iter().any(|o| o.active && (o.pos - p).length() < GIFT_STUCK_DIST);
             // Trabado con un rival y otro propio libre que también podría: se vuelve a elegir.
             let otro_libre = own.iter().any(|r| {
@@ -1310,9 +1326,9 @@ impl HeuristicCoach {
             let sigue = own.iter().find(|r| r.active && r.id == g.id).is_some_and(|r| {
                 !(trabado(r.pos) && otro_libre)
                     && (r.pos - ball).length() <= reach
-                    && Self::alignment(r.pos, ball, g.aim) >= -0.2
+                    && Self::alignment(r.pos, ball, g.aim) >= if g.reach >= GIFT_LINE_REACH { -0.5 } else { -0.2 }
                     && !Self::line_blocked(ball, g.aim, opp, 0.06)
-                    && (on_line || open >= 0.5 * self.p.gift_goal_open)
+                    && (on_line || g.reach >= GIFT_LINE_REACH || open >= 0.5 * self.p.gift_goal_open)
             });
             if sigue && held_s < GIFT_MAX_S {
                 return Some(g);
@@ -1344,7 +1360,7 @@ impl HeuristicCoach {
                 (d <= reach && al >= min_align).then_some((r.id, self.gift_cost(r.pos, ball, aim, opp)))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))?;
-        let g = GiftShot { id, aim, since: self.decision_count };
+        let g = GiftShot { id, aim, since: self.decision_count, reach };
         self.gift = Some(g);
         Some(g)
     }
@@ -3290,6 +3306,40 @@ mod tests {
         c.decide(&o);
         let views: Vec<RobotView> = o.opp_robots.iter().enumerate().map(|(i, r)| HeuristicCoach::view(i, r)).collect();
         assert!(HeuristicCoach::shot_blocked(ball, c.attack_goal, &views[1..2]), "el defensor tapa");
+    }
+
+    #[test]
+    fn a_free_striker_with_the_ball_keeps_it() {
+        // Madera, 6-nov (Seba, t 55.3/116.5/118.4): atacante a 5 cm de la pelota sobre la línea,
+        // conduciendo a lo largo de ella (alineación −1), sin rival encima; el apoyo a 0.35 m. El
+        // gol regalado no interviene: la tiene el atacante.
+        let ball = Vec2::new(0.735, 0.05);
+        let own = [Vec2::new(0.735, 0.10), Vec2::new(0.42, -0.10), Vec2::new(-0.68, 0.0)];
+        let o = obs(ball, Vec2::ZERO, own);
+        let mut c = coach_regalo();
+        c.striker_id = Some(0);
+        c.decisions_since_role_switch = 0;
+        let ch = c.decide(&o);
+        assert!(c.gift.is_none(), "{:?}", c.gift);
+        assert_ne!(choice_of(&ch, 0).skill_id, SkillId::Mark, "el atacante no se aparta");
+    }
+
+    #[test]
+    fn a_line_shot_keeps_its_reach_when_the_ball_leaves_the_band() {
+        // Madera, 6-nov: el apoyo a 0.40 m va a la pelota sobre la línea (atacante trabado); la
+        // pelota sale de la franja (a 10 cm de la línea): antes el alcance bajaba a 0.25 m y lo
+        // soltaba; ahora sigue.
+        let own = [Vec2::new(0.71, -0.16), Vec2::new(0.40, 0.10), Vec2::new(-0.68, 0.0)];
+        let mut o = obs(Vec2::new(0.745, 0.02), Vec2::ZERO, own);
+        o.opp_robots[0] = robot(Vec2::new(0.72, -0.07), 90.0);
+        let mut c = coach_regalo();
+        c.striker_id = Some(0);
+        c.decisions_since_role_switch = 0;
+        c.decide(&o);
+        assert_eq!(c.gift.map(|g| g.id), Some(1), "{:?}", c.gift);
+        o.ball = obs(Vec2::new(0.65, 0.04), Vec2::ZERO, own).ball;
+        c.decide(&o);
+        assert_eq!(c.gift.map(|g| g.id), Some(1), "sigue el apoyo: {:?}", c.gift);
     }
 
     #[test]
