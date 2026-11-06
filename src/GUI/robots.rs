@@ -59,11 +59,39 @@ pub struct EstadoRobots {
     corte: Option<String>,
     /// El resultado de la última identificación y su propuesta.
     resultado: Option<(Resultado, Identidad, Identidad)>,
+    /// Identificación automática al arrancar.
+    auto: AutoIdentificar,
+}
+
+/// Cuánto tiempo seguido tiene que ver la cámara los mismos robots propios antes de la
+/// identificación automática.
+pub const AUTO_ESTABLES: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Identificación automática al arrancar: una vez por corrida, con la base station, durante
+/// la espera del primer comando del árbitro (el equipo quieto). Se apaga con
+/// `VSSL_IDENTIFICAR_AL_ARRANCAR=0`.
+#[derive(Debug)]
+struct AutoIdentificar {
+    habilitada: bool,
+    hecha: bool,
+    en_curso: bool,
+    /// Patrones vistos y desde cuándo.
+    vistos: Option<(Vec<i32>, Instant)>,
 }
 
 impl EstadoRobots {
     pub fn new(tx: Option<mpsc::Sender<OrdenIdentidad>>) -> Self {
-        Self { tx, pendiente: None, guardado: false, estado: None, en_curso: None, corte: None, resultado: None }
+        let habilitada = std::env::var("VSSL_IDENTIFICAR_AL_ARRANCAR").map_or(true, |v| v.trim() != "0");
+        Self {
+            tx,
+            pendiente: None,
+            guardado: false,
+            estado: None,
+            en_curso: None,
+            corte: None,
+            resultado: None,
+            auto: AutoIdentificar { habilitada, hecha: false, en_curso: false, vistos: None },
+        }
     }
 
     pub fn identificando(&self) -> bool {
@@ -248,6 +276,9 @@ impl DebugGui {
             }
             Paso::Cortado(frase) => {
                 self.robots.en_curso = None;
+                if std::mem::take(&mut self.robots.auto.en_curso) {
+                    eprintln!("[GUI] identificación automática cortada: {frase}");
+                }
                 self.robots.corte = Some(frase);
                 let _ = self.robots.mandar(OrdenIdentidad::FinGiro);
             }
@@ -256,19 +287,99 @@ impl DebugGui {
                 if giraba {
                     let _ = self.robots.mandar(OrdenIdentidad::FinGiro);
                 }
+                if std::mem::take(&mut self.robots.auto.en_curso) {
+                    self.fin_auto_identificar(res, inicio);
+                    return;
+                }
                 let propuesta = res.propuesta(&inicio);
                 self.robots.resultado = Some((res, inicio, propuesta));
             }
         }
     }
 
-    /// Con cada foto: suelta la identidad pendiente si la foto ya la trae, y avanza la
-    /// identificación.
+    /// Con cada foto: suelta la identidad pendiente si la foto ya la trae, avanza la
+    /// identificación y, si toca, arranca la automática.
     pub(super) fn foto_robots(&mut self) {
         if self.robots.pendiente.as_ref().is_some_and(|p| self.snap.identidad.as_deref() == Some(p)) {
             self.robots.pendiente = None;
         }
         self.paso_identificacion(Instant::now(), false);
+        self.auto_identificar(Instant::now());
+    }
+
+    /// La identificación automática al arrancar: durante la espera del primer comando del
+    /// árbitro, cuando la cámara ve los mismos robots propios `AUTO_ESTABLES` seguidos.
+    pub(super) fn auto_identificar(&mut self, ahora: Instant) {
+        let a = &self.robots.auto;
+        let toca = a.habilitada
+            && !a.hecha
+            && !self.robots.identificando()
+            && self.robots.resultado.is_none()
+            && self.robots.tx.is_some()
+            && self.run.is_base_station()
+            && self.snap.esperando_arbitro
+            && !self.snap.estop
+            && !self.estop_activa();
+        let mut ids: Vec<i32> = self.vistos_theta().iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if !toca || ids.is_empty() {
+            self.robots.auto.vistos = None;
+            return;
+        }
+        match &self.robots.auto.vistos {
+            Some((v, desde)) if *v == ids => {
+                if ahora.duration_since(*desde) < AUTO_ESTABLES {
+                    return;
+                }
+            }
+            _ => {
+                self.robots.auto.vistos = Some((ids, ahora));
+                return;
+            }
+        }
+        if self.razon_identificar().is_err() {
+            return;
+        }
+        let Some(inicio) = self.identidad_base() else { return };
+        self.robots.auto.hecha = true;
+        self.robots.auto.en_curso = true;
+        eprintln!("[GUI] identificación automática al arrancar (patrones a la vista: {})", lista(&ids));
+        self.robots.estado =
+            Some(("Identificando sola al arrancar: gira cada robot de a uno. No los toques.".to_string(), false));
+        self.robots.corte = None;
+        self.robots.resultado = None;
+        self.robots.en_curso =
+            Some(EnCurso { maquina: Identificacion::nueva(&inicio, ahora), inicio, girando: false });
+        self.paso_identificacion(ahora, false);
+    }
+
+    /// Fin de la identificación automática: sin dudas, aplica y guarda la propuesta; con
+    /// dudas, la deja para que la vea una persona.
+    fn fin_auto_identificar(&mut self, res: Resultado, inicio: Identidad) {
+        let vistos: Vec<i32> = self.vistos_theta().iter().map(|(id, _)| *id).collect();
+        if !res.sin_dudas() {
+            eprintln!("[GUI] identificación automática con dudas: queda para revisar en la pestaña Robots");
+            let propuesta = res.propuesta(&inicio);
+            self.robots.resultado = Some((res, inicio, propuesta));
+            self.robots.estado = Some((
+                "La identificación automática tuvo dudas: revisa el resultado y aplícalo o descártalo.".to_string(),
+                true,
+            ));
+            return;
+        }
+        let propuesta = res.propuesta_auto(&inicio, &vistos);
+        if propuesta == inicio {
+            eprintln!("[GUI] identificación automática: la identidad ya estaba bien");
+            self.robots.estado = Some(("Identificación automática: la identidad ya estaba bien.".to_string(), false));
+            return;
+        }
+        for linea in propuesta.describir() {
+            eprintln!("[GUI] identificación automática: {linea}");
+        }
+        self.aplicar_identidad(propuesta);
+        let guardado = self.robots.estado.take().map(|(s, _)| s).unwrap_or_default();
+        self.robots.estado = Some((format!("Identificación automática aplicada. {guardado}"), false));
     }
 
     /// Atiende un mensaje de la pestaña.
@@ -700,17 +811,91 @@ mod tests {
     }
 
     #[test]
-    fn la_espera_del_arbitro_dice_como_soltarla() {
-        // El lazo espera el primer comando: la foto llega en HALT, sin parada puesta.
+    fn durante_la_espera_del_arbitro_se_puede_identificar() {
+        // El lazo espera el primer comando: la foto llega en HALT, sin parada puesta. El equipo
+        // está quieto: se puede identificar aunque el coach esté activo.
         let mut p = gui("espera");
+        p.pausa.store(false, Ordering::Relaxed);
         let snap = LoopSnapshot { mode: TickMode::Halt, esperando_arbitro: true, ..foto(Identidad::default(), &[(0, 0.0)]) };
         let _ = p.g.update(Message::Snapshot(Arc::new(snap)));
-        let razon = p.g.razon_identificar().unwrap_err();
-        assert!(razon.contains(super::super::status_line::TEXTO_SOLTAR_ESPERA), "{razon}");
-        assert!(!razon.contains("HALT"), "{razon}");
-        // Soltada la espera, se puede.
-        let _ = p.g.update(Message::Snapshot(Arc::new(foto(Identidad::default(), &[(0, 0.0)]))));
         assert_eq!(p.g.razon_identificar(), Ok(()));
+        // Con HALT del árbitro (sin espera), no.
+        let halt = LoopSnapshot { mode: TickMode::Halt, ..foto(Identidad::default(), &[(0, 0.0)]) };
+        let _ = p.g.update(Message::Snapshot(Arc::new(halt)));
+        assert!(p.g.razon_identificar().unwrap_err().contains("HALT"));
+    }
+
+    /// Ángulo (°) del robot que gira con la radio identificada, `s` segundos después de
+    /// empezar: sube hasta 54° y vuelve (la consigna nominal).
+    fn giro_nominal(s: f64) -> f64 {
+        if (0.5..1.1).contains(&s) {
+            (s - 0.5) * 90.0
+        } else if (1.1..1.7).contains(&s) {
+            54.0 - (s - 1.1) * 90.0
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    fn identifica_sola_al_arrancar_y_aplica_sin_dudas() {
+        let mut p = gui("auto");
+        p.pausa.store(false, Ordering::Relaxed); // coach activo: igual se puede durante la espera
+        // Solo la radio 0 activa; su robot lleva el patrón 1 (cambiaron las etiquetas).
+        let mut ident = Identidad::default();
+        for r in 1..SLOT_COUNT {
+            ident.robots[r].activo = false;
+        }
+        let espera = |robots: &[(i32, f64)]| LoopSnapshot {
+            mode: TickMode::Halt,
+            esperando_arbitro: true,
+            ..foto(ident.clone(), robots)
+        };
+        let t0 = Instant::now();
+        p.g.snap = Arc::new(espera(&[(0, 0.0), (1, 0.0)]));
+        p.g.auto_identificar(t0);
+        p.g.auto_identificar(t0 + Duration::from_millis(1000));
+        assert!(!p.g.robots.identificando(), "antes de que la cámara los vea estables no arranca");
+        let t1 = t0 + AUTO_ESTABLES + Duration::from_millis(100);
+        p.g.auto_identificar(t1);
+        assert!(p.g.robots.identificando(), "arranca sola durante la espera del árbitro");
+        for ms in (0..2600u64).step_by(20) {
+            let theta = giro_nominal(ms as f64 / 1000.0);
+            p.g.snap = Arc::new(espera(&[(0, 0.0), (1, theta.to_radians())]));
+            p.g.paso_identificacion(t1 + Duration::from_millis(ms + 10), false);
+        }
+        assert!(!p.g.robots.identificando());
+        // Sin dudas: la aplicó sola (sin resultado pendiente) y la guardó.
+        assert!(p.g.robots.resultado.is_none());
+        let usadas: Vec<Identidad> = ordenes(&mut p.rx)
+            .into_iter()
+            .filter_map(|o| match o {
+                OrdenIdentidad::Usar(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usadas.len(), 1, "{usadas:?}");
+        assert_eq!(usadas[0].robots[0].patron, Some(1));
+        assert_eq!(crate::identidad::cargar(&p.dir.join("identidad.json")).unwrap(), Some(usadas[0].clone()));
+        assert!(
+            p.g.robots.estado.as_ref().is_some_and(|(s, _)| s.starts_with("Identificación automática aplicada")),
+            "{:?}",
+            p.g.robots.estado
+        );
+        // Una sola vez por corrida.
+        p.g.auto_identificar(t1 + Duration::from_secs(10));
+        p.g.auto_identificar(t1 + Duration::from_secs(13));
+        assert!(!p.g.robots.identificando());
+    }
+
+    #[test]
+    fn sin_espera_del_arbitro_no_identifica_sola() {
+        let mut p = gui("auto_no");
+        // En juego (sin espera), nunca arranca sola.
+        let t0 = Instant::now();
+        p.g.auto_identificar(t0);
+        p.g.auto_identificar(t0 + AUTO_ESTABLES + Duration::from_millis(500));
+        assert!(!p.g.robots.identificando());
     }
 
     #[test]
