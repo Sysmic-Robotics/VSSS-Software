@@ -694,6 +694,16 @@ Reporta goles a favor/en contra, posesión, toques por robot, distancia media a 
 de pelota en pared/esquina, cambios de striker por minuto, uso de cada skill y el porcentaje de
 ticks en que un robot recibe comando de avance pero no se mueve (atascado).
 
+Para el análisis después de un partido (simulador o cancha real, `.csv` o `.csv.gz`), en el marco
+"atacamos hacia +x" deducido del arquero: `tools/analizar_partido.py` resume trabas, esquinas,
+reanudaciones y goles; `tools/analizar_detalle.py` da el informe detallado por secciones (goles
+uno por uno, caras, soporte, ataque, saques y casi goles; `--solo goles,caras` elige). Los goles
+salen de la pelota cruzando la línea, no del árbitro, que en la cancha real va a mano.
+
+```bash
+python3 tools/analizar_detalle.py logs/partidos/partido_5nov_tarde/1628_yellow.csv.gz
+```
+
 ## Parámetros clave (`src/main.rs`)
 
 | Constante | Valor | Descripción |
@@ -979,6 +989,19 @@ REPEAT=10 FIRASIM_BIN=~/FIRASim/bin/FIRASim tools/suite_skills.sh rapida logs/su
 ```
 
 Guarda `bd0.jsonl`/`bd1.jsonl` (una línea por repetición), `bd0.txt`/`bd1.txt` (tasa por caso y por skill) y el CSV por tick solo de las repeticiones que fallan. Si FIRASim se cae, reanuda desde la repetición pendiente (lo relanza si `FIRASIM_BIN` está definido). Se niega a correr si hay otro engine abierto.
+
+### No-regresión de saques y penales (`tools/regresion_jugadas.sh`)
+
+Cada cambio de estrategia se revisa para que no empeore el saque ni los penales. `tools/regresion_jugadas.sh` corre en paralelo cuatro baterías del director (`match_director --kickoffs N` o `--penalties N`, con `tools/bateria.sh`), cada una con su FIRASim headless a 480 fps y dos engines con el ruido de cámara, las dos caras y el reloj por frames: saques y penales del candidato (azul) contra la base (amarillo) y los mismos de la base contra sí misma, que son la referencia. Imprime una tabla del azul de cada par, candidato contra referencia: goles con saque propio, goles en contra tras el saque rival, penales convertidos y penales convertidos por el rival. Marca regresión cuando el candidato es peor por más de 2 errores estándar (z de dos proporciones con la proporción conjunta) y avisa si la referencia ya tiene el peor valor posible (por ejemplo, 0 goles con su saque), porque ahí no se puede detectar una regresión.
+
+```bash
+# Como root en WSL, desde la raíz del repo. No compila: usa /root/vsss-target/release.
+bash tools/regresion_jugadas.sh logs/annealing/todo.json        # base real_B.json, 240 saques y 240 penales
+bash tools/regresion_jugadas.sh cand.json base.json --saques 20 --penales 20 --k0 4   # prueba corta (~1 min)
+bash tools/bateria.sh prueba cand.json base.json --kickoffs 40 0   # una sola batería
+```
+
+Cada batería usa un índice de puertos k (visión 10600+10k, comandos 20600+10k, árbitro 10690+10k) y la regresión usa k0..k0+3, así que `--k0` va de 0 a 5 y se elige para no chocar con otra serie: los dos scripts se niegan a partir si uno de sus puertos está tomado. Los resultados quedan en `/root/regresion/<candidato>_k<k0>/`: `resumen.txt` y, por batería, `res.jsonl` y los logs del director, de FIRASim y de los engines. Los CSV de partido (~1 GB por batería) se borran al terminar cada batería, solo los de su carpeta. Código de salida: 0 sin regresión, 1 regresión, 3 alguna batería no terminó.
 
 ## Tests
 
